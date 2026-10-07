@@ -59,6 +59,10 @@ passes them and keeps the names above is safe to hand over.
   config's `num_experts`: every expert of a projection sits in one bank at one rate (gate, up and down may differ
   from each other from 4ca5ece4 on). A rate-group or pruned pack ([pack-format](pack-format.md#rate-groups-per-expert-rates-uneven-expert-counts))
   does not load there; serving one takes `GroupLayout` at load and `moeGroups` at dispatch, as this repo does.
+- **MiMo and GLM packs serve through the same names.** MiMo binds its banks to `moe`; GLM to `moeClamped` (limit =
+  `swiglu_limit`, 10) with the host adding its own ungated shared expert, and `trellisAdmitted` bills the config's k, so
+  GLM's K2.25 layers sit under k2.5. The packs' source-layout trunk (block-FP8 QKV, `kv_b_proj`, hyper-connection names)
+  and the shards the index owns for a duplicated tensor are the host's to read; none of it is module API.
 
 ## MLX pins
 

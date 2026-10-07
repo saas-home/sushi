@@ -688,7 +688,7 @@ pub const DiskTier = struct {
         _ = self;
         e.poisoned = true;
         @memset(e.chunk_bytes, 0);
-        log.warn("  [disk-cache] e{d} write failed ({s}) — entry invalidated\n", .{ e.id, err_name });
+        log.warn("  [disk-cache] e{d} invalidated ({s})\n", .{ e.id, err_name });
     }
 
     fn poisonAll(self: *DiskTier, err_name: []const u8) usize {
@@ -711,6 +711,14 @@ pub const DiskTier = struct {
             // `removeAt` swap-removes; the element moved into `i` was already checked.
             self.removeAt(i);
         }
+    }
+
+    fn chunkOnDisk(self: *DiskTier, e: *const IndexEntry, chunk: u32) bool {
+        if (chunk >= e.chunk_bytes.len) return true;
+        const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, chunk }) catch return true;
+        defer self.allocator.free(cp);
+        const st = statFile(self.io, cp) orelse return false;
+        return st.size == e.chunk_bytes[chunk];
     }
 
     /// Does the filesystem agree with the index about entry `id`? One stat per chunk; catches
@@ -1210,6 +1218,8 @@ pub const DiskTier = struct {
 
         var chunk_i: u32 = 0;
         while (chunk_i < n_chunks) : (chunk_i += 1) {
+            // A chunk the index names but the disk lacks fails every later restore the same way.
+            errdefer if (!self.chunkOnDisk(e, chunk_i)) self.poisonEntry(e, "chunk file missing or short");
             const c0: u64 = @as(u64, chunk_i) * self.chunk_tokens;
             const need: u64 = @min(@as(u64, self.chunk_tokens), limit - c0);
 
@@ -4037,6 +4047,8 @@ pub fn sweepBase(
     }
     var total: u64 = 0;
     var strays: usize = 0;
+    var seen = InodeSet.init(allocator);
+    defer seen.deinit();
     // Each swept root's lock is held to the end: a root a live tier owns is skipped, and no tier
     // can take one while its entries are being deleted.
     var held = std.ArrayList(std.Io.File).empty;
@@ -4084,7 +4096,7 @@ pub fn sweepBase(
             };
             // A `.tmp` older than the same bar is a crash leftover of the writer's tmp+rename.
             reapStaleTmp(io, e_abs);
-            const bytes = dirBytes(io, e_abs);
+            const bytes = dirBytes(io, e_abs, &seen);
             total += bytes;
             victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
                 allocator.free(e_abs);
@@ -4213,19 +4225,24 @@ pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 
     if (rootIsLive(io, root)) return 0;
     var d = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return 0;
     defer d.close(io);
+    var seen = InodeSet.init(std.heap.page_allocator);
+    defer seen.deinit();
     var total: u64 = 0;
     var it = d.iterate();
     while (it.next(io) catch null) |dent| {
         if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'e') continue;
         var e_buf: [std.fs.max_path_bytes]u8 = undefined;
         const e_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, dent.name }) catch continue;
-        total +|= dirBytes(io, e_abs);
+        total +|= dirBytes(io, e_abs, &seen);
     }
     return total;
 }
 
-/// Total bytes of the regular files directly inside `dir_abs`.
-fn dirBytes(io: std.Io, dir_abs: []const u8) u64 {
+/// Inodes already counted: chunk sharing hard-links one file into several entries.
+const InodeSet = std.AutoHashMap(std.Io.File.INode, void);
+
+/// Bytes of the regular files directly inside `dir_abs` whose inode `seen` has not counted yet.
+fn dirBytes(io: std.Io, dir_abs: []const u8, seen: *InodeSet) u64 {
     var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     var total: u64 = 0;
@@ -4233,6 +4250,7 @@ fn dirBytes(io: std.Io, dir_abs: []const u8) u64 {
     while (it.next(io) catch null) |dent| {
         if (dent.kind != .file) continue;
         const st = d.statFile(io, dent.name, .{}) catch continue;
+        if (st.nlink > 1 and (seen.fetchPut(st.inode, {}) catch null) != null) continue;
         total += st.size;
     }
     return total;
@@ -4907,6 +4925,95 @@ test "DiskTier: a token record that differs from the index poisons the entry and
     try testing.expectError(error.DiskCacheTokenMismatch, tier.restoreInto(&out, 0, s));
     try testing.expect(tier.entries.items[0].poisoned);
     try testing.expect(tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense) == null);
+}
+
+test "DiskTier: a restore that finds a chunk file missing or short drops the entry so the prompt stores again" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    for ([_]bool{ true, false }) |delete| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var buf: [512]u8 = undefined;
+        const base = try tmpRoot(&tmp, io, &buf);
+
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-gone", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        if (delete) {
+            try tmp.dir.deleteFile(io, "fp-gone/e1/c000001.safetensors");
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = "fp-gone/e1/c000001.safetensors", .data = "short" });
+        }
+
+        var out = try KVCache.init(testing.allocator, 1);
+        defer out.deinit();
+        try testing.expect(std.meta.isError(tier.restoreInto(&out, 0, s)));
+        try testing.expect(tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense) == null);
+
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+        var again = try KVCache.init(testing.allocator, 1);
+        defer again.deinit();
+        const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense) orelse return error.TestExpectedMatch;
+        _ = try tier.restoreInto(&again, m.idx, s);
+    }
+}
+
+test "DiskTier: hard-linked chunks are counted once by the root-wide sweep and tierBytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    const chunk: [1000]u8 = @splat(0);
+    try tmp.dir.createDirPath(io, "fp-shared/e1");
+    try tmp.dir.createDirPath(io, "fp-shared/e2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e1/c000000.safetensors", .data = &chunk });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e1/meta.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e2/meta.json", .data = "{}" });
+    try std.Io.Dir.hardLink(tmp.dir, "fp-shared/e1/c000000.safetensors", tmp.dir, "fp-shared/e2/c000000.safetensors", io, .{});
+
+    try testing.expectEqual(@as(u64, 1004), tierBytes(io, base, "fp-shared"));
+
+    // 1004 B held, so a 1500 B budget deletes nothing.
+    const other = try std.fmt.allocPrint(testing.allocator, "{s}/fp-other", .{base});
+    defer testing.allocator.free(other);
+    sweepBase(testing.allocator, io, base, other, 1500);
+    try testing.expect(tmp.dir.statFile(io, "fp-shared/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-shared/e2/meta.json", .{}) catch null != null);
+}
+
+test "DiskTier: a second tier in the same process sweeps around a live tier's root" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var first = try DiskTier.init(testing.allocator, io, base, "fp-first", 0, 128);
+    defer first.deinit();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try first.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+
+    var second = try DiskTier.init(testing.allocator, io, base, "fp-second", 0, 128);
+    defer second.deinit();
+    second.ssd_first = true;
+    // No room after the reserve: the probe keeps the zero budget, so every sibling byte is over it.
+    second.armTestSpace(0, 2048 * 1024 * 1024 * 1024);
+    second.max_bytes = 0;
+    second.sweepSiblings();
+    try testing.expect(tmp.dir.statFile(io, "fp-first/e1/meta.json", .{}) catch null != null);
 }
 
 test "DiskTier: a new entry never adopts an existing entry directory" {
@@ -9413,7 +9520,9 @@ test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to
             var d = try std.Io.Dir.openDirAbsolute(t.io, dir, .{});
             defer d.close(t.io);
             const meta = try d.statFile(t.io, "meta.json", .{});
-            return dirBytes(t.io, dir) - meta.size;
+            var seen = InodeSet.init(testing.allocator);
+            defer seen.deinit();
+            return dirBytes(t.io, dir, &seen) - meta.size;
         }
     };
 

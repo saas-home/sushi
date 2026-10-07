@@ -216,7 +216,11 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   entry and the request prefills cold (`DiskCacheTokenMismatch`).
 - `scan` drops an index-less entry with no age bar: the lock keeps every other writer out of the root. `sweepBase`
   holds each sibling root's lock while it sweeps it and skips one a live tier holds (`rootIsLive`); `tierBytes`
-  counts nothing of a live tier's root.
+  counts nothing of a live tier's root. The skip is flock-based, so a second tier in the same process is skipped too.
+- **A byte is counted once per inode** in `sweepBase` and `tierBytes` (`dirBytes` + `InodeSet`): chunk sharing
+  hard-links one chunk into several entries. The tier's own `total_bytes` already bills it once.
+- **A restore that finds a chunk file missing or short poisons the entry** (`restoreKvInto`), so the request prefills
+  cold and the next commit of that prompt stores fresh instead of seeing it as superseded.
 - A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
   covers that.
 
