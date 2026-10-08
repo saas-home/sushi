@@ -2,7 +2,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const Arr = mlx.mlx_array;
-const SOURCE =
+const BODY =
     \\#pragma clang fp contract(off)
     \\#pragma clang fp reassociate(off)
     \\const uint i=thread_position_in_grid.x;
@@ -18,14 +18,27 @@ const SOURCE =
     \\ const bfloat dynamic_product=bfloat(float(b)*float(value));
     \\ result=bfloat(float(result)+float(dynamic_product));
     \\}
-    \\y[i]=result;
+    \\
 ;
-var kernel: ?mlx.mlx_fast_metal_kernel = null;
+const SOURCE = BODY ++ "y[i]=result;\n";
+// The sublayer's residual add rounds like MLX's BF16 add of the stored convolution output.
+const SOURCE_ADD = BODY ++ "y[i]=bfloat(float(residual[row*residual_strides[1]+col*residual_strides[2]])+float(result));\n";
+var kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 const Key = struct { len: c_int, hidden: c_int, group: c_int };
 const Config = struct { key: Key, value: mlx.mlx_fast_metal_kernel_config };
 var configs: [16]?Config = @splat(null);
 
 pub fn apply(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size: u32) !?Arr {
+    return run(s, hidden, dynamic, base, group_size, null);
+}
+
+/// `residual + conv(hidden)` in one dispatch, bit for bit the convolution then MLX's add.
+pub fn applyAdd(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size: u32, residual: Arr) !?Arr {
+    if (residual.ctx == null or mlx.mlx_array_dtype(residual) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(residual), mlx.getShape(hidden))) return null;
+    return run(s, hidden, dynamic, base, group_size, residual);
+}
+
+fn run(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size: u32, residual: ?Arr) !?Arr {
     if (!mlx.streamIsGpu(s) or group_size == 0) return null;
     for ([_]Arr{ hidden, dynamic, base }) |a| if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return null;
     const shape = mlx.getShape(hidden);
@@ -33,14 +46,18 @@ pub fn apply(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size
     const group: c_int = @intCast(group_size);
     if (@mod(shape[2], group) != 0 or !std.mem.eql(c_int, mlx.getShape(dynamic), &.{ 1, shape[1], 2, @divExact(shape[2], group) }) or
         !std.mem.eql(c_int, mlx.getShape(base), &.{ 2, shape[2] })) return null;
-    if (kernel == null) {
-        const ins = mlx.mlx_vector_string_new_data(&.{ "hidden", "dynamic", "base" }, 3);
+    const variant: usize = if (residual == null) 0 else 1;
+    if (kernels[variant] == null) {
+        const ins = if (residual == null) mlx.mlx_vector_string_new_data(&.{ "hidden", "dynamic", "base" }, 3) else mlx.mlx_vector_string_new_data(&.{ "hidden", "dynamic", "base", "residual" }, 4);
         defer _ = mlx.mlx_vector_string_free(ins);
         const outs = mlx.mlx_vector_string_new_data(&.{"y"}, 1);
         defer _ = mlx.mlx_vector_string_free(outs);
-        const k = mlx.mlx_fast_metal_kernel_new("sushi_dflash_two_tap_bf16", ins, outs, SOURCE, "", false, false);
+        const k = if (residual == null)
+            mlx.mlx_fast_metal_kernel_new("sushi_dflash_two_tap_bf16", ins, outs, SOURCE, "", false, false)
+        else
+            mlx.mlx_fast_metal_kernel_new("sushi_dflash_two_tap_bf16_add", ins, outs, SOURCE_ADD, "", false, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
-        kernel = k;
+        kernels[variant] = k;
     }
     const key = Key{ .len = shape[1], .hidden = shape[2], .group = group };
     var cached: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -64,11 +81,11 @@ pub fn apply(s: mlx.mlx_stream, hidden: Arr, dynamic: Arr, base: Arr, group_size
             break;
         };
     }
-    const ins = mlx.mlx_vector_array_new_data(&.{ hidden, dynamic, base }, 3);
+    const ins = if (residual) |r| mlx.mlx_vector_array_new_data(&.{ hidden, dynamic, base, r }, 4) else mlx.mlx_vector_array_new_data(&.{ hidden, dynamic, base }, 3);
     defer _ = mlx.mlx_vector_array_free(ins);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kernel.?, ins, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, kernels[variant].?, ins, cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
@@ -99,6 +116,14 @@ test "DFlash fused convolution preserves BF16 boundaries and strided tap sets" {
                 try mlx.check(mlx.mlx_array_eval(got));
                 const count: usize = @intCast(len * width);
                 try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want).?[0..count], mlx.mlx_array_data_bfloat16(got).?[0..count]);
+                // A residual read as a row view of a wider block.
+                const wide = try ops.own(try fixture.bf16ArrShaped(&.{ 1, 8, width }, 799, ops.s));
+                const residual = try ops.slice(wide, 1, 8 - len, 8);
+                const want_sum = try ops.binary(.add, residual, want);
+                const got_sum = try ops.own((try applyAdd(ops.s, x, dynamic, base, 16, residual)) orelse return error.TestExpectedFusedConv);
+                try mlx.check(mlx.mlx_array_eval(want_sum));
+                try mlx.check(mlx.mlx_array_eval(got_sum));
+                try std.testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(want_sum).?[0..count], mlx.mlx_array_data_bfloat16(got_sum).?[0..count]);
             }
         }
         try std.testing.expect((try apply(ops.s, try ops.cast(hidden, .float32), try ops.zeros(&.{ 1, len, 2, @divExact(width, 16) }, .bfloat16), try ops.zeros(&.{ 2, width }, .bfloat16), 16)) == null);

@@ -214,22 +214,9 @@ Used in sushi (`src/transformer.zig`):
     body itself derives from our own `sushi_attn_p256`, not from their source.
     thank you Jonathan Spangler.
     
-Used in sushi (`lib/ane/`, `src/ane.zig`):
-
-  * The Neural Engine instance-affinity option keys and the requirement that
-    they be passed together, from `custom_kernels/qwen35_prefill/csrc/
-    qwen35_ane.mm`; the per-procedure request construction and the practice
-    of reading a procedure's symbol indices from the model rather than
-    assuming them come from the same file.
-  * The procedure-bank program layout (many linears as procedures inside one
-    compiled program) as a response to the runtime's resident-handle limit.
-
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the fa256
 chunking carries exact online-softmax state between dispatches so a chunked run
-is bit-identical to a single dispatch. The ANE MIL emitter is our own
-(`constexpr_affine_dequantize` with an int8 zero point, our K-chunked down
-conv and power-of-two accumulator wrap); only the bank structure and the
-affinity handle are theirs.
+is bit-identical to a single dispatch.
 
 --------------------------------------------------------------------------------
 jinja.cpp
@@ -353,27 +340,6 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     served packs' configs.
 
 --------------------------------------------------------------------------------
-h3.c-ane (Apple Neural Engine port of h3.c)
-https://github.com/maderix/h3.c-ane
-https://github.com/maderix/ANE
-Copyright (c) 2026 Manjeet Singh (maderix)
-Licensed under the MIT License.
-
-Vendored into `lib/ane/ane_bridge.{h,m}` (from `h3_ane_bridge.{h,m}`): the
-objc-runtime bridge to the private AppleNeuralEngine framework — in-memory
-MIL model compile/load/evaluate, IOSurface I/O binding, and the
-content-addressed compile cache. The ANE port is maderix's addition to a
-fork of antirez's h3.c (whose own code is Metal/GPU only and none of which
-is vendored here), building on the private-API groundwork in
-https://github.com/maderix/ANE. mlx-serve changes: the persistent cache
-entries move to `~/.sushi/ane-cache` (staging stays in $TMPDIR — the
-compile runs inside aned, which cannot read a home-directory path) and the
-cache env var is renamed `SUSHI_ANE_CACHE`. `lib/ane/ane_mlp.m` (the
-per-layer SwiGLU-MLP MIL program builder used by `--ane-prefill`) is an
-sushi addition modeled on the same project's `h3_ane_linear.m` blob
-layout and int8 constexpr-dequantize idioms.
-
---------------------------------------------------------------------------------
 MLX
 https://github.com/ml-explore/mlx
 Copyright (c) 2023 Apple Inc.
@@ -406,11 +372,11 @@ The row-identical 8-bit projection kernel in `src/mtp_qmv.zig` adapts
 It shares packed weights across input rows while preserving each serial
 row's lane assignment, reduction order and output rounding.
 
-The eight-row DFlash FFN kernel in `src/dflash_qmv.zig` adapts
-`qmv_wide_impl` and affine four-bit `dequantize` from MLX
-`backend/metal/kernels/quantized.h`. It specializes the two A4 group-64
-FFN geometries and shares decoded weights across eight input rows while
-retaining MLX's subchunk accumulation and lane-shuffle reduction order.
+The eight-row DFlash FFN kernel and the fused gate/up/SiLU kernel in
+`src/dflash_qmv.zig` adapt `qmv_wide_impl` and affine four-bit `dequantize`
+from MLX `backend/metal/kernels/quantized.h`. They specialize the A4
+group-64 FFN geometries and share decoded weights across the input rows
+while retaining MLX's subchunk accumulation and lane-shuffle reduction order.
 
 The HC RMS kernel in `src/glm5_hc_prefill.zig` adapts the four-value-per-thread
 `rms_looped` reduction from MLX `backend/metal/kernels/rms_norm.metal`
@@ -466,7 +432,7 @@ Used in sushi:
   * The global-sort MoE gather (`_gather_sort`: argsort the flattened
     (token, expert) pairs, gather rows, run with sorted indices, then inverse
     permute) is theirs, used by our multi-position MoE paths in
-    `src/transformer.zig` and `src/deepseek_v4.zig`.
+    `src/transformer.zig`.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c, and the GDN
 kernel is extended by a sequence variant (`capture_seq`) that records
@@ -616,9 +582,6 @@ and they are listed because they made that work possible.
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.
-  * DeepSeek's `inference/model.py` and `encoding_dsv4.py`, shipped with the
-    DeepSeek-V4-Flash release, the reference for the `deepseek_v4` architecture
-    and its chat template.
   * turboderp/exllamav3 (MIT), the EXL3 weight format served for routed
     experts (`src/exl3/`): the 16x16
     trellis tile packing, the MCG and MUL1 codebook decodes, the tensor-core

@@ -38,25 +38,16 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, mimo, glm5 } = .gemma,
+    mode: enum { gemma, qwen, mimo, glm5 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
     min_pixels: u32 = 0,
     max_pixels: u32 = 0,
-    /// muse/lfm2: the resize cap is on MERGED tokens, not pixels.
+    /// glm5: the resize cap and floor are on MERGED tokens, not pixels.
     max_tokens: u32 = 0,
     max_video_tokens: u32 = 0,
-    /// lfm2: the budget has a FLOOR too — a small image is upscaled to it.
     min_tokens: u32 = 0,
-    /// lfm2 tiling. A source past `max_tokens * pixels_tolerance` is split into
-    /// a grid of `tile_size` tiles (plus a thumbnail) and encoded piece by
-    /// piece. `tile_size == 0` disables splitting, which is every other tower.
-    tile_size: u32 = 0,
-    min_tiles: u32 = 0,
-    max_tiles: u32 = 0,
-    use_thumbnail: bool = false,
-    pixels_tolerance: f32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -67,7 +58,7 @@ pub const AudioData = struct {
 };
 
 /// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
+/// groups, concatenated (see `vision_common.buildPixelValuesVideo` /
 /// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
 /// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
 /// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`

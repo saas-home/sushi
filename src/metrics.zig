@@ -117,12 +117,6 @@ pub const Metrics = struct {
     // signature; without these two the gap has no name on any surface.
     mlx_active_bytes: Gauge,
     mlx_cache_bytes: Gauge,
-    // ANE prefill offload (`--ane-prefill`, A8): what the Neural Engine is
-    // holding right now — int8 weight-copy bytes and covered layer count
-    // (mlp + gdn) summed across resident engines. Zero whenever the offload
-    // is off or no covered model is resident (zero-when-off invariant).
-    ane_int8_bytes: Gauge,
-    ane_layers: Gauge,
     // qwen4 background page-cache warm of `ngram_table.bin`: bytes read so far; zero when nothing is warming.
     ngram_warm_bytes: Gauge,
     // Slots in the last batched decode group (0 = the last tick batched nothing).
@@ -158,8 +152,6 @@ pub const Metrics = struct {
             .requests_prefilling = Gauge.init(),
             .mlx_active_bytes = Gauge.init(),
             .mlx_cache_bytes = Gauge.init(),
-            .ane_int8_bytes = Gauge.init(),
-            .ane_layers = Gauge.init(),
             .ngram_warm_bytes = Gauge.init(),
             .batched_group_size = Gauge.init(),
             .decode_serial_total = @splat(Counter.init()),
@@ -278,8 +270,6 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "sushi:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
     try writeGauge(w, "sushi:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
     try writeGauge(w, "sushi:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
-    try writeGauge(w, "sushi:ane_int8_bytes", "Bytes of int8 weight copies held by the ANE prefill offload (0 when off)", m.ane_int8_bytes.load());
-    try writeGauge(w, "sushi:ane_layers", "Layers covered by compiled ANE prefill programs, mlp + gdn (0 when off)", m.ane_layers.load());
     try writeGauge(w, "sushi:ngram_warm_bytes", "Bytes of the qwen4 n-gram table read so far by the background page-cache warm (0 when off or done with no table resident)", m.ngram_warm_bytes.load());
     try writeGauge(w, "sushi:batched_group_size", "Slots in the last batched decode group (0 when the last tick batched nothing)", m.batched_group_size.load());
     try w.print("# HELP sushi:decode_serial_total Slot-ticks that decoded serial beside other live slots, by reason\n# TYPE sushi:decode_serial_total counter\n", .{});
@@ -395,8 +385,6 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             "\"requests_prefilling\":{d}," ++
             "\"mlx_active_bytes\":{d}," ++
             "\"mlx_cache_bytes\":{d}," ++
-            "\"ane_int8_bytes\":{d}," ++
-            "\"ane_layers\":{d}," ++
             "\"ngram_warm_bytes\":{d}," ++
             "\"batched_group_size\":{d}" ++
             "}},\"decode_serial\":{{",
@@ -421,8 +409,6 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             m.requests_prefilling.load(),
             m.mlx_active_bytes.load(),
             m.mlx_cache_bytes.load(),
-            m.ane_int8_bytes.load(),
-            m.ane_layers.load(),
             m.ngram_warm_bytes.load(),
             m.batched_group_size.load(),
         },

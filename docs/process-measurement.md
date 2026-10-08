@@ -55,11 +55,15 @@ scripts/gpu-lock.sh release <owner>
   marker, log), then runs `scripts/gpu-lock.sh break <holder>`, which frees the lock only if it names the current
   holder, so it cannot break a newer one. The next ticket then takes the lock. Only the coordinator breaks a lock.
 
-## 4. Restore QoS for agent-launched timing
+## 4. Restore QoS for agent-launched jobs
 
 Processes spawned from an agent harness inherit background QoS (priority 4 vs 31) and run up to ~3x slower. Launch
 timed jobs with `taskpolicy -a <cmd>` (or restore the running PID), and state the QoS used beside the number. A number
 2-4x worse than a terminal run points at QoS before anything else.
+
+The same holds for builds and tests: on the M5 Max an agent-launched process with inherited QoS stays on the 12
+Performance cores and never reaches the 6 Super cores (CPUs 12-17); under `taskpolicy -a` it does. Run every CPU-heavy
+agent command (`zig build`, `zig build test`, test scripts, conversions) under `taskpolicy -a`.
 
 `taskpolicy` is SIP-protected, so `DYLD_*` in its own environment never reaches the job it launches: write
 `taskpolicy -a env DYLD_LIBRARY_PATH=<stage> <bin>`, and prove the stage with `DYLD_PRINT_LIBRARIES=1` in the log.

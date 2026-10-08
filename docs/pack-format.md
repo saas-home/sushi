@@ -30,7 +30,7 @@ layout; only the routed banks are EXL3.
 
 `n` is the packed halfwords per 256-weight tile and it, not an integer K, is
 what every reader keys on: weight `t`'s codeword is the 16-bit window ending at
-`((t+1)*n)>>4`. Even `n` in `[32, 64]` is admitted — 36 = K2.25, 48 = K3,
+`((t+1)*n)>>4`. Even `n` in `[16, 128]` is admitted (K1 to K8) — 24 = K1.5, 36 = K2.25, 48 = K3,
 64 = K4. `k` printed anywhere reads 2.25, never 36. The per-tensor rate is read
 from the trellis shape, so a shard at or below the config's rate is over-billed
 rather than refused; a wider one refuses.

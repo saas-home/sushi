@@ -10,6 +10,11 @@ const Ops = base.Ops;
 
 var group2_batches: usize = 0;
 var group2_logged = false;
+fn logGroup2(dec: api.format.Decode, shared: bool) void {
+    if (group2_logged or @import("builtin").is_test) return;
+    group2_logged = true;
+    @import("log.zig").info("[glm-dflash] batched expert rows engaged (window {d}{s})\n", .{ dec.window.bits(), if (shared) ", shared expert in the reduce" else "" });
+}
 pub fn group2BatchCount() usize {
     return group2_batches;
 }
@@ -64,14 +69,23 @@ pub fn apply(target: *const forward.Model, index: usize, ops: *Ops, x: Arr) !Arr
             };
             const dec = api.format.Decode{ .codebook = target.cfg.expert_quant_codebook, .window = target.cfg.expert_quant_window };
             const gs = mlx.getShape(layer.bank.gate.trellis);
-            const candidate = if (shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]))
+            const lane_rows = shape[1] >= 3 and shape[1] <= 4 and shape[2] == 4096 and target.cfg.num_experts_per_tok == 8 and target.cfg.glm_swiglu_limit == 10 and dec.codebook == .mcg and gs.len == 4 and gs[2] == 128 and api.glm_group2.servesRate(gs[3]);
+            if (lane_rows) if (layer.shared) |shared| {
+                const y = try dense(shared, ops, x, target.cfg.glm_swiglu_limit);
+                if (try api.glm_group2.moeLayoutShared(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane, y)) |joined| {
+                    group2_batches += 1;
+                    routed_batches += 1;
+                    logGroup2(dec, true);
+                    break :blk try ops.own(joined);
+                }
+            };
+            const candidate = if (lane_rows)
                 try api.glm_group2.moeLayout(ops.s, x, layer.bank, routing.indices, routing.scores, dec, .serial, .grouped, .lane)
             else
                 null;
             const routed = try ops.own(if (candidate) |value| reused: {
                 group2_batches += 1;
-                if (!group2_logged and !@import("builtin").is_test) @import("log.zig").info("[glm-dflash] batched expert rows engaged (window {d})\n", .{dec.window.bits()});
-                group2_logged = true;
+                logGroup2(dec, false);
                 break :reused value;
             } else try api.moeClamped(ops.s, x, layer.bank, routing.indices, routing.scores, dec, @intFromFloat(target.cfg.glm_swiglu_limit)));
             routed_batches += 1;

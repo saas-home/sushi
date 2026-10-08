@@ -4,6 +4,38 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **Cleanup**: code for architectures sushi does not serve is removed, including the dormant ANE prefill path and its
+  `--ane-prefill` flag, the `sushi:ane_*` metrics and the `ane` object in `/props`; unsupported models are still
+  refused by name.
+- **Memory**: the load check bills what each model allocates plus a 1 GiB safety net instead of a flat 7 GiB, the
+  auto context keeps 93% of the memory ceiling on every model, and `--wired-margin-gib` defaults to 1 GiB.
+- **GLM-5.3-Flash**: DFlash2 drafting is about 6% faster per round and verification about 1% faster, with identical
+  output.
+- **EXL3 packs**: expert rates from 1.5 bits per weight take the fast decode and prefill kernels on every served
+  architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
+
+---
+
+## v1.2.1 — Safer prompt cache and server hardening
+
+- **Prompt cache**: two sushi processes on the same model no longer share one SSD cache folder, which could return
+  another session's answer; a restart on a nearly full disk keeps the cache, and loading a second model no longer
+  deletes the first one's entries.
+- **Crash fixes**: an empty `/v1/completions` prompt, deeply nested JSON and oversized WebSocket messages are refused
+  with a 400 instead of stopping the server.
+- **GLM-5.3-Flash**: after a client disconnects, the next request on a streamed GLM no longer fails; `sushi pull`
+  now fetches the DFlash2 assistant, and deleting its BF16 source keeps DFlash2 on.
+- **Tools and structured output**: earlier tool calls with empty or non-object arguments render in the model's own
+  format, `anyOf`/`oneOf`/`$ref` parameters get their real types, and JSON-schema output stops cleanly on numbers and
+  bounded arrays; `logit_bias: null` is accepted again.
+- **CLI**: `sushi launch` quotes model names, `sushi serve` without `--model` honours the sampling flags, `update`
+  no longer logs the API key, and `sushi run` accepts long pasted lines and filters terminal escapes from model output.
+- **mlx-serve**: the guest manifest now lists GLM-5.3-Flash.
+
+---
+
 ## v1.2.0 — GLM-5.3-Flash, 32 GB streaming, zero-RAM prompt cache
 
 - **GLM-5.3-Flash**: the new Sushi-2.4bpw pack runs on 128 GB Macs (KLD 0.074 against the BF16 model) with image and

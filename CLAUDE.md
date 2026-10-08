@@ -15,9 +15,8 @@ stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of dd
   verify the engine, they do not make packs. Converter knowledge (recipes, calibration data, research notes) never
   goes into a committed file: it goes to `docs/private/`, and committed files say only that it lives in the private
   repo.
-- Everything else in `src/` (other architectures' forwards and loaders in `transformer.zig`/`model.zig`, the dormant
-  ANE driver) is INHERITED upstream code: it builds, it is unreachable, and no doc covers it. The loader refuses any
-  other `model_type` by name (`model.served_model_types`, `ArchitectureUnsupported` → 503); an unsupported file
+- `src/` holds only the three served architectures (and their shared machinery): inherited forwards, loaders and the
+  ANE driver for other architectures were removed. The loader refuses any other `model_type` by name (`model.served_model_types`, `ArchitectureUnsupported` → 503); an unsupported file
   format is refused by name (`ModelFormatUnsupported` → 503; `--model` exits).
 
 <a id="docs-index"></a>
@@ -47,7 +46,7 @@ doc for the area before changing it, and update it in the same landing.
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | roofline, recorded tok/s tables with binaries and settings, ruled-out levers |
-| [docs/bench/v1.2.0/summary.md](docs/bench/v1.2.0/summary.md) | version-pinned release context ladder and individual model benchmark reports |
+| [docs/bench/v1.2.1/summary.md](docs/bench/v1.2.1/summary.md) | version-pinned release context ladder and individual model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, KLD of every served pack |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
@@ -89,7 +88,9 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `launch.zig` | `sushi launch <agent>` configs | server-http-apis |
 | `scheduler.zig` / `generate.zig` | slots, inference thread, batching, admission; generation, sampling, MTP orchestration | server-lifecycle |
 | `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
-| `transformer.zig` | forward pass, arch dispatch, quant resolution, custom kernels, `KVCache` | arch-*, engine-* |
+| `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution, custom kernels | arch-*, engine-* |
+| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, attention, GDN, MTP, verify rows / hyper-connections + PLE / QSA | arch-qwen4exp, engine-mtp |
+| `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | arch-mimo-v2 |
 | `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | arch-qwen4exp |
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
 | `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk kept as stored + its GEMV, rank-local QKV, stored-affine trunk, shard-stamp check | arch-mimo-v2 |
@@ -99,7 +100,7 @@ Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `mrope.zig` | media INPUT (Qwen3-VL tower + M-RoPE, MiMo-ViT) | server-lifecycle, arch-mimo-v2 |
+| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT (shared preprocessing, Qwen3-VL tower + M-RoPE, MiMo-ViT, GLM tower) | server-lifecycle, arch-mimo-v2 |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
@@ -221,7 +222,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
 
 **Measurement hygiene.**
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
-- Restore QoS for agent-launched timed jobs (`taskpolicy -a`); state the QoS, lock and baseline beside every number.
+- Run every CPU-heavy agent-launched job (builds, tests, conversions, timings) under `taskpolicy -a`: inherited QoS never
+  reaches the Super cores. State the QoS, lock and baseline beside every number.
 - Bench thermal protocol: under heavy GPU workload AND with a die sensor over 90 °C, fans to max and 3 min idle before
   the bench starts; otherwise fans to max and a 10 s wait. Fans back to auto when the bench ends. Nothing else runs meanwhile.
   Under it one A then one B suffices; A B B A only when the expected difference is within a few percent.

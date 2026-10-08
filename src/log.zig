@@ -214,9 +214,29 @@ pub fn enableStderr() void {
     stderr_enabled = true;
 }
 
-/// Format once, fan out to stderr and (when open) the file.
+/// Only the format call is generic: each log call site instantiates a thunk, and the fan-out
+/// below exists once instead of once per format string.
 fn emit(comptime fmt: []const u8, args: anytype) void {
-    if (stderr_enabled) std.debug.print(fmt, args);
+    const Args = @TypeOf(args);
+    const thunk = struct {
+        fn print(w: *std.Io.Writer, p: *const anyopaque) std.Io.Writer.Error!void {
+            return w.print(fmt, @as(*const Args, @ptrCast(@alignCast(p))).*);
+        }
+    }.print;
+    emitErased(thunk, &args);
+}
+
+/// Format once, fan out to stderr (as `std.debug.print` writes it) and (when open) the file.
+fn emitErased(print: *const fn (*std.Io.Writer, *const anyopaque) std.Io.Writer.Error!void, args: *const anyopaque) void {
+    if (stderr_enabled) {
+        const io = std.Options.debug_io;
+        const prev = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev);
+        var stderr_buf: [64]u8 = undefined;
+        const stderr = std.debug.lockStderr(&stderr_buf);
+        defer std.debug.unlockStderr();
+        print(&stderr.file_writer.interface, args) catch {};
+    }
     if (!@atomicLoad(bool, &sink_active, .acquire)) return;
 
     var buf: [line_buf_len]u8 = undefined;
@@ -224,7 +244,7 @@ fn emit(comptime fmt: []const u8, args: anytype) void {
     // line stays ONE `write(2)` — two writes could interleave with another
     // thread's line between them.
     var w = std.Io.Writer.fixed(buf[0 .. buf.len - truncation_marker.len]);
-    if (w.print(fmt, args)) |_| {
+    if (print(&w, args)) |_| {
         writeToSink(w.buffered());
     } else |_| {
         const kept = w.buffered().len;

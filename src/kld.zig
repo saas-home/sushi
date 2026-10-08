@@ -209,7 +209,7 @@ pub const USAGE =
     \\  --expert-cache-gb <n> streamed expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
-    \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 2..32)
+    \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
     \\                        each layer's experts read once per batch; resumable by rerunning
     \\  --batch-windows <n>   windows per layer-major batch (default: from the budget, at most 32)
@@ -936,7 +936,6 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         self.xfm.compileGelu();
         self.xfm.compileGeglu();
     }
-    if (self.config.final_logit_softcapping > 0.0) self.xfm.compileSoftcap();
     if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
     if (self.config.linear_num_key_heads > 0) self.xfm.compileGdnGate();
     return self;
@@ -1962,7 +1961,7 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);
     try testing.expectEqual(@as(u64, 5) << 30, routed.wired_margin_bytes);
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.7" }));
-    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "1" }));
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "0" }));
 
     try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0.3" }));
     const exact_capture = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0" });

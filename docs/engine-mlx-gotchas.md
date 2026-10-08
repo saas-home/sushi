@@ -82,6 +82,12 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   storage (Debug builds catch what ReleaseFast hides).
 - A failing `std.debug.assert` is UB in ReleaseFast: the full suite can pass while the same test, filtered alone,
   dies with SIGTRAP (inlining decides whether the trap is emitted). Rerun it under ReleaseSafe for the panic.
+- Compile time: Sema and LLVM run on one core per binary. Comptime string work is interpreted: never `++` a byte at
+  a time or `comptimePrint` large kernel templates (build them at first use instead); `zig build --time-report`
+  names the slow decls.
+- `std.testing.expectError` and `expectEqual` on a pointer print the value with `{any}`: one printer per payload
+  type, tens of KiB of code for an engine struct. Use `test_expect.expectError` or `expect(a == b)` there.
+- The unit tests compile as one binary per `test_buckets` entry in `build.zig`; a new file joins the last bucket.
 
 ## Tokenizer
 

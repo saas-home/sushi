@@ -30,10 +30,9 @@ test {
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
-    _ = @import("muse_vision.zig");
+    _ = @import("vision_common.zig");
     _ = @import("mimo_vision.zig");
     _ = @import("glm5_vision.zig");
-    _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -46,7 +45,6 @@ test {
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("model_settings.zig");
-    _ = @import("drafter.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_conv.zig");
     _ = @import("dflash_qmv.zig");
@@ -57,8 +55,6 @@ test {
     _ = @import("round_cost.zig");
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_depth_bounds.zig");
-    _ = @import("diffusion.zig");
-    _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("tokenizer.zig");
     _ = @import("tokenize_cache.zig");
@@ -84,6 +80,7 @@ test {
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
     _ = @import("glm5_dflash_tree.zig");
+    _ = @import("glm5_dflash_topk.zig");
     _ = @import("glm5_dflash.zig");
     _ = @import("glm5_dflash_cache.zig");
     _ = @import("glm5_forward.zig");
@@ -108,7 +105,6 @@ test {
     _ = @import("fp8_block.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
-    _ = @import("ane.zig");
     _ = @import("kld.zig");
     _ = @import("cli.zig");
     _ = @import("repl_tools.zig");

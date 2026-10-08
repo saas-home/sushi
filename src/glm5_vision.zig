@@ -4,10 +4,10 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const base = @import("glm5_model.zig");
-const qwen = @import("qwen_vision.zig");
+const common = @import("vision_common.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
-pub const Resized = qwen.Resized;
+pub const Resized = common.Resized;
 pub const QUERY_CHUNK: u64 = 256;
 const MEAN = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };
 const STD = [3]f32{ 0.26862954, 0.26130258, 0.27577711 };
@@ -19,7 +19,7 @@ fn alignPixels(value: u32, factor: u32) u32 {
 /// HF's aligned canvas; budgets count merged spatiotemporal tokens.
 pub fn smartResize(frames: u32, height: u32, width: u32, temporal: u32, factor: u32, min_tokens: u32, max_tokens: u32) Resized {
     std.debug.assert(frames > 0 and height > 0 and width > 0 and temporal > 0 and factor > 0 and max_tokens > 0);
-    const aligned_frames: u64 = @intFromFloat(@max(@as(f64, @floatFromInt(temporal)), qwen.roundHalfEven(@as(f64, @floatFromInt(frames)) / @as(f64, @floatFromInt(temporal))) * @as(f64, @floatFromInt(temporal))));
+    const aligned_frames: u64 = @intFromFloat(@max(@as(f64, @floatFromInt(temporal)), common.roundHalfEven(@as(f64, @floatFromInt(frames)) / @as(f64, @floatFromInt(temporal))) * @as(f64, @floatFromInt(temporal))));
     const pixels_per_token: u64 = @as(u64, temporal) * factor * factor;
     const min_pixels = @as(u64, min_tokens) * pixels_per_token;
     const max_pixels = @as(u64, max_tokens) * pixels_per_token;
@@ -59,7 +59,7 @@ pub fn resizeNormalizedChw(a: std.mem.Allocator, dst: []f32, rgb: []const u8, sh
     const cw: u32 = @intFromFloat(@max(1, @min(@as(f64, @floatFromInt(dw)), @floor(@as(f64, @floatFromInt(sw)) * scale))));
     const content = try a.alloc(f32, @as(usize, ch) * cw * 3);
     defer a.free(content);
-    try qwen.resizeRgbBicubicNormalizedChw(a, content, rgb, sh, sw, ch, cw);
+    try common.resizeRgbBicubicNormalizedChw(a, content, rgb, sh, sw, ch, cw);
     const plane = @as(usize, dh) * dw;
     for (0..3) |c| {
         @memset(dst[c * plane ..][0..plane], -MEAN[c] / STD[c]);
@@ -341,9 +341,8 @@ fn tinyWeights(tmp: *std.testing.TmpDir) !model.Weights {
     return weights;
 }
 fn assertReference(actual: Arr, expected: Arr, stream: mlx.mlx_stream) !void {
-    const mimo = @import("mimo_vision.zig");
-    const cos = try mimo.cosineSim(actual, expected, stream);
-    const ratio = try mimo.rmsRatio(actual, expected, stream);
+    const cos = try common.cosineSim(actual, expected, stream);
+    const ratio = try common.rmsRatio(actual, expected, stream);
     errdefer std.debug.print("[glm-vision parity] cosine={d:.7} rms_ratio={d:.7}\n", .{ cos, ratio });
     try std.testing.expect(cos > 0.99995);
     try std.testing.expect(ratio > 0.998 and ratio < 1.002);
@@ -384,7 +383,7 @@ test "GLM vision processor matches original HF padded canvas CLIP pixels and pat
     try resizeNormalizedChw(a, chw, mlx.mlx_array_data_uint8(rgb).?[0 .. 55 * 81 * 3], 55, 81, rs.h, rs.w, 2, 2, 8, 16);
     const patches = try a.alloc(f32, 10 * 12 * 3 * 2 * 4 * 4);
     defer a.free(patches);
-    qwen.buildPixelValues(patches, chw, 3, rs.h, rs.w, 4, 2, 2);
+    common.buildPixelValues(patches, chw, 3, rs.h, rs.w, 4, 2, 2);
     const expected = weights.get("fixture.processed_pixels").?;
     try mlx.check(mlx.mlx_array_eval(expected));
     const want = mlx.mlx_array_data_float32(expected).?[0..patches.len];

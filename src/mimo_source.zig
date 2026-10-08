@@ -1513,6 +1513,8 @@ fn writeTinySource(
     try writeTestIndex(io, allocator, dir, entries.items);
 }
 
+const expectError = @import("test_expect.zig").expectError;
+
 test "mimo source loads and bills EXL3 routed banks beside the prepared trunk" {
     const t = std.testing;
     const io = t.io;
@@ -2130,7 +2132,7 @@ test "sushi coder incomplete grouped EXL3 index refuses instead of guessing a la
     try tmp.dir.writeFile(t.io, .{ .sub_path = "model.safetensors.index.json", .data = broken });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(t.io, &buf);
-    try t.expectError(error.ExpertLayoutUnsupported, model.parseConfig(t.io, alloc, buf[0..len]));
+    try expectError(error.ExpertLayoutUnsupported, model.parseConfig(t.io, alloc, buf[0..len]));
 }
 
 test "sushi coder qwen trunk and MTP preflight use each router width" {

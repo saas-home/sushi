@@ -998,6 +998,7 @@ pub fn bf16ToF32(u: u16) f32 {
 // ── tests ──
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 var test_ngram_cache_limit: ?usize = null;
 
@@ -1650,39 +1651,39 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
     try testing.expectEqual(@as(u32, 4), t.bits);
     std.heap.page_allocator.free(@constCast(t.map));
 
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":4,\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"F32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableHeader, ngramTestParse(
+    try expectError(error.NgramTableHeader, ngramTestParse(
         "{\"__metadata__\":{\"format\":\"pt\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
@@ -1692,21 +1693,21 @@ test "ngram table header: a missing or wrong-typed field is a named error, never
 }
 
 test "ngram table header: bits must be a width mx.quantize actually ships" {
-    try testing.expectError(error.NgramTableBits, ngramTestParse(
+    try expectError(error.NgramTableBits, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"32\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,64],\"data_offsets\":[0,1024]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[1024,1040]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[1040,1056]}}",
         1056,
     ));
-    try testing.expectError(error.NgramTableBits, ngramTestParse(
+    try expectError(error.NgramTableBits, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"7\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,14],\"data_offsets\":[0,224]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[224,240]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[240,256]}}",
         256,
     ));
-    try testing.expectError(error.NgramTableBits, ngramTestParse(
+    try expectError(error.NgramTableBits, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"0\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
@@ -1717,7 +1718,7 @@ test "ngram table header: bits must be a width mx.quantize actually ships" {
 
 test "ngram table header: every region is bounded, sized by its own shape and disjoint" {
     // Weight region too small for rows x wcols x 4.
-    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+    try expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,64]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
@@ -1725,28 +1726,28 @@ test "ngram table header: every region is bounded, sized by its own shape and di
         NGRAM_GOOD_BYTES,
     ));
     // Scales overlapping the weights.
-    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+    try expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[120,136]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+    try expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[0,8],\"data_offsets\":[0,0]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[0,2],\"data_offsets\":[0,0]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[0,2],\"data_offsets\":[0,0]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableRegion, ngramTestParse(
+    try expectError(error.NgramTableRegion, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[2,2],\"data_offsets\":[128,136]}," ++
             "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}",
         NGRAM_GOOD_BYTES,
     ));
-    try testing.expectError(error.NgramTableTruncated, ngramTestParse(
+    try expectError(error.NgramTableTruncated, ngramTestParse(
         "{\"__metadata__\":{\"bits\":\"4\",\"group_size\":\"32\"}," ++
             "\"weight\":{\"dtype\":\"U32\",\"shape\":[4,8],\"data_offsets\":[0,128]}," ++
             "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++

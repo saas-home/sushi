@@ -1,7 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
-const dsv4_mod = @import("deepseek_v4.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -12,7 +12,6 @@ const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
 const pld_index = @import("pld_index.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
-const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
@@ -21,7 +20,7 @@ const round_cost = @import("round_cost.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const ane_mod = @import("ane.zig");
+const chip_mod = @import("chip.zig");
 const scheduler_mod = @import("scheduler.zig");
 const think_penalty = @import("think_penalty.zig");
 const logit_bias = @import("logit_bias.zig");
@@ -37,7 +36,6 @@ const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
-const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
 const KVCache = transformer_mod.KVCache;
@@ -1095,19 +1093,9 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
         return;
     };
     defer xfm.allocator.free(ids);
-    // The mask's length is the LOGITS dim, not the embedding table's:
-    // inkling slices its lm_head to `unpadded_vocab_size`, and a mask sized
-    // to the padded vocab would fail the `where` broadcast on every sample.
-    const logits_dim: usize = if (xfm.config.unpadded_vocab_size > 0)
-        xfm.config.unpadded_vocab_size
-    else
-        xfm.config.vocab_size;
-    // Padding rows past the tokenizer's last defined id. A checkpoint that
-    // DECLARES `unpadded_vocab_size` has already had those rows sliced off the
-    // lm_head, so `logits_dim` IS the real width there — applying the
-    // tokenizer's cut on top would be a second, different trim of a vocab that
-    // is already trimmed. One trim, whichever the checkpoint provides.
-    const defined_vocab: usize = if (xfm.config.unpadded_vocab_size > 0) 0 else tok.definedVocabSize();
+    const logits_dim: usize = xfm.config.vocab_size;
+    // Padding rows past the tokenizer's last defined id.
+    const defined_vocab: usize = tok.definedVocabSize();
     const pad_rows: usize = if (defined_vocab > 0 and defined_vocab < logits_dim)
         logits_dim - defined_vocab
     else
@@ -1131,7 +1119,7 @@ pub fn installThinkMarkers(xfm: *Transformer, tok: *const Tokenizer) void {
         return;
     };
     defer xfm.allocator.free(ids);
-    const logits_dim: usize = if (xfm.config.unpadded_vocab_size > 0) xfm.config.unpadded_vocab_size else xfm.config.vocab_size;
+    const logits_dim: usize = xfm.config.vocab_size;
     xfm.think_marker_mask = think_penalty.buildMask(xfm.allocator, ids, logits_dim) catch |err| {
         log.warn("[think-penalty] mask build failed ({s}); penalty off\n", .{@errorName(err)});
         return;
@@ -1582,13 +1570,12 @@ pub fn visionPrefillUnchunked(has_vision: bool) bool {
     return has_vision and !visionChunkedPrefillEnabled();
 }
 
-/// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
+/// Placeholder tokens (image + video soft tokens) in `ids` — the number of
 /// source rows a chunk's splice consumes. Host-side count, no GPU sync.
-pub fn countSpliceRows(ids: []const i32, image_token_id: u32, audio_token_id: u32, video_token_id: u32) usize {
+pub fn countSpliceRows(ids: []const i32, image_token_id: u32, video_token_id: u32) usize {
     var n: usize = 0;
     for (ids) |id| {
         if (id == @as(i32, @intCast(image_token_id)) or
-            (audio_token_id > 0 and id == @as(i32, @intCast(audio_token_id))) or
             (video_token_id > 0 and id == @as(i32, @intCast(video_token_id)))) n += 1;
     }
     return n;
@@ -1668,9 +1655,7 @@ test "every speculative decoder caps accepted drafts before commit" {
     // usage. Output-only clipping in the scheduler is already too late.
     const source = @embedFile("generate.zig");
     const names = [_][]const u8{
-        "nextDspark",
         "nextPld",
-        "nextDrafter",
         "nextDflash",
         "mtpRoundFinish",
     };
@@ -1771,7 +1756,7 @@ pub const Generator = struct {
     /// historical reasons; this one is set during `initWithOptions`.)
     prompt_ids_alloc: ?std.mem.Allocator = null,
     /// Did init actually arm PLD for this generator (`InitOptions.pld_enabled`
-    /// AFTER the deepseek_v4 chokepoint guard)? `nextPld` declines to the
+    /// AFTER the GLM guard)? `nextPld` declines to the
     /// plain serial step when false, and the scheduler's tick dispatch
     /// (`specTickMode`) requires it alongside `slot.enable_pld` — the caller's
     /// flag alone must never put a verify forward through the trunk. This is
@@ -1784,32 +1769,8 @@ pub const Generator = struct {
     /// (not including the always-accepted t1) that were successfully verified.
     pld_attempted: u64 = 0,
     pld_accepted_tokens: u64 = 0,
-    /// DeepSeek-V4 DSpark: init armed the native block-parallel draft mode
-    /// (dsv4 checkpoint shipping mtp.* stages + a clean request).
-    /// Mutually exclusive with pld/drafter/mtp by the chokepoint's
-    /// construction; `nextDspark` declines to the serial step when false.
-    dspark_enabled: bool = false,
-    /// Sampled-request acceptance (the MTP one-hot Leviathan rule over
-    /// filtered target probs) instead of raw argmax equality. Set by the
-    /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
-    /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
-    dspark_stochastic: bool = false,
-    dspark_attempted: u64 = 0,
-    dspark_accepted_tokens: u64 = 0,
-
-    // ── Gemma 4 assistant drafter state ──
-    // External drafter model (cross-attends into target's KV). When
-    // `drafter != null`, callers use `nextDrafter` instead of `next`. The
-    // drafter is owned by the server (loaded once at startup); the Generator
-    // only holds a non-owning pointer.
-    drafter: ?*DrafterModel = null,
-    /// Number of tokens proposed per round (= drafter forwards + 1 verify token).
-    /// Defaults to 4 (3 drafter steps + 1 t1 prepend → length-4 verify).
+    /// Tokens proposed per round (the DFlash-resolved block size).
     drafter_block_size: u32 = 4,
-    /// Stats: count of nextDrafter calls that ran a verify forward.
-    drafter_attempted: u64 = 0,
-    /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
-    drafter_accepted_tokens: u64 = 0,
 
     // ── DFlash block-drafter state ──
     // External block-parallel assistant (src/dflash.zig). When
@@ -2270,15 +2231,6 @@ pub const Generator = struct {
         var hist_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
-        if (self.dspark_enabled and self.dspark_attempted > 0) {
-            const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.dspark_attempted));
-            log.info(
-                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
-                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
-            );
-            return;
-        }
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                 @as(f64, @floatFromInt(@max(self.mtp_attempted, 1)));
@@ -2388,28 +2340,7 @@ pub const Generator = struct {
             }
             return;
         }
-        if (self.drafter != null and self.drafter_attempted > 0) {
-            const avg_per_round: f64 = @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.drafter_attempted));
-            const drafts_per_round: u32 = if (self.drafter_block_size >= 1) self.drafter_block_size - 1 else 0;
-            const drafts_proposed: u64 = self.drafter_attempted * @as(u64, drafts_per_round);
-            const per_draft_pct: f64 = if (drafts_proposed > 0)
-                100.0 * @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
-                    @as(f64, @floatFromInt(drafts_proposed))
-            else
-                0.0;
-            log.info(
-                "  [spec-stats] mode=drafter attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s}\n",
-                .{
-                    self.drafter_attempted,
-                    self.drafter_accepted_tokens,
-                    avg_per_round,
-                    per_draft_pct,
-                    self.drafter_block_size,
-                    if (self.spec_disabled_runtime) "true" else "false",
-                },
-            );
-        } else if (self.pld_attempted > 0) {
+        if (self.pld_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.pld_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.pld_attempted));
             log.info(
@@ -2491,16 +2422,6 @@ pub const Generator = struct {
         pinned_prefill_chunk: usize = 0,
         /// A decode-share ceiling applied after explicit and environment chunk settings.
         decode_share_width_cap: usize = 0,
-        /// Enable Gemma 4 assistant drafter. When set, `drafter` must be
-        /// non-null and already `bind()`-ed to `xfm`. Init's prefill final-token
-        /// forward captures the post-final-norm hidden state into
-        /// `Generator.last_hidden` (reused for the drafter's first-step
-        /// h_prev — see comment in `nextDrafter`). Same lazy-pre-forward
-        /// skip semantics as PLD.
-        drafter_enabled: bool = false,
-        /// Non-owning pointer to the loaded drafter (must be non-null when
-        /// `drafter_enabled` is true).
-        drafter: ?*DrafterModel = null,
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
@@ -2676,45 +2597,6 @@ pub const Generator = struct {
         return lookup_prompt orelse prompt_ids;
     }
 
-    /// Which DSpark accept rule (if any) the dsv4 chokepoint may arm for a
-    /// request. Pure over its inputs so every arm is unit-testable.
-    pub const DsparkArm = enum { off, greedy, stochastic };
-
-    /// `clean` = nothing consumes logits beyond plain sampling: penalties,
-    /// grammar and logprobs stay serial on BOTH arms (matching the greedy-only
-    /// contract this generalizes). A clean greedy request (temp < 0.01 or
-    /// top_k == 1) gets the raw argmax-equality accept; a clean SAMPLED
-    /// request gets the stochastic arm (MTP one-hot Leviathan acceptance over
-    /// filtered target probs) unless `stoch_enabled` is false — the
-    /// SUSHI_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
-    /// gating.
-    pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
-        const clean = sampling.repeat_penalty == 1.0 and
-            sampling.presence_penalty == 0.0 and
-            sampling.constraint == null and
-            logprobs_n == 0;
-        if (!clean) return .off;
-        const greedy = isGreedyTemperature(sampling.temperature) or sampling.top_k == 1;
-        if (greedy) return .greedy;
-        return if (stoch_enabled) .stochastic else .off;
-    }
-
-    /// Stochastic-DSpark kill switch — SUSHI_DSV4_DSPARK_STOCH=0
-    /// restores the greedy-only chokepoint gate for A/Bs.
-    var dspark_stoch_cache: ?bool = null;
-    pub fn dsparkStochEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn dsparkStochEnabled() bool {
-        if (dspark_stoch_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
-        const on = dsparkStochEnabledFromEnv(raw);
-        dspark_stoch_cache = on;
-        return on;
-    }
-
     pub fn initWithOptions(
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -2736,63 +2618,15 @@ pub const Generator = struct {
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
         sampling.think_penalty.file_biases = xfm.logit_bias;
-        const bias_vocab: usize = if (xfm.config.unpadded_vocab_size > 0) xfm.config.unpadded_vocab_size else xfm.config.vocab_size;
+        const bias_vocab: usize = xfm.config.vocab_size;
         try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.s);
         errdefer sampling.think_penalty.deinitPrepared();
-        // DeepSeek-V4 hard-off, at the ONE chokepoint every init site
-        // funnels through: dsv4's per-request state lives on the module
-        // (rings + compressed caches) and a spec VERIFY forward appends
-        // draft tokens to it with NO rollback — two rejected PLD drafts
-        // permanently corrupted a live generation (mangled DSML with dropped
-        // token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
-        // scheduler.runPrefill demonstrably did not cover the engaged path,
-        // and per-site wiring is the class the spec-dispatch rule warns
-        // about).
         var options = options_in;
         const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glmDflashEligible(sampling, options.logprobs_n);
         if (xfm.glm5 != null) {
             options.pld_enabled = false;
-            options.drafter_enabled = false;
-            options.drafter = null;
             options.mtp_enabled = false;
             options.dflash_enabled = glm_dflash_native;
-        }
-        var dspark_active = false;
-        var dspark_stochastic = false;
-        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
-            // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
-            // snapshot rollback inside deepseek_v4.zig) may engage when the
-            // checkpoint ships stages and the request is CLEAN (no
-            // penalties, grammar or logprobs — those consume logits the
-            // draft path never shapes and stay serial). Greedy requests get
-            // the raw argmax-equality accept; sampled requests get the
-            // stochastic arm (MTP one-hot Leviathan acceptance over the
-            // request's own filtered probs — the agent-default temp 0.6
-            // traffic that otherwise always ran serial), env-killable via
-            // SUSHI_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
-            // remain hard-off regardless: their verify forwards go through
-            // machinery this arch cannot roll back.
-            const mdl_ds = xfm.dsv4.?;
-            const dspark_env_off = if (std.c.getenv("SUSHI_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
-            if (mdl_ds.n_mtp > 0 and !dspark_env_off and arm != .off) {
-                dspark_active = true;
-                dspark_stochastic = arm == .stochastic;
-                if (dspark_stochastic) {
-                    log.info("  spec=dspark (stochastic; deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
-                } else {
-                    log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
-                }
-            } else {
-                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
-            }
-            options.pld_enabled = false;
-            options.drafter_enabled = false;
-            options.drafter = null;
-            options.mtp_enabled = false;
-            options.mtp = null;
-            options.dflash_enabled = false;
-            options.dflash = null;
         }
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
@@ -3307,7 +3141,6 @@ pub const Generator = struct {
                     vision_rows_consumed += countSpliceRows(
                         ids_i32[pos..end],
                         xfm.config.image_token_id,
-                        xfm.config.audio_token_id,
                         xfm.config.video_token_id,
                     );
                 }
@@ -3448,16 +3281,13 @@ pub const Generator = struct {
         const last_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[final_start]), &last_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(last_input);
 
-        // Drafter (Gemma 4 assistant) needs the post-final-norm hidden as
-        // its first-step h_prev — captured here so we don't need a second
-        // forward at the start of `nextDrafter`. `forwardWithCapture`
-        // captures the LAST position regardless of span length. When the
-        // span holds backed-off tokens AND MTP is active, the head's history
-        // must also cover them (a hole right before the generation point is
+        // The MTP head needs the post-final-norm hidden as its first-step h_prev.
+        // `forwardWithCapture` captures the LAST position regardless of span
+        // length. When the span holds backed-off tokens the head's history must
+        // also cover them (a hole right before the generation point is
         // acceptance-critical), so capture ALL positions and append.
-        const drafter_active = options.drafter_enabled and options.drafter != null;
         const pld_active = options.pld_enabled;
-        const need_capture = drafter_active or mtp_active;
+        const need_capture = mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
         const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
@@ -3633,7 +3463,7 @@ pub const Generator = struct {
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (sampling.call_force == null and (drafter_active or pld_active or mtp_active or dspark_active or dflash_active)) {
+        if (sampling.call_force == null and (pld_active or mtp_active or dflash_active)) {
             const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -3682,9 +3512,6 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
                 .pld_enabled = pld_active,
-                .dspark_enabled = dspark_active,
-                .dspark_stochastic = dspark_stochastic,
-                .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
@@ -4402,6 +4229,16 @@ pub const Generator = struct {
         used_lookup: bool,
     };
 
+    /// The ONE place a partial accept rolls recurrent state back from the verify capture:
+    /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
+    /// rollback without being counted.
+    fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
+        self.partial_rounds += 1;
+        for (entries) |*entry| {
+            try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
+        }
+    }
+
     /// PLD draft+verify decode step. The draft comes from an n-gram lookup
     /// over `prompt_ids_owned ++ generated_ids`, NOT a model call — that's
     /// what makes PLD model-agnostic and cheap.
@@ -4413,157 +4250,6 @@ pub const Generator = struct {
     /// Returns `null` only when generation is already done. When no n-gram
     /// match exists (cold start, novel output), falls back to the regular
     /// `next()` path and returns a single-token result with `used_lookup=false`.
-    /// DeepSeek-V4 DSpark step (the arch's OWN block-parallel spec decode).
-    /// Entry/exit share the v2 spec invariant: module state = prompt +
-    /// emitted positions, t1 = `next_token_id` NOT in state, pending empty
-    /// (init's spec branch establishes it; every exit restores it). The
-    /// heavy lifting — draft, batched verify, snapshot rollback — lives in
-    /// `deepseek_v4.dsparkRound`; this wrapper only keeps the Generator's
-    /// bookkeeping (generated_ids, step accounting, the shell cache.step
-    /// that forwardDsv4WithImpl keys fresh-vs-decode on) in sync.
-    pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (self.done) return null;
-        if (!self.dspark_enabled) {
-            // Same defensive fallback as nextPld's disarmed arm: the
-            // dispatching caller's flag alone must never run a draft.
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
-        }
-        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-        const mdl = self.xfm.dsv4.?;
-        const t1 = self.next_token_id;
-        const accepted_cap = capAcceptedForTokenBudget(
-            std.math.maxInt(u32),
-            self.completion_tokens,
-            self.max_tokens,
-        );
-        var round = if (self.dspark_stochastic)
-            try self.dsparkStochasticRound(allocator, mdl, t1, accepted_cap)
-        else
-            try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1, accepted_cap);
-        errdefer round.deinit(allocator);
-        // dsparkRound advanced the module state — mirror it on the shell
-        // cache verbatim so a later serial fallback (or the fresh-request
-        // check keying on step==0) sees a consistent position. Generator.step
-        // itself moves through advanceStep below (the clear-cadence clock).
-        self.ctx.cache.step = mdl.dec_state.?.n;
-        self.dspark_attempted += 1;
-        self.dspark_accepted_tokens += round.accepted;
-        try self.generated_ids.appendSlice(allocator, round.tokens);
-        self.advanceStep(@intCast(round.tokens.len));
-        self.next_token_id = round.next_token;
-        // tokens ownership transfers to the caller (scheduler frees).
-        return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
-    }
-
-    /// One stochastic DSpark round: dsv4's own greedy stage draft (a one-hot
-    /// proposal) verified with the MTP acceptance machinery — filtered target
-    /// probs at EVERY verify position (`probsAllPositions`, the request's own
-    /// temperature/top-k/top-p), accept draft k with prob `min(1, p_k)`,
-    /// first reject at `a` corrected from `normalize(max(p_a − onehot, 0))`,
-    /// full accept sampled from the bonus row — corrections pre-sampled in
-    /// ONE batched graph (`mtpBatchedAcceptGraph`, one-hot arm) so the round
-    /// pays ONE bounded sync. The output distribution equals serial sampling
-    /// (the toy-vocab exactness test's invariant), and the correction always
-    /// derives from the ORIGINAL verify logits at the acceptance point — the
-    /// house partial-accept invariant in sampled form.
-    fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4_mod.Dsv4Model, t1: u32, accepted_cap: u32) !dsv4_mod.DsparkRound {
-        const s = self.xfm.s;
-        var pending = try dsv4_mod.dsparkBegin(mdl, allocator, &mdl.dec_state.?, t1);
-        defer pending.deinit();
-        const b: u32 = @intCast(pending.b);
-
-        // Filtered target probs over every verify row: [b+1, V] → [1, b+1, V].
-        const vshape = [_]c_int{ 1, @intCast(pending.b + 1), @intCast(mdl.vocab) };
-        var vl3 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vl3);
-        try mlx.check(mlx.mlx_reshape(&vl3, pending.vl_g, &vshape, 3, s));
-        const probs_all = try probsAllPositions(vl3, self.sampling, s);
-        defer _ = mlx.mlx_array_free(probs_all);
-
-        var accepted: u32 = 0;
-        var next_token: u32 = undefined;
-        if (b == 0) {
-            // The confidence gate submitted nothing: this round verifies t1
-            // alone and row 0 IS the bonus row — sample the next trunk token
-            // from it directly.
-            var log_p = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(log_p);
-            try mlx.check(mlx.mlx_log(&log_p, probs_all, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
-            var sampled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, log_p, -1, null_key, s));
-            var samp_i = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(samp_i);
-            try mlx.check(mlx.mlx_astype(&samp_i, sampled, .int32, s));
-            try mlx.check(mlx.mlx_array_eval(samp_i));
-            var v: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&v, samp_i));
-            next_token = @intCast(v);
-        } else {
-            // [1] int32 arrays of the draft ids (already realized host values
-            // — dsv4 drafts synchronously, unlike the MTP head's lazy chain).
-            var draft_arrs: [16]mlx.mlx_array = undefined;
-            var n_arrs: usize = 0;
-            defer for (draft_arrs[0..n_arrs]) |arr| {
-                _ = mlx.mlx_array_free(arr);
-            };
-            const idshape = [_]c_int{1};
-            for (0..pending.b) |k| {
-                const idv = [_]i32{@intCast(pending.verify[k + 1])};
-                draft_arrs[k] = mlx.mlx_array_new_data(&idv, &idshape, 1, .int32);
-                n_arrs += 1;
-            }
-            var bg = try mtpBatchedAcceptGraph(probs_all, draft_arrs[0..pending.b], null, b, .{}, s);
-            defer bg.deinit();
-
-            // ONE bounded sync: the accept vector + pre-sampled corrections
-            // (and the whole verify graph beneath them) in one batched eval.
-            {
-                const ev = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(ev);
-                _ = mlx.mlx_vector_array_append_value(ev, bg.accept_p);
-                _ = mlx.mlx_vector_array_append_value(ev, bg.corr_samples);
-                try mlx.check(mlx.mlx_async_eval(ev));
-            }
-            try mlx.check(mlx.mlx_array_eval(bg.accept_p));
-            const p_data = mlx.mlx_array_data_float32(bg.accept_p) orelse return error.MlxArrayDataNull;
-            while (accepted < b) {
-                const accept_prob: f32 = @min(1.0, p_data[accepted]);
-                const u: f32 = self.prng.random().float(f32);
-                if (u >= accept_prob) break;
-                accepted += 1;
-            }
-            // Pick the correction at the request-budget boundary and let
-            // dsparkFinish roll module-owned state back to that same point.
-            accepted = @min(accepted, accepted_cap);
-            try mlx.check(mlx.mlx_array_eval(bg.corr_samples));
-            const corr = mlx.mlx_array_data_int32(bg.corr_samples) orelse return error.MlxArrayDataNull;
-            next_token = @intCast(corr[accepted]);
-        }
-        pending.lapVerify(mdl);
-
-        const round = try dsv4_mod.dsparkFinish(mdl, allocator, &mdl.dec_state.?, &pending, accepted, next_token);
-        dsv4_mod.dsparkObserve(mdl, round.phases);
-        return round;
-    }
-
-    /// The ONE place a partial accept rolls recurrent state back from the verify capture:
-    /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
-    /// rollback without being counted.
-    fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCacheEntry, accepted: u32, verify_len: u32, s: mlx.mlx_stream) !void {
-        self.partial_rounds += 1;
-        for (entries) |*entry| {
-            try transformer_mod.ssmRollbackFromCapture(entry, accepted, verify_len, s);
-        }
-    }
-
     pub fn nextPld(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -4571,13 +4257,10 @@ pub const Generator = struct {
         key_len: u32,
     ) !?PldStepResult {
         if (self.done) return null;
-        // Init never armed PLD for this generator (the deepseek_v4 chokepoint
-        // guard, or a caller that simply didn't ask). The dispatching caller's
-        // flag alone must never put a verify forward through the trunk — on
-        // dsv4 the verify appends draft tokens into module-owned state that
-        // the KV snapshot rollback cannot restore (the 2026-07-31 mangled-DSML
-        // corruption). Unlike `spec_disabled_runtime` below this is permanent:
-        // no re-enable check can ever resurrect it.
+        // Init never armed PLD for this generator (GLM, or a caller that simply
+        // didn't ask). The dispatching caller's flag alone must never put a
+        // verify forward through the trunk. Unlike `spec_disabled_runtime`
+        // below this is permanent: no re-enable check can ever resurrect it.
         if (!self.pld_enabled) {
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
@@ -4766,7 +4449,7 @@ pub const Generator = struct {
         const draft = draft_slice.?;
         const m: u32 = @intCast(draft.len);
 
-        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset + DSV4 ──
+        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset ──
         // Cache enters at cache.step = prompt_len + TE.
         //
         // The snapshots below are the FALLBACK rollback path (pure-attention,
@@ -5055,440 +4738,6 @@ pub const Generator = struct {
         accepted_tokens: u32,
     };
 
-    /// Drafter-assisted decode step. Mirrors `nextPld` but the draft comes
-    /// from `block_size - 1` autoregressive forwards through the Gemma 4
-    /// assistant drafter (cross-attending into target's KV) instead of an
-    /// n-gram lookup. Verify is identical: target forward over
-    /// `[t1, draft0..draft_{m-1}]` with greedy / stochastic accept.
-    ///
-    /// Algorithm:
-    ///   1. Run `block_size - 1` drafter steps. Each step's input is
-    ///      `concat(target.embed(prev_tok)*scale, h_prev)`. `prev_tok` starts
-    ///      at `next_token_id` (= t1); after step i it's the just-sampled
-    ///      `draft[i]`. `h_prev` starts at `last_hidden` (captured at
-    ///      prefill or the previous accept's verify-forward); after step i
-    ///      it's the drafter's own `post_proj` output.
-    ///      All drafter forwards in one round share `rope_offset =
-    ///      target.cache.step` (per upstream `set_shared_kv`).
-    ///   2. Snapshot KV + SSM, run target verify forward over
-    ///      `[t1, draft0..draft_{m-1}]` length `block_size` with
-    ///      `forwardCaptureHidden` so we get the new `h_prev` at position m.
-    ///   3. Walk argmax(verify_logits[i]) vs draft[i] for i in 0..m-1.
-    ///      Greedy: equal → accept. Stochastic: standard speculative-decoding
-    ///      ratio test using `probAt(target_p, draft[i])` (the drafter's
-    ///      masked-LM-head produces probabilistic logits, so we treat its
-    ///      sampled draft as a one-hot proposal — same simplification PLD
-    ///      uses).
-    ///   4. Full accept (j == m): emit drafts, sample new pending from
-    ///      verify_logits[m-1] (the target's prediction one position past the
-    ///      last accepted draft — already computed during verify), update
-    ///      `last_hidden` to the captured post-final-norm hidden.
-    ///   5. Partial accept (j < m): roll back KV+SSM, re-forward
-    ///      `[t1, draft[0..j-1]]` length `j+1` (with hidden capture) so
-    ///      cache lands at exactly `+j+1`. Sample correction from the
-    ///      *original* verify_logits[j] (the model's prediction at the
-    ///      rejected position).
-    pub fn nextDrafter(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-        if (self.done) return null;
-        std.debug.assert(self.drafter != null);
-        std.debug.assert(self.has_last_hidden); // captured at init or last accept
-        // Release-enforced guard (issue #97): the drafter path cannot honor a
-        // grammar constraint or logprobs (compiled-out asserts before).
-        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-
-        // Runtime acceptance gate: if a prior step set the flag, fall back
-        // to the regular `next()` path. Drafter's exit invariant is "t1 NOT
-        // in cache" (different from `next()`'s expected entry), so `next()`
-        // contains a transition shim that synchronously seeds pending_logits
-        // when has_pending_logits is false. The shim makes this hand-off safe.
-        if (self.spec_disabled_runtime) {
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return DrafterStepResult{
-                .tokens = tokens,
-                .accepted_tokens = 0,
-            };
-        }
-
-        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-
-        const xfm = self.xfm;
-        const s = xfm.s;
-        const drafter = self.drafter.?;
-        const m: u32 = @max(@as(u32, 1), self.drafter_block_size - 1);
-        const t1: u32 = self.next_token_id; // already-decided token at position cache.step
-
-        // RoPE offset: position the drafter's queries rotate by. Per upstream
-        // `set_shared_kv`, this is `target.cache.step` and stays constant
-        // across all `m` drafter steps in this round.
-        const rope_offset: c_int = @intCast(self.ctx.cache.step);
-
-        // ── Phase 1: draft `m` tokens lazily, no per-step CPU sync ──
-        //
-        // The drafter loop builds a chained lazy graph: each step's sampled
-        // token is a [1]-shaped mlx_array fed directly to the next step's
-        // `embedTargetTokenArr` as the indexer, and forward as the next step's
-        // `prev_token`. No `mlx_array_eval` / `mlx_array_item_int32` calls
-        // here — the entire m-step chain plus the verify forward (built
-        // below) materialize as a single async graph and evaluate together.
-        // For block_size=8 (31B), this collapses 7 GPU→CPU syncs into 0,
-        // saving ~70-100ms of Metal command-buffer sync latency per round.
-        var drafts = try allocator.alloc(u32, m);
-        errdefer allocator.free(drafts);
-
-        // `draft_arrs[i]` is the lazy [1] argmax output of drafter step i.
-        // Owned here; freed at end of nextDrafter (after verify uses them).
-        const draft_arrs = try allocator.alloc(mlx.mlx_array, m);
-        var draft_arrs_n: usize = 0;
-        defer {
-            for (draft_arrs[0..draft_arrs_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(draft_arrs);
-        }
-
-        // Wrap t1 as a [1] mlx_array so the FIRST drafter step can use the
-        // same lazy-chain helper as subsequent steps. This array is also
-        // reshaped + reused as the leading element of the verify input below.
-        const t1_i32: i32 = @intCast(t1);
-        const t1_shape = [_]c_int{1};
-        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32);
-        defer _ = mlx.mlx_array_free(t1_arr);
-
-        // `h_prev_owner` rolls forward through the drafter. Starts at the
-        // captured target hidden; subsequent steps use the drafter's
-        // post_proj output. The output is itself a lazy mlx_array, so the
-        // chain stays lazy across all m steps.
-        var h_prev_owner: ?mlx.mlx_array = null;
-        defer if (h_prev_owner) |h| {
-            _ = mlx.mlx_array_free(h);
-        };
-
-        {
-            var prev_tok_arr: mlx.mlx_array = t1_arr;
-            var i: u32 = 0;
-            while (i < m) : (i += 1) {
-                const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
-                const step_out = try drafter_mod.stepArr(drafter, xfm, self.ctx.cache, prev_tok_arr, h_prev_arg, rope_offset);
-                // Sample lazily — `sampleTokenLazy` for greedy returns the
-                // argmax as a [1]-shaped lazy array. NO eval here.
-                draft_arrs[i] = blk: {
-                    defer _ = mlx.mlx_array_free(step_out.logits);
-                    errdefer _ = mlx.mlx_array_free(step_out.h_prev_next);
-                    break :blk try self.sampleLazy(step_out.logits, .none);
-                };
-                draft_arrs_n = i + 1;
-
-                // Roll h_prev forward.
-                if (h_prev_owner) |h_old| {
-                    _ = mlx.mlx_array_free(h_old);
-                }
-                h_prev_owner = step_out.h_prev_next;
-                // The next step's prev_token is THIS step's lazy sample.
-                prev_tok_arr = draft_arrs[i];
-            }
-        }
-
-        // ── Phase 2: snapshot KV + SSM + DSV4 ──
-        var kv_snap = try self.ctx.cache.snapshot();
-        defer kv_snap.deinit();
-        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
-        defer if (ssm_snaps) |snaps| {
-            for (snaps) |*sn| ssmSnapshotDeinit(sn);
-            xfm.allocator.free(snaps);
-        };
-        if (self.ctx.ssm_entries) |entries| {
-            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
-            for (entries, 0..) |*entry, idx| out[idx] = ssmSnapshot(entry);
-            ssm_snaps = out;
-        }
-        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
-
-        // ── Phase 3: build verify input by concatenating [t1, drafts...] ──
-        //
-        // Build verify_input as a [1, 1+m] tensor without any CPU sync. The
-        // m draft tokens are still lazy mlx_arrays at this point; we reshape
-        // each [1] → [1,1] and stack along axis=1 with t1 reshaped the same
-        // way. The forward pass that consumes verify_input is then chained
-        // onto the drafter's lazy graph.
-        const reshape_2d = [_]c_int{ 1, 1 };
-        var t1_2d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(t1_2d);
-        try mlx.check(mlx.mlx_reshape(&t1_2d, t1_arr, &reshape_2d, 2, s));
-
-        // Stack: each draft_arr[i] is shape [1]; reshape each to [1,1] and
-        // collect into a vector_array along with t1_2d, then concat axis=1.
-        var verify_input = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(verify_input);
-        {
-            const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
-            var drafts_2d_n: usize = 0;
-            defer {
-                for (drafts_2d[0..drafts_2d_n]) |arr| _ = mlx.mlx_array_free(arr);
-                allocator.free(drafts_2d);
-            }
-            for (draft_arrs, drafts_2d) |dlazy, *out| {
-                out.* = mlx.mlx_array_new();
-                drafts_2d_n += 1;
-                try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
-            }
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            _ = mlx.mlx_vector_array_append_value(vec, t1_2d);
-            for (drafts_2d) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-            try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
-        }
-
-        var new_hidden = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(new_hidden);
-        // Captures the post-final-norm hidden at the LAST input position
-        // (= position m, predicting the bonus token if all drafts accept).
-        var verify_logits = try xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
-        errdefer _ = mlx.mlx_array_free(verify_logits);
-        _ = try self.thinkShiftRows(&verify_logits, verify_input);
-        // verify_logits shape: [1, 1+m, V]
-        self.drafter_attempted += 1;
-
-        // ── Phase 4: decide longest accepted prefix ──
-        //
-        // Greedy mode: argmax over the entire [1, 1+m, V] verify_logits in
-        // one op (yields [1, 1+m] indices). Stochastic mode: sample-residual
-        // / accept-prob path needs per-position logits, so it slices below.
-        // Either way, we collapse all per-step syncs into ONE eval at the
-        // end of this round.
-        const stochastic = !isGreedyTemperature(self.sampling.temperature);
-        const vl_shape = mlx.getShape(verify_logits);
-
-        // Stochastic path needs per-position logits to compute target probs
-        // and (on partial accept) build the residual. Greedy path skips
-        // slicing entirely. `per_pos_logits` is null in greedy mode.
-        var per_pos_logits: ?[]mlx.mlx_array = null;
-        var per_pos_logits_n: usize = 0;
-        defer if (per_pos_logits) |slots| {
-            for (slots[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(slots);
-        };
-        if (stochastic) {
-            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
-            per_pos_logits = slots;
-            const slice_strides = [_]c_int{ 1, 1, 1 };
-            for (slots, 0..) |*slot, idx| {
-                slot.* = mlx.mlx_array_new();
-                per_pos_logits_n = idx + 1;
-                const start = [_]c_int{ 0, @intCast(idx), 0 };
-                const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
-                try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
-            }
-        }
-
-        // Build the greedy argmax tensor lazily; it'll be eval'd alongside
-        // the rest of the round below. Its entries are COMMITTED, so they mask
-        // reserved ids like every other block decoder's.
-        var verify_argmax: CommittedArgmax = .{};
-        defer verify_argmax.deinit();
-        if (!stochastic) {
-            verify_argmax = try verifyArgmax(verify_logits, self.sampling.suppress_mask, s);
-        }
-        _ = mlx.mlx_array_free(verify_logits);
-        verify_logits = .{ .ctx = null };
-
-        // ── Phase 4b: batched eval — drafts + verify_argmax + new_hidden ──
-        //
-        // Submit the entire round (drafter chain + verify forward + argmax)
-        // to the GPU in a single async dispatch. Then sync ONCE per array we
-        // need on the CPU. For block_size=8, this collapses ~14 individual
-        // sync points (7 drafter samples + 7 per-position argmaxes in the
-        // old code) into approximately 2: one effective sync to wait for
-        // GPU completion (the first `mlx_array_eval`), and zero-cost evals
-        // afterward since the work is already done.
-        //
-        // CORRECTNESS: `mlx_array_data_int32` only returns valid data once
-        // the array is eval'd. We explicitly eval each array we will read.
-        // `verify_input` is NOT eval'd separately because MLX may fuse it
-        // into the forward pass without materializing a CPU-readable buffer
-        // — instead we read drafts via per-array `mlx_array_item_int32` on
-        // each `draft_arrs[i]` (cheap after the first sync).
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
-            if (!stochastic) {
-                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
-            }
-            _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
-            try mlx.check(mlx.mlx_async_eval(eval_vec));
-        }
-        // Extract drafts. First eval sync waits for the GPU; subsequent
-        // evals are no-ops since they were queued together.
-        for (draft_arrs, 0..) |arr, idx| {
-            try mlx.check(mlx.mlx_array_eval(arr));
-            var v: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&v, arr));
-            drafts[idx] = @intCast(v);
-        }
-        if (!stochastic) {
-            // Force verify_argmax to materialize before bulk-reading. It's a
-            // separate branch from the drafter chain (drafts → concat →
-            // verify → argmax), so eval'ing the drafts above doesn't pull
-            // verify_argmax along with them. This was the v26.5.6 bug that
-            // produced 0% acceptance on 26B/31B (verify ran longer than the
-            // drafter chain, so the data buffer was read while the GPU was
-            // still writing it).
-            try mlx.check(mlx.mlx_array_eval(verify_argmax.lazy()));
-        }
-
-        var accepted: u32 = 0;
-        if (stochastic) {
-            // Stochastic verify (Leviathan et al. probability-ratio test).
-            // The drafted token came from argmax of the drafter's masked LM
-            // head, so we treat it as a one-hot proposal: accept with
-            // probability `min(1, target_p[draft[i]])`, otherwise stop and
-            // sample from the residual at the rejected position.
-            var k: u32 = 0;
-            while (k < m) : (k += 1) {
-                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
-                defer _ = mlx.mlx_array_free(target_p);
-                const p_draft = try probAt(target_p, drafts[k], s);
-                const accept_prob: f32 = @min(1.0, p_draft);
-                const u: f32 = self.prng.random().float(f32);
-                if (u >= accept_prob) break;
-                accepted += 1;
-            }
-        } else {
-            // Bulk-read the [1, 1+m] argmax indices and scan for first
-            // mismatch in CPU. No more GPU syncs in this branch.
-            const argmax_data = try verify_argmax.ids(1 + m);
-            var k: u32 = 0;
-            while (k < m) : (k += 1) {
-                const target_argmax: u32 = @intCast(argmax_data[k]);
-                if (target_argmax != drafts[k]) break;
-                accepted += 1;
-            }
-        }
-
-        accepted = capAcceptedForTokenBudget(
-            accepted,
-            self.completion_tokens,
-            self.max_tokens,
-        );
-
-        // Sample the next pending token from the verify output at position
-        // `accepted`:
-        //   - full accept (accepted == m): position m predicts the bonus
-        //     token one past the last draft.
-        //   - partial accept: position `accepted` predicts the model's
-        //     replacement for the rejected draft.
-        // For greedy, position `accepted`'s argmax is already in
-        // `argmax_data[accepted]` — no extra GPU work. For stochastic, we
-        // need the actual probability distribution at that position, so we
-        // sample from `per_pos_logits[accepted]` (with residual correction
-        // on partial accept per Leviathan et al).
-        const next_pending: u32 = blk: {
-            if (stochastic) {
-                const correction_logits = per_pos_logits.?[accepted];
-                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
-                defer _ = mlx.mlx_array_free(probs);
-                if (accepted < m) {
-                    const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
-                    defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
-                } else {
-                    break :blk try sampleFromProbs(probs, s);
-                }
-            } else {
-                // Greedy: reuse the bulk-read argmax row. Already eval'd in
-                // the single async eval above; no GPU sync here.
-                const argmax_data = try verify_argmax.ids(1 + m);
-                break :blk @intCast(argmax_data[accepted]);
-            }
-        };
-
-        // ── Phase 5: commit / rollback ──
-        if (accepted == m) {
-            // Full accept: cache at +1+m. Emit [t1, ...drafts]. Pending = next_pending.
-            // The captured `new_hidden` is the post-final-norm hidden at
-            // position m — the last accepted draft's position. That's the
-            // h_prev for the NEXT round (drafting from t = next_pending; the
-            // hidden corresponds to draft[m-1], which is what next_pending
-            // follows). This matches the convention `nextDrafter` uses.
-            const tokens = try allocator.alloc(u32, 1 + m);
-            tokens[0] = t1;
-            for (drafts, 0..) |d, idx| tokens[1 + idx] = d;
-
-            try self.generated_ids.append(allocator, t1);
-            for (drafts) |d| try self.generated_ids.append(allocator, d);
-
-            if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
-            self.last_hidden = new_hidden;
-            self.has_last_hidden = true;
-            new_hidden = .{ .ctx = null };
-
-            self.drafter_accepted_tokens += m;
-            self.next_token_id = next_pending;
-            self.advanceStep(1 + m);
-
-            // drafts buffer transferred into tokens copy; free original.
-            allocator.free(drafts);
-            self.checkDrafterRuntimeGate();
-            return DrafterStepResult{
-                .tokens = tokens,
-                .accepted_tokens = m,
-            };
-        }
-
-        // Partial accept (accepted < m). Cache over-advanced by (m - accepted).
-        // The captured new_hidden is for position m (which we're rolling back
-        // past) — discard it. Roll back KV+SSM, then re-forward
-        // [t1, drafts[0..accepted]] length 1+accepted with hidden capture so
-        // last_hidden lands at the position immediately past the last
-        // accepted draft (where next_pending will live).
-        _ = mlx.mlx_array_free(new_hidden);
-        new_hidden = .{ .ctx = null };
-
-        try self.ctx.cache.restore(&kv_snap);
-        if (ssm_snaps) |snaps| {
-            for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
-        }
-        self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
-
-        const re_seq_len: c_int = @intCast(1 + accepted);
-        const re_input_buf = try allocator.alloc(i32, 1 + accepted);
-        defer allocator.free(re_input_buf);
-        re_input_buf[0] = @intCast(t1);
-        for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
-        const re_shape = [_]c_int{ 1, re_seq_len };
-        const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(re_input);
-
-        var re_new_hidden = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(re_new_hidden);
-        const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
-        _ = mlx.mlx_array_free(re_logits);
-
-        const tokens = try allocator.alloc(u32, 1 + accepted);
-        tokens[0] = t1;
-        for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
-
-        try self.generated_ids.append(allocator, t1);
-        for (drafts[0..accepted]) |d| try self.generated_ids.append(allocator, d);
-
-        if (self.has_last_hidden) _ = mlx.mlx_array_free(self.last_hidden);
-        self.last_hidden = re_new_hidden;
-        self.has_last_hidden = true;
-        re_new_hidden = .{ .ctx = null };
-
-        self.drafter_accepted_tokens += accepted;
-        self.next_token_id = next_pending;
-        self.advanceStep(1 + accepted);
-
-        allocator.free(drafts);
-        self.checkDrafterRuntimeGate();
-        return DrafterStepResult{
-            .tokens = tokens,
-            .accepted_tokens = accepted,
-        };
-    }
-
     /// DFlash block-drafter step. ONE assistant forward proposes
     /// `block_size - 1` drafts, conditioned on the trunk's cached
     /// target_layer_ids hiddens (the per-request `dflash_ctx`); the trunk
@@ -5740,17 +4989,9 @@ pub const Generator = struct {
         const bs: u32 = round_width + 1;
         const m: u32 = bs - 1;
         const t1: u32 = self.next_token_id;
-        // On the moe/GDN path positions come from moe_seq_offset (cache.step
-        // is a bookkeeping counter the model never reads there — same rule as
-        // nextMtp); the standard path keeps cache.step as the anchor.
-        const moe_path = self.xfm.moe_layers != null;
-        // A hybrid trunk (LFM2 DSpark) positions from moe_seq_offset too, but
-        // its cache.step IS genuine (every token passes the attention layers),
-        // so it keeps the truncate and only needs the offset + conv-state
-        // rollback. Deciding the two independently is what keeps a partial
-        // accept from either mis-positioning or double-counting.
-        const hybrid_path = self.xfm.hybrid_layers != null;
-        const anchor_pos: usize = if (moe_path or hybrid_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
+        // Positions come from moe_seq_offset (cache.step is a bookkeeping
+        // counter the model never reads — same rule as nextMtp).
+        const anchor_pos: usize = self.ctx.moe_seq_offset.*;
         const kv_step_snap = self.ctx.cache.step;
         std.debug.assert(dctx.absLen() == anchor_pos);
 
@@ -6125,36 +5366,18 @@ pub const Generator = struct {
         const n_commit: usize = 1 + @as(usize, accepted);
         if (accepted < m) {
             try self.ctx.cache.truncate(anchor_pos + n_commit, s);
-            if (moe_path) {
-                // Same bookkeeping as nextMtp's GDN arm: preserve the
-                // pre-verify cache.step (prefix-cache kv_step contract),
-                // roll every linear layer's recurrent state back to the
-                // accepted position from the verify pass's capture, and
-                // re-point moe_seq_offset at the committed length.
-                self.ctx.cache.step = kv_step_snap;
-                if (self.ctx.ssm_entries) |entries| {
-                    const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
-                    if (!gdn_captured) return error.SpecRollbackUnavailable;
-                    try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
-                }
-                self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
-            } else if (hybrid_path) {
-                if (self.ctx.ssm_entries) |entries| {
-                    // On a hybrid trunk only the CONV layers hold state, so
-                    // entry 0 may legitimately be an attention layer with no
-                    // capture at all — ask whether ANY layer recorded one.
-                    var captured = false;
-                    for (entries) |*e| {
-                        if (e.spec_conv_input.ctx != null or e.spec_state_seq.ctx != null) {
-                            captured = true;
-                            break;
-                        }
-                    }
-                    if (!captured) return error.SpecRollbackUnavailable;
-                    try self.rollbackSsmFromCapture(entries, accepted, bs, s);
-                }
-                self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
+            // Same bookkeeping as nextMtp's GDN arm: preserve the
+            // pre-verify cache.step (prefix-cache kv_step contract),
+            // roll every linear layer's recurrent state back to the
+            // accepted position from the verify pass's capture, and
+            // re-point moe_seq_offset at the committed length.
+            self.ctx.cache.step = kv_step_snap;
+            if (self.ctx.ssm_entries) |entries| {
+                const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                if (!gdn_captured) return error.SpecRollbackUnavailable;
+                try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
             }
+            self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
         }
         if (accepted == m) {
             try dflash_mod.appendContext(model, dctx, cap_out, anchor_pos);
@@ -6238,27 +5461,6 @@ pub const Generator = struct {
         log.info(
             "  dflash=disabled (runtime yield {d:.2} accepted/round < {d:.2} after {d} attempts)\n",
             .{ avg, self.dflash_min_accepted_per_round, self.dflash_attempted },
-        );
-        self.spec_disabled_runtime = true;
-    }
-
-    /// Runtime acceptance gate for the drafter: after warmup, if the per-draft
-    /// acceptance probability is below `RUNTIME_GATE_MIN_PER_DRAFT_RATE`,
-    /// disable speculation for the rest of this request. Sticky for the rest
-    /// of the generation.
-    fn checkDrafterRuntimeGate(self: *Generator) void {
-        if (self.spec_disabled_runtime) return;
-        const drafts_per_round: u32 = if (self.drafter_block_size >= 1) self.drafter_block_size - 1 else 0;
-        if (!runtimeGateShouldDisable(self.drafter_attempted, self.drafter_accepted_tokens, drafts_per_round)) return;
-        const drafts_proposed: u64 = self.drafter_attempted * @as(u64, drafts_per_round);
-        const rate: f32 = if (drafts_proposed > 0)
-            @as(f32, @floatFromInt(self.drafter_accepted_tokens)) /
-                @as(f32, @floatFromInt(drafts_proposed))
-        else
-            0.0;
-        log.info(
-            "  drafter=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
-            .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.drafter_attempted },
         );
         self.spec_disabled_runtime = true;
     }
@@ -9576,7 +8778,7 @@ pub const Generator = struct {
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
     pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
-        const chip = ane_mod.chipBrand();
+        const chip = chip_mod.chipBrand();
         const cap = mtpDepthCapResolved(configured, adaptive, profile, chip);
         // Name the row ONCE when a per-silicon measurement is what fenced the
         // depth. Without it `[spec-stats] depth=4` on an M1 Pro reads the same
@@ -13103,130 +12305,7 @@ pub fn generatePld(
     return finishPldResult(&gen, &output_ids, allocator, prefill_tps, timer, tok);
 }
 
-/// Drafter-enabled non-streaming variant of `generate`. Mirrors
-/// `generatePld` (multi-token-per-step emit pattern) but the draft comes from
-/// a Gemma 4 assistant drafter cross-attending into the target's KV cache
-/// instead of an n-gram lookup.
-///
-/// `drafter` must already be `bind()`-ed to `xfm`. `block_size` is the
-/// per-round token budget (drafter forwards = block_size - 1; verify forward
-/// length = block_size).
-pub fn generateDrafter(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    xfm: *Transformer,
-    drafter: *DrafterModel,
-    tok: *const Tokenizer,
-    prompt_ids: []const u32,
-    max_tokens: u32,
-    sampling: SamplingParams,
-    eos_token_ids: []const u32,
-    timeout_ns: u64,
-    block_size: u32,
-    lookup_prompt: ?[]const u32,
-) !GenerationResult {
-    var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
-        .drafter_enabled = true,
-        .drafter = drafter,
-        .drafter_block_size = block_size,
-        .lookup_prompt = lookup_prompt,
-    });
-    gen.timeout_ns = timeout_ns;
-    defer gen.deinit(allocator);
-
-    const prefill_ns = timer.read();
-    const prefill_tps: f64 = if (prefill_ns > 0)
-        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
-    else
-        0.0;
-    log.debug("Prefill (drafter): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
-        prefill_ns / std.time.ns_per_ms,
-        prompt_ids.len,
-        prefill_tps,
-    });
-
-    var output_ids = std.ArrayList(u32).empty;
-    defer output_ids.deinit(allocator);
-
-    timer.reset();
-
-    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
-        const result = (try gen.nextDrafter(allocator)) orelse break;
-        defer allocator.free(result.tokens);
-        for (result.tokens) |tok_id| {
-            if (isEosId(tok_id, eos_token_ids)) {
-                gen.done = true;
-                gen.finish_reason = "stop";
-                break :decode;
-            }
-            try output_ids.append(allocator, tok_id);
-            if (output_ids.items.len >= max_tokens) {
-                gen.done = true;
-                gen.finish_reason = "length";
-                break :decode;
-            }
-        }
-        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
-            gen.done = true;
-            gen.finish_reason = "length";
-            break;
-        }
-    }
-
-    return finishDrafterResult(&gen, &output_ids, allocator, prefill_tps, timer, tok);
-}
-
-fn finishDrafterResult(
-    gen: *Generator,
-    output_ids: *std.ArrayList(u32),
-    allocator: std.mem.Allocator,
-    prefill_tps: f64,
-    timer: io_util.Stopwatch,
-    tok: *const Tokenizer,
-) !GenerationResult {
-    const decode_ns = timer.read();
-    const num_decoded = output_ids.items.len;
-    const decode_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
-    if (gen.drafter_attempted > 0) {
-        const avg_acc: f64 = @as(f64, @floatFromInt(gen.drafter_accepted_tokens)) / @as(f64, @floatFromInt(gen.drafter_attempted));
-        log.info("Decode (drafter): {d}ms ({d} tokens, {d:.3} tok/s; drafter accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-            gen.drafter_accepted_tokens,
-            gen.drafter_attempted,
-            avg_acc,
-        });
-    } else {
-        log.debug("Decode (drafter): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-        });
-    }
-    gen.logSpecStats();
-    gen.logQsaArms();
-    const strip_leading = tok.tok_type == .sentencepiece_bpe;
-    const text = try tok.decode(allocator, output_ids.items, strip_leading);
-    const token_ids = try output_ids.toOwnedSlice(allocator);
-    return .{
-        .text = text,
-        .token_ids = token_ids,
-        .prompt_tokens = gen.prompt_tokens,
-        .completion_tokens = gen.completion_tokens,
-        .finish_reason = gen.finish_reason,
-        .prefill_tps = prefill_tps,
-        .decode_tps = decode_tps,
-        .logprobs = null,
-    };
-}
-
-/// MTP-enabled non-streaming variant of `generate`. Mirrors `generateDrafter`
-/// but drives `nextMtp` (the model's own multi-token-prediction head).
+/// MTP-enabled non-streaming variant of `generate`. Drives `nextMtp` (the model's own multi-token-prediction head).
 /// `head` must already be `bind()`-ed to `xfm`.
 pub fn generateMtp(
     io: std.Io,
@@ -13965,20 +13044,13 @@ pub fn computeEmbeddingsBatch(
         const hidden = try xfm.forwardEmbeddingMasked(input, mask);
         defer _ = mlx.mlx_array_free(hidden);
 
-        // Sentence-transformers pipeline order: pool (per the checkpoint's
-        // declared mode — mean by default, CLS for bge/mxbai, last-token for
-        // Qwen3-Embedding) → dense head (when the checkpoint ships one —
-        // EmbeddingGemma) → normalize.
+        // Pool (per the checkpoint's declared mode — mean by default) → normalize.
         const pooled = switch (xfm.config.effectivePooling()) {
             .mean => try maskedMeanPool(allocator, hidden, pb.lengths, xfm.s),
             .cls, .last_token => |m| try gatherTokenPool(allocator, hidden, pb.lengths, m, xfm.s),
         };
         defer _ = mlx.mlx_array_free(pooled);
-        const rows = if (xfm.hasEmbedProjection()) blk: {
-            const projected = try xfm.embedProjection(pooled);
-            defer _ = mlx.mlx_array_free(projected);
-            break :blk try l2NormalizeRows(allocator, projected, xfm.s);
-        } else try l2NormalizeRows(allocator, pooled, xfm.s);
+        const rows = try l2NormalizeRows(allocator, pooled, xfm.s);
         defer allocator.free(rows);
         for (rows, 0..) |r, i| {
             results[start + i] = r;
@@ -14704,6 +13776,7 @@ fn argmax(last_logits: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
 // ── Tests ──
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 test "SamplingParams defaults" {
     const params = SamplingParams{};
@@ -17052,7 +16125,7 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
         try testing.expect(std.mem.indexOf(u8, body, "mtp_depth_cap_logged") != null);
     }
 
-    const live_generic = mtp_mod.adaptiveDepthCapForMachine(ane_mod.chipBrand(), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
+    const live_generic = mtp_mod.adaptiveDepthCapForMachine(chip_mod.chipBrand(), Generator.MTP_ADAPTIVE_DEFAULT_CAP).cap;
     try testing.expectEqual(live_generic, Generator.mtpDepthCapFor(0, true, false));
     try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }
@@ -19032,314 +18105,6 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     }
 }
 
-test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
-    // DSpark is opt-in at load; the nextDspark arm below needs it armed.
-    _ = setenv("SUSHI_DSV4_DSPARK", "1", 1);
-    // The live corruption path (2026-07-31, log 166348-166361): the scheduler
-    // decode tick dispatched on `slot.enable_pld` alone, so it called
-    // `nextPld` on a generator whose init the dsv4 guard had already flipped
-    // to pld_enabled=false — and nextPld trusted its caller, ran lookup +
-    // verify forwards, and the rejected drafts left dsv4's module-owned
-    // state (rings + kv/comp caches) permanently ahead of the rolled-back
-    // KVCache shell. This test reproduces the bypassing caller directly:
-    // nextPld on such a generator must (a) report the chokepoint flip via
-    // `gen.pld_enabled == false`, (b) never run a verify forward
-    // (`pld_attempted == 0`), and (c) emit the exact serial-decode tokens.
-    //
-    // Fabricate the mini with:
-    //   python3 tests/dsv4_mlx_ref.py --fabricate /tmp/dsv4-mini
-    //   DSV4_MINI=/tmp/dsv4-mini zig build test -Dtest-filter=DSV4_MINI
-    const path_z = std.c.getenv("DSV4_MINI") orelse return;
-    if (mlx.noGpuBackend()) return;
-    const path = std.mem.span(path_z);
-    const allocator = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
-    defer allocator.free(cfg_path);
-    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    file.close(io);
-    defer allocator.free(cfg_json);
-    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
-    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
-    defer allocator.free(shard_path);
-    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
-    defer weights.deinit();
-
-    // Never read by the Generator (stored only) — see the field comment.
-    var tok_dummy: Tokenizer = undefined;
-
-    // Prompt = every vocab id once. With key_len=1 any sampled t1 < V has an
-    // earlier occurrence, so PLD's lookup ALWAYS proposes a draft — on the
-    // pre-fix code that guarantees a verify forward (and the corruption);
-    // random-content prompts can idle in the cold path and mask the bug
-    // (exactly how the first two live requests read as "guards held").
-    var prompt: [64]u32 = undefined;
-    for (&prompt, 0..) |*v, i| v.* = @intCast(i);
-    const greedy = SamplingParams{ .temperature = 0.0 };
-    const want: usize = 10;
-
-    // Serial baseline: the regular scheduler shape (skip_lazy_preforward).
-    var serial: [want]u32 = undefined;
-    {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
-        defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
-            .skip_lazy_preforward = true,
-        });
-        defer gen.deinit(allocator);
-        var n: usize = 0;
-        while (n < want) {
-            const t = (try gen.next(allocator)) orelse break;
-            serial[n] = t;
-            n += 1;
-        }
-        try testing.expectEqual(want, n);
-    }
-
-    // Bypass arm: init asks for PLD (the app's always-on flags), the dsv4
-    // chokepoint flips it off, and the caller drives nextPld anyway — the
-    // scheduler tick's exact live behavior before specTickMode grew the
-    // generator-state conjunct.
-    {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
-        defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
-            .pld_enabled = true,
-            .skip_lazy_preforward = true,
-            .lookup_prompt = &prompt,
-        });
-        defer gen.deinit(allocator);
-        try testing.expect(!gen.pld_enabled);
-
-        var pld_toks: [want]u32 = undefined;
-        var n: usize = 0;
-        while (n < want) {
-            const r = (try gen.nextPld(allocator, 4, 1)) orelse break;
-            defer allocator.free(r.tokens);
-            for (r.tokens) |t| {
-                if (n < want) {
-                    pld_toks[n] = t;
-                    n += 1;
-                }
-            }
-        }
-        try testing.expectEqual(want, n);
-        try testing.expectEqual(@as(u64, 0), gen.pld_attempted);
-        try testing.expectEqualSlices(u32, serial[0..], pld_toks[0..]);
-    }
-
-    // DSpark arm: the SAME app-shaped init (spec flags on, greedy) now arms
-    // dsv4's own draft mode on a stage-bearing checkpoint. The tick driver
-    // is nextDspark; the sequence must match serial (the batch-verify vs
-    // single-token kernel-choice class allows a late near-tie flip on the
-    // random mini — the module-level dsparkRound gate pins the loop itself,
-    // this pins the GENERATOR wiring: engagement, step accounting, and the
-    // shell-cache mirror).
-    {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
-        defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
-            .pld_enabled = true,
-            .mtp_enabled = true,
-            .skip_lazy_preforward = true,
-            .lookup_prompt = &prompt,
-        });
-        defer gen.deinit(allocator);
-        try testing.expect(!gen.pld_enabled);
-        try testing.expect(gen.mtp == null);
-        try testing.expect(gen.dspark_enabled);
-
-        var ds_toks: [want]u32 = undefined;
-        var n: usize = 0;
-        while (n < want) {
-            const r = (try gen.nextDspark(allocator)) orelse break;
-            defer allocator.free(r.tokens);
-            for (r.tokens) |t| {
-                if (n < want) {
-                    ds_toks[n] = t;
-                    n += 1;
-                }
-            }
-        }
-        try testing.expectEqual(want, n);
-        // ENGAGEMENT: silent serial fallback is output-identical — count rounds.
-        try testing.expect(gen.dspark_attempted >= 1);
-        // Shell cache mirrors the module state exactly.
-        try testing.expectEqual(xfm.dsv4.?.dec_state.?.n, gen.ctx.cache.step);
-        // Sequence agreement: exact up to the sanctioned near-tie window.
-        var first_div: usize = want;
-        for (0..want) |k| {
-            if (serial[k] != ds_toks[k]) {
-                first_div = k;
-                break;
-            }
-        }
-        if (first_div < 4) {
-            std.debug.print("nextDspark serial={any} dspark={any}\n", .{ serial, ds_toks });
-            try testing.expect(false);
-        }
-        std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
-    }
-}
-
-test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill switch restores greedy-only" {
-    // Greedy clean → the argmax-equality arm (temp 0 or top_k 1), with or
-    // without the stochastic arm enabled.
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_k = 1 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, false));
-    // Sampled clean → stochastic (the checkpoint-default temp 0.6 agent
-    // shape: pi and friends omit temperature, generation_config fills 0.6).
-    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 1.0, .top_k = 40 }, 0, true));
-    // Kill switch: sampled requests fall back to serial-only.
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, false));
-    // Penalties / grammar / logprobs stay serial on BOTH arms — the
-    // pre-stochastic contract, unchanged.
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .presence_penalty = 0.5 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6 }, 5, true));
-    var c: Constraint = undefined;
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .constraint = &c }, 0, true));
-    // Env parser: unset/empty/anything-but-0 → on, "0" → off.
-    try testing.expect(Generator.dsparkStochEnabledFromEnv(null));
-    try testing.expect(Generator.dsparkStochEnabledFromEnv(""));
-    try testing.expect(Generator.dsparkStochEnabledFromEnv("1"));
-    try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
-}
-
-test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit invariant (DSV4_MINI)" {
-    // The motivating traffic shape: the checkpoint ships generation_config
-    // temp 0.6 and agent CLIs omit temperature, so every real agent request
-    // ran serial while only pinned `--temp 0` earned DSpark. The stochastic
-    // arm ports the MTP probsAllPositions acceptance (one-hot Leviathan over
-    // filtered target probs) onto dsv4's own draft stages. Engagement is
-    // COUNTED (dspark_attempted) — a silent serial fallback emits perfectly
-    // plausible tokens.
-    _ = setenv("SUSHI_DSV4_DSPARK", "1", 1);
-    const path_z = std.c.getenv("DSV4_MINI") orelse return;
-    if (mlx.noGpuBackend()) return;
-    const path = std.mem.span(path_z);
-    const allocator = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
-    defer allocator.free(cfg_path);
-    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    file.close(io);
-    defer allocator.free(cfg_json);
-    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
-    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
-    defer allocator.free(shard_path);
-    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
-    defer weights.deinit();
-
-    // Never read by the Generator (stored only) — see the field comment.
-    var tok_dummy: Tokenizer = undefined;
-
-    var prompt: [64]u32 = undefined;
-    for (&prompt, 0..) |*v, i| v.* = @intCast(i);
-    // The agent-default request shape, seeded so the run is reproducible.
-    const sampled = SamplingParams{ .temperature = 0.6, .top_p = 0.95, .seed = 0xD54A };
-
-    // The kill-switch cache is process-global (set at first chokepoint use),
-    // so honor whatever env this test binary was LAUNCHED with and assert
-    // the matching behavior — that makes the `SUSHI_DSV4_DSPARK_STOCH=0`
-    // run a real test of the fallback, not a skip.
-    const stoch_raw: ?[]const u8 = if (std.c.getenv("SUSHI_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
-    const stoch_on = Generator.dsparkStochEnabledFromEnv(stoch_raw);
-
-    var xfm = try Transformer.init(io, allocator, cfg, &weights);
-    defer xfm.deinit();
-    var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 64, sampled, &.{}, .{
-        .pld_enabled = true,
-        .mtp_enabled = true,
-        .skip_lazy_preforward = true,
-        .lookup_prompt = &prompt,
-    });
-    defer gen.deinit(allocator);
-
-    if (!stoch_on) {
-        // Kill-switch arm: the chokepoint declines the sampled request and
-        // nextDspark serves the defensive serial step.
-        try testing.expect(!gen.dspark_enabled);
-        const r = (try gen.nextDspark(allocator)) orelse return error.TestExpectedResult;
-        defer allocator.free(r.tokens);
-        try testing.expectEqual(@as(usize, 1), r.tokens.len);
-        try testing.expectEqual(@as(u64, 0), gen.dspark_attempted);
-        return;
-    }
-
-    try testing.expect(gen.dspark_enabled);
-    try testing.expect(gen.dspark_stochastic);
-
-    const mdl = xfm.dsv4.?;
-    const want: usize = 10;
-    var n: usize = 0;
-    while (n < want) {
-        const t1 = gen.next_token_id;
-        const r = (try gen.nextDspark(allocator)) orelse break;
-        defer allocator.free(r.tokens);
-        try testing.expect(r.tokens.len >= 1);
-        try testing.expectEqual(t1, r.tokens[0]);
-        try testing.expect(r.accepted_tokens <= mdl.ds_block);
-        for (r.tokens) |tok| {
-            try testing.expect(tok < mdl.vocab);
-            n += 1;
-        }
-        // Module state and the shell-cache mirror stay in lockstep with
-        // exactly what was committed (the v2 spec exit invariant).
-        try testing.expectEqual(prompt.len + n, mdl.dec_state.?.n);
-        try testing.expectEqual(mdl.dec_state.?.n, gen.ctx.cache.step);
-    }
-    try testing.expect(n >= want);
-    // ENGAGEMENT: count rounds, never output shape.
-    try testing.expect(gen.dspark_attempted >= 1);
-    // Exit invariant survives a hand-off: a following serial step decodes a
-    // valid token (finite logits) from the state the rounds left behind.
-    const t = (try gen.next(allocator)) orelse return error.TestExpectedResult;
-    try testing.expect(t < mdl.vocab);
-    std.debug.print("dsv4 stochastic dspark (generator): {d} tokens over {d} rounds, {d} drafts accepted\n", .{ n, gen.dspark_attempted, gen.dspark_accepted_tokens });
-
-    // b==0 arm: an over-threshold confidence gate submits NOTHING — the round
-    // verifies t1 alone, commits it, and samples the next trunk token from
-    // row 0's filtered probs (the stochastic sibling of the greedy
-    // confidence-gate test). The env is read at initModel, so this needs a
-    // fresh Transformer; unset after — test order must not inherit the gate.
-    _ = setenv("SUSHI_DSV4_DSPARK_CONF", "999999", 1);
-    defer _ = unsetenv("SUSHI_DSV4_DSPARK_CONF");
-    var xfm2 = try Transformer.init(io, allocator, cfg, &weights);
-    defer xfm2.deinit();
-    var gen2 = try Generator.initWithOptions(io, allocator, &xfm2, &tok_dummy, &prompt, 64, sampled, &.{}, .{
-        .pld_enabled = true,
-        .mtp_enabled = true,
-        .skip_lazy_preforward = true,
-        .lookup_prompt = &prompt,
-    });
-    defer gen2.deinit(allocator);
-    try testing.expect(gen2.dspark_enabled);
-    var n2: usize = 0;
-    while (n2 < 4) {
-        const r = (try gen2.nextDspark(allocator)) orelse break;
-        defer allocator.free(r.tokens);
-        try testing.expectEqual(@as(u32, 0), r.accepted_tokens);
-        try testing.expectEqual(@as(usize, 1), r.tokens.len);
-        try testing.expect(r.tokens[0] < mdl.vocab);
-        n2 += 1;
-    }
-    try testing.expectEqual(@as(usize, 4), n2);
-    try testing.expect(gen2.dspark_attempted >= 4);
-    try testing.expectEqual(xfm2.dsv4.?.dec_state.?.n, gen2.ctx.cache.step);
-    std.debug.print("dsv4 stochastic dspark (b==0 gate): {d} single-token rounds\n", .{n2});
-}
-
 fn evalLazyToken(lazy: mlx.mlx_array) !u32 {
     defer _ = mlx.mlx_array_free(lazy);
     try mlx.check(mlx.mlx_array_eval(lazy));
@@ -19551,148 +18316,6 @@ test "logprobs publish through the one-token delay, never straight from sampleTo
     try testing.expect(seen >= 1);
 }
 
-test "dflash: nextDflash greedy equals serial decode, invariants exact each round" {
-    // Hermetic end-to-end round loop on the tiny llama trunk + tiny DFlash
-    // assistant (dflash.TinyFix). The bar is the spec-decode contract:
-    //   - greedy dflash-on emits EXACTLY the serial greedy tokens (any bug in
-    //     verify alignment, rollback truncate, correction indexing, or the
-    //     anchor-row drop shifts the stream);
-    //   - after EVERY round: trunk cache.step == prompt_len + emitted and the
-    //     assistant context tracks it exactly (base + step == cache.step) at
-    //     whatever accepted counts the round produced.
-    if (mlx.noGpuBackend()) return;
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var tmp_trunk = std.testing.tmpDir(.{});
-    defer tmp_trunk.cleanup();
-    var trunk_buf: [512]u8 = undefined;
-    const trunk_len = try tmp_trunk.dir.realPath(io, &trunk_buf);
-    const trunk_path = trunk_buf[0..trunk_len];
-    try dflash_mod.TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
-
-    var tmp_asst = std.testing.tmpDir(.{});
-    defer tmp_asst.cleanup();
-    var asst_buf: [512]u8 = undefined;
-    const asst_len = try tmp_asst.dir.realPath(io, &asst_buf);
-    const asst_path = asst_buf[0..asst_len];
-    try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
-
-    var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-
-    var tok_dummy: Tokenizer = undefined; // never read by the Generator
-    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
-    const greedy = SamplingParams{ .temperature = 0.0 };
-    const want: usize = 16;
-
-    // Serial baseline.
-    var serial: [want]u32 = undefined;
-    {
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
-            .skip_lazy_preforward = true,
-        });
-        defer gen.deinit(allocator);
-        var n: usize = 0;
-        while (n < want) {
-            const t = (try gen.next(allocator)) orelse break;
-            serial[n] = t;
-            n += 1;
-        }
-        try testing.expectEqual(want, n);
-    }
-
-    // DFlash arm.
-    {
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
-        defer dm.deinit();
-        try dm.bind(&xfm);
-
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
-            .dflash_enabled = true,
-            .dflash = &dm,
-            // This is the numeric DFlash guard, not the economics-gate test:
-            // every emitted token must pass through nextDflash itself.
-            .dflash_min_accepted_per_round = 0,
-        });
-        defer gen.deinit(allocator);
-        try testing.expectEqual(@as(u32, 4), gen.dflash_block_size);
-        // Prefill built context for the whole prompt.
-        try testing.expectEqual(prompt.len, gen.dflash_ctx.?.absLen());
-        try testing.expectEqual(prompt.len, gen.ctx.cache.step);
-
-        var got = std.ArrayList(u32).empty;
-        defer got.deinit(allocator);
-        while (true) {
-            const attempts_before = gen.dflash_attempted;
-            const res = (try gen.nextDflash(allocator)) orelse break;
-            defer allocator.free(res.tokens);
-            try got.appendSlice(allocator, res.tokens);
-            // A real DFlash round commits trunk and assistant context to the
-            // same exact boundary at every accepted count. Falling back here
-            // would make the remaining equality checks compare serial decode
-            // with itself and gut the default-on draft-quantization guard.
-            try testing.expect(gen.dflash_attempted != attempts_before);
-            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
-            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
-        }
-        try testing.expect(gen.dflash_attempted > 0);
-        try testing.expect(!gen.spec_disabled_runtime);
-        try testing.expectEqual(want, got.items.len);
-        try testing.expectEqual(@as(u32, @intCast(want)), gen.completion_tokens);
-        try testing.expectEqual(want, gen.generated_ids.items.len);
-        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
-    }
-
-    // DFlash2 arm: selector-traced greedy drafts + dyn-conv forward. The bar
-    // is unchanged — a selector draft only survives verify when it IS the
-    // trunk argmax, so the emitted stream must still be byte-identical to
-    // serial at every accepted count.
-    {
-        var tmp_a2 = std.testing.tmpDir(.{});
-        defer tmp_a2.cleanup();
-        var a2_buf: [512]u8 = undefined;
-        const a2_path = a2_buf[0..try tmp_a2.dir.realPath(io, &a2_buf)];
-        try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s);
-
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var dm = try dflash_mod.loadDflash(io, allocator, s, a2_path);
-        defer dm.deinit();
-        try testing.expect(dm.selector != null);
-        try dm.bind(&xfm);
-
-        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
-            .dflash_enabled = true,
-            .dflash = &dm,
-            .dflash_min_accepted_per_round = 0,
-        });
-        defer gen.deinit(allocator);
-
-        var got = std.ArrayList(u32).empty;
-        defer got.deinit(allocator);
-        while (true) {
-            const attempts_before = gen.dflash_attempted;
-            const res = (try gen.nextDflash(allocator)) orelse break;
-            defer allocator.free(res.tokens);
-            try got.appendSlice(allocator, res.tokens);
-            try testing.expect(gen.dflash_attempted != attempts_before);
-            try testing.expectEqual(prompt.len + gen.generated_ids.items.len, gen.ctx.cache.step);
-            try testing.expectEqual(gen.ctx.cache.step, gen.dflash_ctx.?.absLen());
-        }
-        try testing.expect(gen.dflash_attempted > 0);
-        try testing.expectEqual(want, got.items.len);
-        for (serial, got.items) |a, b| try testing.expectEqual(a, b);
-    }
-}
-
 test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
     // The scheduler runs decode ticks for active streams at this seam so a
     // long prefill cannot stall them for its whole duration. The final
@@ -19709,12 +18332,11 @@ test "prefill chunk loop yields to the interleave hook between chunks, never aft
     try std.testing.expect(call_at - guard_at < 200);
 }
 
-test "countSpliceRows counts image, audio and video placeholders, extras only when declared" {
-    const ids = [_]i32{ 7, 99, 99, 8, 88, 9, 77 };
-    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0, 0));
-    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 88, 0));
-    try testing.expectEqual(@as(usize, 4), countSpliceRows(&ids, 99, 88, 77));
-    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
+test "countSpliceRows counts image and video placeholders, video only when declared" {
+    const ids = [_]i32{ 7, 99, 99, 8, 9, 77 };
+    try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0));
+    try testing.expectEqual(@as(usize, 3), countSpliceRows(&ids, 99, 77));
+    try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 77));
 }
 
 test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
@@ -20630,7 +19252,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .livecost = false,
         .round_watch = undefined,
     };
-    try testing.expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
+    try expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
 }
 
 test "batched MTP state includes the last row activated by round begin" {
@@ -20783,7 +19405,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const coarse_before = transformer_mod.mtp_coarse_pair_dispatches;
-    const hc_prepared_before = transformer_mod.mtp_verify_hc_prepared_calls;
+    const hc_prepared_before = qwen4_forward.mtp_verify_hc_prepared_calls;
     const verify_kernel_before = transformer_mod.mtp_verify_kernel_calls;
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |path| a.free(path);
@@ -20901,8 +19523,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     if (transformer_mod.verifySharedHardware()) {
         try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
         {
-            try testing.expect(transformer_mod.mtp_verify_hc_prepared_calls > hc_prepared_before);
-            std.debug.print("[prepared HC] calls={d}\n", .{transformer_mod.mtp_verify_hc_prepared_calls - hc_prepared_before});
+            try testing.expect(qwen4_forward.mtp_verify_hc_prepared_calls > hc_prepared_before);
+            std.debug.print("[prepared HC] calls={d}\n", .{qwen4_forward.mtp_verify_hc_prepared_calls - hc_prepared_before});
         }
         inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
             {
@@ -21344,7 +19966,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
         try L11PlainReplay.tick(&xfm, &reference, true);
         try L11PlainReplay.tick(&xfm, &planned, false);
     }
-    for (planned) |slot| try testing.expectError(error.MtpHiddenStale, slot.gen.?.mtpRoundBegin(a));
+    for (planned) |slot| try expectError(error.MtpHiddenStale, slot.gen.?.mtpRoundBegin(a));
     try L11PlainReplay.tick(&xfm, &reference, true);
     try L11PlainReplay.tick(&xfm, &planned, true);
     for (reference, planned) |ref, candidate| {
@@ -22017,7 +20639,6 @@ test "serial and MTP agree at the greedy temperature cutoff" {
         const mtp_greedy = Generator.mtpDraftSamplingFor(sampling, false, 0.6).temperature == 0.0;
         try testing.expectEqual(temperature < cutoff, serial_greedy);
         try testing.expectEqual(serial_greedy, mtp_greedy);
-        try testing.expectEqual(serial_greedy, Generator.dsparkArmFor(sampling, 0, true) == .greedy);
     }
 }
 
@@ -22342,7 +20963,7 @@ pub fn installLogitBias(io: std.Io, xfm: *Transformer, tok: *const Tokenizer) !v
     const path = settings.pick(?[]const u8, settings.logit_bias_file_flag, setting, null).value orelse return;
     const body = try std.Io.Dir.cwd().readFileAlloc(io, path, xfm.allocator, .limited(16 << 20));
     defer xfm.allocator.free(body);
-    const logits_dim: usize = if (xfm.config.unpadded_vocab_size > 0) xfm.config.unpadded_vocab_size else xfm.config.vocab_size;
+    const logits_dim: usize = xfm.config.vocab_size;
     const loaded = logit_bias.parse(xfm.allocator, body, std.fs.path.extension(path), tok, @min(logits_dim, tok.definedVocabSize())) catch |err| {
         log.err("[logit-bias] {s}: {s}\n", .{ path, @errorName(err) });
         return err;
@@ -22436,7 +21057,7 @@ test "an empty prompt is a typed error at the generator, never an index" {
     const cfg = try glmGeneratorFixture(&weights);
     var xfm = try Transformer.init(testing.io, a, cfg, &weights);
     defer xfm.deinit();
-    try testing.expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
+    try expectError(error.EmptyPrompt, Generator.initWithOptions(testing.io, a, &xfm, &tok, &.{}, 4, .{ .temperature = 0.0 }, &.{}, .{}));
 }
 
 fn glmGeneratorFixture(weights: *model_mod.Weights) !model_mod.ModelConfig {

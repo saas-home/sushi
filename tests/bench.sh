@@ -61,9 +61,6 @@ mkdir -p "$OUT"
 # A missing path skips the row silently — a bench you can't run on this box
 # isn't an error on the box that can.
 MD="${SUSHI_MODELS_DIR:-$HOME/.sushi/models}"
-# ANE=1 adds --ane-prefill to every boot
-# (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
-# ane-on cells are their own column, never diffed against ane-off ones.
 TARGETS=(
     "sushi-4bpw|$MD/Qwen3.8-Flash-Next-Sushi-4bpw"
     "mimo-2.3bpw|$MD/MiMo-V2.6-Flash-Sushi-2.3bpw"
@@ -96,7 +93,6 @@ spec_flags() { # model_path
        || grep -qi '"mtp' "$1/config.json" 2>/dev/null; then
         f=" --mtp"
     fi
-    [[ "${ANE:-0}" == "1" ]] && f+=" --ane-prefill"
     echo "$f"
 }
 

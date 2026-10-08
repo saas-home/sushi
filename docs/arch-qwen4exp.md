@@ -19,7 +19,8 @@ hidden 2560, expert intermediate 640.
 
 | File | Role |
 |---|---|
-| `src/transformer.zig` | Flash Next trunk = `forwardQwen4With` (hyper-connections, PLE, QSA mask over `gatedFullAttnWith`); EXL3 MoE = `moeExl3` |
+| `src/qwen4_forward.zig` / `src/qwen4_hc.zig` / `src/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
+| `src/transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3` |
 | `src/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
 | `src/mtp.zig` | The native MTP head (`Qwen4Mtp`), see [engine-mtp](engine-mtp.md) |

@@ -35,7 +35,6 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
-const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
@@ -472,7 +471,7 @@ pub fn quantGroupFor(in_features: u32) ?u32 {
 }
 
 /// One assistant linear. Dense weights are pre-transposed to `[in, out]` and
-/// contracted with a plain matmul (drafter.zig's convention); quantized ones
+/// contracted with a plain matmul; quantized ones
 /// keep the checkpoint's `[out, in]` packing and ride `mlx_quantized_matmul`
 /// with transpose=true, exactly like the trunk. `bits == 0` IS the dense
 /// discriminator — never probe the scales handle.
@@ -752,12 +751,6 @@ pub const DflashModel = struct {
                 });
                 return error.DflashTargetMismatch;
             }
-        }
-        if (!target.supportsLayerCapture()) {
-            log.err("[dflash] target arch '{s}' does not run a capture-capable forward path\n", .{
-                target.config.model_type,
-            });
-            return error.DflashTargetMismatch;
         }
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
@@ -1536,6 +1529,27 @@ fn convFinish(
     return groupedDynConv(sub_out, finish_dyn, base1, group_size, s);
 }
 
+/// `out = residual + convFinish(...)`, in one dispatch where the fused convolution serves the shape.
+fn convFinishAdd(
+    out: *mlx.mlx_array,
+    conv: *const DynConv,
+    sub_out: mlx.mlx_array,
+    finish_dyn: mlx.mlx_array,
+    group_size: u32,
+    residual: mlx.mlx_array,
+    s: mlx.mlx_stream,
+) !void {
+    const base1 = try baseKernelHalf(conv.base_kernel, 1, s);
+    defer _ = mlx.mlx_array_free(base1);
+    if (try @import("dflash_conv.zig").applyAdd(s, sub_out, finish_dyn, base1, group_size, residual)) |fused| {
+        defer _ = mlx.mlx_array_free(fused);
+        return mlx.check(mlx.mlx_array_set(out, fused));
+    }
+    const fin = try groupedDynConv(sub_out, finish_dyn, base1, group_size, s);
+    defer _ = mlx.mlx_array_free(fin);
+    try mlx.check(mlx.mlx_add(out, residual, fin, s));
+}
+
 /// `base_kernel[half]` → `[ksize, H]`.
 fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const bsh = mlx.getShape(base_kernel); // [2, ksize, H]
@@ -1949,6 +1963,28 @@ pub fn forwardBlockPrefix(model: *const DflashModel, ctx: *DflashCtx, noise_embe
     return forwardBlockMode(model, ctx, noise_embeds, anchor_pos, blockTailEligible(model, ctx, noise_embeds), rows);
 }
 
+var tail_mask: ?mlx.mlx_array = null;
+var tail_mask_shape: [4]usize = .{ 0, 0, 0, 0 };
+
+/// The sliding mask depends only on positions relative to the first context key (`relative` is
+/// the anchor's), so one evaluated copy serves every draft of that geometry; the caller owns the
+/// returned reference.
+fn tailMask(q_len: u32, ctx_len: usize, relative: usize, window: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (relative + q_len - 1 < window) return null;
+    const shape = [4]usize{ q_len, ctx_len, relative, window };
+    if (tail_mask == null or !std.mem.eql(usize, &shape, &tail_mask_shape)) {
+        const built = (try buildBlockMask(.sliding_attention, 0, ctx_len, relative, q_len, window, s)) orelse return null;
+        errdefer _ = mlx.mlx_array_free(built);
+        try mlx.check(mlx.mlx_array_eval(built));
+        if (tail_mask) |old| _ = mlx.mlx_array_free(old);
+        tail_mask = built;
+        tail_mask_shape = shape;
+    }
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&out, tail_mask.?));
+    return out;
+}
+
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
     if (!model.native_glm_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
     for (model.layers, ctx.cache.entries) |layer, entry| {
@@ -1971,7 +2007,10 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         _ = mlx.mlx_array_free(mask);
     };
     for (model.layers) |layer| if (layer.layer_type == .sliding_attention) {
-        sliding_mask = try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
+        sliding_mask = if (model.native_glm_serving)
+            try tailMask(q_len, tail_len, anchor_pos - (ctx.base_pos + dropped), cfg.sliding_window, s)
+        else
+            try buildBlockMask(.sliding_attention, ctx.base_pos + dropped, tail_len, anchor_pos, q_len, cfg.sliding_window, s);
         break;
     };
     const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
@@ -2039,20 +2078,12 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
         const o_out = try lw.o.apply(attn_flat, s);
         defer _ = mlx.mlx_array_free(o_out);
-        var attn_fin: mlx.mlx_array = .{ .ctx = null };
-        defer if (attn_fin.ctx != null) {
-            _ = mlx.mlx_array_free(attn_fin);
-        };
-        var attn_add = o_out;
-        if (lw.attention_conv) |*cv| {
-            const finish_dyn = if (rows < q_len_c) try tail_ops.slice(attn_prep.?.finish_dyn, 1, 0, rows) else attn_prep.?.finish_dyn;
-            attn_fin = try convFinish(cv, o_out, finish_dyn, cfg.conv_group_size, s);
-            attn_add = attn_fin;
-        }
-
         var h_new = mlx.mlx_array_new();
         const residual = if (rows < q_len_c) try tail_ops.slice(x, 1, 0, rows) else x;
-        try mlx.check(mlx.mlx_add(&h_new, residual, attn_add, s));
+        if (lw.attention_conv) |*cv| {
+            const finish_dyn = if (rows < q_len_c) try tail_ops.slice(attn_prep.?.finish_dyn, 1, 0, rows) else attn_prep.?.finish_dyn;
+            try convFinishAdd(&h_new, cv, o_out, finish_dyn, cfg.conv_group_size, residual, s);
+        } else try mlx.check(mlx.mlx_add(&h_new, residual, o_out, s));
         _ = mlx.mlx_array_free(x);
         x = h_new;
 
@@ -2067,28 +2098,28 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
             _ = mlx.mlx_array_free(cp.finish_dyn);
         };
         const mlp_in = if (mlp_prep) |*cp| cp.hidden else ff_normed;
-        const gate = try lw.gate.apply(mlp_in, s);
-        defer _ = mlx.mlx_array_free(gate);
-        const up = try lw.up.apply(mlp_in, s);
-        defer _ = mlx.mlx_array_free(up);
-        const act = try swiglu(gate, up, s);
+        const act = if (try @import("dflash_qmv.zig").gateUpAct(s, mlp_in, .{ lw.gate.w, lw.gate.scales, lw.gate.biases }, .{ lw.up.w, lw.up.scales, lw.up.biases })) |fused| fused else blk: {
+            const gate = try lw.gate.apply(mlp_in, s);
+            defer _ = mlx.mlx_array_free(gate);
+            const up = try lw.up.apply(mlp_in, s);
+            defer _ = mlx.mlx_array_free(up);
+            break :blk try swiglu(gate, up, s);
+        };
         defer _ = mlx.mlx_array_free(act);
         const down = try lw.down.apply(act, s);
         defer _ = mlx.mlx_array_free(down);
-        var mlp_fin: mlx.mlx_array = .{ .ctx = null };
-        defer if (mlp_fin.ctx != null) {
-            _ = mlx.mlx_array_free(mlp_fin);
-        };
-        var mlp_add = down;
-        if (lw.mlp_conv) |*cv| {
-            mlp_fin = try convFinish(cv, down, mlp_prep.?.finish_dyn, cfg.conv_group_size, s);
-            mlp_add = mlp_fin;
-        }
-
         var h_next = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&h_next, x, mlp_add, s));
+        if (lw.mlp_conv) |*cv| {
+            try convFinishAdd(&h_next, cv, down, mlp_prep.?.finish_dyn, cfg.conv_group_size, x, s);
+        } else try mlx.check(mlx.mlx_add(&h_next, x, down, s));
         _ = mlx.mlx_array_free(x);
         x = h_next;
+        // The GPU runs each finished layer while the host builds the next one.
+        if (model.native_glm_serving and li + 1 < model.layers.len) {
+            const pending = mlx.mlx_vector_array_new_value(x);
+            defer _ = mlx.mlx_vector_array_free(pending);
+            try mlx.check(mlx.mlx_async_eval(pending));
+        }
     }
 
     // Evict the block K/V — the context cache must be exactly as it was.
@@ -3229,71 +3260,6 @@ test "dflash2: selectPath traces the pairwise-scored path, edges outvote unary l
     }
 }
 
-test "dflash: the draft-only lm_head shrinks the draft read and leaves verify alone" {
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    if (mlx.noGpuBackend()) return;
-
-    var tmp_trunk = std.testing.tmpDir(.{});
-    defer tmp_trunk.cleanup();
-    var trunk_buf: [512]u8 = undefined;
-    const trunk_path = trunk_buf[0..try tmp_trunk.dir.realPath(io, &trunk_buf)];
-    try TinyFix.writeTrunk(io, tmp_trunk.dir, trunk_path, s);
-
-    var tmp_asst = std.testing.tmpDir(.{});
-    defer tmp_asst.cleanup();
-    var asst_buf: [512]u8 = undefined;
-    const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
-    try TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
-
-    var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-
-    const bits: u32 = 3;
-    var m = try loadDflashQuant(io, allocator, s, asst_path, 0);
-    defer m.deinit();
-    try m.bindWithDraftBits(&xfm, bits);
-
-    try testing.expect(m.draft_head != null);
-    try testing.expectEqual(bits, m.draft_head_bits);
-    try testing.expectEqual(QUANT_GROUP, m.draft_head_group);
-    // Packed [vocab, hidden*bits/32] — the head's own rows, not a transpose.
-    const dh_shape = mlx.getShape(m.draft_head.?.w);
-    try testing.expectEqual(@as(c_int, TinyFix.VOCAB), dh_shape[0]);
-    try testing.expectEqual(@as(c_int, (TinyFix.HIDDEN * bits) / 32), dh_shape[1]);
-
-    // The draft head is a DRAFT surface: same shape as the trunk projection,
-    // correlated with it, and the trunk head itself is untouched (verify
-    // reads it through the ordinary forward).
-    const x = try TinyFix.capArr(TinyFix.BLOCK, 800, s);
-    defer _ = mlx.mlx_array_free(x);
-    const via_draft = try m.draftLogits(&xfm, x);
-    defer _ = mlx.mlx_array_free(via_draft);
-    const via_trunk = try xfm.lmHeadForDraft(x);
-    defer _ = mlx.mlx_array_free(via_trunk);
-    try testing.expectEqualSlices(c_int, mlx.getShape(via_trunk), mlx.getShape(via_draft));
-    const a = try TinyFix.readF32(via_draft, allocator, s);
-    defer allocator.free(a);
-    const b = try TinyFix.readF32(via_trunk, allocator, s);
-    defer allocator.free(b);
-    const p = try paritySlices(a, b);
-    try testing.expect(p.cos > 0.9);
-
-    // A width that would not shrink the read never builds one (a bf16 head
-    // costs 16 bits/weight — an 8-bit re-encode saves, a 16-bit one does not).
-    try m.bindWithDraftBits(&xfm, 16);
-    try testing.expect(m.draft_head == null);
-    try m.bindWithDraftBits(&xfm, 8);
-    try testing.expect(m.draft_head != null);
-    try m.bindWithDraftBits(&xfm, 0);
-    try testing.expect(m.draft_head == null);
-}
-
 test "dflash: quantGroupFor picks the widest divisor, declines what affine cannot pack" {
     try testing.expectEqual(@as(?u32, 64), quantGroupFor(6656));
     try testing.expectEqual(@as(?u32, 64), quantGroupFor(19968));
@@ -3301,151 +3267,6 @@ test "dflash: quantGroupFor picks the widest divisor, declines what affine canno
     try testing.expectEqual(@as(?u32, 32), quantGroupFor(96));
     try testing.expectEqual(@as(?u32, null), quantGroupFor(48));
     try testing.expectEqual(@as(?u32, null), quantGroupFor(0));
-}
-
-test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunked prefill" {
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    var path_buf: [512]u8 = undefined;
-    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
-    const dir_path = path_buf[0..root_len];
-    try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
-
-    var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-
-    const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
-
-    // target_layer_ids semantics use TRUNK indices; here just pick 1 and 3.
-    const cap_ids = [_]u32{ 1, 3 };
-
-    // ── Full forward over all 8 tokens, capturing layers + final hidden ──
-    var full_out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (&full_out) |*a| {
-        _ = mlx.mlx_array_free(a.*);
-    };
-    var all_hidden = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(all_hidden);
-    {
-        var cl = transformer_mod.CaptureLayers{ .ids = &cap_ids, .out = &full_out };
-        var ctx = xfm.defaultCtx();
-        ctx.capture_layers = &cl;
-        ctx.capture_hidden_all = &all_hidden;
-        const shape = [_]c_int{ 1, 8 };
-        const input = mlx.mlx_array_new_data(&prompt, &shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(input);
-        const logits = try xfm.forwardWith(&ctx, input);
-        _ = mlx.mlx_array_free(logits);
-    }
-
-    // hidden_states[i+1] pin: final-norm(capture at LAST layer) must equal
-    // the post-final-norm capture_hidden_all — the capture sits exactly one
-    // final_norm before it.
-    {
-        var manual = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(manual);
-        try mlx.check(mlx.mlx_fast_rms_norm(&manual, full_out[1], xfm.final_norm, xfm.config.rms_norm_eps, s));
-        const a = try TinyFix.readF32(manual, allocator, s);
-        defer allocator.free(a);
-        const b = try TinyFix.readF32(all_hidden, allocator, s);
-        defer allocator.free(b);
-        for (a, b) |x, y| try testing.expect(@abs(x - y) < 1e-5);
-    }
-
-    // ── Chunked: [0..5) then [5..8) — captures must concatenate to the full ──
-    try xfm.resetCache();
-    var chunk_vals = std.ArrayList(f32).empty;
-    defer chunk_vals.deinit(allocator);
-    var chunk_vals2 = std.ArrayList(f32).empty;
-    defer chunk_vals2.deinit(allocator);
-    const splits = [_][2]usize{ .{ 0, 5 }, .{ 5, 8 } };
-    for (splits) |sp| {
-        var out = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-        defer for (&out) |*a| {
-            _ = mlx.mlx_array_free(a.*);
-        };
-        var cl = transformer_mod.CaptureLayers{ .ids = &cap_ids, .out = &out };
-        var ctx = xfm.defaultCtx();
-        ctx.capture_layers = &cl;
-        const shape = [_]c_int{ 1, @intCast(sp[1] - sp[0]) };
-        const input = mlx.mlx_array_new_data(@ptrCast(&prompt[sp[0]]), &shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(input);
-        const logits = try xfm.forwardWith(&ctx, input);
-        _ = mlx.mlx_array_free(logits);
-        const v0 = try TinyFix.readF32(out[0], allocator, s);
-        defer allocator.free(v0);
-        try chunk_vals.appendSlice(allocator, v0);
-        const v1 = try TinyFix.readF32(out[1], allocator, s);
-        defer allocator.free(v1);
-        try chunk_vals2.appendSlice(allocator, v1);
-    }
-    const full0 = try TinyFix.readF32(full_out[0], allocator, s);
-    defer allocator.free(full0);
-    const full1 = try TinyFix.readF32(full_out[1], allocator, s);
-    defer allocator.free(full1);
-    try testing.expectEqual(full0.len, chunk_vals.items.len);
-    // bf16 + different GEMM widths: tolerance, not bit equality.
-    for (full0, chunk_vals.items) |x, y| try testing.expect(@abs(x - y) < 0.05);
-    for (full1, chunk_vals2.items) |x, y| try testing.expect(@abs(x - y) < 0.05);
-}
-
-test "dflash: trunk rawEmbedding is the bare table row; embedding layers norm on top" {
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    var path_buf: [512]u8 = undefined;
-    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
-    const dir_path = path_buf[0..root_len];
-    try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
-
-    var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-
-    const ids = [_]i32{ 4, 31 };
-    const shape = [_]c_int{ 1, 2 };
-    const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
-    defer _ = mlx.mlx_array_free(input);
-
-    const raw = try xfm.rawEmbedding(input);
-    defer _ = mlx.mlx_array_free(raw);
-    const raw_vals = try TinyFix.readF32(raw, allocator, s);
-    defer allocator.free(raw_vals);
-    // Row 4 of the table was written as val(4*16 + c, seed 1).
-    for (0..TinyFix.HIDDEN) |c| {
-        try testing.expect(@abs(raw_vals[c] - TinyFix.val(4 * TinyFix.HIDDEN + c, 1)) < 0.01);
-    }
-
-    // Simulate a normed-embeddings trunk (the muse shape): embedding() must
-    // now be rms_norm(raw) while rawEmbedding stays the bare row — this is
-    // the DFlash noise-embed contract ("embed without the norm").
-    var ones = mlx.mlx_array_new();
-    const one_scalar = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one_scalar);
-    const ones_shape = [_]c_int{TinyFix.HIDDEN};
-    try mlx.check(mlx.mlx_full(&ones, &ones_shape, 1, one_scalar, .bfloat16, s));
-    xfm.config.normed_embeddings = true;
-    std.debug.assert(xfm.ones_hidden == null);
-    xfm.ones_hidden = ones; // freed by xfm.deinit
-    const normed = try xfm.rawEmbedding(input); // still raw
-    defer _ = mlx.mlx_array_free(normed);
-    const still_raw = try TinyFix.readF32(normed, allocator, s);
-    defer allocator.free(still_raw);
-    for (raw_vals, still_raw) |x, y| try testing.expectEqual(x, y);
 }
 
 test "dflash: sliding window hides out-of-window context from the block, in-window reaches it" {
@@ -3782,35 +3603,6 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     }
 }
 
-test "dflash: every server-side drafter-loaded gate also consults lm.dflash (per-site wiring class)" {
-    // The live 2026-08-10 miss: the request PARSE said drafter=enabled, but
-    // four per-surface `use_drafter = ... lm.drafter != null ...` re-derivations
-    // silently dropped the dflash handle and every request decoded serial.
-    // A drafter-loaded conjunct written per-site is a list of ONE — pin that
-    // any non-comment line reading `lm.drafter != null` (or the entry./
-    // scheduler. spellings) also reads the dflash sibling.
-    const src = @embedFile("server.zig");
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var lineno: usize = 0;
-    var checked: usize = 0;
-    while (it.next()) |raw| {
-        lineno += 1;
-        const trimmed = std.mem.trimStart(u8, raw, " ");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        const has_drafter_gate = std.mem.indexOf(u8, raw, "lm.drafter != null") != null or
-            std.mem.indexOf(u8, raw, "entry.drafter != null") != null or
-            std.mem.indexOf(u8, raw, "scheduler.drafter != null") != null;
-        if (!has_drafter_gate) continue;
-        checked += 1;
-        if (std.mem.indexOf(u8, raw, "dflash") == null) {
-            std.debug.print("server.zig:{d}: drafter-loaded gate without a dflash sibling: {s}\n", .{ lineno, std.mem.trim(u8, raw, " ") });
-            return error.DrafterGateMissesDflash;
-        }
-    }
-    // Zero means the gates were renamed and this guard went vacuous.
-    try testing.expect(checked >= 10);
-}
-
 test "GLM assistant bounded block tail preserves visible keys and masks" {
     const s = mlx.gpuStream();
     const window = 2048;
@@ -3830,6 +3622,26 @@ test "GLM assistant bounded block tail preserves visible keys and masks" {
             try testing.expectEqualSlices(u16, a[q * (ctx_len + q_len) + dropped .. (q + 1) * (ctx_len + q_len)], b[q * (window - 1 + q_len) .. (q + 1) * (window - 1 + q_len)]);
         }
     }
+}
+
+test "GLM assistant cached sliding mask equals the mask built at any absolute position" {
+    const s = mlx.gpuStream();
+    const window = 2048;
+    for ([_]u32{ 8, 3 }) |q_len| for ([_]usize{ 0, 6145, 1_040_000 }) |base| for ([_]usize{ window - 1, 2040 }) |ctx_len| {
+        // `ctx_len` rows ending one before the anchor, as the cropped serving context and the tail view hold them.
+        const built = (try buildBlockMask(.sliding_attention, base, ctx_len, base + ctx_len, q_len, window, s)) orelse {
+            try testing.expect((try tailMask(q_len, ctx_len, ctx_len, window, s)) == null);
+            continue;
+        };
+        defer _ = mlx.mlx_array_free(built);
+        const cached = (try tailMask(q_len, ctx_len, ctx_len, window, s)).?;
+        defer _ = mlx.mlx_array_free(cached);
+        try mlx.check(mlx.mlx_array_eval(built));
+        try mlx.check(mlx.mlx_array_eval(cached));
+        try testing.expectEqualSlices(c_int, mlx.getShape(built), mlx.getShape(cached));
+        const n = mlx.mlx_array_size(built);
+        try testing.expectEqualSlices(u16, mlx.mlx_array_data_bfloat16(built).?[0..n], mlx.mlx_array_data_bfloat16(cached).?[0..n]);
+    };
 }
 
 test "GLM serving DFlash2 trims physical window and preserves absolute append positions" {

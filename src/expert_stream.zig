@@ -1818,6 +1818,8 @@ pub const Engine = struct {
     }
 };
 
+const expectError = @import("test_expect.zig").expectError;
+
 test "expert stream span adapter derives fused first middle and last slices" {
     const t = std.testing;
     const layout = TensorLayout{ .data_offset = 4096, .tensor_offset = 8192, .tensor_bytes = 300, .experts = 3 };
@@ -2469,7 +2471,7 @@ test "expert stream a failed component fill leaves no ready slot" {
     const down_index = (0 * @as(usize, 4) + 1) * 2 + 1;
     const good = engine.store.spans[down_index];
     engine.store.spans[down_index] = .{ .file = good.file, .offset = 1 << 40, .len = good.len };
-    try t.expectError(error.FillSpanPastEof, engine.prepareHost(0, &.{1}));
+    try expectError(error.FillSpanPastEof, engine.prepareHost(0, &.{1}));
     try t.expect(!fixture.anyReady());
     try t.expectEqual(@as(i32, -1), engine.layers[0].cache.expert_to_slot[1]);
 
@@ -2496,7 +2498,7 @@ test "expert stream a failed fill never serves the expert whose slot it took" {
     const down_index = (0 * @as(usize, 4) + 2) * 2 + 1;
     const good = engine.store.spans[down_index];
     engine.store.spans[down_index] = .{ .file = good.file, .offset = 1 << 40, .len = good.len };
-    try t.expectError(error.FillSpanPastEof, engine.prepareHost(0, &.{2}));
+    try expectError(error.FillSpanPastEof, engine.prepareHost(0, &.{2}));
     engine.store.spans[down_index] = good;
 
     try t.expect(!engine.slotReady(0, victim_slot));
@@ -2527,7 +2529,7 @@ test "expert stream never serves a hit from a slab that is still filling" {
     engine.drainPendingReaders();
 
     _ = try engine.layers[0].slabs[0].slab.?.tryBeginFill();
-    try t.expectError(error.SlabFilling, engine.prepareHost(0, &.{2}));
+    try expectError(error.SlabFilling, engine.prepareHost(0, &.{2}));
     abortFill(&engine.layers[0].slabs[0]);
 }
 
@@ -2540,7 +2542,7 @@ test "expert stream a failure after the first lease leaves every slab reusable" 
     var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
     const real = engine.layers[0].slabs[1].slab.?.allocator;
     engine.layers[0].slabs[1].slab.?.allocator = failing.allocator();
-    try t.expectError(error.OutOfMemory, engine.prepareHost(0, &.{1}));
+    try expectError(error.OutOfMemory, engine.prepareHost(0, &.{1}));
     engine.layers[0].slabs[1].slab.?.allocator = real;
 
     var after = try engine.prepareHost(0, &.{2});
@@ -2573,7 +2575,7 @@ test "expert stream union workspace refuses reuse while the previous reader hold
     var held = try engine.prepareHost(0, &.{ 0, 1, 2 });
     defer held.deinit();
     try t.expect(held.workspace);
-    try t.expectError(error.SlabLeased, engine.prepareHost(0, &.{ 0, 1, 3 }));
+    try expectError(error.SlabLeased, engine.prepareHost(0, &.{ 0, 1, 3 }));
 }
 
 test "expert stream a cancelled fill drains before the slab is reused" {
@@ -3089,7 +3091,7 @@ test "expert stream MXFP4 keeps nine component ids but imports and leases only s
     try t.expectEqual(@as(u64, 12), engine.slab_imports);
     try t.expectEqual(@as(usize, 0), engine.layers[0].slabs.len);
     try t.expectEqual(@as(usize, quant.component_count), engine.layers[1].slabs.len);
-    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{1}));
+    try expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{1}));
 
     try engine.warmCache();
     try t.expectEqual(@as(u64, 1), engine.fill_experts_total);
@@ -3314,7 +3316,7 @@ fn checkMimoExl3Streaming(runtime: bool) !void {
     try t.expect(!engine.layers[0].active);
     try t.expectEqual(@as(usize, 0), engine.layers[0].slabs.len);
     try t.expectEqual(@as(u64, 0), engine.fallback_imports);
-    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
+    try expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
     try engine.warmCache();
     for ([_]u16{ 1, 2 }) |layer| {
         const before = engine.fill_bytes_total;
@@ -3566,7 +3568,7 @@ test "GLM BF16 stream imports split expert slabs and preserves bytes across cach
     try t.expectEqual(@as(u64, 6), engine.slab_imports);
     try t.expectEqual(@as(u64, 0), engine.fallback_imports);
     try t.expectEqual(@as(u64, 3072), engine.store.perExpertBytes());
-    try t.expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
+    try expectError(error.ExpertLayerAbsent, engine.prepareHost(0, &.{0}));
     try t.expect((try engine.specRoute(3)) == null);
     const groups = [_][]const u16{ &.{ 3, 1 }, &.{ 1, 3, 1 }, &.{ 0, 1, 2, 3 }, &.{ 2, 0 } };
     for (groups, 0..) |ids, group| {

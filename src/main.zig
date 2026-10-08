@@ -11,7 +11,6 @@ const generate_mod = @import("generate.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_discovery = @import("model_discovery.zig");
 const model_registry_mod = @import("model_registry.zig");
-const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const chat_mod = @import("chat.zig");
@@ -27,7 +26,6 @@ pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
-const ane_mod = @import("ane.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
 
@@ -39,10 +37,6 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
 var expert_cache_bytes: u64 = 0;
 var ssd_budget_bytes: u64 = 0;
-// `--ane-prefill`: opt-in ANE prefill-MLP offload (qwen3_5-family dense MLP,
-// lossy int8/fp16). File-level so the headless serve path
-// reads the same flag (the runHeadlessServe flag-eater class).
-var ane_prefill: bool = false;
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
 
@@ -323,7 +317,7 @@ fn printUsage(io: std.Io) void {
         \\                        prefix cache's byte budget.
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
-        \\                        reach (default: 4, integers 2..32).
+        \\                        reach (default: 1, integers 1..32).
         \\  --expert-pick-tolerance <n>
         \\                      LOSSY, streamed packs only (default: 0 = off,
         \\                        exact routing). A routed expert missing from the
@@ -539,7 +533,7 @@ pub fn main(init: std.process.Init) !void {
     var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
-    var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
+    var draft_block_size: u32 = 4;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     // --mtp: force the head ON where requests do not default to it: an SSD-streamed
@@ -757,12 +751,6 @@ pub fn main(init: std.process.Init) !void {
             mtp_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
-        } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
-            // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
-            // by design (int8 fp16 datapath). Eligibility + machine gates
-            // are named [ane] log lines at load; SUSHI_ANE_SPLIT tunes
-            // the row share.
-            ane_prefill = true;
         } else if (std.mem.eql(u8, args[i], "--dspark")) {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
@@ -905,7 +893,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
-                log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
+                log.err("--wired-margin-gib: expected an integer 1..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--expert-pick-tolerance") and i + 1 < args.len) {
@@ -1420,8 +1408,6 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    config.populateLfm2ImageTokens(tok);
-
     const load_vision = config.has_vision and !no_vision;
 
     if (serve_mode) {
@@ -1518,9 +1504,6 @@ pub fn main(init: std.process.Init) !void {
             .mtp_explicit = mtp_explicit,
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = depth_bounds.active.max,
-            .ane_prefill = ane_prefill,
-            .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
@@ -1588,9 +1571,6 @@ pub fn main(init: std.process.Init) !void {
         if (config.hidden_act == .gelu_approx) {
             xfm.compileGelu();
             xfm.compileGeglu();
-        }
-        if (config.final_logit_softcapping > 0.0) {
-            xfm.compileSoftcap();
         }
         if (xfm.moe_layers != null) {
             xfm.compileMoeRouting();
@@ -1802,7 +1782,6 @@ fn runHeadlessServe(
         .tokenizer = null,
         .chat_config = null,
         .vision_encoder = null,
-        .drafter = null,
         .drafter_path = "",
         .drafter_block_size = 0,
         .prefix_cache = null,
@@ -1857,9 +1836,6 @@ fn runHeadlessServe(
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .ane_prefill = ane_prefill,
-        .ane_chunk_resolver = server_mod.pinPrefillChunk,
-        .ane_headroom_resolver = server_mod.aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 

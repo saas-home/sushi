@@ -75,10 +75,10 @@ source FP8→bf16 loader (`usesMimoSourceTrunk`), billed dense by `mimoSourceRes
 GLM-5.3 routes 288 experts top-8 (hidden 4096, expert width 2048; the shipped Sushi-2.4bpw is MCG W14, K2.25 (n36) in most layers and K2.5 (n40) in
 layers 37–44; every path serves any window) through
 `moeClamped`: the gate upper clamp and symmetric up clamp (limit 10) apply in FP32 before SwiGLU, at every packed rate
-from 2 to 4 bpw in eighth-bit steps. Bank geometry (H128 alignment, matching gate/up/down shapes and expert counts, U16
+the format admits (n16 to n128 in eighth-bit steps). Bank geometry (H128 alignment, matching gate/up/down shapes and expert counts, U16
 trellises, F16 scale grids, routed input/score shapes) is checked before dispatch; router IDs inside the expert range
-are the router's precondition, never synced to the CPU. Every path below is bit-identical to the staged chain at all
-17 rates and is always on for eligible shapes ([arch-glm5-next](arch-glm5-next.md)).
+are the router's precondition, never synced to the CPU. Every path below is bit-identical to the staged chain at every
+admitted rate and is always on for eligible shapes ([arch-glm5-next](arch-glm5-next.md)).
 
 - **GLM's cooperative GEMV is not MiMo's.** `INDEXED_COOP_SOURCE` writes all lane partials and adds them r=0..15
   outside simdgroup g=0..3 before the F16 store; MiMo's grouped epilogue (XOR shuffles, K-split planes) rounds
@@ -86,10 +86,10 @@ are the router's precondition, never synced to the CPU. Every path below is bit-
 - **Decode** keeps slots in top-k order and prepares both gate/up input planes from token rows in one kernel, stored
   in GEMV lane order (tile rows 2q, 2q+1, 2q+8, 2q+9) so each lane loads one `half4` (rows 1–16, equal-shaped MCG
   banks at any window; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
-  by `half4` (`downLanePrepare` + `downLaneCoop`: even n 32–64, MCG at any window, BF16 out; −10–15% against the fused
+  by `half4` (`downLanePrepare` + `downLaneCoop`: every admitted n, MCG at any window, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
 - **Verification rows share weight reads** (`src/exl3/glm_group2.zig`, 3–4 BF16 rows, 4096/2048, top-8, clamp 10,
-  MCG at any window, every even n 32–64, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
+  MCG at any window, every admitted n, gate/up equal and down free): a ballot pairs equal-expert slots in original slot order, the leader decodes each weight once and
   feeds two independent FP32 accumulator sets, and a serial 4 KiB member reduction keeps the r-then-simdgroup order.
   Singleton leaders run the unchanged body. Routed-chain replay −20% on layers with expert overlap; DFlash2 N2 512/64
   decode 42.43 → 45.45 tok/s at n36 (`ba106e5e`); at n40 (Sushi-2.5bpw, kv8, A4 DFlash2, ABBA in one boot, AC power, `taskpolicy -a`, lock `glm-n40`) +3.2% at 512/64 (4/4 pairs) and +5.0% at 8K/128, same bytes. Real 8K verify rounds are singleton-heavy (70% of assignments). The gate is `glm_group2.servesRate`; a guard test enumerates every admitted n.
@@ -166,10 +166,11 @@ Ruled out for GLM experts (each exact unless noted; "component" = an isolated re
 - A rate on the generic reader decodes ~40% slower per GEMV than on the funnel, with no other symptom. The engagement
   line `[exl3] n<n> funnel engaged arm=<arm>` names the rate and arm in a live log.
 - **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
-  byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K2 to K4, the served
-  range: the test `every K2 to K4 rate decodes within a margin of n48` holds each even n from 32 to 64 within 1.4x of
-  n48's GEMV steps (n64's packed branch 1.8x). Rates below K2 and above K4 stay admitted and tested for correctness,
-  never timed.
+  byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K1.5 to K4, the
+  range the converters write: the test `every K1.5 to K4 rate decodes within a margin of n48` holds each even n from
+  24 to 64 within 1.4x of n48's GEMV steps (n64's packed branch 1.8x). Rates below K1.5 and above K4 stay admitted and tested for correctness,
+  never timed. `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
+  GEMMs over n32's at Flash-Next geometry (w8, w12, w15), interleaved in one process.
 - **MiMo verify rows share an expert's weight reads** (`PAIR_GEMV_GROUPED_SOURCE`, `DOWN_PREPARED_GROUPED_SOURCE`;
   prepared-mid geometry, 2+ rows): among an expert's slots, each even-ranked slot leads itself and the next one,
   decodes each weight once and feeds both members in the single-slot order, so every row's bytes are its one-row

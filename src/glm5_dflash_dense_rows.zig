@@ -17,7 +17,7 @@ pub fn project(ops: *native.Ops, linear: native.Linear, x: mlx.mlx_array) !?mlx.
     const ws = mlx.getShape(linear.w);
     if (sh.len != 3 or sh[0] != 1 or sh[1] < 2 or sh[1] > 4 or ws.len != 2 or ws[1] != sh[2] or linear.input != sh[2] or linear.output != ws[0]) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(linear.w) != .bfloat16) return null;
-    if (!((sh[2] == 4096 and (ws[0] == 64 or ws[0] == 128)) or (sh[2] == 128 and ws[0] == 8192))) return null;
+    if (!((sh[2] == 4096 and (ws[0] == 32 or ws[0] == 64 or ws[0] == 128)) or (sh[2] == 128 and ws[0] == 8192))) return null;
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, linear.w));
     if (!available) return null;

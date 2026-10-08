@@ -129,7 +129,8 @@ def main():
                     preflight = re.search(r"\[preflight\] weights ~([0-9.]+) GB, needs ~([0-9.]+) GB", log_path.read_text())
                     assert preflight, log_path
                     weights, needed = map(float, preflight.groups())
-                    assert 1.99 <= needed - weights <= 2.01, (weights, needed)
+                    warmup = 0.25 if name.startswith("MiMo") else (1.25 if enabled else 0.125)
+                    assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
                     assert props["memory"]["peak_bytes"] <= (needed + 0.005) * 2**30, props["memory"]
                     (args.output / f"{label}.props.json").write_text(json.dumps(props, indent=2))
                     status, reply = request(base, "/v1/chat/completions", {

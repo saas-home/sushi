@@ -15,6 +15,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   healthy inputs = MEMORY symptom.
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
+- `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
 - The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is over 90 GB, so two
   heavy GPU jobs at once risk an OOM for both (and concurrent conversions have died together in a GPU reset).
 
@@ -25,22 +26,31 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
-- Resident Sushi Flash-Next and MiMo EXL3 packs bill the exact enabled text, vision and MTP tensors, including
-  draft rerank copies. Qwen drops disabled native MTP tensors before the transformer binds them. Their load bill
-  is weights + max(2 GiB measured load/warmup allowance, the requested context's full admission bill). Auto context
-  reserves the warmup allowance and retains the post-load context sizer. Their default KV remains affine 8-bit.
-- An explicit launch or model-settings context is checked before loading those packs. `loadServingBill` uses
-  `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch. It prices an explicit
-  prefill width at that width after the architecture's cap; otherwise it proves the per-request floor. A refusal
-  reports the largest context that fits the same bill and available memory, capped at the model's context limit.
-  Existing active MLX buffers are subtracted from the GPU working-set limit before this check. Cold-load HTTP 503
-  responses retain the numeric maximum through the transient unloaded reset; retry and successful load clear it.
+- **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
+  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient and the requested
+  context's admission bill (the warmup ends before any request allocates) + a fixed 1 GiB net. No proportional term,
+  no flat headroom. The cold-load registry gates (`residentColdLoadBillBytes`, `glmColdLoadBillBytes`) call the same
+  function, so gate and preflight read one number.
+- **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
+  plus 1.125 GiB while MTP is on, MiMo 0.25 GiB, GLM its fixed KDA state, pool rings and first 1024 latent rows plus
+  0.375 GiB. A new arch or layout adds its own measured figure here, never a percentage of its weights.
+- Qwen drops disabled native MTP tensors before the transformer binds them. An auto context bills no context term: it
+  is pinned after the load from what the weights leave. Their default KV remains affine 8-bit.
+- An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.
+  `loadServingBill` uses `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch.
+  It prices an explicit prefill width at that width after the architecture's cap; otherwise it proves the per-request
+  floor. A refusal reports the largest context that fits the same bill (net included) and available memory, capped at
+  the model's context limit. Existing active MLX buffers are subtracted from the GPU working-set limit before this
+  check. Cold-load HTTP 503 responses retain the numeric maximum through the transient unloaded reset; retry and
+  successful load clear it.
 - Request-time memory refusals for these packs also report a maximum context using the request's actual KV width,
   effective chunk, MTP choice and warm-prefix credits. The connection-thread 400 and a later scheduler refusal
   carry the same numeric diagnostic; generation error mapping consumes the slot's diagnostic on its connection
   thread so it cannot leak into another request.
-- Other layouts and architectures retain the legacy flat headroom (min(weights/8, 6 GiB) + 1 GiB), with the existing
-  explicit-context reduction where applicable. Native GLM has its separate BF16 load and serving bill.
+- **A streamed load bills what it holds** (`streamedLoadRequirementBytes`): resident trunk, MTP and vision + the expert
+  cache + the whole-layer fill union + the bounce buffers + the net; `expertCacheFitForLoad` separately proves the
+  planned KV against the wired limit. GLM allocates KV row by row per request, so its load bill carries no context
+  term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
   from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
@@ -60,41 +70,52 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A resident Sushi Qwen or MiMo cold load reserves its load preflight's own requirement** (`residentColdLoadBillBytes`:
   exact enabled weights and the same full-context admission callback), rather than the 1.1x disk-size guess. The auto resident cap bounds co-residence only ([server-lifecycle](server-lifecycle.md)).
 
-### Explicit-context warmup envelope
+<a id="load-warmup"></a>
+### Load warmup
 
-`ad4a3ce0` plus the context-bill change, ReleaseFast binary mtime 2026-09-26 15:26:43 local, M5 Max 128 GB:
-`test_load_context_preflight.sh`, `--ctx-size 1248 --kv-quant 8`, vision enabled, MTP as below. Each row is the
-larger pre-request `/props` peak across startup and cold `/v1/load-model`; both paths then completed a short chat.
-QoS `taskpolicy -a`, one `load-context-<pid>` GPU lock per run, conversion concurrent (memory validation, not timing).
-The baseline is the existing flat formula, not an old-binary rerun.
+The warmup term of `loadRequirementBytes` is the pre-request `/props` `peak_bytes` less the bytes the load bills, at the
+worst setting measured for each arch. Binary: `165c2d59` plus the margin and auto-context changes (before this bill),
+ReleaseFast, M5 Max 128 GB, `taskpolicy -a`, one `wired-margin` GPU lock per boot, one boot per row, 2026-10-08.
 
-| Pack | MTP | Old requirement (GiB) | Context requirement (GiB) | Load/warmup peak (GiB) |
-|---|---|---:|---:|---:|
-| Sushi-3bpw | on | 56.33 | 51.35 | 49.9073 |
-| Sushi-3bpw | off | 56.33 | 51.35 | 47.6341 |
-| Sushi-4bpw | on | 70.68 | 65.70 | 64.2628 |
-| Sushi-4bpw | off | 70.68 | 65.70 | 61.6967 |
+| arch, pack, settings | billed weights (GiB) | peak (GiB) | peak - billed (GiB) |
+|---|---:|---:|---:|
+| Flash-Next 2.6bpw, `--mtp` (vision billed, tower not yet resident) | 44.20 | 44.53 | 0.32 |
+| Flash-Next 2.6bpw, `--mtp --no-vision` | 43.37 | 44.53 | 1.16 |
+| Flash-Next 2.6bpw, `--no-mtp` | 43.08 | 42.36 | -0.72 |
+| Flash-Next 4bpw, `--mtp` | 63.94 | 64.26 | 0.32 |
+| MiMo 2.3bpw, `--mtp` | 89.65 | 89.88 | 0.23 |
+| MiMo 2.3bpw, `--mtp --no-vision` | 88.30 | 88.52 | 0.22 |
+| GLM 2.4bpw, DFlash2 + vision | 89.76 | 90.16 | 0.40 |
+| GLM 2.4bpw, `--no-drafter --no-vision` | 88.58 | 88.98 | 0.40 |
 
-MiMo-V2.6-Flash-Sushi-2.3bpw, `--ctx-size 1248 --kv-quant 8`, MTP and vision on (1-8-row verify warm-up and the three
-heads), `taskpolicy -a`, GPU lock, one boot per row, 2026-10-01:
+The peak is the same with `--ctx-size 1248` and with an auto context (the KV allocates at the first request).
+Flash-Next's transient is its MTP head load: peak less resident bytes is 1.11 GiB with MTP and 0.08 without. GLM's 0.40
+is its KDA state, rings and latent rows (0.15) plus 0.25 of activations.
 
-| Mode | Binary | Billed weights (GiB) | Requirement (GiB) | Pre-request `/props` peak (GiB) |
-|---|---|---:|---:|---:|
-| startup, flat headroom | gap/mimo-g1b e425a1a2, built 10:17:14 | 89.65 | 96.65 | 89.88 |
-| cold `/v1/load-model`, context term | gap/mimo-g1b c5f8f3ac, built 10:46:23 | 89.65 | 91.76 | 89.88 |
+The bill against the same peaks (this change; `--mtp` where the arch has it; the context row is the request-time
+admission bill at 1248 tokens, which replaces the warmup once it is larger):
 
-Both peaks were unchanged after a short chat. The 2 GiB allowance leaves ~1.9 GiB unused, so MiMo takes the same term.
+| pack, settings | weights | warmup or context | net | bill | peak | slack |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash-Next 2.6bpw, auto or `--ctx-size 1248` | 44.20 | 1.25 | 1.00 | 46.45 | 44.53 | 1.93 |
+| Flash-Next 2.6bpw, `--no-vision` | 43.37 | 1.25 | 1.00 | 45.62 | 44.53 | 1.09 |
+| MiMo 2.3bpw, auto | 89.65 | 0.25 | 1.00 | 90.90 | 89.88 | 1.02 |
+| MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | 1.00 | 92.44 | 89.88 | 2.56 |
+| GLM 2.4bpw, auto or `--ctx-size 1248` | 89.76 | 0.52 | 1.00 | 91.28 | 90.16 | 1.12 |
+| Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
 
-These historical measurements establish the 2 GiB load/warmup allowance for resident Sushi Qwen and MiMo EXL3.
-The current bill compares that allowance with the full requested-context admission bill instead of capping context
-at legacy headroom. Assistant checkpoint payloads are additional resident weights. Other expert layouts and
-architectures need their own measured envelope. These runs do not simulate a 64 GB host or establish a timing result.
+Flash-Next's extra slack is the vision tower: it is billed at load for the first image and not resident until then.
+MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. The streamed warmup is its cache, fill
+union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
+Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
+
+Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.
 
 ## Context and chunk
 
-- **Auto-context is PINNED at load** (`pinAutoContext`, 85% margin on the memory ceiling, 93% on GLM, whose
-  admission refuses past its exact bill); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED width and
-  activations ONCE.
+- **Auto-context is PINNED at load** (`pinAutoContext`, one 93% margin on the memory ceiling for every model, then
+  capped at the checkpoint's own maximum, un-margined); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED
+  width and activations ONCE.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises

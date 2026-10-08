@@ -3,18 +3,23 @@
 //! Preprocessing follows the vendor serving processors (SGLang and vLLM agree):
 //! smart-resize to a multiple of patch*merge, torch bilinear resampling
 //! (align_corners=False, no antialias) on 0..255 floats, then ImageNet mean/std
-//! scaled by 255. The patch layout is Qwen2-VL's (`qwen_vision.buildPixelValues`).
+//! scaled by 255. The patch layout is Qwen2-VL's (`vision_common.buildPixelValues`).
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
-const qwen_vision = @import("qwen_vision.zig");
+const vision_common = @import("vision_common.zig");
+const binary = vision_common.binary;
+const astype = vision_common.astype;
+const reshape = vision_common.reshape;
+const cosineSim = vision_common.cosineSim;
+const rmsRatio = vision_common.rmsRatio;
 const log = @import("log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 
-pub const Resized = qwen_vision.Resized;
+pub const Resized = vision_common.Resized;
 
 const PIXEL_MEAN = [3]f32{ 123.675, 116.28, 103.53 };
 const PIXEL_STD = [3]f32{ 58.395, 57.12, 57.375 };
@@ -30,11 +35,11 @@ pub fn smartResize(height: u32, width: u32, factor: u32, min_pixels: u32, max_pi
     const fmax: f64 = @floatFromInt(max_pixels);
     if (@min(fh, fw) < ff) {
         const scale = ff / @min(fh, fw);
-        fh = qwen_vision.roundHalfEven(fh * scale);
-        fw = qwen_vision.roundHalfEven(fw * scale);
+        fh = vision_common.roundHalfEven(fh * scale);
+        fw = vision_common.roundHalfEven(fw * scale);
     }
-    var h_bar = qwen_vision.roundHalfEven(fh / ff) * ff;
-    var w_bar = qwen_vision.roundHalfEven(fw / ff) * ff;
+    var h_bar = vision_common.roundHalfEven(fh / ff) * ff;
+    var w_bar = vision_common.roundHalfEven(fw / ff) * ff;
     if (h_bar * w_bar > fmax) {
         const beta = @sqrt((fh * fw) / fmax);
         h_bar = @max(ff, std.math.floor(fh / beta / ff) * ff);
@@ -629,18 +634,6 @@ fn unary(comptime f: anytype, a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arra
     return out;
 }
 
-fn binary(comptime f: anytype, a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    try mlx.check(f(&out, a, b, s));
-    return out;
-}
-
-fn astype(a: mlx.mlx_array, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, a, dtype, s));
-    return out;
-}
-
 fn copyOf(a: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_contiguous(&out, a, false, s));
@@ -652,12 +645,6 @@ fn rmsNorm(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array
     defer _ = mlx.mlx_array_free(wf);
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&out, x, wf, MimoVision.EPS, s));
-    return out;
-}
-
-fn reshape(a: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&out, a, shape.ptr, shape.len, s));
     return out;
 }
 
@@ -721,44 +708,6 @@ fn gelu(xf: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return binary(mlx.mlx_multiply, xh, onep, s);
 }
 
-fn sumProduct(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    const af = try astype(a, .float32, s);
-    defer _ = mlx.mlx_array_free(af);
-    const bf = try astype(b, .float32, s);
-    defer _ = mlx.mlx_array_free(bf);
-    const flat = [_]c_int{-1};
-    const a1 = try reshape(af, &flat, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const b1 = try reshape(bf, &flat, s);
-    defer _ = mlx.mlx_array_free(b1);
-    const prod = try binary(mlx.mlx_multiply, a1, b1, s);
-    defer _ = mlx.mlx_array_free(prod);
-    var total = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(total);
-    try mlx.check(mlx.mlx_sum(&total, prod, false, s));
-    try mlx.check(mlx.mlx_array_eval(total));
-    var v: f32 = 0;
-    try mlx.check(mlx.mlx_array_item_float32(&v, total));
-    return v;
-}
-
-/// Cosine of two tensors read as flat vectors, in f32. NaN fails every bar.
-pub fn cosineSim(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    const ab = try sumProduct(a, b, s);
-    const aa = try sumProduct(a, a, s);
-    const bb = try sumProduct(b, b, s);
-    if (!std.math.isFinite(ab) or aa <= 0 or bb <= 0) return std.math.nan(f32);
-    return ab / (@sqrt(aa) * @sqrt(bb));
-}
-
-/// ||a|| / ||b||: the scale error a cosine cannot see.
-pub fn rmsRatio(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
-    const aa = try sumProduct(a, a, s);
-    const bb = try sumProduct(b, b, s);
-    if (!std.math.isFinite(aa) or bb <= 0) return std.math.nan(f32);
-    return @sqrt(aa / bb);
-}
-
 // ── Tests ──
 
 const testing = std.testing;
@@ -792,9 +741,9 @@ test "resizeNormalizedChw matches torch bilinear (align_corners=False) and Image
     };
     // torch.nn.functional.interpolate on the float image, then (x - mean) / std.
     const want_3x4 = [_]f32{
-        -1.3223165, 0.8568086,  -0.2520193, -0.2648630, -0.2662900, -1.9231099, 0.8040071, -0.8528128, 0.7897363,  -0.8670834, -0.6972623, 0.2032135,
-        -0.2944969, 0.6260797,  0.7996909,  0.2263363,  0.7851016,  -0.9087010, 1.8792893, 0.1854867,  0.7442520,  0.1708975,  -0.9626810, 1.2650851,
-        0.8527814,  -0.8334931, 1.9421062,  0.2558316,  0.2543791,  0.2413072,  -0.8872331, 1.3306319, 1.3291795,  0.9442846,  -0.1842557, 0.5463184,
+        -1.3223165, 0.8568086,  -0.2520193, -0.2648630, -0.2662900, -1.9231099, 0.8040071,  -0.8528128, 0.7897363, -0.8670834, -0.6972623, 0.2032135,
+        -0.2944969, 0.6260797,  0.7996909,  0.2263363,  0.7851016,  -0.9087010, 1.8792893,  0.1854867,  0.7442520, 0.1708975,  -0.9626810, 1.2650851,
+        0.8527814,  -0.8334931, 1.9421062,  0.2558316,  0.2543791,  0.2413072,  -0.8872331, 1.3306319,  1.3291795, 0.9442846,  -0.1842557, 0.5463184,
     };
     var got: [3 * 3 * 4]f32 = undefined;
     try resizeNormalizedChw(&got, &rgb, h, w, 3, 4);
@@ -804,9 +753,9 @@ test "resizeNormalizedChw matches torch bilinear (align_corners=False) and Image
     var up: [3 * 8 * 11]f32 = undefined;
     try resizeNormalizedChw(&up, &rgb, h, w, 8, 11);
     const picks = [_]struct { i: usize, v: f32 }{
-        .{ .i = 0, .v = -2.1179039 },  .{ .i = 10, .v = -1.5356623 }, .{ .i = 87, .v = 0.9988012 },
+        .{ .i = 0, .v = -2.1179039 },  .{ .i = 10, .v = -1.5356623 },  .{ .i = 87, .v = 0.9988012 },
         .{ .i = 88, .v = -1.1078432 }, .{ .i = 100, .v = -0.1002953 }, .{ .i = 175, .v = 2.0784314 },
-        .{ .i = 176, .v = 0.0430501 }, .{ .i = 200, .v = 1.7993391 }, .{ .i = 263, .v = -1.2467102 },
+        .{ .i = 176, .v = 0.0430501 }, .{ .i = 200, .v = 1.7993391 },  .{ .i = 263, .v = -1.2467102 },
     };
     for (picks) |p| try testing.expectApproxEqAbs(p.v, up[p.i], 2e-5);
 }
@@ -878,7 +827,7 @@ test "VisionEncoder serves a MiMo config through the MiMo-ViT" {
     defer weights.deinit();
     var enc = try @import("vision.zig").VisionEncoder.init(testing.allocator, tinyConfig(), &weights);
     defer enc.deinit();
-    try testing.expect(enc.mimo != null and !enc.supportsAudio());
+    try testing.expect(enc.mimo != null);
     const pv = weights.get("fixture.pixel_values") orelse return error.MissingFixtureTensor;
     const out = try enc.forwardPatches(pv, 8, 12);
     defer _ = mlx.mlx_array_free(out);
@@ -922,7 +871,7 @@ test "mimo vision real: preprocessing and the bf16 tower match the f32 reference
         const sh: u32 = @intCast(shape[0]);
         const sw: u32 = @intCast(shape[1]);
         const rgb = (mlx.mlx_array_data_uint8(rgb_arr) orelse return error.MissingFixtureTensor)[0 .. @as(usize, sh) * sw * 3];
-        const bounds = qwen_vision.effectivePixelBounds(config.qv_min_pixels, config.qv_max_pixels);
+        const bounds = vision_common.effectivePixelBounds(config.qv_min_pixels, config.qv_max_pixels);
         const rs = smartResize(sh, sw, config.qv_patch * config.qv_merge, bounds.min, bounds.max);
         try testing.expectEqual(gh * config.qv_patch, rs.h);
         try testing.expectEqual(gw * config.qv_patch, rs.w);
@@ -932,7 +881,7 @@ test "mimo vision real: preprocessing and the bf16 tower match the f32 reference
         const feat: usize = 3 * config.qv_temporal_patch * config.qv_patch * config.qv_patch;
         const pv = try a.alloc(f32, @as(usize, gh) * gw * feat);
         defer a.free(pv);
-        qwen_vision.buildPixelValues(pv, chw, 3, rs.h, rs.w, config.qv_patch, config.qv_temporal_patch, config.qv_merge);
+        vision_common.buildPixelValues(pv, chw, 3, rs.h, rs.w, config.qv_patch, config.qv_temporal_patch, config.qv_merge);
         try mlx.check(mlx.mlx_array_eval(want_pv));
         const want = (mlx.mlx_array_data_float32(want_pv) orelse return error.MissingFixtureTensor)[0..pv.len];
         var worst: f32 = 0;
@@ -1001,7 +950,7 @@ test "mimo vision ubench: encode time and scratch peak per image" {
         }
         const bill = encodeScratchBytes(&config, @intCast(n));
         std.debug.print("[mimo-vit ubench] grid {d}x{d} ({d} patches, {d} tokens): best {d:.1} ms of {d}, scratch peak {d:.1} MB (first run {d:.1} MB), bill {d:.1} MB\n", .{
-            g[0], g[1], n, @divExact(n, 4), @as(f64, @floatFromInt(best)) / 1e6, reps,
+            g[0],                                       g[1],                                      n,                                   @divExact(n, 4), @as(f64, @floatFromInt(best)) / 1e6, reps,
             @as(f64, @floatFromInt(steady_peak)) / 1e6, @as(f64, @floatFromInt(first_peak)) / 1e6, @as(f64, @floatFromInt(bill)) / 1e6,
         });
         if (bill < @max(steady_peak, first_peak)) under_billed = true;

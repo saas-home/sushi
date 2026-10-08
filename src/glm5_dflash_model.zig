@@ -139,7 +139,8 @@ fn mlaProject(layer: *const forward.Mla, ops: *Ops, x: Arr, cfg: *const @import(
 
 /// One request's tree, rows `from ..` of `rows`: its branches attend its own cache. Each row's
 /// `[1, heads, 1, width]` output lands at `attended[row]`.
-fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, attended: []Arr) !MlaTape {
+/// `joined`, when given, receives every row's output as one `[rows, heads, 1, width]` array.
+fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, cfg: *const @import("model.zig").ModelConfig, state: *const attention.State, parents: []const i32, attended: []Arr, joined: ?*?Arr) !MlaTape {
     const native = @import("glm5_attention_decode_batch.zig");
     const dtype = mlx.mlx_array_dtype(rows.latent);
     const native_mode = native.enabled() and native.supportedConfig(cfg, dtype, ops.s);
@@ -222,6 +223,9 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
         const prefix = if (state.processed == 0) attention.Latent{ .data = readable } else state.latentView();
         const selected = try ops.concat(native_ids[0..parents.len], 0);
         const batched = try native.run(ops, qa, prefix, state.processed, readable, native_branches[0..parents.len], selected, scale);
+        if (joined) |slot| if (batched) |all| {
+            slot.* = try ops.reshape(all, &.{ @intCast(parents.len), heads, 1, width });
+        };
         for (0..parents.len) |row| {
             const y = if (batched) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else (try native.run(ops, try ops.slice(qa, 0, @intCast(row), @intCast(row + 1)), prefix, state.processed, readable, native_branches[row .. row + 1], native_ids[row], scale)) orelse return error.GlmDecodeNativeUnsupported;
             attended[row] = try ops.reshape(y, &.{ 1, heads, 1, width });
@@ -231,10 +235,12 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
 }
 
 /// Value unembedding and output projection over all rows' attention outputs.
-fn mlaFinish(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, attended: []const Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !Arr {
+/// `joined` is `attended` as one array when the attention produced it so; the value rows then stay joined too.
+fn mlaFinish(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, attended: []const Arr, joined: ?Arr, cfg: *const @import("model.zig").ModelConfig, mode: kda.ProjectionMode) !Arr {
     const value_width: c_int = @intCast(cfg.num_attention_heads * cfg.mla_v_head_dim);
     var result_rows: [16]Arr = undefined;
-    const broadcast = if (rows.broadcast or (layer.quantized and attended.len == 4)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
+    const broadcast = if (rows.broadcast or (layer.quantized and attended.len == 4)) try @import("glm5_mla_verify_batch.zig").run(ops, .{ .x = joined orelse try ops.concat(attended, 0), .w = layer.wv, .scales = layer.sv, .biases = layer.bv }, .value) else null;
+    if (joined != null) if (broadcast) |all| return kda.linearRows(ops, layer.out, try ops.reshape(all, &.{ 1, @intCast(attended.len), value_width }), mode);
     for (attended, 0..) |y4, row| {
         const values = if (broadcast) |all| try ops.slice(all, 0, @intCast(row), @intCast(row + 1)) else if (layer.quantized) try ops.qmm(y4, layer.wv, layer.sv, layer.bv, true) else try ops.binary(.mm, y4, try ops.transpose(layer.wv, &.{ 0, 2, 1 }));
         result_rows[row] = try ops.reshape(values, &.{ 1, 1, value_width });
@@ -419,10 +425,11 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
             .mla => |*weights| blk: {
                 const projected = try mlaProject(weights, &ops, x, &target.cfg, mode);
                 var outputs: [max_rows]Arr = undefined;
+                var joined: ?Arr = null;
                 for (groups, out, 0..) |group, *v, g| {
-                    v.layers[index] = .{ .mla = try mlaAttend(weights, &ops, projected, starts[g], &target.cfg, &group.request.layers[index].attention, group.parents, outputs[starts[g]..starts[g + 1]]) };
+                    v.layers[index] = .{ .mla = try mlaAttend(weights, &ops, projected, starts[g], &target.cfg, &group.request.layers[index].attention, group.parents, outputs[starts[g]..starts[g + 1]], if (groups.len == 1) &joined else null) };
                 }
-                break :blk try mlaFinish(weights, &ops, projected, outputs[0..total], &target.cfg, mode);
+                break :blk try mlaFinish(weights, &ops, projected, outputs[0..total], joined, &target.cfg, mode);
             },
         };
         const expanded_attn = if (fold_norm) try @import("glm5_hc_expand_norm.zig").apply(target.s, h, attended, pre.post, pre.comb, target.cfg.rms_norm_eps) else null;
@@ -457,6 +464,13 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
                 try mlx.check(mlx.mlx_array_set(&v.captures.hook.out[tap], value));
             }
         };
+        // The first layer starts on the GPU while the host builds the rest of its group.
+        if (index == 0 and cadence > 1) {
+            const evals = mlx.mlx_vector_array_new_value(next);
+            defer _ = mlx.mlx_vector_array_free(evals);
+            for (out) |v| try appendTape(evals, v.layers[0].?);
+            try mlx.check(mlx.mlx_async_eval(evals));
+        }
         if (cadence == 0 or (index + 1) % cadence == 0) {
             const evals = mlx.mlx_vector_array_new_value(next);
             defer _ = mlx.mlx_vector_array_free(evals);

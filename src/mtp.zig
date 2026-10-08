@@ -34,7 +34,6 @@ const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
 const io_util_mod = @import("io_util.zig");
-const ane_mod = @import("ane.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -69,7 +68,7 @@ pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
 ///   M1 Pro: 4 (2026-08-20, Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
 ///     13.01 tok/s at depth 4 vs 10.78/9.63 at 5/6 — the verify width 6
 ///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
-/// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrand`
+/// `chip` is sysctl machdep.cpu.brand_string via `chip.chipBrand`
 /// (the GPU arch string cannot tell Ultra from Max); "" lands on default.
 /// The row carries its own LABEL so the resolve site can say which one it
 /// applied: a bare depth=4 in the spec-stats line is indistinguishable from
@@ -2389,7 +2388,6 @@ fn loadHy3Mtp(
             .shared_down_s = shd.s,
             .shared_down_b = shd.b,
             .expert_bias = try ownWeight(weights, K.k(&kb, p, "layer.mlp.expert_bias")),
-            .shared_ungated = true,
         } },
     };
     errdefer m.deinit();
@@ -3549,7 +3547,6 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
     try testing.expect(m.fc.w.ctx == null);
     try testing.expect(m.mlp == .moe);
     try testing.expect(m.mlp.moe.expert_bias != null);
-    try testing.expect(m.mlp.moe.shared_ungated);
     try testing.expect(m.mlp.moe.shared_expert_gate_w == null);
     // enorm/hnorm ride the pre_fc_norm slots (same role, no +1 folding).
     const en_shape = mlx.getShape(m.pre_fc_norm_emb);

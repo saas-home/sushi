@@ -75,9 +75,13 @@ try:
         assert len(matches) == 1, matches
         weights, needed = map(float, matches[0])
         assert weights >= 48, "this regression needs a large resident pack"
-        assert 1.99 <= needed - weights <= 2.25, (weights, needed)
+        # Billed weights + the larger of the measured warmup and the context bill + the 1 GiB net.
+        warmup = 0.25 if "mimo" in model.name.lower() else (1.25 if mtp == "--mtp" else 0.125)
+        assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
         assert 0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"]
-        assert props["memory"]["peak_bytes"] <= (needed + 0.005) * 2**30, props["memory"]
+        peak = props["memory"]["peak_bytes"] / 2**30
+        assert peak <= needed + 0.005, props["memory"]
+        assert needed - peak <= 3.0, (needed, peak)
         models = request("/v1/models")["data"]
         model_id = model.name if mode == "cold" else next(m["id"] for m in models if m.get("loaded"))
         reply = request("/v1/chat/completions", {

@@ -83,9 +83,8 @@ pub fn build(b: *std.Build) void {
     // stb_image for JPEG/PNG decoding in the vision pipeline
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
     mod.addIncludePath(b.path("lib"));
-
-    addAneSources(b, mod);
 
     // The staged MLX library path must precede Homebrew's.
     addMlxLib(b, mod);
@@ -140,8 +139,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addCSourceFile(.{ .file = b.path("lib/dflash_cache_space.c"), .flags = &.{"-O2"} });
+    test_mod.addCSourceFile(.{ .file = b.path("lib/volume_space.m"), .flags = &.{ "-O2", "-fobjc-arc" } });
     test_mod.addIncludePath(b.path("lib"));
-    addAneSources(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
@@ -164,10 +163,24 @@ pub fn build(b: *std.Build) void {
         "qwen-preprocess-fixture",
         "CPU reference fixture for the gated Qwen preprocessing parity test",
     );
-    const unit_tests = b.addTest(.{
-        .root_module = test_mod,
-        .filters = if (test_filter) |f| &.{f} else &.{},
-    });
+    const test_build = b.step("test-build", "Compile unit tests without running them");
+    const test_step = b.step("test", "Run unit tests");
+    // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
+    const unit_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+        b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = &.{f} })}) catch @panic("OOM")
+    else
+        addTestBuckets(b, test_mod);
+    for (unit_tests) |unit_test| {
+        test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const run_unit_tests = b.addRunArtifact(unit_test);
+        if (qwen_preprocess_fixture) |fixture| {
+            run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
+            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
+            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
+            run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
+        }
+        test_step.dependOn(&run_unit_tests.step);
+    }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
     const exl3_tests = b.addTest(.{
@@ -175,21 +188,69 @@ pub fn build(b: *std.Build) void {
         .root_module = exl3_test_mod,
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
-
-    const test_build = b.step("test-build", "Compile unit tests without running them");
-    test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
     test_build.dependOn(&b.addInstallArtifact(exl3_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    if (qwen_preprocess_fixture) |fixture| {
-        run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
-    }
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&b.addRunArtifact(exl3_tests).step);
+}
+
+/// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
+/// A test's name starts with `<file stem>.`, so a bucket is a list of stems used as filters, and
+/// the last bucket takes every src/*.zig stem the others do not name.
+const test_buckets = [_][]const []const u8{
+    &.{ "transformer", "gdn_decode", "cli", "repl_tools", "repl_input", "update", "launch" },
+    &.{ "generate", "scheduler", "prefix_cache", "kv_disk_cache", "kv_disk_writer", "restore_dump", "mtp", "dflash" },
+    &.{ "server", "chat", "format_corpus_test", "tool_traffic_replay_test", "responses", "ws", "reasoning_protocol", "json_grammar", "json_schema", "regex", "token_mask", "tokenizer" },
+};
+
+fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
+    const io = b.graph.io;
+    var stems: std.ArrayList([]const u8) = .empty;
+    var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src/: {t}", .{e});
+    defer src.close(io);
+    var it = src.iterate();
+    while (it.next(io) catch |e| std.debug.panic("src/: {t}", .{e})) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        stems.append(b.allocator, b.fmt("{s}.", .{entry.name[0 .. entry.name.len - ".zig".len]})) catch @panic("OOM");
+    }
+    // Directory order varies; the filters key the compile step's cache.
+    std.mem.sortUnstable([]const u8, stems.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    const bucket = b.allocator.alloc(usize, stems.items.len) catch @panic("OOM");
+    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - 1]);
+    // A filter matches anywhere in a name, so "dflash." also selects glm5_dflash's tests: stems
+    // that contain one another must share a bucket, or their tests would run twice.
+    var moved = true;
+    while (moved) {
+        moved = false;
+        for (stems.items, bucket) |a, *ka| {
+            for (stems.items, bucket) |s, *ks| {
+                if (ka.* == ks.* or std.mem.indexOf(u8, a, s) == null) continue;
+                if (ka.* != test_buckets.len and ks.* != test_buckets.len)
+                    std.debug.panic("test buckets {d} and {d} split overlapping stems {s} and {s}", .{ ka.*, ks.*, a, s });
+                ka.* = @min(ka.*, ks.*);
+                ks.* = ka.*;
+                moved = true;
+            }
+        }
+    }
+    var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
+    for (0..test_buckets.len + 1) |i| {
+        var filters: std.ArrayList([]const u8) = .empty;
+        for (stems.items, bucket) |stem, k| if (k == i) filters.append(b.allocator, stem) catch @panic("OOM");
+        if (filters.items.len == 0) continue;
+        const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
+        out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items })) catch @panic("OOM");
+    }
+    return out.items;
+}
+
+fn namedBucket(stem: []const u8) usize {
+    for (test_buckets, 0..) |names, i| {
+        for (names) |name| if (std.mem.eql(u8, stem, name)) return i;
+    }
+    return test_buckets.len;
 }
 
 fn addCHeaderModule(
@@ -206,18 +267,6 @@ fn addCHeaderModule(
     });
     translate.addIncludePath(include_dir);
     return translate.createModule();
-}
-
-/// ARC bridge to AppleNeuralEngine, dlopen'd and checked for availability at runtime.
-fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
-    const objc_flags = &[_][]const u8{
-        "-O3",
-        "-fobjc-arc",
-        "-Wno-deprecated-declarations",
-    };
-    module.addCSourceFile(.{ .file = b.path("lib/ane/ane_bridge.m"), .flags = objc_flags });
-    module.addCSourceFile(.{ .file = b.path("lib/ane/ane_mlp.m"), .flags = objc_flags });
-    module.addIncludePath(b.path("lib/ane"));
 }
 
 fn buildRootHandle(b: *std.Build) std.Io.Dir {

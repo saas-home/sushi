@@ -161,6 +161,57 @@ pub fn hcExpand(residual: mlx.mlx_array, branch: mlx.mlx_array, post: mlx.mlx_ar
     return result;
 }
 
+fn sigmoidF32(v: f32) f32 {
+    return 1.0 / (1.0 + @exp(-v));
+}
+
+const HcSplit = struct { pre: [8]f32, post: [8]f32, comb: [64]f32 };
+
+/// Scalar reference for the mHC Sinkhorn split: pre = σ(m·s0+b)+eps; post = 2σ(m·s1+b);
+/// comb = row-softmax(+eps) → colnorm → (iters-1)×(rownorm, colnorm).
+/// hc ≤ 8. Returns fixed-size buffers; read the first hc / hc² entries.
+fn hcSplitSinkhorn(mixes: []const f32, hc_scale: []const f32, hc_base: []const f32, hc: usize, iters: u32, eps: f32) HcSplit {
+    std.debug.assert(hc <= 8 and mixes.len >= (2 + hc) * hc);
+    var out: HcSplit = .{ .pre = @splat(0), .post = @splat(0), .comb = @splat(0) };
+    for (0..hc) |j| {
+        out.pre[j] = sigmoidF32(mixes[j] * hc_scale[0] + hc_base[j]) + eps;
+        out.post[j] = 2.0 * sigmoidF32(mixes[hc + j] * hc_scale[1] + hc_base[hc + j]);
+    }
+    var comb = out.comb[0 .. hc * hc];
+    for (0..hc) |j| {
+        for (0..hc) |k| comb[j * hc + k] = mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    // row softmax + eps
+    for (0..hc) |j| {
+        var m: f32 = -std.math.inf(f32);
+        for (comb[j * hc ..][0..hc]) |v| m = @max(m, v);
+        var sum: f32 = 0;
+        for (comb[j * hc ..][0..hc]) |*v| {
+            v.* = @exp(v.* - m);
+            sum += v.*;
+        }
+        for (comb[j * hc ..][0..hc]) |*v| v.* = v.* / sum + eps;
+    }
+    var it: u32 = 0;
+    while (it < iters) : (it += 1) {
+        if (it > 0) {
+            // row normalize (skipped on the first pass — softmax already did)
+            for (0..hc) |j| {
+                var sum: f32 = 0;
+                for (comb[j * hc ..][0..hc]) |v| sum += v;
+                for (comb[j * hc ..][0..hc]) |*v| v.* /= (sum + eps);
+            }
+        }
+        // column normalize
+        for (0..hc) |k| {
+            var sum: f32 = 0;
+            for (0..hc) |j| sum += comb[j * hc + k];
+            for (0..hc) |j| comb[j * hc + k] /= (sum + eps);
+        }
+    }
+    return out;
+}
+
 test "GLM mHC collapse and expand agree with scalar Sinkhorn" {
     const s = mlx.gpuStream();
     const rows = 3;
@@ -193,7 +244,7 @@ test "GLM mHC collapse and expand agree with scalar Sinkhorn" {
     const comb = mlx.mlx_array_data_float32(pre.comb).?;
     const output = mlx.mlx_array_data_float32(expanded).?;
     for (0..rows) |row| {
-        const ref = @import("deepseek_v4.zig").hcSplitSinkhorn(mix[row * 24 ..][0..24], &scale, &base, 4, 20, 1e-6);
+        const ref = hcSplitSinkhorn(mix[row * 24 ..][0..24], &scale, &base, 4, 20, 1e-6);
         for (0..4) |i| try std.testing.expectApproxEqAbs(ref.post[i], post[row * 4 + i], 1e-6);
         for (0..16) |i| try std.testing.expectApproxEqAbs(ref.comb[i], comb[row * 16 + i], 1e-6);
         for (0..dim) |d| {

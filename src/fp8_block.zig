@@ -342,9 +342,14 @@ const TILE_REDUCE_TAIL =
 fn tileRepeat(comptime text: []const u8) []const u8 {
     comptime {
         @setEvalBranchQuota(100_000);
+        // Split once and join per tile: a comptime loop over every byte costs seconds of Sema.
+        var pieces: []const []const u8 = &.{};
+        var rest = text;
+        while (std.mem.indexOfScalar(u8, rest, '$')) |i| : (rest = rest[i + 1 ..]) pieces = pieces ++ .{rest[0..i]};
         var out: []const u8 = "";
         for (0..TILE_ROW_TILES) |t| {
-            for (text) |ch| out = out ++ (if (ch == '$') &[_]u8{'0' + t} else &[_]u8{ch});
+            for (pieces) |p| out = out ++ p ++ &[_]u8{'0' + t};
+            out = out ++ rest;
         }
         return out;
     }
@@ -871,6 +876,12 @@ fn uploadX(s: mlx.mlx_stream, x: []const f32, m: usize, k: usize, dtype: mlx.mlx
 }
 
 const PARITY_SEEDS = [_]u64{ 0xF8B10C, 0x5EED8, 0xE4A3 };
+
+test "fp8 block tile text repeats once per row tile with each $ set to the tile index" {
+    try std.testing.expectEqualStrings("c0[0];c1[1];c2[2];c3[3];c4[4];c5[5];c6[6];c7[7];", comptime tileRepeat("c$[$];"));
+    try std.testing.expectEqualStrings("x\nx\nx\nx\nx\nx\nx\nx\n", comptime tileRepeat("x\n"));
+    try std.testing.expectEqualStrings("01234567", comptime tileRepeat("$"));
+}
 
 const PARITY_SPLITS = [_]RowSplit{
     RowSplit.dense(256),

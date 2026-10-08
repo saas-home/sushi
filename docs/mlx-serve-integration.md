@@ -73,8 +73,8 @@ mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does
 
 ## Recommended pin
 
-sushi v1.2.0 (ae63f880). mlx-serve's submodule still pins 44315136 (`ddalcu/sushi`, `exl3-module`) until that branch
-fetches v1.2.0; ddalcu/mlx-serve#761 moves `lib/sushi` to it. Reasons it matters, oldest first:
+sushi v1.2.1 (3f3ff7bc). mlx-serve main pins it since ddalcu/mlx-serve#768, which also serves the GLM and MiMo packs
+in-process. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
 - d1408a57 (after v1.1.1) adds the branch-free NAX prefill GEMM body: each expert GEMM runs in x0.73-0.75 of its time,

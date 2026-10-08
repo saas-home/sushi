@@ -65,7 +65,13 @@ pub fn lattice(
     defer _ = mlx.mlx_array_free(cands_i32);
     var unary_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(unary_f32);
-    {
+    const fused = try @import("glm5_dflash_topk.zig").apply(s, draft_logits, @intCast(k));
+    if (fused) |picked| {
+        _ = mlx.mlx_array_free(cands_i32);
+        cands_i32 = picked.ids;
+        _ = mlx.mlx_array_free(unary_f32);
+        unary_f32 = picked.unary;
+    } else {
         var part = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_argpartition_axis(&part, draft_logits, vocab - @as(c_int, @intCast(k)), 2, s));

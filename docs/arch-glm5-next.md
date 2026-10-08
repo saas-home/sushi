@@ -167,7 +167,7 @@ inside 1.46% drift) because verification per round grew 20.6%.
   prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
   ([prefix cache](engine-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
-  a 93% margin (85% elsewhere): GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
+  the engine's 93% margin: GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
   vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill).
   The prefix cache reserves nothing here: admission evicts its RAM tier and bills a request's checkpoints, keeping
   fewer where they do not fit. The quarter-share rule had pinned the prefill to 512 rows; at 85% the auto context
