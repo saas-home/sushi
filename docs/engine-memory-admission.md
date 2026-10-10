@@ -5,9 +5,9 @@ prefill chunk width, the admission line for a long prompt, and why under-billing
 any `*Bytes` bill, `Scheduler.init`, the preflight, or the admission path.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-kv-cache.md),
-[engine-qsa-long-context](engine-qsa-long-context.md#admission-and-load-time-bills),
+[qwen4-qsa-long-context](qwen4-qsa-long-context.md#admission-and-load-time-bills),
 [engine-prefix-cache](engine-prefix-cache.md#budget), [engine-expert-streaming](engine-expert-streaming.md#budget),
-[arch-mimo-v2](arch-mimo-v2.md#bills-the-bill-follows-the-storage-in-the-same-commit).
+[mimo2-arch](mimo2-arch.md#bills-the-bill-follows-the-storage-in-the-same-commit).
 
 ## Metal OOM
 
@@ -55,10 +55,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
   from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
   1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
-  ([engine-prefix-cache](engine-prefix-cache.md#glm)).
+  ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
-- Load-time bills run INSIDE `Scheduler.init` ([engine-qsa-long-context](engine-qsa-long-context.md)).
+- Load-time bills run INSIDE `Scheduler.init` ([qwen4-qsa-long-context](qwen4-qsa-long-context.md)).
 - **The kernel unwires a freed Metal buffer asynchronously** (~0.5 s for 50 GB): an unload and an eviction-before-load
   wait until most of the freed bytes left the wired set (`waitForUnwire`, bounded at 3 s), or the next preflight reads
   them as taken (45 GB free where 95 GB was a moment later).
@@ -120,7 +120,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
   as much context as 512: the `max_safe_context` bill picks it, not a quarter of free memory
-  ([arch-glm5-next](arch-glm5-next.md#memory)).
+  ([glm5-arch](glm5-arch.md#memory)).
 - RAM retention is off by default and the SSD tier on, so every model bills as SSD-first: a ringed arch with a disk tier
   bills its restore's coexistence (`oldBuffersInEvalWindow`) ([engine-prefix-cache](engine-prefix-cache.md#defaults)). Context sizing reserves nothing
   for an idle cache (`ctxSizingCacheReserve` is 0 with RAM off). A model whose tier did not come up bills as without one
@@ -227,7 +227,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   scratch (`qwen_vision.encodeScratchBytes`, fitted >= 25% over the measured peak) plus every block's float32 pixels
   and three bf16 copies of its soft-token rows (group outputs, video concatenation, request concatenation); past what
   the GPU has left it is a named 400. The tower evaluates per block, so the peak is one block's f32 score sheet
-  (heads x N^2) and rows; table in [arch-qwen4exp](arch-qwen4exp.md#vision-tower).
+  (heads x N^2) and rows; table in [qwen4-arch](qwen4-arch.md#vision-tower).
 - **A queued vision encode is billed again on the inference thread** (`runVisionEncode`, `vision_encode_available`),
   right before the tower runs: a prefill's cache growth or an earlier encode's resident output may have taken the
   headroom since the connection thread's check, and the refusal is that same named 400.
@@ -263,7 +263,45 @@ same configurable 8 GiB reserve as Qwen and MiMo. An unchanged system limit reta
 physical free-memory ceiling.
 
 GLM uploads only indexed payloads from one shard at a time, preserving their stored
-dtypes. It closes each shard before opening the next. MLX lazy safetensor Load nodes
+dtypes. It closes each shard before opening the next. Each tensor is read through a page-aligned
+window on an `F_NOCACHE` descriptor (`model.readTensorArray`; macOS ignores `F_NOCACHE` unless the file offset, length
+and buffer are all page-aligned). Four workers each read the next 16 MiB chunk into their own scratch and copy it
+into place (`expert_io.ParallelReader`); a tensor of 1 MiB or more lands at offset 0 of its own mapping, imported by MLX
+without a copy (a view at an offset inside a buffer gave NaN logits). Same settings, H N H N per pack, sequential aligned reads → the
+overlapped reader: GLM upload 13.6/13.9 → 9.0/8.8 s (listening 18.4/15.9 → 12.1/10.7 s), Qwen 4bpw 12.0/10.5 → 9.5/7.7 s
+(14.8/12.3 → 11.9/9.3 s); no compression or swap in any arm.
+Four workers instead of one read-ahead thread, file cache evicted before each arm: GLM upload 9.0/9.3 → 8.0/8.0 s
+(listening 11.7/10.9 → 10.4/9.5 s); Qwen 4bpw against `mlx_load_safetensors` 6.7/6.7 vs 7.0/7.2 s (listening 8.3/8.2
+vs 8.7/8.6 s), compressor +4.4/+5.5 GB vs 0. Read
+through the file cache, the ~90 GB upload filled it and macOS compressed the weights already uploaded (not yet wired)
+rather than drop it, then decompressed them when the wired limit applied: on a busier box, that compression is swap.
+Sushi-2.4bpw, `serve` defaults, `taskpolicy -a`, lock held, 2026-10-08, ~90 GB free at start: compressor +59.0 GB →
++0.6 GB, file cache peak 64.2 → 21.7 GB, listening 22 → 15 s, warmup 5.6 → 0.16 s (the loader at `3f3ff7bc` → the aligned read). MiMo's
+source trunk (`mimo_source.readTensor`) and every `model.loadSafetensorsFile` shard (Qwen, streamed trunks) read the
+same way; the latter no longer goes through `mlx_load_safetensors`, whose descriptor cannot take `F_NOCACHE`. Qwen3.8-Flash-Next-Sushi-4bpw
+(64 GB resident), same settings, A F A F: compressor +5.7/+4.3 GB → +0.0/+0.0 GB, no swap either way, listening 12/8 s →
+13/10 s (`mlx_load_safetensors` → sushi's own aligned reader).
+
+Landing A/B of the merged loader (`39e546a4` vs its base `d28a87ee`, first run then four reruns; `serve` defaults, `taskpolicy -a`,
+one GPU lock per boot, M5 Max 128 GB, 2026-10-10). To `[kv-cache]` is the weight-upload phase, Listening the full
+boot, Warmup the first-prompt weight warmup, Compressor the memory-compressor growth during the load:
+
+| Pack        | Arm  | To `[kv-cache]` | Listening | Warmup  | Compressor |
+| ----------- | ---- | --------------: | --------: | ------: | ---------: |
+| Qwen 4bpw   | main | 5.36 s          | 8.30 s    | —       | +4.3 GB    |
+| Qwen 4bpw   | PR   | 7.27 s          | 11.65 s   | 949 ms  | +0.2 GB    |
+| GLM 2.4bpw  | main | 14.25 s         | 22.18 s   | 6219 ms | +57.3 GB   |
+| GLM 2.4bpw  | PR   | 9.47 s          | 12.23 s   | 1427 ms | +6.7 GB    |
+| MiMo 2.3bpw | main | 14.95 s         | 25.67 s   | 843 ms  | +56.1 GB   |
+| MiMo 2.3bpw | PR   | 9.56 s          | 15.06 s   | 859 ms  | +4.6 GB    |
+
+Qwen 4bpw, the four reruns: main 5.26/5.25/5.22/5.27 s to `[kv-cache]`, listening 10.00/9.28/8.99/9.14 s, warmup
+543 then 80/81/80 ms, spec-warmup 3.04/2.73/2.67/2.66 s, compressor +3.5 to +4.0 GB; PR 6.66/6.74/6.58/6.69 s,
+listening 10.67/9.96/9.72/9.89 s, warmup 683 then 88/85/86 ms, spec-warmup 2.82/2.63/2.55/2.61 s, compressor
++0.2 then 0. Qwen pays ~1.4 s of upload (per-tensor page-mapped reads instead of one bulk MLX read) for a
+compressor at ~zero; GLM and MiMo win on time and compression alike, ~57 GB of load-time compression down to <7 GB.
+
+MLX lazy safetensor Load nodes
 kept one descriptor per shard alive until evaluation, so the 566-shard affine pack
 exceeded macOS's default 256-handle terminal limit despite a successful memory
 preflight. The bounded reader also reports descriptor exhaustion separately from

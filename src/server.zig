@@ -922,6 +922,10 @@ fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8,
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
 }
 
+/// `--edit on|off`: whether a new chat on the page starts with its write tools on. Each chat's
+/// Edit chip then switches them for itself.
+pub var g_web_edit: bool = false;
+
 /// The browser orchestrates calls; this local-only bridge shares the REPL's restrictions.
 fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, body: []const u8) !void {
     const origin = findHeaderValueCI(headers, "origin") orelse "";
@@ -952,18 +956,22 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *Conn, headers: []const 
         if (browse.bool) return sendWebToolFolders(allocator, stream, root);
     }
     const vision = if (parsed.value.object.get("vision")) |v| v == .bool and v.bool else false;
+    if (parsed.value.object.get("write")) |w| {
+        if (w != .bool) return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Write must be a boolean", 400);
+    }
+    const writable = if (parsed.value.object.get("write")) |w| w.bool else false;
     const name = parsed.value.object.get("name");
     if (name == null) {
-        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision), .{});
+        const defs = try std.json.parseFromSlice(std.json.Value, allocator, pack.definitionsJson(vision, writable), .{});
         defer defs.deinit();
-        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root }, .{});
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ .tools = defs.value, .root = root, .edit_default = g_web_edit }, .{});
         defer allocator.free(json);
         return sendResponse(stream, "200 OK", "application/json", json);
     }
     const args = parsed.value.object.get("arguments");
     if (name.? != .string or args == null or args.? != .string)
         return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Tool name and arguments must be strings", 400);
-    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision }, name.?.string, args.?.string);
+    const result = try pack.run(.{ .allocator = allocator, .io = stream.io, .root = root, .vision = vision, .writable = writable }, name.?.string, args.?.string);
     defer result.deinit(allocator);
     const json = try std.json.Stringify.valueAlloc(allocator, result, .{});
     defer allocator.free(json);
@@ -1424,6 +1432,15 @@ fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const T
 }
 
 const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
+
+/// The decode-time half of tool_choice "none": the template's call opener, banned when it is one
+/// token, so a model that sees earlier calls in the history cannot write one as plain text.
+fn noneCallBan(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?@import("logit_bias.zig").Bias {
+    const opener = (chat_mod.callOpener(allocator, chat_config) catch null) orelse return null;
+    defer allocator.free(opener);
+    const id = atomicTokenId(allocator, tok, opener) orelse return null;
+    return .{ .id = id, .delta = -100 };
+}
 
 /// Arm the decode-time half of a forced tool_choice (required or named), or
 /// null when the choice forces nothing or the call cannot be committed: no
@@ -9096,6 +9113,49 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
+const CompletionPrompt = union(enum) {
+    text: []const u8,
+    /// Caller frees.
+    ids: []u32,
+    invalid: []const u8,
+    missing,
+};
+
+/// `/v1/completions` `prompt`: a string or token ids (OpenAI's `int[]`, what lm-eval sends),
+/// either also as a one-item list. A real batch is a named 400, like `n`.
+fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab_size: u32) !CompletionPrompt {
+    const val = v orelse return .missing;
+    switch (val) {
+        .null => return .missing,
+        .string => |s| return .{ .text = s },
+        .array => |arr| {
+            if (arr.items.len == 0) return .{ .invalid = "'prompt' is empty" };
+            if (arr.items[0] == .string or arr.items[0] == .array) {
+                if (arr.items.len > 1) return .{ .invalid = "batched prompts are not supported: send one prompt per request" };
+                return parseCompletionPrompt(allocator, arr.items[0], vocab_size);
+            }
+            const ids = try allocator.alloc(u32, arr.items.len);
+            for (arr.items, ids) |item, *id| {
+                if (item != .integer or item.integer < 0 or item.integer >= vocab_size) {
+                    allocator.free(ids);
+                    return .{ .invalid = "'prompt' token ids must be integers inside the model's vocabulary" };
+                }
+                id.* = @intCast(item.integer);
+            }
+            return .{ .ids = ids };
+        },
+        else => return .{ .invalid = "'prompt' must be a string or a list of token ids" },
+    }
+}
+
+/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty sum it
+/// reads as perplexity 1; refused by name instead.
+fn echoRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("echo") orelse return null;
+    if (v != .bool or !v.bool) return null;
+    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
+}
+
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     const v = root.get("n") orelse return null;
     switch (v) {
@@ -9652,7 +9712,10 @@ fn handleChatCompletions(
         return;
     } else &.{};
     defer allocator.free(request_bias);
-    sampling.think_penalty.biases = request_bias;
+    const none_ban = if (tool_choice == .none and lm.transformer != null) noneCallBan(allocator, tok, chat_config) else null;
+    const biases = if (none_ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
+    defer if (none_ban != null) allocator.free(biases);
+    sampling.think_penalty.biases = biases;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -9724,16 +9787,22 @@ fn handleCompletions(
         else => 0,
     } else 0;
 
-    // Extract prompt (required)
-    const prompt_text = if (root.get("prompt")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-
-    if (prompt_text == null) {
-        log.warn("POST /v1/completions -> 400 (missing prompt)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'prompt' is a required field", 400);
+    if (echoRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
+    }
+
+    const prompt = try parseCompletionPrompt(allocator, root.get("prompt"), @min(config.vocab_size, tok.definedVocabSize()));
+    defer if (prompt == .ids) allocator.free(prompt.ids);
+    switch (prompt) {
+        .missing, .invalid => {
+            const reason = if (prompt == .invalid) prompt.invalid else "'prompt' is a required field";
+            log.warn("POST /v1/completions -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .text, .ids => {},
     }
 
     const requested_max_tokens = root.get("max_tokens") orelse root.get("max_completion_tokens");
@@ -9817,13 +9886,20 @@ fn handleCompletions(
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log the request
-    const preview_len = @min(prompt_text.?.len, 80);
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
     log.info("POST /v1/completions (max_tokens={s}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ describeMaxTokens(&max_tokens_desc_buf, max_tokens, max_tokens_origin), temperature, top_p, top_k, is_stream });
-    log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
+    switch (prompt) {
+        .text => |s| log.info("  > \"{s}{s}\"\n", .{ s[0..@min(s.len, 80)], if (s.len > 80) "..." else "" }),
+        .ids => |ids| log.info("  > [{d} token ids]\n", .{ids.len}),
+        else => unreachable,
+    }
 
-    // Tokenize prompt directly (no chat template).
-    const prompt_ids = try tok.encode(allocator, prompt_text.?);
+    // Tokenize prompt directly (no chat template); token ids are taken as sent.
+    const prompt_ids = switch (prompt) {
+        .text => |s| try tok.encode(allocator, s),
+        .ids => |ids| try allocator.dupe(u32, ids),
+        else => unreachable,
+    };
     defer allocator.free(prompt_ids);
     if (prompt_ids.len == 0) {
         log.warn("POST /v1/completions -> 400 (prompt tokenizes to zero tokens)\n", .{});
@@ -21566,6 +21642,49 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
 }
 
+test "parseCompletionPrompt: a token-id prompt is a prompt, a batch is a named 400" {
+    const allocator = std.testing.allocator;
+    const Want = union(enum) { text: []const u8, ids: []const u32, invalid, missing };
+    const cases = [_]struct { body: []const u8, want: Want }{
+        .{ .body = "{\"prompt\":\"hi\"}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[\"hi\"]}", .want = .{ .text = "hi" } },
+        .{ .body = "{\"prompt\":[1,2,3]}", .want = .{ .ids = &.{ 1, 2, 3 } } },
+        .{ .body = "{\"prompt\":[[5,6]]}", .want = .{ .ids = &.{ 5, 6 } } },
+        .{ .body = "{\"prompt\":[[1],[2]]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[\"a\",\"b\"]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,-2]}", .want = .invalid },
+        .{ .body = "{\"prompt\":[1,100]}", .want = .invalid },
+        .{ .body = "{\"prompt\":7}", .want = .invalid },
+        .{ .body = "{}", .want = .missing },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = try parseCompletionPrompt(allocator, parsed.value.object.get("prompt"), 100);
+        defer if (got == .ids) allocator.free(got.ids);
+        switch (case.want) {
+            .text => |t| try std.testing.expectEqualStrings(t, got.text),
+            .ids => |ids| try std.testing.expectEqualSlices(u32, ids, got.ids),
+            .invalid => try std.testing.expect(got == .invalid),
+            .missing => try std.testing.expect(got == .missing),
+        }
+    }
+}
+
+test "echoRejectReason: echo is refused by name, never silently dropped" {
+    const allocator = std.testing.allocator;
+    for ([_]struct { body: []const u8, rejected: bool }{
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"echo\":false}", .rejected = false },
+        .{ .body = "{\"echo\":true}", .rejected = true },
+    }) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.rejected, echoRejectReason(parsed.value.object) != null);
+    }
+}
+
 test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, rejected: bool }{
@@ -25615,6 +25734,28 @@ test "tool_choice auto and none arm no forced call" {
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .none, null) == null);
 }
 
+test "tool_choice none bans each family's one-token call opener, and nothing else" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
+    defer deinitTestTokenizer(&tok);
+    var split = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer deinitTestTokenizer(&split);
+    for ([_][]const u8{
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+        @embedFile("fixtures/mimo_v26_chat_template.jinja"),
+        @embedFile("fixtures/glm53_chat_template.jinja"),
+    }) |tpl| {
+        var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const ban = noneCallBan(a, &tok, &config) orelse return error.OpenerNotBanned;
+        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, ban.id);
+        try std.testing.expectEqual(@as(f32, -100), ban.delta);
+        // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
+        try std.testing.expect(noneCallBan(a, &split, &config) == null);
+    }
+}
+
 /// Render one turn as the surface builds it: Responses input (with `instructions`)
 /// or a /v1/messages body.
 fn renderSurfaceTurnForTests(a: std.mem.Allocator, tpl: []const u8, surface: enum { responses, messages }, body_json: []const u8) ![]const u8 {
@@ -25959,7 +26100,9 @@ test "web tools: list, confined execution, and browser origin guard" {
     }
     listen_host = "127.0.0.1";
     listen_port = 12345;
-    const cases = [_]struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8 }{
+    const Case = struct { origin: []const u8, body: []const u8, status: []const u8, contains: []const u8, lacks: []const u8 = "" };
+    const write_call = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside.md\\\",\\\"content\\\":\\\"x\\\"}\",\"write\":true}";
+    const cases = [_]Case{
         .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "web_search" },
         .{ .origin = "http://evil.test", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
         .{ .origin = "null", .body = "{}", .status = "403 Forbidden", .contains = "Origin" },
@@ -25969,14 +26112,31 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "400 Bad Request", .contains = "no such folder" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
+        // The chat's own write flag is the switch: with it the call reaches the confinement check,
+        // which is what keeps the test from writing anything; without it the call is refused.
+        .{ .origin = "http://localhost:12345", .body = write_call, .status = "200 OK", .contains = "outside the folder" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\",\\\"old_string\\\":\\\"a\\\",\\\"new_string\\\":\\\"b\\\"}\",\"write\":true}", .status = "200 OK", .contains = "outside the folder" },
+        .{ .origin = "http://localhost:12345", .body = "{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"x.md\\\",\\\"content\\\":\\\"x\\\"}\"}", .status = "200 OK", .contains = "writing files is off" },
+        .{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = "\"edit_default\":false", .lacks = "write_file" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":true,\"vision\":true}", .status = "200 OK", .contains = "edit_file" },
+        .{ .origin = "http://localhost:12345", .body = "{\"write\":\"yes\"}", .status = "400 Bad Request", .contains = "boolean" },
+        .{ .origin = "http://evil.test", .body = write_call, .status = "403 Forbidden", .contains = "Origin" },
     };
-    for (cases) |c| {
-        const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
-        defer t.allocator.free(req);
-        const response = try serveOneForTest(req);
-        defer t.allocator.free(response);
-        try t.expect(std.mem.indexOf(u8, response, c.status) != null);
-        try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
+    const old_edit = g_web_edit;
+    defer g_web_edit = old_edit;
+    for ([_]bool{ false, true }) |edit_default| {
+        g_web_edit = edit_default;
+        // --edit on only changes what a new chat starts with; it never writes on its own.
+        const extra = [_]Case{.{ .origin = "http://localhost:12345", .body = "{}", .status = "200 OK", .contains = if (edit_default) "\"edit_default\":true" else "\"edit_default\":false", .lacks = "write_file" }};
+        for (if (edit_default) &extra else &cases) |c| {
+            const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ c.origin, c.body.len, c.body });
+            defer t.allocator.free(req);
+            const response = try serveOneForTest(req);
+            defer t.allocator.free(response);
+            try t.expect(std.mem.indexOf(u8, response, c.status) != null);
+            try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
+            if (c.lacks.len > 0) try t.expect(std.mem.indexOf(u8, responseBody(response), c.lacks) == null);
+        }
     }
 }
 

@@ -835,8 +835,10 @@ pub const ForcedCall = struct {
 /// Read the forced call from the template's own rendering of an assistant tool
 /// call. Null when the template renders no think closer before the call to
 /// anchor on, or no delimiter after the function name.
-pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
-    const probe_name = "__sushi_forced_call_probe__";
+const probe_name = "__sushi_forced_call_probe__";
+
+/// The template's rendering of a turn whose assistant calls `probe_name` after a closed thought.
+fn renderProbeCall(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
     const calls = [_]ToolCall{.{ .id = "call_probe", .name = probe_name, .arguments = "{\"a\": \"v\"}" }};
     const probe = [_]Message{
         .{ .role = "user", .content = "u" },
@@ -844,17 +846,40 @@ pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConf
     };
     const extra_json = try serializeExtraContext(allocator, chat_config, true, null);
     defer allocator.free(extra_json);
-    const rendered = (try templateProbeRender(allocator, chat_config.chat_template, extra_json, &probe)) orelse return null;
-    defer allocator.free(rendered);
+    return templateProbeRender(allocator, chat_config.chat_template, extra_json, &probe);
+}
 
+/// Where the probe's call markup sits: `between` runs from the think closer to the name.
+const ProbeCall = struct { between: []const u8, head: []const u8, after: []const u8 };
+
+fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
     const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], BARE_THINK_CLOSER) orelse return null;
     const between = rendered[closer_at + BARE_THINK_CLOSER.len .. name_at];
     const head = std.mem.trimStart(u8, between, " \t\r\n");
     if (head.len == 0) return null;
-    const sep = between[0 .. between.len - head.len];
+    return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
+}
 
-    const after = rendered[name_at + probe_name.len ..];
+/// The `<tag>` the template opens every tool call with (`<tool_call>`), or null when its call
+/// markup does not start with one.
+pub fn callOpener(allocator: std.mem.Allocator, chat_config: *const ChatConfig) !?[]u8 {
+    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    defer allocator.free(rendered);
+    const head = (locateProbeCall(rendered) orelse return null).head;
+    if (head[0] != '<') return null;
+    const end = std.mem.indexOfScalar(u8, head, '>') orelse return null;
+    return try allocator.dupe(u8, head[0 .. end + 1]);
+}
+
+pub fn forcedCallText(allocator: std.mem.Allocator, chat_config: *const ChatConfig, name: ?[]const u8) !?ForcedCall {
+    const rendered = (try renderProbeCall(allocator, chat_config)) orelse return null;
+    defer allocator.free(rendered);
+    const at = locateProbeCall(rendered) orelse return null;
+    const head = at.head;
+    const sep = at.between[0 .. at.between.len - head.len];
+
+    const after = at.after;
     var delim: usize = 0;
     while (delim < after.len and delim < 4 and !nameByte(after[delim]) and !std.ascii.isWhitespace(after[delim]) and after[delim] != '<') delim += 1;
     if (delim == 0) return null;
@@ -6832,16 +6857,19 @@ fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
     const fn_start_tag = "<function=";
     const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
-    const name_start = fn_start + fn_start_tag.len;
-    const name_end = std.mem.indexOf(u8, block[name_start..], ">") orelse return null;
-    const fn_name = std.mem.trim(u8, block[name_start .. name_start + name_end], " \n");
+    var name_start = fn_start + fn_start_tag.len;
+    while (name_start < block.len and std.ascii.isWhitespace(block[name_start])) name_start += 1;
+    // A name never spans a line or a tag: a newline or `<` before the `>` means the model
+    // dropped the `>`, so the name ends there and the body starts there.
+    const name_end = std.mem.indexOfAnyPos(u8, block, name_start, ">\n\r<") orelse return null;
+    const fn_name = std.mem.trim(u8, block[name_start..name_end], " \t");
     if (!isPlausibleParamName(fn_name)) return null;
 
     var args_map = std.ArrayList(u8).empty;
     defer args_map.deinit(allocator);
     args_map.append(allocator, '{') catch return null;
 
-    const fn_body_start = name_start + name_end + 1;
+    const fn_body_start = if (block[name_end] == '>') name_end + 1 else name_end;
     const fn_end = blk: {
         var from = fn_body_start;
         while (std.mem.indexOfPos(u8, block, from, "</function>")) |found| {
@@ -8213,6 +8241,34 @@ test "parseToolCalls recovers a bare <function=> call with NO <tool_call> opener
     defer parsed.deinit();
     try testing.expectEqualStrings("/tmp/index.html", parsed.value.object.get("file_path").?.string);
     try testing.expectEqualStrings("<!DOCTYPE html>\n<html></html>", parsed.value.object.get("content").?.string);
+}
+
+test "parseHermesToolCall ends a function name whose > is missing at the line break" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { text: []const u8, path: ?[]const u8 }{
+        .{ .text = "<tool_call>\n<function=read_file\n</parameter>\n</function>\n</tool_call>", .path = null },
+        .{ .text = "<tool_call>\n<function=read_file\n<parameter=path>\n./a.txt\n</parameter>\n</function>\n</tool_call>", .path = "./a.txt" },
+        .{ .text = "<tool_call>\n<function=read_file<parameter=path>./a.txt</parameter></function>\n</tool_call>", .path = "./a.txt" },
+    };
+    for (cases) |case| {
+        const calls = (try parseToolCalls(allocator, case.text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("read_file", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        if (case.path) |p| {
+            try testing.expectEqualStrings(p, parsed.value.object.get("path").?.string);
+        } else {
+            try testing.expectEqual(@as(usize, 0), parsed.value.object.count());
+        }
+    }
 }
 
 test "parseHermesToolCall never emits invalid JSON on a malformed <parameter=> tag" {

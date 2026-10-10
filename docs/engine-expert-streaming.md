@@ -5,8 +5,8 @@ the zero-copy slab I/O and the correctness bars. Read this before touching `src/
 `src/expert_io.zig` or `src/glm5_stream.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
-[engine-memory-admission](engine-memory-admission.md), [arch-qwen4exp](arch-qwen4exp.md),
-[arch-mimo-v2](arch-mimo-v2.md), [arch-glm5-next](arch-glm5-next.md), [server-lifecycle](server-lifecycle.md#settings).
+[engine-memory-admission](engine-memory-admission.md), [qwen4-arch](qwen4-arch.md),
+[mimo2-arch](mimo2-arch.md), [glm5-arch](glm5-arch.md), [server-lifecycle](server-lifecycle.md#settings).
 
 ## Code map
 
@@ -196,10 +196,17 @@ Imatrix capture rides the streamed bf16 forward (`SUSHI_IMATRIX_OUT=<abs>.safete
 per-layer per-expert sum(x²) and routed counts accumulate ON the GPU keyed by GLOBAL expert ids (slab slots are
 remapped), in the collector's contract the converter reads; the flush runs on the INFERENCE thread (loop exit or
 `/v1/unload-model`), never on `Scheduler.deinit`'s caller thread. MiMo's o_proj and lm_head inputs ride the same
-file as per-channel mean squares under their source weight names ([arch-mimo-v2](arch-mimo-v2.md)). The drivers that feed it a corpus live in the private
+file as per-channel mean squares under their source weight names ([mimo2-arch](mimo2-arch.md)). The drivers that feed it a corpus live in the private
 converter repo. Routed counts reconcile to
 tokens x top-k exactly on every layer; the two load-time warmup forwards add a few tokens.
 
+- **GLM**: the native BF16 teacher capture (`sushi kld capture --layer-major`, also window-major) accumulates the same file
+  from `Stream.apply`: the MLP input and the clamped SwiGLU activation rows, keyed by the router's global expert ids,
+  under the source names `model.language_model.layers.{L}.mlp.experts.*`. `--imatrix-windows N` counts only the first N
+  windows (a batch never straddles the cut), so held-out windows can ride the same pass for the tune's boundaries.
+  A layer-major run resumes with its sums: each committed batch leaves `imatrix-<windows>.safetensors` (raw
+  accumulators) in `<out>.partial`, and a resume without the matching file is refused (`GlmLayerMajorImatrixStateMissing`).
+  Only BF16 experts are observed; any other layout is refused (`GlmImatrixNeedsBf16Experts`).
 - **Hidden capture** (`SUSHI_HIDDEN_OUT=<abs dir>`): `sushi kld capture` (no prefix cache, no warmup) appends every
   prompt token's residual at each block boundary (`boundary-XX.bin`, raw bf16 [tokens, hidden]; 00 = layer 0's input,
   b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` and the native GLM teacher (all four

@@ -17,7 +17,9 @@ const history = [
   { role: 'tool', tool_call_id: 'c1', content: 'Found a page' },
 ];
 assert.equal(context.buildRequest('test', history).tools, undefined);
+assert.equal(context.buildRequest('test', history).tool_choice, 'none', 'no tools offered: the server bans call markup');
 assert.deepEqual(context.buildRequest('test', history, tools).tools, tools);
+assert.equal(context.buildRequest('test', history, tools).tool_choice, undefined);
 const wire = context.wireMessages(history);
 assert.equal(wire.length, 3);
 assert.equal(wire[1].tool_calls[0].id, 'c1');
@@ -38,15 +40,18 @@ const call = (id) => ({ id, type: 'function', function: { name: 'web_search', ar
       return { text: '', tool_calls: [call(`c${count}`)] };
     }
     assert.equal(defs, null);
+    assert.equal(messages.at(-1).role, 'user');
+    assert.match(messages.at(-1).content, /Answer now/);
     return { text: 'Done', tool_calls: [] };
   };
-  context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); executed++; return { text: 'Result' }; };
+  context.callResearchTools = async (body) => { assert.equal(body.directory, "/selected/chat/folder"); assert.equal(body.write, true); executed++; return { text: 'Result' }; };
   const messages = [];
-  await context.runResearchTurn('test', messages, { aborted: false }, tools, false, '/selected/chat/folder');
+  await context.runResearchTurn('test', messages, { aborted: false }, tools, false, '/selected/chat/folder', true);
   assert.equal(count, 9);
   assert.equal(executed, 8);
   assert.equal(messages.at(-1).content, 'Done');
   assert.equal(messages.filter((m) => m.role === 'tool').length, 8);
+  assert.ok(!messages.some((m) => /Answer now/.test(m.content)), 'the nudge rides the last request only, never the saved chat');
 
   const signal = { aborted: false };
   context.streamReply = async () => ({ text: '', tool_calls: [call('a'), call('b')] });
@@ -104,6 +109,64 @@ assert.equal(context.toolCallLabel(history[1].tool_calls[0]), 'web_search · sus
 assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{"url":"https://example.com/article"}' } }), 'fetch_url · https://example.com/article');
 assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: '{"query":"one\\ntwo"}' } }), 'web_search · one two');
 assert.equal(context.toolCallLabel({ function: { name: 'read_file', arguments: '{"path":"README.md"}' } }), 'read_file · README.md');
+assert.equal(context.toolCallLabel({ function: { name: 'write_file', arguments: '{"path":"notes.md","content":"x"}' } }), 'write_file · notes.md');
+assert.equal(context.toolCallLabel({ function: { name: 'edit_file', arguments: '{"path":"sub/a.md","old_string":"x"}' } }), 'edit_file · sub/a.md');
 assert.equal(context.toolCallLabel({ function: { name: 'fetch_url', arguments: '{' } }), 'fetch_url');
 assert.equal(context.toolCallLabel({ function: { name: 'web_search', arguments: 'null' } }), 'web_search');
 console.log('Web UI tool labels: passed');
+/* The pencil chip: per-chat state, reset to the --edit default when the folder changes. */
+const editStart = script.indexOf('function chatDirectory(');
+const editNodes = {};
+const editEl = (id) => (editNodes[id] ??= { id, textContent: '', title: '', disabled: null, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+const editCtx = vm.createContext({
+  $: editEl,
+  toolsEnabled: true,
+  chatAbort: null,
+  currentChat: null,
+  draftDirectory: '',
+  draftEdit: false,
+  editDefault: false,
+  touchChat: () => {},
+  callResearchTools: async () => ({ edit_default: true }),
+});
+vm.runInContext(script.slice(editStart, script.indexOf('let folderSelection', editStart)), editCtx);
+
+(async () => {
+  editCtx.currentChat = { id: 'c1', directory: '/a', edit: false };
+  editCtx.renderDirectoryButton();
+  assert.equal(editCtx.chatEdit(), false);
+  assert.equal(editNodes.editButton.hidden, false, 'no server flag is needed to switch it');
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.currentChat.edit, true);
+  assert.equal(editNodes.editName.textContent, 'Edit on');
+  assert.equal(editNodes.editButton.attrs['aria-pressed'], 'true');
+  editCtx.setChatDirectory('/b');
+  assert.equal(editCtx.currentChat.directory, '/b');
+  assert.equal(editCtx.currentChat.edit, false, 'editing starts over from the default on another folder');
+
+  editCtx.currentChat = null;
+  editCtx.draftEdit = true;
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.draftEdit, false, 'the pencil toggles the draft chat too');
+
+  await editCtx.loadEditDefault();
+  assert.equal(editCtx.editDefault, true);
+  assert.equal(editCtx.draftEdit, true, '--edit on starts a new chat with editing on');
+  editCtx.currentChat = { id: 'c2', directory: '/a', edit: false };
+  editCtx.setChatDirectory('/c');
+  assert.equal(editCtx.currentChat.edit, true);
+  editNodes.editButton.onclick();
+  assert.equal(editCtx.currentChat.edit, false, '--edit on is a default, not a lock');
+
+  editCtx.toolsEnabled = false;
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.hidden, true, 'no tool pack, no edit chip');
+  editCtx.toolsEnabled = true;
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.hidden, false);
+  assert.equal(editNodes.editName.textContent, 'Edit off');
+  editCtx.chatAbort = {};
+  editCtx.renderEditButton();
+  assert.equal(editNodes.editButton.disabled, true, 'fixed while a reply runs');
+  console.log('Web UI edit chip: per-chat state, folder reset, --edit default passed');
+})().catch((error) => { console.error(error); process.exit(1); });

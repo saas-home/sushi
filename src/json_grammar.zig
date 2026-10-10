@@ -22,6 +22,7 @@
 //!   * `enum` / `const` (prefix-matched against canonical JSON encoding)
 //!   * `minItems` / `maxItems`
 //!   * `minLength` / `maxLength` on strings
+//!   * `$ref` to a local pointer (resolved in json_schema.zig; others relax to any)
 //! Best-effort (relaxed) — accept any valid JSON value, rely on prompt for shape:
 //!   * `anyOf` / `oneOf` — treated as "any JSON value" inside the union
 //!   * `pattern`, `minimum`, `maximum`, `exclusiveMinimum/Maximum` — soft prompt-only
@@ -392,7 +393,6 @@ fn canAcceptFreeWhitespace(frame: *const Frame) bool {
 fn stepExpectValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
     const schema = g.top().schema;
     return switch (schema.kind) {
-        .any => try startAnyValue(g, byte),
         .null_ => try startKeyword(g, byte, "null"),
         .boolean => switch (byte) {
             't' => try startKeyword(g, byte, "true"),
@@ -404,9 +404,9 @@ fn stepExpectValue(g: *Grammar, byte: u8) std.mem.Allocator.Error!StepResult {
         .array => startArray(g, byte),
         .object => startObject(g, byte),
         .enum_ => startEnum(g, byte),
-        .any_of => blk: {
-            // Relaxed: accept any valid JSON value here.
-            // Replace the schema with `any` and re-dispatch.
+        .any, .any_of => blk: {
+            // Relaxed: accept any valid JSON value here. A parsed `any` node allows
+            // no extra keys, so swap in the free-form one and re-dispatch.
             g.top().schema = anyNode();
             break :blk try startAnyValue(g, byte);
         },
@@ -1349,4 +1349,52 @@ test "no reachable grammar state is a dead end" {
             }
         }
     }
+}
+
+test "a value whose schema names no type accepts any object" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","required":["meta"],"properties":{"meta":{"description":"free-form"}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"meta\":{\"k\":[1,{\"x\":null}]}}");
+    try testing.expect(g.isComplete());
+}
+
+test "grammar enforces a $ref into $defs like the inlined schema" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","additionalProperties":false,"required":["facts"],
+        \\ "properties":{"facts":{"type":"array","items":{"$ref":"#/$defs/Fact"}}},
+        \\ "$defs":{"Fact":{"type":"object","additionalProperties":false,"required":["kind"],
+        \\   "properties":{"kind":{"enum":["fact"]}}}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"facts\":[{\"kind\":\"fact\"}]}");
+    try testing.expect(g.isComplete());
+
+    var bad = try Grammar.init(testing.allocator, &schema);
+    defer bad.deinit();
+    try testing.expectError(error.GrammarRejected, feed(&bad, "{\"facts\":[false"));
+}
+
+test "grammar enforces a recursive $ref at every depth" {
+    var schema = try parseSchema(testing.allocator,
+        \\{"type":"object","additionalProperties":false,"required":["name"],
+        \\ "properties":{"name":{"type":"string"},"children":{"type":"array","items":{"$ref":"#"}}}}
+    );
+    defer schema.deinit();
+
+    var g = try Grammar.init(testing.allocator, &schema);
+    defer g.deinit();
+    try feed(&g, "{\"name\":\"a\",\"children\":[{\"name\":\"b\",\"children\":[{\"name\":\"c\"}]}]}");
+    try testing.expect(g.isComplete());
+
+    var bad = try Grammar.init(testing.allocator, &schema);
+    defer bad.deinit();
+    try testing.expectError(error.GrammarRejected, feed(&bad, "{\"name\":\"a\",\"children\":[{\"x"));
 }

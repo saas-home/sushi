@@ -15,6 +15,12 @@ earlier history is mlx-serve's, in that project's changelog.
   output.
 - **EXL3 packs**: expert rates from 1.5 bits per weight take the fast decode and prefill kernels on every served
   architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
+- **Structured output**: a `response_format` schema property that names no type (a bare `description`, `true` or `{}`) now accepts any JSON object instead of only `{}`.
+- **Structured output**: `response_format` schemas may use `$ref` to `#`, `#/$defs/Name` or `#/definitions/Name`, recursive refs included, so nested Pydantic or Zod models are enforced instead of collapsing to `{}`.
+- **Tool calls**: a `<function=name` whose closing `>` the model dropped is recovered with its parameters instead of the call being lost as plain text.
+- **File tools**: the chat page and `sushi run` can let the model add and edit files (`write_file`, `edit_file`) in the folder you choose for the chat; the Edit chip (shown while Tools is on) or `/edit on|off` switches it per conversation, off unless the server was launched with `--edit on`, and every write stays inside that folder.
+- **Tool calls**: `tool_choice: "none"` on chat completions now stops the model from writing a tool call as plain text after earlier calls in the conversation; the chat page and `sushi run` send it on their final, tool-less round, which no longer shows raw `<tool_call>` markup.
+- **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
 
 ---
 
