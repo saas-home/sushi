@@ -21,7 +21,6 @@ const SSMCacheEntry = trf.SSMCacheEntry;
 const capBufAppend = trf.capBufAppend;
 const diagEnvOnCached = trf.diagEnvOnCached;
 const diagEnvValueOn = trf.diagEnvValueOn;
-const envFlagCached = trf.envFlagCached;
 const fusedSdpa256Masked = trf.fusedSdpa256Masked;
 const gatherQsa256 = trf.gatherQsa256;
 const gatherQsa256Packed = trf.gatherQsa256Packed;
@@ -31,7 +30,6 @@ const getQsaSelectSplitMergeKernel = qwen4_forward.getQsaSelectSplitMergeKernel;
 const log = trf.log;
 const markPosOf = qwen4_forward.markPosOf;
 const qsaAttnKernelEnabled = trf.qsaAttnKernelEnabled;
-const qsaAttnMinS = trf.qsaAttnMinS;
 const qsaBatchedGatherEnabled = trf.qsaBatchedGatherEnabled;
 const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
 const qsaDecodeGatherEnabled = trf.qsaDecodeGatherEnabled;
@@ -51,7 +49,6 @@ const qsaScoreRowsPerChunkFused = trf.qsaScoreRowsPerChunkFused;
 const qsaScoreSheetComposed = trf.qsaScoreSheetComposed;
 const qsaSelectKernelEnabled = trf.qsaSelectKernelEnabled;
 const qsaSelectSplitEnabled = trf.qsaSelectSplitEnabled;
-const qsaSelectTg = trf.qsaSelectTg;
 const qsaSparseAttn = trf.qsaSparseAttn;
 const qsaSparseAttnServes = trf.qsaSparseAttnServes;
 const qsaVerifyGatherAttn = trf.qsaVerifyGatherAttn;
@@ -66,10 +63,8 @@ const verifyQmmNaxAvailable = trf.verifyQmmNaxAvailable;
 
 pub fn qsaPrefillGatherMinKv() c_int {
     if (trf.qsa_gather_min_kv_override != null) return qsaGatherMinKv();
-    const raw = std.c.getenv("SUSHI_QSA_GATHER_MIN_KV");
-    if (raw != null) return qsaGatherMinKv();
     const serving = qsaNaxEnabled() and qsaNaxOsOk() and verifyQmmNaxAvailable();
-    return qsaPrefillGatherMinKvFrom(FUSED256_MIN_Q_LEN, serving, null, null);
+    return qsaPrefillGatherMinKvFrom(FUSED256_MIN_Q_LEN, serving, null);
 }
 
 pub var qsa_batched_gather_logged: bool = false;
@@ -357,15 +352,13 @@ pub const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ 
 
 pub const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_MERGE_SETUP, QSA_SELECT_RADIX_BODY });
 
-/// Threads per row-threadgroup. `SUSHI_QSA_SELECT_TG=256|512|1024` is the A/B. Read once.
+/// Threads per row-threadgroup.
 pub const QSA_SELECT_TG_DEFAULT: c_int = 1024;
 
 // A row's threadgroup is a per-shape choice: the wide passes of a prefill chunk run more
 // rows concurrently at 256 threads, a narrow pass wants 512, and the decode widths keep
 // 1024 (the split kernels size their own slices). Outputs are identical at every width.
 pub fn qsaSelectTgFor(rows: c_int) c_int {
-    const forced = qsaSelectTg();
-    if (forced != 0) return forced;
     if (rows >= 256) return 256;
     if (rows >= 64) return 512;
     return QSA_SELECT_TG_DEFAULT;
@@ -454,7 +447,7 @@ pub fn qsaSelectTopBlocks(
     qsa_index_select_graphs += 1;
     if (qsa_select_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
-            "[qsa-select] engaged (S={d} nb={d} k={d} tg={d}) — SUSHI_QSA_SELECT_KERNEL=0 restores the argpartition chain\n",
+            "[qsa-select] engaged (S={d} nb={d} k={d} tg={d})\n",
             .{ rows, nb, kb, tg },
         );
     }
@@ -513,9 +506,8 @@ pub fn qsaSelectTopBlocksSplit(
     const loc_count = std.math.mul(c_int, kb, g) catch return null;
     const local_kernel = getQsaSelectSplitLocalKernel() catch return null;
     const merge_kernel = getQsaSelectSplitMergeKernel() catch return null;
-    const forced = qsaSelectTg();
-    const slice_tg: c_int = if (forced != 0) forced else 512;
-    const merge_tg: c_int = if (forced != 0) forced else QSA_SELECT_TG_DEFAULT;
+    const slice_tg: c_int = 512;
+    const merge_tg: c_int = QSA_SELECT_TG_DEFAULT;
     const digits = qsaSelectDigitBits(rows);
     const key = QsaSelectSplitCfgKey{ .rows = rows, .k = kb, .slice_tg = slice_tg, .merge_tg = merge_tg, .digits = digits };
     const cfgs: [2]mlx.mlx_fast_metal_kernel_config = trf.qsa_select_split_cfgs.get(key) orelse blk: {
@@ -563,7 +555,7 @@ pub fn qsaSelectTopBlocksSplit(
     try mlx.check(mlx.mlx_vector_array_get(&out, merge_out_vec, 0));
     if (qsa_select_split_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
-            "[qsa-select] engaged (split G={d} S={d} nb={d} k={d} tg={d}) — SUSHI_QSA_SELECT_SPLIT=0 restores the single-threadgroup kernel\n",
+            "[qsa-select] engaged (split G={d} S={d} nb={d} k={d} tg={d})\n",
             .{ g, rows, nb, kb, slice_tg },
         );
     }
@@ -797,7 +789,6 @@ pub fn qsaBatchedGatherAttn(
     if (views.len != n or blocks.len != n) return error.QsaBatchedGatherLen;
     if (masks.len != 0 and masks.len != n) return error.QsaBatchedGatherLen;
     if (out_arms.len != 0 and out_arms.len != n) return error.QsaBatchedGatherLen;
-    const fused_min_s = qsaAttnMinS();
     const standin_sdpa = qwen4Standin().attn_sdpa;
     var outs = try allocator.alloc(mlx.mlx_array, n);
     defer allocator.free(outs);
@@ -824,7 +815,7 @@ pub fn qsaBatchedGatherAttn(
         ));
         var gathered: ?mlx.mlx_array = null;
         const qsa_ok = blk.ctx != null and slot_mask.ctx == null and !standin_sdpa;
-        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, fused_min_s)) {
+        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
             gathered = try qsaAlignedSparseAttn(s, q_slot, kv_view, blk, ratio, attn_scale, budget);
         }
         if (gathered == null and qsa_ok and seq_len == 1) {
@@ -1238,7 +1229,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     const kv: c_int = offset + seq_len;
     entry.qsa_ratio = ratio;
     if (!qsaEntrySatisfiesForward(entry, offset)) return error.QsaHistoryGap;
-    if (envFlagCached(&qwen4_forward.qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
+    if (diagEnvOnCached(&qwen4_forward.qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
     if (nb > nb_cached) {
@@ -1330,7 +1321,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     }
 
     // Pooled block keys: mean of leftover + this chunk, already appended above.
-    if (envFlagCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (diagEnvOnCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
         const qs = mlx.getShape(entry.qsa_pooled);
         std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
     }
@@ -1343,7 +1334,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     // A packed cache gathers at every width (split-K, packed, or from its rebuild), never the mask arm.
     const quantized = ctx.cache.config.scheme == .affine;
     const row_sparse = qsaAttnKernelEnabled() and
-        (qsaSparseAttnServes(quantized, seq_len, qsaAttnMinS()) or (quantized and seq_len >= FUSED256_MIN_Q_LEN));
+        (qsaSparseAttnServes(quantized, seq_len) or (quantized and seq_len >= FUSED256_MIN_Q_LEN));
     const nax_geometry = seq_len >= FUSED256_MIN_Q_LEN and ratio == 4 and block_topk == 512 and cfg.head_dim == 256 and
         cfg.num_attention_heads == 24 and cfg.num_key_value_heads == 2 and mlx.mlx_array_dtype(qk) == .bfloat16;
     const gather_floor = if (nax_geometry) qsaPrefillGatherMinKv() else qsaGatherMinKv();
@@ -1379,7 +1370,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     const scores = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
     defer _ = mlx.mlx_array_free(scores);
 
-    if (envFlagCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (diagEnvOnCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
         try mlx.check(mlx.mlx_astype(&f, scores, .float32, self.s));
@@ -1619,7 +1610,7 @@ pub fn qsaBatchedAttn(
     }
     if (!qsa_batched_gather_logged) {
         qsa_batched_gather_logged = true;
-        log.info("[qsa-batched-gather] engaged (slots={d} S={d}) — SUSHI_QSA_BATCHED_GATHER=0 restores the dense padded mask\n", .{ slots.len, seq_len });
+        log.info("[qsa-batched-gather] engaged (slots={d} S={d})\n", .{ slots.len, seq_len });
     }
     const stacked = try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, slot_masks, ratio, attn_scale, arms, @intCast(self.config.indexer_budget));
     for (slots, arms) |slot_ctx, arm| {

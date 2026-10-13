@@ -35,7 +35,8 @@ pub const Options = struct {
     ctx_size: u32 = 0,
     /// Dense, not the serving default: the teacher adds no quantization of its own.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
-    expert_cache_bytes: u64 = 0,
+    /// `--qwen-gdn 16` stores the GDN state in bf16, so a student arm can be scored against the f32 teacher.
+    qwen_gdn_f32: bool = true,
     ssd_budget_bytes: u64 = 0,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
@@ -81,8 +82,8 @@ const ValueFlag = enum {
     limit,
     ctx_size,
     kv_quant,
+    qwen_gdn,
     ssd_budget_gb,
-    expert_cache_gb,
     expert_pick_tolerance,
     wired_margin_gib,
     batch_windows,
@@ -90,8 +91,7 @@ const ValueFlag = enum {
     pause_file,
 };
 
-fn valueFlag(name: []const u8) ?ValueFlag {
-    const table = [_]struct { []const u8, ValueFlag }{
+const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--model", .model },
         .{ "--prompts", .prompts },
         .{ "--out", .out },
@@ -103,15 +103,17 @@ fn valueFlag(name: []const u8) ?ValueFlag {
         .{ "--limit", .limit },
         .{ "--ctx-size", .ctx_size },
         .{ "--kv-quant", .kv_quant },
+        .{ "--qwen-gdn", .qwen_gdn },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
-        .{ "--expert-cache-gb", .expert_cache_gb },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
         .{ "--batch-windows", .batch_windows },
         .{ "--imatrix-windows", .imatrix_windows },
         .{ "--pause-file", .pause_file },
-    };
-    for (table) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
+};
+
+fn valueFlag(name: []const u8) ?ValueFlag {
+    for (value_flags) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
     return null;
 }
 
@@ -161,8 +163,8 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .limit => o.limit = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
+                .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
-                .expert_cache_gb => o.expert_cache_bytes = server_mod.parseExpertCacheGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
                 .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
@@ -198,12 +200,18 @@ pub const USAGE =
     \\  a captured fixture dir (its prompts are reused), a directory of
     \\  *.txt files (one prompt each, sorted by name), or a .jsonl of
     \\  {"id":...,"prompt":...} lines; a line may give "prompt_ids":[...]
-    \\  (token ids, used as given) instead of "prompt".
+    \\  (token ids, used as given) instead of "prompt", and with it
+    \\  "continuation_ids":[...] that capture scores teacher-forced
+    \\  instead of generating a continuation.
     \\
     \\  SUSHI_HIDDEN_OUT=<dir> makes capture append each prompt forward's
     \\  residual at every block boundary to <dir> (boundary-XX.bin, tokens.bin).
     \\
     \\options:
+    \\  --model <dir>         pack or checkpoint to capture from / score
+    \\  --prompts <src>       capture: the prompt source (see above)
+    \\  --out <dir>           capture: fixture output directory
+    \\  --fixture <dir>       compare: teacher fixture directory
     \\  --tokens <n>          greedy tokens per prompt to capture (default 64)
     \\  --top-k <n>           top_k recorded in baseline.json (default 10)
     \\  --label <s>           label/run recorded in the output (default sushi)
@@ -212,9 +220,12 @@ pub const USAGE =
     \\  --json <file>         compare: write the numbers as JSON
     \\  --ctx-size <n>        context length override
     \\  --kv-quant <16|8|4>   KV cache quantization (16 = BF16, also off)
+    \\  --qwen-gdn <32|16>    Qwen only: bits of the GatedDeltaNet recurrent state (default 32 =
+    \\                        f32; 16 = bf16, the decay gate is f32 either way). A student at 16 is
+    \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
-    \\  --expert-cache-gb <n> streamed expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
+    \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
@@ -291,6 +302,11 @@ fn rowNll(row: []const f32, chosen: u32) f64 {
     return max + @log(sum) - @as(f64, row[chosen]);
 }
 
+/// The token row `step` is scored against: the forced continuation's, else the greedy one.
+fn pickToken(force: ?[]const u32, step: usize, row: []const f32) u32 {
+    return if (force) |f| f[step] else argmaxOf(row);
+}
+
 fn argmaxOf(row: []const f32) u32 {
     var best: usize = 0;
     var best_v = -std.math.inf(f64);
@@ -303,8 +319,9 @@ fn argmaxOf(row: []const f32) u32 {
     return @intCast(best);
 }
 
-/// `ids` set: the prompt is these token ids as given (no template, no tokenizer).
-pub const Prompt = struct { id: []u8, text: []u8, ids: ?[]u32 = null };
+/// `ids` set: the prompt is these token ids as given (no template, no tokenizer). `force` set (needs `ids`): capture
+/// scores this continuation teacher-forced instead of generating one.
+pub const Prompt = struct { id: []u8, text: []u8, ids: ?[]u32 = null, force: ?[]u32 = null };
 
 pub const PromptList = struct {
     allocator: std.mem.Allocator,
@@ -315,6 +332,7 @@ pub const PromptList = struct {
             self.allocator.free(p.id);
             self.allocator.free(p.text);
             if (p.ids) |ids| self.allocator.free(ids);
+            if (p.force) |f| self.allocator.free(f);
         }
         self.allocator.free(self.items);
         self.items = &.{};
@@ -348,6 +366,7 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
             allocator.free(p.id);
             allocator.free(p.text);
             if (p.ids) |ids| allocator.free(ids);
+            if (p.force) |f| allocator.free(f);
         }
         items.deinit(allocator);
     }
@@ -414,6 +433,9 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                 };
                 const ids = if (obj.get("prompt_ids")) |v| try tokenIdsField(allocator, v) else null;
                 errdefer if (ids) |i| allocator.free(i);
+                const force = if (obj.get("continuation_ids")) |v| try tokenIdsField(allocator, v) else null;
+                errdefer if (force) |f| allocator.free(f);
+                if (force != null and ids == null) return error.BadPromptJsonl;
                 const text = if (ids != null) try allocator.dupe(u8, "") else blk: {
                     const text_value = obj.get("prompt") orelse return error.BadPromptJsonl;
                     break :blk switch (text_value) {
@@ -428,7 +450,7 @@ pub fn loadPrompts(allocator: std.mem.Allocator, io: std.Io, path: []const u8, l
                     else => try std.fmt.allocPrint(allocator, "prompt-{d:0>2}", .{seq}),
                 } else try std.fmt.allocPrint(allocator, "prompt-{d:0>2}", .{seq});
                 errdefer allocator.free(id);
-                try items.append(allocator, .{ .id = id, .text = text, .ids = ids });
+                try items.append(allocator, .{ .id = id, .text = text, .ids = ids, .force = force });
                 seq += 1;
             }
         },
@@ -873,6 +895,7 @@ pub const Loaded = struct {
 pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Loaded {
     const self = try allocator.create(Loaded);
     errdefer allocator.destroy(self);
+    model_mod.qwen_gdn_f32 = opts.qwen_gdn_f32;
     self.* = .{
         .allocator = allocator,
         .io = io,
@@ -890,11 +913,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     if (expert_stream_mod.expertStreamingEngaged(
         self.config.supportsExpertStreaming(),
         self.config.expertStreamingRequired(),
-        opts.expert_cache_bytes,
         kld_budget.bytes,
     )) {
         const budget = kld_budget;
-        if (opts.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
+        if (budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, opts.enable_mtp, opts.mtp_explicit), self.config.mtp_override, false);
         switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default, false)) {
             .keep, .refuse => {
@@ -907,7 +929,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, opts.expert_cache_bytes, budget.bytes, false);
+        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
         scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
@@ -1143,13 +1165,14 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
         const row = try allocator.alloc(f32, vocab);
         defer allocator.free(row);
 
+        const steps: u32 = if (p.force) |f| @intCast(f.len) else opts.tokens;
         var step: u32 = 0;
-        while (step < opts.tokens) : (step += 1) {
+        while (step < steps) : (step += 1) {
             try readLastRow(&l.xfm, logits, row);
-            const chosen = argmaxOf(row);
+            const chosen = pickToken(p.force, step, row);
             try writer.appendRow(row, chosen);
             try generated.append(allocator, chosen);
-            if (step + 1 == opts.tokens) break;
+            if (step + 1 == steps) break;
             const next = try forwardOne(l, &ctx, chosen);
             _ = mlx.mlx_array_free(logits);
             logits = next;
@@ -1558,6 +1581,12 @@ fn teacherFixture(buf: []u8, io: std.Io) ?[]const u8 {
     return path;
 }
 
+test "kld: --help lists every flag the parser accepts" {
+    for (value_flags) |row| try testing.expect(std.mem.indexOf(u8, USAGE, row[0]) != null);
+    for ([_][]const u8{ "--no-template", "--mtp", "--no-mtp", "--layer-major" }) |name|
+        try testing.expect(std.mem.indexOf(u8, USAGE, name) != null);
+}
+
 test "kld: compare memory report serializes aggregate MLX byte counters" {
     const report = MemoryReport{
         .model_active_bytes = 11_000,
@@ -1940,8 +1969,6 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
         "8",
         "--ssd-budget-gb",
         "94",
-        "--expert-cache-gb",
-        "40",
         "--no-mtp",
     });
     try testing.expectEqual(Command.capture, capture.command);
@@ -1956,7 +1983,6 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(u32, 8192), capture.ctx_size);
     try testing.expectEqual(@as(u8, 8), capture.kv_quant_config.bits);
     try testing.expectEqual(@as(u64, 94) << 30, capture.ssd_budget_bytes);
-    try testing.expectEqual(@as(u64, 40) * 1_000_000_000, capture.expert_cache_bytes);
     try testing.expect(!capture.enable_mtp);
 
     const compare = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--json", "/tmp/out.json" });
@@ -1985,6 +2011,7 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectError(error.MissingFlagValue, parseArgs(&.{ "compare", "--model" }));
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--tokens", "zero" }));
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--kv-quant", "3" }));
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "fp32" }));
     try testing.expectError(error.MissingModel, parseArgs(&.{ "capture", "--prompts", "/p", "--out", "/o" }));
     try testing.expectError(error.MissingPrompts, parseArgs(&.{ "capture", "--model", "/m", "--out", "/o" }));
     try testing.expectError(error.MissingOut, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p" }));
@@ -1997,6 +2024,14 @@ test "kld: an unflagged capture keeps a full-width teacher KV, never the serving
     try testing.expectEqual(transformer_mod.KVQuantConfig.dense, capture.kv_quant_config);
     try testing.expect(transformer_mod.KVQuantConfig.engine_default.isQuant());
     try testing.expectEqualStrings("bf16", kvCacheFormat(capture.kv_quant_config));
+    try testing.expect(capture.qwen_gdn_f32);
+}
+
+test "kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width" {
+    const narrow = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--qwen-gdn", "16" });
+    try testing.expect(!narrow.qwen_gdn_f32);
+    const wide = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--qwen-gdn", "32" });
+    try testing.expect(wide.qwen_gdn_f32);
 }
 
 test "kld: the recorded strict NLL is the teacher's own log-softmax, as the capture wrote it" {
@@ -2757,4 +2792,30 @@ test "kld: GLM full-stream hidden capture retains chunked boundaries and native 
     const tokens = try tmp.dir.readFileAlloc(io, "hidden/tokens.bin", arena, .limited(1 << 20));
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&ids), tokens);
     try testing.expect(loaded.xfm.glm5_request.?.boundaries == null);
+}
+
+test "a jsonl line may force its continuation, and only after prompt_ids" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTextFile(io, tmp.dir, "ok.jsonl", "{\"id\":\"t\",\"prompt_ids\":[1,2,3],\"continuation_ids\":[4,5]}\n");
+    try writeTextFile(io, tmp.dir, "bad.jsonl", "{\"id\":\"t\",\"prompt\":\"x\",\"continuation_ids\":[4,5]}\n");
+    var path_buf: [512]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const ok_path = try std.fmt.allocPrint(a, "{s}/ok.jsonl", .{root});
+    defer a.free(ok_path);
+    var list = try loadPrompts(a, io, ok_path, 0);
+    defer list.deinit();
+    try testing.expectEqualSlices(u32, &.{ 4, 5 }, list.items[0].force.?);
+    const bad_path = try std.fmt.allocPrint(a, "{s}/bad.jsonl", .{root});
+    defer a.free(bad_path);
+    try testing.expectError(error.BadPromptJsonl, loadPrompts(a, io, bad_path, 0));
+}
+
+test "pickToken scores the forced token and falls back to the argmax" {
+    const row = [_]f32{ 0.1, 2.0, 0.3 };
+    try testing.expectEqual(@as(u32, 1), pickToken(null, 0, &row));
+    try testing.expectEqual(@as(u32, 2), pickToken(&.{ 2, 0 }, 0, &row));
+    try testing.expectEqual(@as(u32, 0), pickToken(&.{ 2, 0 }, 1, &row));
 }

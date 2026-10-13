@@ -14,6 +14,54 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ```
 A browser download is quarantined by macOS: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`.
 GPU memory and the largest context per Mac for each pack: [README, Memory](../README.md#memory).
+To download a pack and see which one suits your Mac: [`sushi pull` and `sushi list`](#sushi-pull-and-sushi-list).
+
+## `sushi pull` and `sushi list`
+
+`sushi pull <model>` downloads a Sushi pack into `~/.sushi/models/beamster/<repo>`; `sushi serve` and `sushi run`
+then load it by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`)
+or `beamster/<repo>`. Only packs of the Hugging Face org `beamster` are accepted; any other `org/repo` exits with an
+error before anything downloads (`sushi run <model>` follows the same rule when it has to download).
+
+`sushi list` shows each published pack with its size, whether it is downloaded and whether this Mac meets the pack's
+memory tier, and marks the pack it recommends for this Mac; the other models on disk follow. A Mac's tier is its
+installed RAM in whole GB (a 64 GB Mac reports 68.7e9 bytes and counts as 64):
+
+| pack | runs in memory from | recommended from |
+|---|---:|---:|
+| Qwen3.8-Flash-Next-Sushi-2bpw | 48 GB | 32 GB (streamed) |
+| Qwen3.8-Flash-Next-Sushi-2.6bpw | 64 GB | 64 GB |
+| Qwen3.8-Flash-Next-Sushi-3bpw | 64 GB | |
+| Qwen3.8-Flash-Next-Sushi-4bpw | 96 GB | 96 GB |
+| GLM-5.3-Flash-Sushi-2bpw | 96 GB | 96 GB |
+| GLM-5.3-Flash-Sushi-2.4bpw | 128 GB | 128 GB |
+| MiMo-V2.6-Flash-Sushi-2.3bpw | 128 GB | 128 GB |
+
+Each family recommends its largest pack the Mac reaches in the last column. `fits` means the Mac meets the pack's tier.
+Below it the pack is labelled `may stream (--ssd-budget-gb)`: it may still run with `--ssd-budget-gb`
+([README, Streaming on a 32 GB Mac](../README.md#streaming-on-a-32-gb-mac)), and nothing promises it does.
+`sushi pull` prints that warning before it downloads a pack below its tier, then pulls anyway. A pack whose repo
+Hugging Face does not return yet is listed as `(not yet published)` and `sushi pull` of it says so.
+
+On a 64 GB Mac:
+
+```
+$ sushi list
+This Mac: 64 GB
+
+PACK                                SIZE  DOWNLOADED  THIS MAC
+qwen3.8-flash-next:2bpw          64.8 GB  no          fits
+qwen3.8-flash-next:2.6bpw        73.7 GB  yes         fits  <- recommended
+qwen3.8-flash-next:3bpw          79.1 GB  no          fits
+qwen3.8-flash-next:4bpw         159.0 GB  no          may stream (--ssd-budget-gb)
+mimo-v2.6-flash:2.3bpw          100.7 GB  no          may stream (--ssd-budget-gb)
+glm-5.3-flash:2bpw               81.5 GB  no          may stream (--ssd-budget-gb)
+glm-5.3-flash:2.4bpw             93.2 GB  no          may stream (--ssd-budget-gb)
+```
+
+Sizes are the whole Hugging Face download and differ per release. A Qwen pack's size includes its n-gram table, which
+stays on the SSD and is not loaded into memory. With Hugging Face unreachable (no network, or no answer within a few
+seconds), `sushi list` prints one line saying so and lists only the models on disk, without sizes or recommendations.
 
 ## Recommended launch
 
@@ -26,12 +74,18 @@ sudo sysctl iogpu.wired_limit_mb=43000
 
 ```bash
 hf download beamster/Qwen3.8-Flash-Next-Sushi-2bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw
+# or: sushi pull qwen3.8-flash-next:2bpw   (lands in ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-2bpw)
 
-# images, 8-bit KV, 128k context
+# images, 8-bit KV, 128k context; --qwen-gdn 16 keeps the GatedDeltaNet state in bf16 (see below)
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 131072 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
+
+Every 32 GB, 48 GB and 64 GB Qwen recipe passes `--qwen-gdn 16` (the 32 GB one is in the
+[README](../README.md#streaming-on-a-32-gb-mac)): the recurrent state is f32 by default, and bf16 halves it in every
+cache checkpoint (about 54 MB each on Flash-Next), the memory these recipes are sized to. The 96 GB and larger recipes
+keep the f32 default.
 
 **64 GB Mac, Sushi-2.6bpw**
 
@@ -46,15 +100,16 @@ memory, so its answer is not the same on two 64 GB machines.
 
 ```bash
 hf download beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw
+# or: sushi pull qwen3.8-flash-next:2.6bpw   (lands in ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw)
 
 # 1. images, 8-bit KV — the default quality
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 250000 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 
 # 2. images, 4-bit KV — 1.8 times the context, at 8% KLD and 0.2 points of next-token agreement
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2.6bpw \
-  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 450000 \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 450000 \
   --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
@@ -65,15 +120,16 @@ At 4-bit KV the quality cost: mean KLD 0.1355 at 8-bit KV to 0.1458, and next-to
 ```bash
 sudo sysctl iogpu.wired_limit_mb=59000
 hf download beamster/Qwen3.8-Flash-Next-Sushi-3bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw
+# or: sushi pull qwen3.8-flash-next:3bpw   (lands in ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-3bpw)
 
 # 1. images, 8-bit KV — the default quality
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 128000 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 128000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 
 # 2. images, 4-bit KV — twice the context, at 9% KLD and 0.7 points of next-token agreement
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-3bpw \
-  --mtp --kv-quant 4 --mtp-head-kv-quant --ctx-size 256000 \
+  --mtp --kv-quant 4 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 256000 \
   --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
@@ -81,6 +137,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-3bpw --local-dir ~/.sushi/models/Q
 
 ```bash
 hf download beamster/Qwen3.8-Flash-Next-Sushi-4bpw --local-dir ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-4bpw
+# or: sushi pull qwen3.8-flash-next:4bpw   (lands in ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-4bpw)
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-4bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 \
   --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB \
@@ -89,7 +146,7 @@ hf download beamster/Qwen3.8-Flash-Next-Sushi-4bpw --local-dir ~/.sushi/models/Q
 
 Set the GPU memory limit before serving (it resets at reboot):
 ```bash
-sudo sysctl iogpu.wired_limit_mb=88000    # 96 GB Mac
+sudo sysctl iogpu.wired_limit_mb=90000    # 96 GB Mac
 sudo sysctl iogpu.wired_limit_mb=120000   # 128 GB Mac
 ```
 
@@ -98,6 +155,7 @@ sudo sysctl iogpu.wired_limit_mb=120000   # 128 GB Mac
 ```bash
 sudo sysctl iogpu.wired_limit_mb=120000
 hf download beamster/MiMo-V2.6-Flash-Sushi-2.3bpw --local-dir ~/.sushi/models/MiMo-V2.6-Flash-Sushi-2.3bpw
+# or: sushi pull mimo-v2.6-flash   (lands in ~/.sushi/models/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw)
 
 # images, 8-bit KV, MTP, the full 1M context
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/MiMo-V2.6-Flash-Sushi-2.3bpw --ctx-size 1048576
@@ -114,11 +172,25 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
 - Seen prompt prefixes live on the SSD by default, so a repeated prompt skips its prefill; the budget is sized per model and capped at 20GB, and `--prefix-cache-disk 20GB` sets it.
 - `--prefix-cache-entries 1` keeps one conversation's prefix; raise it to 4-8 when several agents share the server.
 
+**96 GB Mac, GLM-5.3-Flash-Sushi-2bpw**
+
+```bash
+sudo sysctl iogpu.wired_limit_mb=90000
+hf download beamster/GLM-5.3-Flash-Sushi-2bpw --local-dir ~/.sushi/models/GLM-5.3-Flash-Sushi-2bpw
+# or: sushi pull glm-5.3-flash:2bpw   (lands in ~/.sushi/models/beamster/GLM-5.3-Flash-Sushi-2bpw)
+
+# images and video, 8-bit KV, DFlash2 when present
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/GLM-5.3-Flash-Sushi-2bpw
+```
+
+- The auto context is 512K at 8-bit KV and 300K with `--kv-quant 16` (BF16 latent).
+
 **128 GB Mac, GLM-5.3-Flash-Sushi-2.4bpw**
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=120000
 hf download beamster/GLM-5.3-Flash-Sushi-2.4bpw --local-dir ~/.sushi/models/GLM-5.3-Flash-Sushi-2.4bpw
+# or: sushi pull glm-5.3-flash   (lands in ~/.sushi/models/beamster/GLM-5.3-Flash-Sushi-2.4bpw)
 
 # images and video, 8-bit KV, DFlash2 when present
 ./sushi-macos-arm64/sushi serve --model ~/.sushi/models/GLM-5.3-Flash-Sushi-2.4bpw

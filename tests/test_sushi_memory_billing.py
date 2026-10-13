@@ -38,8 +38,7 @@ def main():
     packs = args.pack or list(PACKS)
     for name in packs:
         assert (args.models / name / "config.json").is_file(), name
-    # Keep the native rerank defaults used by the audited reference bills.
-    env = {**os.environ, "SUSHI_MTP_DRAFT_RERANK": "1"}
+    env = dict(os.environ)
     env.pop("SUSHI_MTP_DRAFT_HEAD_BITS", None)  # Native defaults: Qwen 3 bits, MiMo 2 bits.
     owner = f"sushi-memory-live-{os.getpid()}"
     lock = root / "scripts/gpu-lock.sh"
@@ -64,7 +63,7 @@ def main():
         log_path = args.output / f"{label}.log"
         command = [str(binary), "serve", "--host", "127.0.0.1", "--port", str(run_port),
                    "--ctx-size", str(context), "--prefill-chunk", "512" if context < 1_000_000 else "2048",
-                   "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-pld", "--no-drafter"]
+                   "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
         command += ["--model", str(model)] if model else ["--model-dir", str(args.models)]
         command += list(flags)
         subprocess.run([str(lock), "acquire", owner], check=True)

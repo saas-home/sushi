@@ -300,6 +300,35 @@ Bounding readout saved about 1.1 ms of drafting, but N3 still lost on the longer
 three-row default remains; the faster four-row verifier also serves existing lookup chains and mixed-request ticks.
 The N3 policy/readout experiment and benchmark switches were removed from production code.
 
+<a id="glm-a5-verify"></a>
+## GLM DFlash2: A5 trunk takes the row tiles, hoist and decode QKV
+
+2026-10-11, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2bpw (A5 g128 trunk, A6 `lm_head`, K2 MCG W14 experts) against
+Sushi-2.4bpw (A6 g128 trunk). Before this change every 5-bit verify projection ran one stock qmv per row. Old binary
+= `57b7ec5e` (SHA256 prefix `915ff17920c65f41`), new = this change on `57b7ec5e` (`a2a6b8f914e01593`), both ReleaseFast.
+`sushi --serve` defaults (kv8 latent, A4 g64 DFlash2 from the pack), llmprobe 0.6.16 `--bench-only` default rungs,
+plus two greedy requests per boot. `taskpolicy -a`, GPU lock per boot, QUIET window (no `zig`/`clang` running),
+maximum fans, 3 min between boots, one boot per arm in the order shown.
+Verify is the median `glm_round_ms verify` over the 36–37 requests of each boot.
+
+| Arm | Power | Decode tok/s | Spec predictable / novel | Ladder ~4.2k / 8.3k / 16.3k | Verify ms/round |
+|---|---|---:|---:|---:|---:|
+| Sushi-2bpw, old | battery 94% | 45.4 (41.6–45.6) | 58.0 / 37.5 | 41.0 / 41.9 / 40.8 | 49.58 |
+| Sushi-2bpw, new | battery 85%, then AC | 53.3 (51.4–54.6) | 64.7 / 36.9 | 41.1 / 42.2 / 45.0 | 45.10 |
+| Sushi-2.4bpw, new (A6 path unchanged) | AC | 50.2 (46.9–50.2) | 60.2 / 37.7 | 46.7 / 47.8 / 44.4 | 44.60 |
+
+- Decode +17% on the same pack. At the 8.3k and 16.3k rungs, verify per round is 47.06 / 46.33 ms against 2.4bpw's
+  45.82 / 45.64 (old 2bpw: about 51.6). The ~512 rung is left out: new-2bpw's request there slowed every phase about
+  2.5x during the battery-to-AC switch, the untouched draft included (10.83 vs 4.12 ms).
+- The owner's recorded 2.4bpw run (`8896da54` era, the same llmprobe, rungs 2k–32k) read decode 54 (50.7–54.2), spec
+  65.2 / 41.9. Its ladder rungs differ from these, so only the headline cells compare.
+- Engagement in the new 2bpw log: `[glm] copy-free QKV engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged
+  (A5g128)`, `[glm-dflash] affine row tiles engaged (A5g128)`. The A6 lines come from `lm_head`. Both greedy answers
+  matched the old binary byte for byte in every 2bpw boot.
+- Component, `SUSHI_GLM_QMM_UBENCH` (3 rows, 12 distinct banks per arm, lock, not a quiet window): 8192x4096 serial
+  stock 0.104 ms, A5 hoist 0.0645, A5 row tiles 0.078 (A6 hoist 0.089); 4096x16384 0.210 / 0.130 / 0.146. An A5
+  hoist holding all 24 coefficients at once ran 0.191 ms, slower than the serial rows.
+
 <a id="glm-three-row-a6-offset"></a>
 ## GLM DFlash2: specialize the complete three-row A6 tile
 
@@ -354,6 +383,55 @@ tests, `taskpolicy -a`, GPU lock per boot, 2026-10-04: 2048-row chunks prefilled
 2048 for numerics
 ([glm5-kernels](glm5-kernels.md#prefill-chunk-2048-two-layers-pending)); a quiet-box A/B is owed.
 
+<a id="glm-a6-trunk-dense"></a>
+## Prefill: A6 dense-once beyond the KDA banks
+
+Per call at 2048 rows, qmm against dequantize + dense NAX GEMM, six calls per graph, medians of 9, arms interleaved in
+one process (`SUSHI_GLM_A6_SHAPES_UBENCH=1`, `a6296520` ancestry, `taskpolicy -a`, GPU lock, QUIET, AC). Bytes are
+compared with qmm on random banks.
+
+| K→N | projection | qmm | dense-once | bytes | served |
+|---|---|---|---|---|---|
+| 4096→1536 | MLA q_a | 0.747 ms | 0.662 (−11.3%) | equal | yes |
+| 1536→16384 | MLA q_b | 2.015 | 1.924 (−4.5%) | equal | yes |
+| 4096→512 | MLA kv_a | 0.341 | 0.324 (−5.2%) | equal | yes |
+| 1536→4096 | indexer wq_b | 0.670 | 0.637 (−4.9%) | equal | yes |
+| 4096→2048 | shared gate / up | 0.852 | 0.781 (−8.4%) | equal | no |
+| 2048→4096 | shared down | 0.818 | 0.765 (−6.6%) | equal | no |
+| gate + up stacked | 4096→4096 | 1.70 (two qmm) | 1.408 (−17%) | equal | no |
+| 4096→12288 | dense gate / up | 3.943 | 3.641 (−7.7%) | equal | no |
+| 12288→4096 | dense down | 4.203 | 3.958 (−5.8%) | 4421 of 8.4M differ | no |
+
+The served MLA shapes save about 2.7 ms of a roughly 2,470 ms chunk (0.1%), under run-to-run noise. They cost no bill: an
+MLA layer expands 140 MiB, a KDA layer's four banks 256 MiB. The shared expert would save about 15 ms a chunk (0.6%; the
+stacked gate/up GEMM with a packed-row activation kernel, 12.5 ms of it) but its transient (45 MiB for the stacked pair
+plus 16 MiB for down, per pending layer) moves the Sushi-2.5bpw 1M-context default from a 2048-row to a 1024-row prefill
+chunk (`GLM release defaults advertise the full context`: 16 MiB per layer still keeps 2048, 32 MiB does not), which also
+turns dense-once off. Kept off; the code is on branch `a6-shared-expert-held`. Model level for that arm, one boot,
+6,756-token prompt, `--no-drafter --prefix-cache-entries 0`, fans max, AC, old/new/new/old six times: paired `prompt_ms`
+−0.4% median (−1.1 to +2.3% per block against a 3% thermal drift), greedy text identical in all 24 requests.
+
+<a id="glm-prefill-pool-clear"></a>
+## Prefill: the per-chunk pool clear stays (A/B, not landed)
+
+The prefill chunk loop returns MLX's buffer pool after every chunk (`mlx_clear_cache` in `generate.zig`). Handing the
+pool to the next chunk instead lost on speed and on memory. Seam binary `d0d3216a` (main `e8c9c47e` plus PR #41 and a
+throwaway env arm), Sushi-2bpw at release defaults (kv8 latent, DFlash2), `--prefix-cache-entries 0`,
+`--prefill-trace`, llmprobe's prefill prompt builder at 8,210 and 16,505 tokens, a warmup then three timed requests per
+cell, `taskpolicy -a`, GPU lock per boot, fans at max, quiet window, boots A B B A, 2026-10-11 (another worker's benches
+ran between boots). Greedy output was equal in all 28 requests.
+
+| arm | 8K tok/s (boot medians) | 16K tok/s | peak footprint 8K / 16K | pool between chunks |
+|---|---|---|---|---|
+| clear every chunk (shipped) | 768.6, 796.5 | 721.7, 748.6 | 82.1 / 82.3 GB | 0 (2.2-3.0 GB before the clear) |
+| keep the pool | 721.7, 737.2 | 693.2, 708.3 | 85.1 / 85.4 GB | 2.9-3.2 GB; 5.5-6.0 after the last chunk |
+
+Keeping the pool: -6.8% at 8K and -4.7% at 16K, with every chunk slower (chunk 0 included) and the fastest keep boot
+under the slowest clear boot. The process footprint was 3 GB higher and `/props` `available_bytes` 4.4 GB lower after
+the run; `mlx_get_peak_memory` did not move (80.39 GiB). Qwen 2.6bpw at 9,134 tokens, one boot each: 2,221 → 2,121
+tok/s (-4.5%), footprint 47.5 → 48.5 GB. A chunk boundary spends 10-17 ms outside the forwards, about 5 ms of it in
+the clear, so the clear is not what idles the GPU between chunks.
+
 <a id="glm-longctx"></a>
 ## GLM-5.3-Flash: long-context profile and the exact index-scoring wins (contended)
 
@@ -402,6 +480,18 @@ Verify per round at 128K: 69.1 → 61.5 ms, so DFlash2 again beats serial there 
 peaked 2.14 GB above active at 32K and 2.80 GB at 128K (bill 4,984 MiB). A 2K prompt prefilled at 669 tok/s at 512
 rows and 853 at 2048 (one request each).
 
+Settle-one-behind tiles and 32-row selection (`12d2e5f6` + `ebb7224c`), Sushi-2.4bpw kv8, GPU lock + QUIET, `taskpolicy -a`.
+Whole attention per 2048-row chunk (`SUSHI_GLM_LONGCTX_UBENCH`, one MLA layer, contended box, 6K-32K): about 9 ms lower
+than the paired-tile schedule (57 → 48 ms at 6K-16K); the 32-row selection adds −1 to −1.4 ms (locked, quiet:
+48.7 vs 50.1 at 6K, 56.3 vs 57.5 at 16K). Model level, one boot with a per-request arm switch, ABBA x2, `--no-drafter`,
+prefix cache off, greedy text equal: 7.5K prompt 661.5 → 672.9 tok/s (+1.7%), 15.9K prompt 621.2 → 632.6 (+1.8%).
+
+Serial decode row (`runRow`, this branch on main `075978d7`), Sushi-2.4bpw kv8, `--no-drafter`, `SUSHI_GLM_ROWS_UBENCH=24` B=1
+serial ms/token, arms alternated every round in one boot (12 rounds each), GPU lock + QUIET + AC, `taskpolicy -a`:
+1K 27.93 → 27.71 (−0.8%), 8K 29.35 → 28.76 (−2.0%), 16K 30.38 → 29.79 (−1.9%); one earlier boot: 27.84 → 27.56, 29.82 → 29.49.
+`SUSHI_GLM_DECODE_UBENCH` per MLA layer (µs, dependent 16-layer chain, ~20 µs of it chain plumbing), before → after: 1K 129 → 116,
+8K 172 → 157, 32K 187 → 177, 128K 230 → 218.
+
 Quiet bench, binary `b8267038` (carries the four wins), llmprobe 0.6.13 `--bench-only --rungs 2k,8k,32k,128k --runs 1`,
 `--prefill-chunk 2048` on every arm, fans at max (die 54 °C), load ~1.2, no compiles, GPU lock per arm, 2026-10-04:
 
@@ -414,3 +504,83 @@ Quiet bench, binary `b8267038` (carries the four wins), llmprobe 0.6.13 `--bench
 kv8 and BF16 latents decode within noise on one pack; the 32K ladder gap is acceptance (2.74 against 2.06 tokens
 per step). Four concurrent requests decode 44 tok/s in aggregate against ~34 alone. The 2.3bpw row matches or beats
 the `4fcb541e` table in [glm5-arch](glm5-arch.md#recorded-performance).
+
+<a id="glm-decode-fusions"></a>
+## GLM serial decode: shared-expert and KDA projection fusions (small, exact)
+
+Sushi-2.4bpw, kv8, `--no-drafter`, serial one-row `forwardLast` (`SUSHI_GLM_ROWS_UBENCH`-style loop, arms interleaved in
+one process with alternating order each round, 250 rounds, paired differences with standard error), `taskpolicy -a`, GPU
+lock, QUIET marker, AC. Arms: all off; shared gate/up/activation kernel; KDA projection kernel; both; both plus the shared
+add folded into the routed finish reduce with `shared` as its first input (the landed form).
+
+| arm vs all off | ctx 1K, ms/token | ctx 8K, ms/token |
+|---|---:|---:|
+| shared gate/up/activation | -0.044 +- 0.020 | -0.059 +- 0.022 |
+| KDA projections | -0.105 +- 0.021 | -0.109 +- 0.021 |
+| both | -0.131 +- 0.022 | -0.127 +- 0.022 |
+| fold only (shared first) | -0.181 +- 0.022 | -0.235 +- 0.022 |
+| all three (landed) | -0.231 +- 0.023 | -0.300 +- 0.022 |
+
+Absolute medians of that boot were 33.8 (1K) and 35.6 ms (8K), the box being contended; a quiet boot ran 28.6 ms. The
+whole set is 0.7-0.85%. A dispatch costs about 1 us here (consistent with the f_b/g_b in-kernel result), so fusions only
+pay through order: the fold with the shared chain LAST was +0.55 to +0.7 ms slower than the unfused add.
+
+<a id="glm-one-row-experts"></a>
+## GLM serial decode: one-row routed experts, two tiles and two k-tiles per iteration (exact)
+
+On `ad562c40` plus this landing, Sushi-2.4bpw, kv8, `--no-drafter`, `taskpolicy -a`, GPU lock, QUIET, AC power, fans max.
+
+Component (`SUSHI_GLM_T1_UBENCH=1`, synthetic E288 banks, 4096/2048, top-8 over 24 rotating routes, MCG w14, 24 dependent
+layers per eval, medians of 9, arms interleaved in one process; each phase is the difference of prefix chains):
+
+| µs per layer | pair prepare | gate/up | mid prepare | down | finish | chain |
+|---|---:|---:|---:|---:|---:|---:|
+| n36 lane | 4.1 | 108.8 | 2.8 | 59.5 | 3.4 | 178.6 |
+| n36 one-row | 4.5 | 82.7 | 2.9 | 47.0 | 3.5 | 140.5 |
+| n40 lane | 4.3 | 109.5 | 2.8 | 59.8 | 3.6 | 179.9 |
+| n40 one-row | 5.0 | 84.4 | 3.1 | 48.5 | 3.8 | 144.8 |
+
+Five dispatches per layer before and after; the prepare, mid and finish steps are ~3-4 µs each, dispatch gap included, so
+fusing them away is worth at most ~6 µs per layer (not attempted: it needs a cross-group arrival counter).
+
+Model (`SUSHI_GLM_ROWS_UBENCH=24`, B=1 serial, one boot, lane and one-row alternating per round, 12 rounds each):
+
+| ctx | lane | one-row | delta |
+|---|---:|---:|---:|
+| 1K | 27.04 ms | 25.55 ms | -1.49 ms (-5.5%) |
+| 8K | 29.58 ms | 28.02 ms | -1.56 ms (-5.3%) |
+
+Bytes equal the lane chain's at n32..64 and 72/80/96/112/128 (small shape) and at 4096/2048 n36/n40 w14, clamp live.
+
+## Prefill: KDA prework reads q/k/v in place (T2048 layer, 8K prompt)
+
+Settings: Sushi-2.4bpw trunk shapes, `taskpolicy -a`, GPU lock, QUIET, AC power, base `ad562c40`. Synthetic T2048 layer
+(`SUSHI_GLM_KDA_PREFILL_UBENCH`, stages queued one eval each, medians of 14, minima in brackets): dequant q,k,v 1.1,
+q,k,v GEMMs 7.3, concat 0.57, dequant o 0.33, o GEMM 2.6, FA/GA/beta cluster 0.6, f_b+g_b 0.55, prework 0.89, recurrence
+3.6, post 0.39; whole layer 14.7 (stages overlap). A single 8192^3 bf16 GEMM runs 60 TFLOPs, the QKV GEMMs 56, the
+output GEMM 53. Dropping the concat (prework addresses the three projections): prework 1.29 -> 0.89 ms with the concat,
+whole layer interleaved in one process 14.91 -> 14.46 ms (min), 20.98 -> 20.45 (median, contended).
+
+Live 8338-token prompt, `--no-drafter`, prefix cache off, arms switched per request by a temporary file, W A B B A A B
+B A: totals 11805/11907/11901/11913/11971/12058/12102/13066 ms (thermal drift of the box); paired ABBA A 11859 vs B
+11904 ms (-0.4%, inside noise). The generated message is byte-identical in all arms.
+
+<a id="glm-opt-combined"></a>
+## GLM serial decode and prefill: combined exact levers against `ad562c40`
+
+Sushi-2.4bpw, kv8, `--no-drafter`, prefix cache off, one boot per arm, base `ad562c40` vs branch head, `taskpolicy -a`,
+GPU lock per boot, QUIET marker, AC power, fans max. Every arm generates byte-identical text.
+
+Serial decode (`SUSHI_GLM_ROWS_UBENCH=24`, B=1, boots A B B A A B, this landing):
+
+| ctx | base ms/token | branch ms/token | delta |
+|---|---:|---:|---:|
+| 1K | 27.83 (27.79/27.83/27.87) | 25.37 (25.36/25.37/25.38) | -8.8% (+9.7% tok/s) |
+| 8K | 29.61 (29.41/29.53/29.88) | 27.14 (26.99/27.36/27.08) | -8.3% (+9.1% tok/s) |
+
+Prefill (five chat requests per boot, 7.5K-15K prompt tokens, boots A B B A, before the one-row expert GEMVs,
+which run on one row only): base 835.3 tok/s (837.4/833.2), branch 876.5 (868.5/884.4), +4.9%.
+
+Levers: prefill queues every layer and waits one interval back; two-row HC RMS mix; settle-one-behind packed tiles and
+32-row pool selection; A6 dense-once for the MLA projections; KDA prework in place; serial-decode shared/KDA fusions; HC
+normalized carry; one-dispatch MLA decode row; one-row routed expert GEMVs. Prefill chunk widths and bills are unchanged.

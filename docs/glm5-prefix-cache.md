@@ -38,7 +38,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   - Appended prompt: 0.57, 0.41 and 0.43 s warm against 11.1, 42.4 and 79.6 s cold.
   - Grid restore with up to 2K tokens to prefill: 2.1, 1.6 and 3.3 s against 6.2, 37.5 and 75.8 s.
   - Decode is unchanged, 29.9 to 30.2 tok/s.
-  - SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`), turns growing from 32K to 42K tokens: 6.5 to 7.6 s
+  - SSD-only (`--prefix-cache-mem off --prefix-cache-disk 12GB`), turns growing from 32K to 42K tokens: 6.5 to 7.6 s
     warm against 33.9 s cold at 28K. A restart restored 41,720 tokens from disk in 115 ms.
 - **Sushi-2.5bpw + vision + A4, cache on at its defaults** (this change on fbdedc01, kv8, `--prefix-cache-entries 1`
   so the cold arms follow an eviction, `taskpolicy -a`, lock held, 2026-10-05):
@@ -55,7 +55,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   long prefill.
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one
     to its checkpoint near 121K with 1. Each case keeps the assistant window.
-  - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`).
+  - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--prefix-cache-mem off --prefix-cache-disk 12GB`).
 - **The RAM tier's rows are a real copy at commit**, through the newest checkpoint it keeps
   (`HotPrefixCache.glmCommitLen`, chosen before the copy; a restore resumes from a checkpoint, so later rows are never
   read). It keeps rows, checkpoints and window within its budget, and the checkpoints above the chosen row are freed
@@ -64,6 +64,12 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   ([SSD flush](engine-prefix-cache.md#ssd-flush)).
   - Billed in `kv_bytes` beside the checkpoints: 6,688 bytes per row at kv8, 11,968 at BF16.
   - A budget trim lands on a checkpoint (`MlaRows.trimmedCopy`), sheds interior checkpoints and keeps the window.
+  - Beside an SSD tier the hot entry keeps only its newest 2 checkpoints (`checkpoint_hot_kept`): the pending record
+    holds all of them for the flush, and a restore under the oldest of the two reads SSD
+    ([the longer tier restores](engine-prefix-cache.md#ssd-flush)). Without an SSD tier it keeps them all.
+    The byte budget and the row length (`glmLenFor`) are judged by those two, not by the full list.
+  - A fork's disk record inherits restore points only from RAM donors (`bestCheckpointDonor`), so a hot entry with two
+    checkpoints gives it fewer; the same trade MiMo's ring restore points make.
 - **A restore shares the rows; the first append copies them.** A checkout releases them, so that append donates.
 - **The assistant window rides the entry as prefill left it** (`Generator.glm_prefill_window`). Every GLM restore
   point is at or below the prompt end, and a window cropped at the reply's end misses it once the reply passes
@@ -78,7 +84,28 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
     newest one is Qwen's.
   - GLM is never SSD-first while RAM retention is on. Under SSD-only storage it is, and keeps no idle RAM entry.
     Either way the commit captures every row through the newest checkpoint, the checkpoints and the window into the
-    pending flush, which lands whole after the response ([SSD flush](engine-prefix-cache.md#ssd-flush)). There is no prefill write-through.
+    pending flush, which lands whole after the response ([SSD flush](engine-prefix-cache.md#ssd-flush)). Only
+    SSD-only storage writes through during the prefill (next bullet).
+- **SSD-only prefill writes through, and a checkpoint leaves RAM once it is on SSD.** After each chunk
+  (`HotPrefixCache.writeThroughGlm`, armed by the gate every arch shares: SSD-first, a live writer, no media, at least
+  one disk chunk of new tokens) the rows through the chunk and the checkpoints so far go to the entry the commit later
+  extends.
+  - `DiskTier.settleCheckpoints` then waits out every checkpoint file but the newest one's and frees that state
+    (`SSMCheckpoint.release`). The request holds at most 2 states (`glm5_prefix.checkpoint_ram_held`) from its first
+    chunk through its decode, where it held up to 9.
+  - A released checkpoint stays in the list as a position (`released_bytes` prices it for the disk budget). It is never
+    written again and never restored from RAM; its file is the restore point.
+  - A write that failed poisons the entry, which the next write drops and rewrites from the rows and the checkpoints
+    still held; one the tier did not take is freed too. Neither is a restore point.
+  - The write-through entry has no spec sidecar. The commit adds it, and a restore from a mid-prefill state takes the
+    trunk alone.
+  - A cancelled prefill commits its salvaged list the same way.
+  - Costs taken on purpose: a freed checkpoint is not rechecked against the entry's file list, so a tier that skipped,
+    lost or restarted the entry leaves fewer restore points, never a wrong one; the first write-through that extends an
+    existing entry deletes its spec sidecar until the commit rewrites it, so a prefill killed in between restores
+    without drafts.
+  - A flush that swaps one checkpoint position for another compares the position lists, not their lengths
+    (`appendCommitWithSpecBounded`); with eight kept, the prompt-end checkpoint was otherwise dropped from the index.
 - **A decode-phase cancel commits in `cullDecoding`**, before `releaseNativeState` resets the request that the
   cleanup drain's commit would otherwise read. The drop decision is taken once per slot under `queue_mu`; the commit
   and the release run outside it on the dropped slots, so a late cancel waits for the next tick.
@@ -87,7 +114,8 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   prompt-end checkpoint, pool alignment, cold/warm backoff, the cap). The configured stride never enters, and
   `glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
-  and one assistant window. The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
+  and one assistant window; a prefill that writes through holds 2 (`WarmPrefix.released`, decided by the scheduler's
+  `glmCheckpointsRelease`, the same answer that arms the hook). The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
   tier's row copy (at most its budget; the SSD tier copies none), the checkpoints and the window, whichever of that
   and the prefill's transient is larger. At 1M tokens it is the smaller, so it costs no checkpoints. The writer's
   1 GiB permit (the previous request's staged flush) is not in this bill: admission takes it off the headroom for every

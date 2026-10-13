@@ -26,7 +26,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - `/v1/models` rows, loaded or not, list `reasoning_efforts` and `default_reasoning_effort`, the word a request naming
   none runs at (`model.defaultReasoningEffort`: `--think`, else GLM high, else off/on per `defaultEnableThinking`,
   where a thinking Qwen silence renders low).
-- `--think X` is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
+- CLI `--think X` requires an explicit effort word and is checked against the `--model` model only; a model loaded on demand takes X by the same rule (MiMo:
   any X but off is on) or, lacking it, keeps its own default. It never fails a load.
 - A thinking request that names NO effort gets no server budget (decided): Qwen3.8 renders it as low
   (`chat.qwen38EffortFor`), whose preamble shortens the thought without truncating it. `/v1/responses`:
@@ -34,9 +34,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `ResponseStore`, WS via Upgrade. Continuing a partial reply: `continue_final_message` explicit on chat, INFERRED on
   `/v1/messages`.
 - **Anthropic `/v1/messages`** (Claude Code): typed blocks, `input_schema`→`parameters`, stop-reason map incl.
-  `stop_sequence` echo, full SSE block lifecycle; a `system`-role message past index 0 (Claude Code's hook output,
-  Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only for a template that cannot
-  place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as `system` (`canonicalRole`).
+  `stop_sequence` echo, full SSE block lifecycle (a block opens only once the open one is stopped, so each owns its
+  index: `closeAnthropicBlock`); `usage.input_tokens` excludes `cache_read_input_tokens`, which clients add back, and
+  `message_delta` restates both since the cache hit is known only after prefill; a `system`-role message past index 0
+  (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
+  for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
+  `system` (`canonicalRole`).
 - **`preserve_thinking`** (templates that read it: Qwen3.8), resolved per request as `chat_template_kwargs.preserve_thinking`
   (bool, all three surfaces) > `--preserve-thinking on|off` > `preserve_thinking` in model-settings.json > the template
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
@@ -61,6 +64,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   Stored Responses history keeps text only.
 
 ## Streaming
+
+- Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
 
 - **A stream and a non-stream answer are the SAME BYTES**; leading whitespace is the one thing a stream may withhold
   (`streamContentLead`). A spent reasoning budget WITHHOLDS the rest of the thought; a non-stream tool-call reply
@@ -134,8 +139,7 @@ before reading a completed stream and requires clean EOF.
 
 ## Experimental logit bias
 
-`--logit-bias-file <path>` loads a JSON or CSV file at model load; the launch flag overrides the per-model
-`logit_bias_file` setting. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
+The per-model `logit_bias_file` setting in `model-settings.json` loads a JSON or CSV file at model load. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
 or `word`; words expand to single-token lower/capital spellings with and without a leading space. Split spellings
 are skipped and counted in the load log.
 
@@ -162,8 +166,8 @@ out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0`
 Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
 
 Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
-head, including positive rewards. Serial, MTP, PLD and prompt-lookup rows apply the same prefix-dependent shifts;
-streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
+head, including positive rewards. Serial, MTP, prompt-lookup and GLM DFlash2 rows apply the same prefix-dependent
+shifts; streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
 can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
 comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.
 
@@ -207,6 +211,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 
 - `--api-key`: loopback exempt, `/health` + OPTIONS + `GET` of the chat page open, `constTimeEql`.
 - A JSON request nests at most `chat.max_json_nesting` (256) levels, checked on the raw body before any route parses it (HTTP and each WebSocket message); an assistant history `tool_calls[].arguments` nested deeper is sent to the template as a string. A schema nests at most `json_schema.max_schema_depth` (64).
+- A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
 - `--metrics`: zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`.
 - **A request outcome is counted exactly once** (`Slot.metrics_recorded`, inference thread): `finishSlot` or the cleanup drain,
@@ -292,9 +297,11 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.
 - opencode 2.x talks to a background service that never sees `OPENCODE_CONFIG_CONTENT` and refuses `--model` on its
-  default command: the launcher passes `--standalone` (after a subcommand, flags bind to it), carries the model as
+  default command: the launcher passes `--standalone` only when CLI help advertises it (after a subcommand), carries the model as
   `model`, and marks a row with efforts `reasoning` + `interleaved: reasoning_content` + one `variants` entry per graded
-  word (GLM: low/high/max; on/off make none, and a default effort option would send words GLM refuses).
+  word (GLM: low/high/max; on/off make none).
+- OpenCode `--think WORD` validates the selected model's advertised efforts and sets only its `options.reasoningEffort`; omission preserves existing defaults.
+- OpenCode `--persist` backs up and merges the global JSON/JSONC config under `XDG_CONFIG_HOME` or `~/.config`, preserves unrelated settings, and normalizes comments into the backup; successful replacements print the backup's full path to stderr; invalid or ambiguous files are refused.
 - opencode sends no `max_tokens`, and GLM reserves a request's whole window without one (1M rows): serve GLM with
   `--max-tokens N` for opencode (live: a 12k-token agent prompt hit `GlmReserveMemoryLimit` with 16 GB free). grok
   sends its configured `max_completion_tokens`.

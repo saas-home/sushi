@@ -13,6 +13,8 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const expert_stream = @import("expert_stream.zig");
 const log = @import("log.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
+const transformer_mod = @import("transformer.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -248,7 +250,7 @@ pub const NgramTable = struct {
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
         log.info("[qwen4] ngram table: {d} rows x {d} at {d} bits ({d:.1} GB)\n", .{ t.rows, t.dim, t.bits, asGb(size) });
-        if (plePrefetchEnabled()) t.pool = PrefetchPool.create() catch null;
+        t.pool = PrefetchPool.create() catch null;
         return t;
     }
 
@@ -267,7 +269,7 @@ pub const NgramTable = struct {
             .scols = 0,
             .bf16 = store,
         };
-        if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
+        table.pool = PrefetchPool.create() catch null;
         return table;
     }
 
@@ -778,8 +780,8 @@ const PrefetchPool = struct {
         std.mem.sort(RowRead, refs, {}, RowRead.less);
         const before = self.wide_preads.load(.monotonic);
         const ok = self.dispatch(table, rows, out, refs);
-        if (std.c.getenv("QWEN4_PROFILE_FWD")) |raw| {
-            if (raw[0] != '0') log.info("[qwen4-prof] ple reads rows={d} preads={d} rounds=1\n", .{ rows.len, self.wide_preads.load(.monotonic) - before });
+        if (transformer_mod.diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) {
+            log.info("[qwen4-prof] ple reads rows={d} preads={d} rounds=1\n", .{ rows.len, self.wide_preads.load(.monotonic) - before });
         }
         return ok;
     }
@@ -857,17 +859,6 @@ const PrefetchPool = struct {
     }
 };
 
-fn plePrefetchEnabled() bool {
-    const S = struct {
-        var v: ?bool = null;
-    };
-    if (S.v) |v| return v;
-    const raw = std.c.getenv("QWEN4_PLE_PREFETCH");
-    const v = raw == null or raw.?[0] != '0';
-    S.v = v;
-    return v;
-}
-
 /// One-shot engagement lines per arm; both arms say something.
 /// Narrowest gather that is a genuine prefill chunk rather than a warmup forward.
 pub const PREFILL_SAY_MIN_ROWS: usize = 1024;
@@ -889,13 +880,13 @@ fn notePrefillGatherArm(pooled: bool, rows: usize, batch_rows: usize, why: []con
     }
 }
 
-/// Test seams for the prefill gate below (both envs are read once per process).
+/// Test seams for the prefill gate below.
 pub var ple_prefill_prefetch_override: ?bool = null;
 pub var ple_prefill_min_kv_override: ?u64 = null;
 
 /// The kv length past which a wide prefill gather takes the pool: the top of the measured
 /// cost range (the pool loses at every rung to 256k on a resident table; the only win is the
-/// evicted table on the 374k ladder). `QWEN4_PLE_PREFETCH_PREFILL_MIN_KV` overrides.
+/// evicted table on the 374k ladder).
 pub const PREFILL_PREFETCH_MIN_KV: u64 = 262144;
 
 pub const PrefillPrefetchMode = enum { off, kv_gated, on };
@@ -907,14 +898,6 @@ pub fn plePrefillPrefetchModeFromEnv(raw: ?[]const u8) PrefillPrefetchMode {
     if (r[0] == '0') return .off;
     if (r[0] == '1') return .on;
     return .kv_gated;
-}
-
-/// The threshold, or the constant when the override is absent or unparsable.
-pub fn plePrefillPrefetchMinKvFromEnv(raw: ?[]const u8) u64 {
-    const r = raw orelse return PREFILL_PREFETCH_MIN_KV;
-    const t = std.mem.trim(u8, r, " \t");
-    if (t.len == 0) return PREFILL_PREFETCH_MIN_KV;
-    return std.fmt.parseInt(u64, t, 10) catch PREFILL_PREFETCH_MIN_KV;
 }
 
 const Region = struct { off: usize, len: usize };
@@ -956,15 +939,7 @@ pub fn plePrefillPrefetchWanted(mode: PrefillPrefetchMode, kv_len: u64, min_kv: 
 }
 
 fn plePrefillPrefetchMinKv() u64 {
-    if (ple_prefill_min_kv_override) |v| return v;
-    const S = struct {
-        var v: ?u64 = null;
-    };
-    if (S.v) |v| return v;
-    const raw = std.c.getenv("QWEN4_PLE_PREFETCH_PREFILL_MIN_KV");
-    const v = plePrefillPrefetchMinKvFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-    S.v = v;
-    return v;
+    return ple_prefill_min_kv_override orelse PREFILL_PREFETCH_MIN_KV;
 }
 
 fn plePrefillPrefetchMode() PrefillPrefetchMode {
@@ -1328,12 +1303,6 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
     try testing.expectEqual(PrefillPrefetchMode.kv_gated, plePrefillPrefetchModeFromEnv(""));
     try testing.expectEqual(PrefillPrefetchMode.off, plePrefillPrefetchModeFromEnv("0"));
     try testing.expectEqual(PrefillPrefetchMode.on, plePrefillPrefetchModeFromEnv("1"));
-
-    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(null));
-    try testing.expectEqual(@as(u64, 131_072), plePrefillPrefetchMinKvFromEnv("131072"));
-    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv("64k"));
-    try testing.expectEqual(min, plePrefillPrefetchMinKvFromEnv(""));
-    try testing.expectEqual(@as(u64, 0), plePrefillPrefetchMinKvFromEnv("0")); // an explicit always-on
 }
 
 test "ngram prefill prefetch pools at any kv when the calibration measured the pool faster" {

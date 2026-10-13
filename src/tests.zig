@@ -40,7 +40,6 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("responses.zig");
     _ = @import("ws.zig");
-    _ = @import("pld_index.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
@@ -80,6 +79,8 @@ test {
     _ = @import("glm5_kda_prework.zig");
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
+    _ = @import("glm5_shared.zig");
+    _ = @import("glm5_kda_project.zig");
     _ = @import("glm5_dflash_tree.zig");
     _ = @import("glm5_dflash_topk.zig");
     _ = @import("glm5_dflash.zig");
@@ -111,6 +112,7 @@ test {
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");
     _ = @import("launch.zig");
+    _ = @import("opencode_persist.zig");
     _ = @import("mlx.zig");
     _ = @import("test_models.zig");
 }

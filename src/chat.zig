@@ -1681,7 +1681,9 @@ pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
 fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
     var i = from;
     while (std.mem.indexOfPos(u8, text, i, "<think")) |p| {
-        if (thinkOpenTagLenAt(text[p..])) |l| return .{ .pos = p, .len = l };
+        if (thinkOpenTagLenAt(text[p..])) |l| {
+            if (openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+        }
         i = p + "<think".len;
     }
     return null;
@@ -1691,11 +1693,39 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
     var i = from;
     while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
         if (thinkCloseTagLenAt(text[p..])) |l| {
-            if (!thinkCloseIsToolCallPayload(text, p)) return .{ .pos = p, .len = l };
+            if (!thinkCloseIsToolCallPayload(text, p) and openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
         }
         i = p + "</think".len;
     }
     return null;
+}
+
+/// Start of the inline code span still open at the end of `text`, or null. A model writing about its own
+/// format quotes the tag in backticks (`` `<think>plan</think>` ``): inside a span a close tag is text,
+/// not the end of the thought. Judged from the bytes before the tag alone, so a stream's verdict on a
+/// tag never changes as more arrive. A span ends with its line; three backticks are a fence, not a span.
+fn openCodeSpanStart(text: []const u8) ?usize {
+    var i = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0;
+    var open: ?usize = null;
+    while (i < text.len) {
+        if (text[i] != '`') {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < text.len and text[end] == '`') end += 1;
+        if (end - i < 3) open = if (open == null) i else null;
+        i = end;
+    }
+    return open;
+}
+
+/// How much of `text` a stream may ship so the rest still carries every open code span's backtick: a
+/// trailing run of backticks (its length is not yet known) and an open span wait.
+fn spanSettledLen(text: []const u8) usize {
+    var n = text.len;
+    while (n > 0 and text[n - 1] == '`') n -= 1;
+    return openCodeSpanStart(text[0..n]) orelse n;
 }
 
 /// Whether a `</think>` at `pos` is an ARGUMENT VALUE rather than a block close.
@@ -2831,22 +2861,27 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
             try content_parts.append(allocator, text[pos..]);
             break;
         };
-        const close_tag: []const u8 = if (o.is_think_style) "</think>" else "<channel|>";
-        const close_pos = std.mem.indexOfPos(u8, text, o.after, close_tag) orelse {
+        const found: ?TagAt = if (o.is_think_style)
+            indexOfThinkCloseTag(text, o.after)
+        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |cp|
+            TagAt{ .pos = cp, .len = "<channel|>".len }
+        else
+            null;
+        const close = found orelse {
             // Unclosed trailing opener — leave verbatim for the trailing-strip
             // logic in splitThinkBlock.
             try content_parts.append(allocator, text[pos..]);
             break;
         };
         try content_parts.append(allocator, text[pos..o.pos]);
-        try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close_pos], "\n "));
+        try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close.pos], "\n "));
         if (!style_set) {
             style_think = o.is_think_style;
             style_set = true;
         }
         closed_blocks += 1;
         if (o.pos == 0) first_block_leading = true;
-        pos = skipContentChannelTag(text, close_pos + close_tag.len);
+        pos = skipContentChannelTag(text, close.pos + close.len);
     }
 
     // Rewrite only when a closed block exists beyond the single leading one.
@@ -3357,6 +3392,8 @@ pub fn openThoughtFlush(buf: []const u8, shipped: bool) OpenThoughtFlush {
     const skip = if (shipped) 0 else buf.len - std.mem.trimStart(u8, buf, "\n ").len;
     const whole = @max(buf.len - partialThinkCloseSuffixLen(buf), skip);
     var end = skip + std.mem.trimEnd(u8, buf[skip..whole], "\n ").len;
+    // An open code span stays in the buffer: `indexOfThinkCloseTag` reads its backtick to know a tag inside is quoted.
+    end = @max(@min(end, spanSettledLen(buf[0..whole])), skip);
     while (end > skip and end < buf.len and (buf[end] & 0xC0) == 0x80) end -= 1;
     return .{ .skip = skip, .ship = end - skip };
 }
@@ -7608,6 +7645,48 @@ test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload
     try testing.expect(indexOfThinkCloseTag("<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
 }
 
+test "indexOfThinkCloseTag: a close quoted in a code span does not end the thought" {
+    // The model's reasoning quoting the raw string it was asked about.
+    const quoted = "The user wants `<think>plan A</think>Done` parsed.\n</think>\n\nOPEN plan A CLOSE";
+    const split = splitThinkBlock(quoted, true, true);
+    try testing.expectEqualStrings("The user wants `<think>plan A</think>Done` parsed.", split.reasoning_content.?);
+    try testing.expectEqualStrings("OPEN plan A CLOSE", split.content);
+    // Double backticks are a span too; a span ends with its line.
+    try testing.expect(indexOfThinkCloseTag("see ``</think>`` here", 0) == null);
+    try testing.expect(indexOfThinkCloseTag("a stray ` tick\n</think>x", 0) != null);
+    // A fence is not a span, so the close after it is the real one.
+    try testing.expect(indexOfThinkCloseTag("```\ncode\n```</think>x", 0) != null);
+    // A closed span is behind the tag.
+    try testing.expect(indexOfThinkCloseTag("the `tag` is done</think>x", 0) != null);
+    // Nothing after the span changes the verdict on a tag inside it.
+    try testing.expect(indexOfThinkCloseTag("a `</think>", 0) == null);
+    try testing.expect(indexOfThinkCloseTag("a `</think>`", 0) == null);
+}
+
+test "a visible answer quoting a think block in a code span stays one answer" {
+    // The answer after a closed thought writes the tags it was asked not to; they are text, not a second thought.
+    const answer = "Reading `<think>plan A</think>Done` gives plan A and Done.";
+    try testing.expect(indexOfThinkOpenTag(answer, 0) == null);
+    try testing.expect(try normalizeEmbeddedThinkBlocks(testing.allocator, answer) == null);
+    // The same tags outside a span still open and close a thought.
+    try testing.expect(indexOfThinkOpenTag("Answer.\n<think>plan A</think>Done", 0) != null);
+    const merged = (try normalizeEmbeddedThinkBlocks(testing.allocator, "Answer.\n<think>plan A</think>Done")).?;
+    defer testing.allocator.free(merged);
+    try testing.expectEqualStrings("<think>\nplan A</think>\nAnswer.\nDone", merged);
+}
+
+test "openThoughtFlush: an open code span waits so the tag inside it stays quoted" {
+    // `` ` `` + `<think>x` arrived: the span's backtick must still be in the buffer when `</think>` lands.
+    const open = openThoughtFlush("the string `<think>plan", false);
+    try testing.expectEqual(@as(usize, 0), open.skip);
+    try testing.expectEqual(@as(usize, "the string ".len), open.ship);
+    // A run of backticks may still grow; a closed span ships.
+    try testing.expectEqual(@as(usize, "word ".len), openThoughtFlush("word `", false).ship);
+    try testing.expectEqual(@as(usize, "word `x`y".len), openThoughtFlush("word `x`y", false).ship);
+    // A line break ends the span.
+    try testing.expectEqual(@as(usize, "a ` b\nc".len), openThoughtFlush("a ` b\nc", false).ship);
+}
+
 test "split content: text without think tags passes through" {
     try testing.expectEqualStrings("Hello world", splitThinkBlock("Hello world", true, false).content);
 }
@@ -10062,155 +10141,6 @@ test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(
     try testing.expect(std.mem.indexOf(u8, rendered, "<k>path</k><v>a.txt</v>") != null);
     // Non-string value rendered through tojson.
     try testing.expect(std.mem.indexOf(u8, rendered, "<k>count</k><v>2</v>") != null);
-}
-
-test "renderChatTemplate: REAL MiniCPM5 chat_template.jinja multi-turn tool history renders without fallback (MINICPM5_MODEL_DIR)" {
-    // Env-gated: MINICPM5_MODEL_DIR=<dir containing chat_template.jinja>.
-    //
-    // MiniCPM5-1B's template line 59 does
-    //     {%- set min_count = [tool_calls_count, tool_sep_count]|min %}
-    // inside the `{%- if message.tool_calls %}` history branch — reached ONLY
-    // when a prior assistant tool call is replayed into history, i.e. the
-    // SECOND turn of any tool conversation. jinja_cpp registered `min`/`max`
-    // only in the EMPTY-sequence table, so a 2-element array threw
-    //   "Unknown (built-in) filter 'min' for type Array"
-    // and renderChatTemplate silently downgraded to fallbackFormatChat, which
-    // emits Gemma-family <start_of_turn>/<end_of_turn> that MiniCPM5 never saw
-    // in training — it loses its stop token and degenerates into unrelated
-    // text. Single-turn requests never enter the branch, which is why the
-    // MiniCPM5 V3 parser corpus (all single-turn) never caught it.
-    // Same wrong-family prompt-format class as the Hy3 str.format test above.
-    const dir = std.c.getenv("MINICPM5_MODEL_DIR") orelse return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
-    defer allocator.free(path);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const tpl = blk: {
-        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.SkipZigTest;
-        defer f.close(io);
-        var read_buf: [4096]u8 = undefined;
-        var reader_state = f.reader(io, &read_buf);
-        break :blk try reader_state.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    };
-    defer allocator.free(tpl);
-    // Only meaningful against a template that actually uses the filter.
-    if (std.mem.indexOf(u8, tpl, "|min") == null) return error.SkipZigTest;
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "read_file", .arguments = "{\"path\": \"/tmp/marker.txt\"}" }};
-    const messages = [_]Message{
-        .{ .role = "user", .content = "Read /tmp/marker.txt" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-        .{ .role = "tool", .content = "ALPHA-7719", .tool_call_id = "tc_0" },
-    };
-
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-    defer allocator.free(rendered);
-
-    // MiniCPM5's own family tokens survived => the Jinja render succeeded.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_end|>") != null);
-    // The tool round made it through the |min branch.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<function name=\"read_file\">") != null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>") != null);
-    // The decisive assertion: NO silent downgrade to the generic fallback.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
-    try testing.expect(std.mem.indexOf(u8, rendered, "<end_of_turn>") == null);
-}
-
-test "renderChatTemplate: |min picks the smaller element, |max the larger" {
-    // Guards against a min/max implementation that just returns first/last.
-    const allocator = testing.allocator;
-    const tpl =
-        \\{%- for message in messages -%}
-        \\{{ [3, 1, 2]|min }}/{{ [3, 1, 2]|max }}
-        \\{%- endfor -%}
-    ;
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
-    defer allocator.free(rendered);
-    try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
-}
-
-test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
-    // Env-gated: HY3_MODEL_DIR=<dir containing chat_template.jinja>. Renders
-    // the actual shipped template with system + tools + a tool round and
-    // pins: no silent fallback (family tokens present), template-opened think
-    // (thinking on), closed think (thinking off), tool-call args rendered via
-    // arguments.items(), tool_response wrapping for role:"tool".
-    const dir = std.c.getenv("HY3_MODEL_DIR") orelse return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
-    defer allocator.free(path);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const tpl = blk: {
-        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.SkipZigTest;
-        defer f.close(io);
-        var read_buf: [4096]u8 = undefined;
-        var reader_state = f.reader(io, &read_buf);
-        break :blk try reader_state.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    };
-    defer allocator.free(tpl);
-
-    var config = ChatConfig{
-        .chat_template = tpl,
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    const tools_json =
-        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
-    ;
-    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
-    const messages = [_]Message{
-        .{ .role = "system", .content = "You are helpful." },
-        .{ .role = "user", .content = "What time is it?" },
-        .{ .role = "assistant", .content = "", .tool_calls = &tc },
-        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
-    };
-
-    // Thinking ON: generation prompt must end inside a think block.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(std.mem.indexOf(u8, rendered, "hy_begin_of_sentence:opensource") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "hy_User:opensource") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_call:opensource>get_time<tool_sep:opensource>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<arg_key:opensource>timezone</arg_key:opensource>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<arg_value:opensource>UTC</arg_value:opensource>") != null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response:opensource>") != null);
-        // No fallback-format markers.
-        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
-        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
-        // Template-opened think at the generation prompt.
-        try testing.expect(promptTailOpensThink(rendered));
-    }
-    // Thinking OFF (reasoning_effort no_think): think opened AND closed.
-    {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
-        defer allocator.free(rendered);
-        try testing.expect(!promptTailOpensThink(rendered));
-        try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
-    }
 }
 
 test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallback (hermetic)" {

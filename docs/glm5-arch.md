@@ -62,7 +62,7 @@ private converter repo.
   expansion beyond it (billed for the widest pending layer: 576 MiB at two pending layers).
 - The BF16 source checkpoint is the KLD teacher, run with SSD-streamed experts
   ([engine-expert-streaming](engine-expert-streaming.md)).
-- `--ssd-budget-gb`/`--expert-cache-gb` stream any pack's EXL3 experts, or the BF16 source's, through the same engine
+- `--ssd-budget-gb` streams any pack's EXL3 experts, or the BF16 source's, through the same engine
   for `serve`, `run` and `kld compare`: DFlash2 off, image and video only with `--vision`, output identical to the
   resident load.
 - The FP8 release (E4M3FN block-128 trunk and experts) streams its experts as stored and runs its trunk on `fp8_block`
@@ -114,7 +114,10 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
   verify through the same batched rows, whose logits equal per-row serial projections bit for bit.
-  Constrained, forced-tool-call, penalized, logprobs or explicitly budgeted-thinking requests decode serially.
+  Logit biases (`logit_bias`, the `tool_choice: "none"` call-opener ban, `logit_bias_file`) and the think penalty
+  shift each tree row at the span state its own ancestry reaches, before the reserved-id mask, as serial sampling does
+  (`Generator.glmPenalty`); greedy output stays byte-identical to `--no-drafter`. Constrained, forced-tool-call,
+  repeat/presence-penalized, logprobs or explicitly budgeted-thinking requests decode serially.
 - **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRound`): the verifier refuses an
   ancestry past the context, so a two-token tail never carries a three-row chain.
 - **Bills**: assistant weights at load; per request the sliding window ×4, captures per prefill row, three recurrent
@@ -131,7 +134,7 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - **N2 saturates on copies, breaks even on prose** (no runtime yield gate): a ~2K-token verbatim copy and a rename
   edit accepted 2.00 of 2 drafts every round (41.4/40.8 vs 25.2 tok/s serial), low-effort prose 0.88 (26.1 vs 25.6);
   greedy bytes equal serial (`144f63db`, BF16 latent, Sushi-2.3bpw + A4 g64, `taskpolicy -a`, busy box, 2026-10-04).
-- **Verbatim lookup chains instead of PLD**: PLD never runs on GLM (`specInitWiring`'s module branch), so `--no-drafter`
+- **Verbatim lookup chains**: there is no standalone PLD, so `--no-drafter`
   decodes plain serial and the 0.010 n-gram gate is inert. A request drafting alone whose output agrees with its context
   for `mtp_lookup.STRONG_SUFFIX` tokens verifies the context's next three tokens as a four-row chain in place of the
   assistant's tree (`glmLookupProposal`, `[spec-stats] … lookup=rounds/landed`). `--no-mtp-lookup` turns the chains off.
@@ -164,7 +167,8 @@ inside 1.46% drift) because verification per round grew 20.6%.
   attention with its second tile 256 MiB, index scores 8 MiB, and under kv8 the dense-prefill dequantization
   (≤ 2051 rows) plus one chunk's quantizer output, 3.1 MiB. Without NAX the packed tiles (the FP32 composite) keep
   their 256 MiB and the A6, MLA, index and cluster terms drop. With the prefix cache on, a
-  prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit
+  prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit;
+  under SSD-only storage the prefill writes each checkpoint through and frees its RAM copy, so it holds 2
   ([prefix cache](glm5-prefix-cache.md#glm)).
 - Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
   the engine's 93% margin: GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +

@@ -256,6 +256,22 @@ width; the context grows ~7.3k keys over a boot. ms per forward:
   (72.8 / 73.6 °C die vs 90.6-then-3-min / 53.2 °C); the kernel is ~1% of a round and cannot reach prefill by 13%
   (the recorded v1.0.4 cell reads 1671).
 
+<a id="gdn-pipelined"></a>
+## Flash-Next: pipelined GDN prefill and the balanced split-K arm (9b3369a6)
+
+M5 Max, 2026-10-11, Sushi-4bpw, `--kv-quant 8 --no-mtp --prefix-cache-disk 0`, binary 9b3369a6, llmprobe rungs, A B B A
+twice, one boot per arm.
+
+- Pipelined GDN prefill (`SUSHI_GDN_PIPELINED` unset) against the blocked kernel (`=0`): prefill 8K 2534 against
+  2415 tok/s (+4.9%, ranges overlap), 32K 2384 against 2296 (+3.8%, outside the spread), 32K TTFT about 13.7 against
+  14.3 s, decode unchanged. KLD had passed at landing (0.058801 against 0.059171, Sushi-4bpw 16x512, inside the
+  floor); the dot order differs, so the output is not bit-identical. The pipelined kernel is now the only route of
+  qwen4_exp on NAX; the blocked kernel serves MiMo, GLM and non-NAX GPUs.
+- Balanced split-K (`SUSHI_QSA_ATTN_BALANCED=1`, tile remainder spread one per split) against ceil per split, decode
+  at 32K and 64K KV: 57.9 against 57.8 tok/s (+0.2%) and 57.1 against 56.0 (+2.0%, inside the ceil arm's 3% spread),
+  one contaminated boot excluded. Greedy output diverged around token 8 of a 70K prompt. Not adopted: the arm and
+  its kernel branch are removed.
+
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 
 Greedy 300-token decode of one prompt after a warm-up (tok/s; same box, arms run back to back):
@@ -305,8 +321,8 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
   (9.2x, 8.8x per pair); first token at 16.3k 45.8 / 418.5 / 418.8 / 47.7 s; decode 32.7 / 34.1 / 33.8 / 32.5 tok/s
   (the change cannot reach decode: rows <= 16 take the decode chain; MTP 2.9-3.9 tokens per step across cells).
 - Quality, teacher-forced against f42cd8e's own capture (16 doc paragraphs x 256 tokens, kv8): the body scores KLD
-  0.0406 / top-1 91.0% / NLL 0.7830; a rounding-only control (f42cd8e with `SUSHI_FUSED_256=0`) 0.0347 / 90.8% /
-  0.7831; f42cd8e itself 0.0000. On this pack any bit-different kernel reads about 0.04 against another.
+  0.0406 / top-1 91.0% / NLL 0.7830; a rounding-only control (f42cd8e with `SUSHI_FUSED_256=0`, a switch since
+  removed: a past control, not a current lever) 0.0347 / 90.8% / 0.7831; f42cd8e itself 0.0000. On this pack any bit-different kernel reads about 0.04 against another.
 - `QWEN4_PLE_PREFETCH_PREFILL=1` (pool) vs the default serial walk on f22a383 + the body, A B B A, a distinct 3.5-4.3k
   prompt per run: 165.2 / 378.7 / 353.1 / 224.9 tok/s, the pool 2.29x and 1.57x per pair. (On f42cd8e, with the
   scalar GEMM dominating, the same screen read 14-24%.)
@@ -557,3 +573,39 @@ quiet box, AC, 2026-10-05, boots main / revert / revert / main, tok/s:
 - On 2.6bpw it does not go deep (m_avg 3.2) and tokens per ms are equal.
 - Above 8192 KV both arms run the same planner. Against v1.1.1 on 4bpw in other boots that day (decode 80.8-89.4,
   2k rung 76.1-82.5; llmprobe 0.6.12 and 0.6.13) the revert is at parity.
+
+<a id="gdn-f32-cost"></a>
+## f32 GDN gate and state (default): cost
+
+Quality of the same arms: [qwen4-kld](qwen4-kld.md#gdn-f32-teacher). Arms: **a** = main `60272184` (bf16 gate; mtime 2026-10-12 10:19:17,
+sha256 `3a03a4f5...`), **b** = the f32-gate change, default flags (f32 gate, bf16 state), **c** = `--qwen-gdn fp32` (`794b4bb0`, mtime 12:44:03, sha256
+`f4899eff...`; the kernels are the landed ones). Arm c is now the default (`--qwen-gdn 32`) and b is `--qwen-gdn 16`; a is gone.
+
+Cell: Sushi-2.6bpw, `--kv-quant 8 --mtp`, llmprobe 0.6.15 `--bench-only --rungs 4k,32k --runs 3`, one boot per row in the order a b c c b a,
+M5 Max 128 GB on AC, fans max, quiet window, 3 min idle between boots, `taskpolicy -a`, GPU lock per boot, an empty prefix-cache base per
+boot (`SUSHI_PREFIX_CACHE_DIR`; the SSD tier restores another boot's prefix otherwise), 2026-10-12. Every boot logged `[spec-stats]` (MTP on);
+`[gdn] recurrent state f32` appears in the c boots only.
+
+| boot | decode | 4k decode | 32k decode | 4k prefill | 32k prefill | 4 streams single | 4 streams aggregate | tok/step 4k, 32k | loadDrift |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 a | 87.6 | 96.5 | 84.4 | 2119 | 2115 | 74.3 | 95.5 | 3.2, 4.0 | ok |
+| 2 b | 100.8 | 79.7 | 86.8 | 2330 | 2250 | 64.3 | 95.8 | 2.9, 4.0 | -10.3% |
+| 3 c | 101.2 | 92.1 | 91.0 | 2118 | 2097 | 68.0 | 93.9 | 3.6, 3.8 | -15.5% |
+| 4 c | 99.3 | 86.0 | 80.1 | 2120 | 2065 | 73.2 | 94.5 | 3.1, 3.6 | -13.7% |
+| 5 b | 91.1 | 93.0 | 91.5 | 2099 | 2080 | 66.5 | 96.0 | 3.4, 3.4 | ok |
+| 6 a | 90.9 | 87.9 | 77.9 | 1767 | 1766 | 62.5 | 87.6 | 3.4, 3.0 | ok |
+
+Adjacent pairs, change of the first over the second (decode / 4k / 32k decode, 4k / 32k prefill, 4-stream aggregate):
+- b over a: 2 vs 1: +15.1 / -17.4 / +2.8, +10.0 / +6.4, +0.3%; 5 vs 6: +0.2 / +5.8 / +17.5, +18.8 / +17.8, +9.6%.
+- c over b: 3 vs 2: +0.4 / +15.6 / +4.8, -9.1 / -6.8, -2.0%; 4 vs 5: +9.0 / -7.5 / -12.5, +1.0 / -0.7, -1.6%.
+
+- The default change (f32 gate) has no measurable cost: the two pairs disagree in sign on every decode metric.
+- MTP decode swings 10-17% between boots of one arm (b 4k decode 79.7 against 93.0, tokens per step 2.9-4.0): a few percent cannot be resolved.
+- The 4-stream aggregate is the quiet metric: b 95.8 / 96.0, c 93.9 / 94.5, so the f32 state (arm c, now the default) costs about 2% there, which `--qwen-gdn 16` (arm b) gets back.
+- Prefill is within ~5% for c over b, not resolved (-9.1/-6.8 in one pair, +1.0/-0.7 in the other).
+
+Bills (default flags, kv8, `--mtp`, a 6000-token prompt sent twice, an empty SSD base per boot, `794b4bb0`):
+- The f32 state (arm c) adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, resident 147.8 MB; c
+  `1 ssm-cp, 121.4 MB`, resident 201.8 MB.
+- The admission bill at that request rises 4549 → 4616 MB (+67 MB).
+- Auto context stays 1,048,576 tokens and the boot `active_bytes` stay 47.51 GB on this 128 GB box.

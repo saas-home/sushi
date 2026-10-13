@@ -62,6 +62,23 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
+- **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
+  (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
+  tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
+  the entry and its `kv_bytes`, and a lookup needing it restores from the file (the SSD tier wins past
+  `MIN_DISK_ADVANTAGE_TOKENS`, bit-identical rows). A staged file counts: its bytes are the writer's, billed by its
+  permit, and a restore drains them first. A point with no file in the index (a cut or failed staging) stays in RAM.
+  A donor's released points are not inherited into a fork's RAM entry or record; they stay on the donor's SSD entry.
+  A RAM tier with no SSD tier keeps all eight; SSD-only holds none (its commit is a `disk_only` record the flush stages
+  and frees). Limits: a staged write that later fails poisons its entry (`harvestWriteFailures`), and the released
+  points go with it; points under `MIN_DISK_ADVANTAGE_TOKENS` have no file and stay, so a lookup whose only SSD
+  candidate lies within 256 tokens of such a RAM point takes the RAM one.
+  Measured (MiMo-V2.6-Flash-Sushi-2.3bpw, kv8, `--prefix-cache-mem 4GB`, a 46,223-token prompt of four messages, binary
+  stamp 09:38 of this change vs 20f6068d, `taskpolicy -a`, GPU lock per boot, QUIET, 2026-10-13): `/props` hot-cache bytes
+  after the cold turn 684 -> 636 MiB, after the append 1378 -> 1250, after two more 1890 -> 1759; a turn diverging at an
+  old message mark restores 15,518 tokens from SSD in 25 ms (`ring@15518`) where it was a RAM checkpoint. Default
+  SSD-only: `/props` active bytes after every turn equal the boot figure (91,806 MiB) with the SSD tier on or off, so
+  nothing is retained; peak during the cold turn +1.9 GiB either way (live KV and prefill).
 - **A disk restore fills its buffers chunk by chunk** (`restoreKvInto`): each chunk is evaluated into buffers
   allocated at the restored length before the next file opens. A lazy `mlx_load_safetensors` holds its file open until
   eval (one eval at the end failed past the soft limit of 256 files), and a concatenation at the end held every chunk
@@ -123,8 +140,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 ## Defaults: SSD tier on, RAM tier off
 
 - **RAM retention is opt-in.** Unnamed, `server.prefix_cache_ram_enabled` is false and the RAM budget is 0 bytes for
-  every served model; `--prefix-cache-mem <n>` turns it on (`0` or `off` keeps it off, like `--no-prefix-cache-ram`) and `--no-prefix-cache-ram`
-  wins over it. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
+  every served model; `--prefix-cache-mem <n>` turns it on and `--prefix-cache-mem 0` (or `off`) keeps it off. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
   `LoadParams.prefix_cache_disk_resolver`, the pure `kv_disk_cache.resolveDiskBudget`):
@@ -134,8 +150,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
     `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
-    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank and a
-    second history copy are execution state and never count, so no QSA switch moves it. GLM's KDA checkpoints and
+    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank is
+    execution state and never counts, so no QSA switch moves it. GLM's KDA checkpoints and
     DFlash2 window, Qwen's GDN checkpoints and MiMo's ring files are fixed per entry, not per token; the 2 GB slack is
     all the formula leaves them.
   - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at
@@ -185,7 +201,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 ## SSD-only storage
 
-`--no-prefix-cache-ram --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
+`--prefix-cache-mem off --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
 prefixes on SSD without retaining idle KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
 buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
@@ -193,7 +209,8 @@ With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` rep
 Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless
 of `--prefix-cache-mem`; live KV and temporary SSD write buffers still consume memory.
 
-Qwen prefill chunks write through continuously in SSD-only mode. Hybrid SSM checkpoints, MiMo ring
+Qwen prefill chunks write through continuously in SSD-only mode (no env turns it off; a turn with under one chunk of new tokens skips it). GLM's
+prefill writes through too and frees each checkpoint's RAM copy once it is staged ([GLM](glm5-prefix-cache.md#glm)). Hybrid SSM checkpoints, MiMo ring
 restore points and GLM state ([GLM](glm5-prefix-cache.md#glm)) survive restart. Image-bearing entries remain ineligible for disk persistence. RAM+SSD is the opt-in
 `--prefix-cache-mem` arrangement. `SUSHI_PREFIX_CACHE_DIR` can select an absolute cache directory; unset, the root stays
 `~/.sushi/kv-cache`. Live tests use a separate root without changing home settings.
@@ -221,6 +238,7 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   hard-links one chunk into several entries. The tier's own `total_bytes` already bills it once.
 - **A restore that finds a chunk file missing or short poisons the entry** (`restoreKvInto`), so the request prefills
   cold and the next commit of that prompt stores fresh instead of seeing it as superseded.
+- **A restore that fails on an unreadable or corrupt file poisons its entry on every arm** (`poisonUnreadable`: `MlxError`, `DiskCacheCorrupt*`), so a same-size rotted chunk is not retried on each lookup; a coverage miss (no checkpoint, QSA gap) leaves the entry, since a shorter prefix can still serve.
 - A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
   covers that.
 
@@ -241,7 +259,8 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
     finished request's buffers, is gone after the flush), and otherwise keeps the legacy path: the RAM entry, one
     piece per turn, a declined candidate spilled synchronously.
 - **The record carries the restore points the RAM entry inherits**: a donor's SSM or ring checkpoints below the
-  shared prefix (`bestCheckpointDonor`, `bestRingDonor`), taken before the RAM tier sheds any. Chunk sharing links a
+  shared prefix (`bestCheckpointDonor`, `bestRingDonor`; a ringed donor with an SSD tier holds its newest two), taken
+  before the RAM tier sheds any. Chunk sharing links a
   fork's chunks, never its donor's checkpoint or ring files, so without them a fork restored only above the fork
   once the donor left the SSD tier.
 - **A second commit before the flush flushes the first** (`capturePendingDisk`): the cull pass commits every
@@ -307,7 +326,11 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
 
 ## SSD-first
 
-- Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed.
+- Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag
+  (`ModelConfig.cacheLayoutNamespace`): `gdn-f32-state-v1` for the default f32 state, `gdn-gate-f32-v1` for
+  `--qwen-gdn 16`, so the two widths never restore each other's checkpoints and entries written under the old bf16
+  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. KV width is not in the namespace: `bestMatch` skips an
+  entry whose manifest quant differs from the live one.
 
 - `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +
   `DiskTier.ssd_first`: with RAM enabled it floors at ONE session, `--prefix-cache-mem` = the IDLE allowance.

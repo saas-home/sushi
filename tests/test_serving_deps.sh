@@ -69,6 +69,30 @@ check_flag() {
 }
 check_flag --no-such-flag 8
 check_flag --engine mlx
+# Removed launch flags: each must stay refused, not quietly accepted again.
+check_flag --no-safety
+check_flag --warmup-eager
+check_flag --no-warmup-eager
+check_flag --kv-attn-mode auto
+check_flag --decode-attn-quant
+check_flag --no-decode-attn-quant
+check_flag --mtp-depth 3
+check_flag --mtp-history-window 0
+check_flag --draft-block-size 4
+check_flag --tokenize-cache-entries 4
+check_flag --prefill-trace
+check_flag --hf-overrides '{}'
+check_flag --mtp-cascade 0.95
+check_flag --no-prefix-cache-ram
+check_flag --fast
+check_flag --pld
+check_flag --no-pld
+check_flag --pld-draft-len 5
+check_flag --pld-key-len 3
+check_flag --ssm-checkpoint-stride 256
+check_flag --expert-cache-gb 60
+check_flag --embedding-max-length 512
+check_flag --logit-bias-file bias.json
 
 echo "== unsupported checkpoint format refused by name =="
 TMP=$(mktemp -d)

@@ -52,7 +52,6 @@ const decodeProfileEnabled = trf.decodeProfileEnabled;
 const decodeRowsProjection = trf.decodeRowsProjection;
 const diagEnvOn = trf.diagEnvOn;
 const diagEnvOnCached = trf.diagEnvOnCached;
-const envFlagCached = trf.envFlagCached;
 const fusedQkNormRope = trf.fusedQkNormRope;
 const fusedQkNormRope256 = trf.fusedQkNormRope256;
 const fusedSdpa256Masked = trf.fusedSdpa256Masked;
@@ -74,11 +73,9 @@ const moeRouterFusedEnabled = trf.moeRouterFusedEnabled;
 const mtp_mod = trf.mtp_mod;
 const noteExpertDeferred = trf.noteExpertDeferred;
 const noteQsaArmForSlots = qwen4_qsa.noteQsaArmForSlots;
-const qkNormRopeFusedEnabled = trf.qkNormRopeFusedEnabled;
 const qkvAttnDecodeKernel = trf.qkvAttnDecodeKernel;
 const qkvAttnVerifyKernel = trf.qkvAttnVerifyKernel;
 const qsaAlignedSparseAttn = qwen4_qsa.qsaAlignedSparseAttn;
-const qsaAttnMinS = trf.qsaAttnMinS;
 const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
 const qsaHistoryRows = trf.qsaHistoryRows;
 const qsaLeftoverAt = trf.qsaLeftoverAt;
@@ -280,7 +277,8 @@ pub const Qwen4Mtp = struct {
 };
 
 /// Compile the GatedDeltaNet gating chain (astype→exp→add→astype→exp→log1p→
-/// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel.
+/// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel, at the dtype
+/// `config.gdnGateDtype()` holds when the first call traces it.
 /// shapeless=true: pure elementwise chain, same trace for any [B,S,Hv].
 pub fn compileGdnGate(self: *Transformer) void {
     const raw_closure = mlx.mlx_closure_new_func_payload(
@@ -293,7 +291,7 @@ pub fn compileGdnGate(self: *Transformer) void {
     _ = mlx.mlx_closure_free(raw_closure);
     if (rc == 0 and compiled.ctx != null) {
         self.compiled_gdn_gate = compiled;
-        log.info("GDN gate compiled (kernel fusion enabled)\n", .{});
+        log.info("GDN gate compiled (kernel fusion enabled), g {s}\n", .{@tagName(self.config.gdnGateDtype())});
     }
 }
 
@@ -309,7 +307,7 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
     if (mlx.mlx_vector_array_get(&dt_bias, input, 2) != 0) return -1;
     defer _ = mlx.mlx_array_free(dt_bias);
 
-    const g = gdnGateChain(A_log, a, dt_bias, self.s) catch return -1;
+    const g = gdnGateChain(A_log, a, dt_bias, self.config.gdnGateDtype(), self.s) catch return -1;
     const out_arr = [_]mlx.mlx_array{g};
     res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
     _ = mlx.mlx_array_free(g);
@@ -318,7 +316,6 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
-    if (std.c.getenv("QWEN4_NO_HCFUSE") != null) return;
     const specs = .{
         .{ &self.compiled_hc_silu, &Transformer.hcSiluCallback, true },
         .{ &self.compiled_hc_mix, &Transformer.hcMixCallback, false },
@@ -1308,7 +1305,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 
 /// Build the qwen4_exp head's coarse rerank head. ONE-SHOT (`rerank_tried`
 /// caches the refusal too) and infallible — false keeps the full-vocab
-/// draft projection, which is what SUSHI_MTP_DRAFT_RERANK=0 restores.
+/// draft projection.
 ///
 /// Called at LOAD (`scheduler.doLoadOnInferenceThread`, the site both the
 /// boot load and the `/v1/load` cold load route through), the sidecar
@@ -1320,7 +1317,6 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
     const m = &(self.qwen4_mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     m.rerank_tried = true;
-    if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Timestamp.now(io, .awake);
     // The ONE env read: the built head carries its width from here on.
@@ -1329,7 +1325,7 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
     const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
     log.info(
-        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring (SUSHI_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
+        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring\n",
         .{ rc.bits, bytes / (1024 * 1024), ms },
     );
     return true;
@@ -1422,7 +1418,7 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     {
         return false;
     }
-    if (Transformer.qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+    if (Transformer.qwen4_trace != null or diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) return false;
     // The grouped verify reads resident expert banks; a streamed trunk has none.
     if (self.expert_stream != null) return false;
     const si = qwen4Standin();
@@ -1486,7 +1482,7 @@ pub fn forwardQwen4VerifyRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1748,7 +1744,7 @@ pub fn forwardQwen4DecodeRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1932,7 +1928,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     var h = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
     errdefer _ = mlx.mlx_array_free(h);
-    if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+    if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
         _ = mlx.mlx_array_free(h);
@@ -2161,7 +2157,7 @@ pub fn gatedFullAttnProjected(
     const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
     // Q projection
-    const q_proj = if (projected) |values| values.q else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
+    const q_proj = if (projected) |values| values.q else try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(q_proj);
     };
@@ -2203,11 +2199,11 @@ pub fn gatedFullAttnProjected(
     }
 
     // K, V projections
-    const k_proj = if (projected) |values| values.k else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
+    const k_proj = if (projected) |values| values.k else try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(k_proj);
     };
-    const v_proj = if (projected) |values| values.v else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
+    const v_proj = if (projected) |values| values.v else try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(v_proj);
     };
@@ -2263,7 +2259,7 @@ pub fn gatedFullAttnProjected(
     var fused_qk = false;
     if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
-        self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
+        self.rms_eps_arr.ctx != null)
     blk: {
         const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
         const angles = self.qkAngleFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
@@ -2284,7 +2280,7 @@ pub fn gatedFullAttnProjected(
     if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
         ctx.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
-        self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
+        self.rms_eps_arr.ctx != null)
     blk: {
         const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
         // The kernel has no mscale slot: YaRN's factor is uniform across the
@@ -2406,7 +2402,7 @@ pub fn gatedFullAttnProjected(
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
             }
         }
-        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, skip_output);
     }
 
     var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
@@ -2446,11 +2442,8 @@ pub fn gatedFullAttnProjected(
         // verify widths (and a declined gather) run under the bool mask.
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         var gathered: ?mlx.mlx_array = null;
-        // Three arms, three independent widths: `fused_min_s` gates the fused kernel only
-        // (gating the whole block on it dropped S=2..5 onto the dense mask).
         const qsa_ok = ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
-        const fused_min_s = qsaAttnMinS();
-        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, fused_min_s)) {
+        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
             // One fused dispatch per layer: each row indexes its own selection + tail.
             gathered = try qsaAlignedSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale, @intCast(self.config.indexer_budget));
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 1;
@@ -2470,7 +2463,7 @@ pub fn gatedFullAttnProjected(
         // The prefill kernel has no q_len floor of its own; a verify-width
         // selection must never fall into it (it walks the WHOLE cache).
         if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
-            const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+            const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(q_rope));
@@ -2547,7 +2540,7 @@ pub fn gatedFullAttnProjected(
     if (Qwen4AttnProf.active) Qwen4AttnProf.lap(attn_out, .qsa);
 
     if (layer == 3) if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
-    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, skip_output);
 }
 
 /// Shared tail of `gatedFullAttnWith`: transpose the attention output back
@@ -2559,9 +2552,6 @@ pub fn gatedAttnTail(
     gate: mlx.mlx_array,
     fa: *const FullAttnWeights,
     flat_shape: [3]c_int,
-    batch: c_int,
-    is_prefill: bool,
-    layer: u32,
     skip_output: bool,
 ) !mlx.mlx_array {
     // Transpose back [B,H,S,D] -> [B,S,H,D] (view)
@@ -2585,14 +2575,14 @@ pub fn gatedAttnTail(
         defer _ = mlx.mlx_array_free(gated);
         try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, self.s));
         if (skip_output) return standinRef(gated);
-        return self.attnProj(gated, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
+        return self.qmatmul(gated, fa.o_w, fa.o_s, fa.o_b);
     }
 
     var attn_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_flat);
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
     if (skip_output) return standinRef(attn_flat);
-    return self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
+    return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
 }
 
 pub const AttnVerifyInputs = struct {
@@ -2712,7 +2702,7 @@ pub fn verifyRowsJoined(
             errdefer _ = mlx.mlx_array_free(result[i]);
             try mlx.check(mlx.mlx_slice(&result[i], value, &.{ 0, offset, 0 }, 3, &.{ 1, offset + widths[i], mlx.getShape(value)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         } else result[i] = switch (kind) {
-            .attention => try self.attnProj(flat[i], out_w, out_s, out_b, decode, @intCast(layer)),
+            .attention => try self.qmatmul(flat[i], out_w, out_s, out_b),
             .gdn => try self.qmatmul(flat[i], out_w, out_s, out_b),
         };
         built += 1;
@@ -2909,11 +2899,11 @@ pub const Qwen4FwdProf = struct {
     op_ns: [6]u64 = @splat(0),
 
     pub fn init(seq_len: c_int, h: mlx.mlx_array) !Qwen4FwdProf {
-        const env = std.c.getenv("QWEN4_PROFILE_FWD");
+        const env = if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) std.c.getenv("QWEN4_PROFILE_FWD") else null;
         // `=1`: S 2..16 (verify). `=all`: any S, including decode S=1 and prefill.
         const all = env != null and env.?[0] == 'a';
-        const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
-        var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
+        const timing = env != null and (all or (seq_len >= 2 and seq_len <= 16));
+        var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOnCached(&qwen4_opcount_env, "QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (p.ops) {
             trf.moe_rows_fused_layers = 0;
             trf.moe_sorted_layers = 0;
@@ -3037,6 +3027,8 @@ pub var qwen4_debug_scores_env: ?bool = null;
 pub var qwen4_profile_fwd_env: ?bool = null;
 
 pub var qwen4_profile_qsa_env: ?bool = null;
+
+var qwen4_opcount_env: ?bool = null;
 
 pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     if (qwen4_hc.hc_fused_kernels[which]) |k| return k;

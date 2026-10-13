@@ -430,7 +430,7 @@ fn rowBytes(a: mlx.mlx_array) u64 {
 }
 
 fn checkpointFileBytes(cp: *const transformer_mod.SSMCheckpoint) u64 {
-    var n: u64 = FILE_OVERHEAD_BYTES;
+    var n: u64 = FILE_OVERHEAD_BYTES + cp.released_bytes;
     for (cp.layers) |*l| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |a| {
         if (a.ctx != null) n += nbytesOf(a) + TENSOR_OVERHEAD_BYTES;
     };
@@ -635,6 +635,27 @@ pub const DiskTier = struct {
         const pre = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, id }) catch return true;
         defer self.allocator.free(pre);
         return w.pendingPrefix(pre);
+    }
+
+    /// Frees the RAM state of every checkpoint in `cps` (ascending by position) but the newest one still
+    /// held, after waiting for its file to leave the writer: staged for entry `id`, the file is the
+    /// restore point from then on. A checkpoint the tier did not take, or whose write failed, is not
+    /// a restore point (the failure poisons the entry on the next commit) and its state is not kept.
+    pub fn settleCheckpoints(self: *DiskTier, id: ?u64, cps: []transformer_mod.SSMCheckpoint) void {
+        var newest: ?usize = null;
+        for (cps, 0..) |*cp, i| {
+            if (!cp.isReleased()) newest = i;
+        }
+        for (cps, 0..) |*cp, i| {
+            if (cp.isReleased() or i == newest) continue;
+            if (self.writer) |w| if (id) |entry| {
+                if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, entry, cp.pos })) |path| {
+                    defer self.allocator.free(path);
+                    w.drainPrefix(path);
+                } else |_| {}
+            };
+            cp.release();
+        }
     }
 
     /// Attribute the writer's failed blobs to the entries that staged them and poison those
@@ -912,6 +933,32 @@ pub const DiskTier = struct {
             }
         }
         return best;
+    }
+
+    /// Which of the ascending restore points `steps` of a cache holding `tokens` an intact entry
+    /// keeps a ring file for. A file counts once staged: a restore drains its entry first, and a
+    /// write that then fails poisons the entry (`harvestWriteFailures`).
+    pub fn ringPointsHeld(
+        self: *const DiskTier,
+        tokens: []const u32,
+        has_tools: bool,
+        quant: kv_quant.KVQuantConfig,
+        steps: []const usize,
+        held: []bool,
+    ) void {
+        @memset(held, false);
+        for (self.entries.items) |*e| {
+            if (e.poisoned or e.rings.len == 0) continue;
+            if (e.has_tools != has_tools) continue;
+            if (!std.meta.eql(e.quant, quant)) continue;
+            const common = commonPrefixLen(e.tokens, tokens);
+            for (steps, held) |step, *h| {
+                if (h.* or step > common or step > e.kv_len) continue;
+                for (e.rings) |r| {
+                    if (r.pos == step) h.* = true;
+                }
+            }
+        }
     }
 
     /// Rebuild `entries[idx]` at `len` into a ringed cache: the chunked layers up to `len`, then
@@ -1868,7 +1915,7 @@ pub const DiskTier = struct {
         const chunks_done: u32 = chunk_i;
         const chunk_complete = chunks_done == n_chunks;
         const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
-        if (kv_len <= old_kv and ssm_res.positions.len == old_ssm_pos.len and ringsEqual(rings, old_rings)) {
+        if (kv_len <= old_kv and std.mem.eql(u32, ssm_res.positions, old_ssm_pos) and ringsEqual(rings, old_rings)) {
             // Cap so tight nothing new landed — nothing to commit (a
             // checkpoint-only write still counts as progress).
             chunk_sizes.deinit(self.allocator);
@@ -2761,7 +2808,8 @@ pub const DiskTier = struct {
         errdefer set.deinit(self.allocator);
         try set.appendSlice(self.allocator, old_positions);
         for (cps) |*cp| {
-            if (cp.pos == 0 or cp.pos > kv_len) continue;
+            // A released state has no bytes to write: it is a restore point only where its file already is.
+            if (cp.pos == 0 or cp.pos > kv_len or cp.isReleased()) continue;
             const p: u32 = @intCast(cp.pos);
             if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
         }
@@ -3415,7 +3463,7 @@ pub const DiskTier = struct {
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the synchronous legacy arm or under `SUSHI_SSD_CHUNK_SHARE=0`.
+    /// the synchronous legacy arm.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
@@ -4278,6 +4326,11 @@ fn fingerprintFile(h: *std.hash.XxHash64, io: std.Io, dir: std.Io.Dir, name: []c
 }
 
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
+    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+/// `layout` names a stored-state layout the model files do not tell apart; null keeps the historical fingerprint.
+pub fn modelFingerprintWithLayout(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, layout: ?[]const u8) ![]u8 {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
     var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
     h.update(model_dir);
@@ -4322,6 +4375,7 @@ pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []c
     for (names.items) |name| fingerprintFile(&h, io, dir, name);
     fingerprintFile(&h, io, dir, "ngram_table.bin");
     if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout) |tag| h.update(tag);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
 }
 
@@ -4378,19 +4432,11 @@ pub fn commonPrefixLen(a: []const u32, b: []const u32) usize {
     return i;
 }
 
-var chunk_share_env_cached: ?bool = null;
+/// Test seam: false makes every commit write all its chunks instead of hard-linking a donor's.
 pub var chunk_share_override: ?bool = null;
 
-/// `SUSHI_SSD_CHUNK_SHARE=0` restores the write-everything commit (SSD-first arm only).
 pub fn chunkShareEnabled() bool {
-    if (chunk_share_override) |v| return v;
-    if (chunk_share_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_SSD_CHUNK_SHARE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    chunk_share_env_cached = v;
-    return v;
+    return chunk_share_override orelse true;
 }
 
 fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {
@@ -6693,6 +6739,42 @@ test "modelFingerprint: stable per path, rolls with config.json changes" {
 
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
     try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+test "modelFingerprint: the f32 and the --qwen-gdn 16 GDN layouts each get their own SSD namespace" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
+    defer testing.allocator.free(dir);
+
+    const wide = model.ModelConfig{ .linear_num_value_heads = 48 };
+    var narrow = wide;
+    narrow.gdn_state_f32 = false;
+    var glm = wide;
+    glm.model_type = "glm5_next";
+    const mimo = model.ModelConfig{ .model_type = "mimo_v2" };
+
+    const today = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(today);
+    // Entries written before the gate became f32 sit under `today`'s value and are never restored.
+    const fp_narrow = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_narrow);
+    try testing.expect(!std.mem.eql(u8, today, fp_narrow));
+    const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, wide.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_f32);
+    try testing.expect(!std.mem.eql(u8, today, fp_f32));
+    try testing.expect(!std.mem.eql(u8, fp_narrow, fp_f32));
+    // GLM (KDA state, f32 always) and MiMo (no GDN layers) keep the historical namespace.
+    for ([_]*const model.ModelConfig{ &glm, &mimo }) |c| {
+        const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, c.cacheLayoutNamespace());
+        defer testing.allocator.free(fp);
+        try testing.expectEqualStrings(today, fp);
+    }
 }
 
 test "modelFingerprint: rolls with --config-overrides" {

@@ -137,12 +137,6 @@ pub const LoadParams = struct {
     /// the decode path on the inference thread. Adds ~600-900 ms at boot but
     /// keeps the first user request fast.
     warmup_eager: bool = true,
-    /// Drafter block size (caller computed via `drafter.recommendedBlockSize`).
-    /// Ignored when `drafter_dir` is empty.
-    draft_block_size: u32 = 4,
-    /// Whether the user passed --draft-block-size explicitly (used for
-    /// human-readable startup logging). Ignored when `drafter_dir` is empty.
-    draft_block_size_explicit: bool = false,
     /// KV-cache storage backend: `--kv-quant`, else the kv8 engine default. Stored on every
     /// per-slot KVCache and consulted at every read/write boundary.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
@@ -164,7 +158,6 @@ pub const LoadParams = struct {
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
-    expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -202,8 +195,8 @@ pub const LoadParams = struct {
 /// deinit); a `submit` that fails hands it to the inference thread to free.
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
-    /// Full original prompt for PLD lookup. When null, defaults to
-    /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
+    /// Full original prompt for the MTP lookup. When null, defaults to
+    /// `prompt_ids` (the lookup table = full_prompt + generated).
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
@@ -214,7 +207,6 @@ pub const SubmitParams = struct {
     eos_token_ids: []const u32,
     max_tokens: u32,
     timeout_ns: u64 = 0,
-    enable_pld: bool = false,
     enable_drafter: bool = false,
     /// DFlash assistant for this model. Rides the SAME `enable_drafter`
     /// request switch (a model loads at most ONE of drafter/dflash);
@@ -226,8 +218,6 @@ pub const SubmitParams = struct {
     mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
-    pld_draft_len: u32 = 5,
-    pld_key_len: u32 = 3,
     /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
     /// instead of dequant + dense SDPA. No effect when the cache scheme
     /// isn't `.affine`. Default false → unchanged behavior.
@@ -265,12 +255,19 @@ pub const SubmitParams = struct {
     model: *model_registry_mod.LoadedModel,
 };
 
+/// The KDA checkpoints a GLM request keeps for the prefix cache, as admission bills them: how many it
+/// keeps, and whether its prefill moves each to SSD and drops the RAM copy (`glmCheckpointsRelease`).
+pub const CheckpointPlan = struct {
+    keep: u32 = 0,
+    released: bool = false,
+};
+
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
 /// right now? Null (unit tests, no HTTP server) disables evict-to-admit. The trailing warm
 /// arguments are the restored rows, their capacity, and whether the restore checked the
 /// entry out (the only restore whose rows the request will not allocate); then MTP and the GLM
 /// checkpoints the request keeps (`server.WarmPrefix.checkpoints`).
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool = null;
 
 /// {needed, available, commit} of the same cold bill, live memory re-read (`server.prefillBillNumbersNow`).
 /// Null (unit tests) skips the inference thread's hold for an ungated arch.
@@ -354,7 +351,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) ?model_registry_mod.MemoryContextRefusal = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) ?model_registry_mod.MemoryContextRefusal = null;
 
 /// GPU bytes a vision encode may still take, read live (`server.visionEncodeAvailable`). Null skips the recheck.
 pub var vision_encode_available: ?*const fn (*const model_mod.ModelConfig) u64 = null;
@@ -478,7 +475,6 @@ pub const Slot = struct {
     timeout_ns: u64,
     has_tools: bool,
     enable_thinking: bool,
-    enable_pld: bool,
     enable_drafter: bool,
     dflash: ?*DflashModel,
     drafter_block_size: u32,
@@ -486,8 +482,6 @@ pub const Slot = struct {
     allow_batch_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
-    pld_draft_len: u32,
-    pld_key_len: u32,
     /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
     kv_attn_fused: bool,
     cached_tokens: u32,
@@ -690,7 +684,6 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_thinking = params.enable_thinking,
-            .enable_pld = params.enable_pld,
             // An external drafter does not carry M-RoPE positions for image tokens.
             .enable_drafter = assistantSidecarEnabledForRequest(
                 params.enable_drafter,
@@ -702,8 +695,6 @@ pub const Slot = struct {
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
-            .pld_draft_len = params.pld_draft_len,
-            .pld_key_len = params.pld_key_len,
             .kv_attn_fused = params.kv_attn_fused,
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
@@ -1166,8 +1157,6 @@ pub const LoadRequest = struct {
 
     load_vision: bool = false,
     warmup_eager: bool = true,
-    draft_block_size: u32 = 4,
-    draft_block_size_explicit: bool = false,
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
     kv_quant_explicit: bool = false,
     prefix_cache_capacity: u32 = 1,
@@ -1177,7 +1166,6 @@ pub const LoadRequest = struct {
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
-    expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1274,7 +1262,6 @@ pub const Scheduler = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget,
-    expert_cache_bytes: u64,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,
@@ -1299,8 +1286,6 @@ pub const Scheduler = struct {
     no_drafter: bool,
     drafter_dir: []const u8,
     primary_model_dir: []const u8,
-    draft_block_size: u32,
-    draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     drafter_path: []const u8,
@@ -1474,7 +1459,7 @@ pub const Scheduler = struct {
             .xfm = null,
             .weights = null,
             .vision_encoder = null,
-            .drafter_block_size = params.draft_block_size,
+            .drafter_block_size = 0,
             .kv_quant_config = params.kv_quant_config,
             .kv_quant_explicit = params.kv_quant_explicit,
             .ctx_size_flag = params.ctx_size,
@@ -1484,7 +1469,6 @@ pub const Scheduler = struct {
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
-            .expert_cache_bytes = params.expert_cache_bytes,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
@@ -1496,8 +1480,6 @@ pub const Scheduler = struct {
             .no_drafter = params.no_drafter,
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
-            .draft_block_size = params.draft_block_size,
-            .draft_block_size_explicit = params.draft_block_size_explicit,
             .drafter_path = params.drafter_dir,
             .hot_prefix_cache = null,
             .max_concurrent = cap,
@@ -1865,15 +1847,16 @@ pub const Scheduler = struct {
         // slice handed to the LoadRequest stays valid while we block on `done`.
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
+        var pinned = false;
+        errdefer if (pinned) self.registry.releaseStatus(entry);
 
         const settings_budget = resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming()).bytes;
         const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
             owned.config.supportsExpertStreaming(),
             owned.config.expertStreamingRequired(),
-            self.expert_cache_bytes,
             settings_budget,
         )) blk: {
-            if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
+            if (settings_budget == 0) return error.ExpertStreamingRequired;
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
             switch (verdict) {
@@ -1882,7 +1865,7 @@ pub const Scheduler = struct {
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
-            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget, coldLoadVision(owned.config, true));
+            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, settings_budget, coldLoadVision(owned.config, true));
             break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
@@ -1903,7 +1886,7 @@ pub const Scheduler = struct {
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
             self.registry.mutex.lockUncancelable(self.io);
-            errdefer self.registry.mutex.unlock(self.io); // bail on early returns
+            errdefer self.registry.mutex.unlock(self.io); // the one unlock of every error return
 
             // Wait out any concurrent .loading / .evicting state.
             wait_loop: while (true) {
@@ -1919,7 +1902,6 @@ pub const Scheduler = struct {
                     },
                     .error_state => {
                         const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
-                        self.registry.mutex.unlock(self.io);
                         return load_err;
                     },
                     .unloaded => break :wait_loop,
@@ -1928,6 +1910,7 @@ pub const Scheduler = struct {
 
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+            pinned = true;
 
             // Estimate post-load bytes (`gateEstimateBytes`).
             const estimated: u64 = streaming_gate_bytes orelse gateEstimateBytes(entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
@@ -1957,7 +1940,6 @@ pub const Scheduler = struct {
                     self.registry.countLoadedLocked(),
                 });
                 self.registry.markUnloadedLocked(entry); // releases the reservation
-                self.registry.mutex.unlock(self.io);
                 return error.NotEnoughMemory;
             };
             n_victims = n;
@@ -1973,14 +1955,12 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
-            // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
-            // loads too; the path itself is scoped by `coldLoadDrafterDir`.
+            // `--no-drafter` / `--drafter` reach cold loads too; the path
+            // itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             .no_drafter = self.no_drafter,
             .load_vision = coldLoadVision(owned.config, false),
             .warmup_eager = true,
-            .draft_block_size = self.draft_block_size,
-            .draft_block_size_explicit = self.draft_block_size_explicit,
             .kv_quant_config = self.kv_quant_config,
             .kv_quant_explicit = self.kv_quant_explicit,
             // Cold loads get the SAME prefix-cache configuration as the
@@ -1992,7 +1972,6 @@ pub const Scheduler = struct {
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
-            .expert_cache_bytes = self.expert_cache_bytes,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
@@ -2036,11 +2015,12 @@ pub const Scheduler = struct {
         // Success — inference thread installed cpu_state onto the entry.
         owned_active = false;
 
-        // Re-acquire under mutex and refcount the ready entry.
+        // Already referenced since the claim, so no other load evicted it; only an explicit
+        // unload can have claimed it since `markReady`, and that is a 503, not a failed load.
         self.registry.mutex.lockUncancelable(self.io);
-        defer self.registry.mutex.unlock(self.io);
-        if (entry.state != .ready) return error.LoadFailed;
-        _ = entry.refcount.fetchAdd(1, .acq_rel);
+        const ready = entry.state == .ready;
+        self.registry.mutex.unlock(self.io);
+        if (!ready) return error.NotLoaded;
         return entry;
     }
 
@@ -2190,35 +2170,17 @@ pub const Scheduler = struct {
     /// Does this slot's next decode tick actually run the regular (non-speculative)
     /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
     /// the authoritative dispatch answer, and a generator can also have turned spec
-    /// off at runtime. Reading the armed flags here vetoed batched decode for any
-    /// slot whose prompt merely n-gram-scored high enough to ARM PLD, even after
-    /// PLD's own yield gate had disabled itself — neither speculation nor batching
-    /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
-    /// INIT options does not bind DISPATCH".
+    /// off at runtime. Same class as "a guard that shapes INIT options does not bind DISPATCH".
     fn slotTicksRegular(slot: *const Slot) bool {
         if (Planner.enabled() and slot.planner_force_plain) return true;
-        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
-        //
-        // The POLICY this encodes, which is deliberate and not free: `nextPld`'s
-        // periodic re-enable check (`SPEC_REENABLE_INTERVAL`) lives on the serial
-        // path, and the batched tick never calls it. So a slot whose PLD yield
-        // gate disabled itself stays disabled for as long as it keeps company —
-        // even if its tail later turns into the file/tool echo PLD is best at.
-        // That is the right trade at N>1 (the batched kernel reads the weight set
-        // once for the whole group, which beats one slot's lookup wins) and it
-        // self-corrects: a SOLO slot never reaches the batched path, so the
-        // re-enable check resumes the moment concurrency drops back to one.
-        // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
-        // documented trade` below — flip either half deliberately, not by accident.
         return gen.spec_disabled_runtime or specTickMode(
             slot.enable_mtp,
             gen.mtp != null,
             slot.enable_drafter,
             gen.dflash != null,
-            slot.enable_pld,
-            gen.pld_enabled,
         ) == .regular;
     }
 
@@ -2692,17 +2654,15 @@ fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelCon
     return ptr;
 }
 
-/// A load's MTP decision: `--mtp`/`--no-mtp` > `--fast` > the per-model `mtp` > on.
+/// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
 pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelConfig) model_settings.MtpChoice {
-    const choice = model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
-    return if (config.expert_streaming) choice.streamed() else choice;
+    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
 }
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
 /// runs before the load marks its config streamed.
 fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) expert_stream_mod.MtpUnderStreaming {
-    const c = choice.streamed();
-    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default, head_supported);
+    return expert_stream_mod.mtpUnderStreaming(choice.on, choice.source == .model_settings, choice.source == .default, head_supported);
 }
 
 fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
@@ -2725,7 +2685,7 @@ test "a streamed load drops only the engine-default MTP, never an asked-for one"
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true, false));
 }
 
-/// What a load line and `/props` read for the four keys `--fast` sets, under the launch globals.
+/// What a load line and `/props` read for the MTP, acceptance, greedy-tail and KV keys, under the launch globals.
 const LaunchPicks = struct {
     mtp: model_settings.MtpChoice,
     acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
@@ -2743,14 +2703,12 @@ const LaunchPicks = struct {
 };
 
 const LaunchGlobals = struct {
-    fast: bool,
     acceptance: mtp_acceptance_mod.Mode,
     acceptance_explicit: bool,
     greedy_tail_explicit: bool,
 
     fn save() LaunchGlobals {
         return .{
-            .fast = model_settings.fast,
             .acceptance = generate_mod.mtp_acceptance_default,
             .acceptance_explicit = generate_mod.mtp_acceptance_explicit,
             .greedy_tail_explicit = generate_mod.mtp_greedy_tail_explicit,
@@ -2758,49 +2716,35 @@ const LaunchGlobals = struct {
     }
 
     fn restore(self: LaunchGlobals) void {
-        model_settings.fast = self.fast;
         generate_mod.mtp_acceptance_default = self.acceptance;
         generate_mod.mtp_acceptance_explicit = self.acceptance_explicit;
         generate_mod.mtp_greedy_tail_explicit = self.greedy_tail_explicit;
     }
 };
 
-test "--fast: its preset, named --fast, outranks model-settings.json; an explicit flag outranks --fast; no --fast, no change" {
+test "an explicit launch flag outranks model-settings.json for MTP, acceptance, greedy tail and KV" {
     const saved = LaunchGlobals.save();
     defer saved.restore();
-    (LaunchGlobals{ .fast = false, .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
-    const p = model_settings.fast_preset;
+    (LaunchGlobals{ .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
     var file = ModelConfig{};
-    file.mtp_override = !p.mtp.?;
+    file.mtp_override = false;
     file.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    file.mtp_greedy_tail_override = !p.mtp_greedy_tail.?;
+    file.mtp_greedy_tail_override = true;
     file.kv_quant_override = .dense;
 
-    const unfast = LaunchPicks.of(null, null, &file);
-    try testing.expectEqual(!p.mtp.?, unfast.mtp.on);
-    try testing.expectEqual(model_settings.Source.model_settings, unfast.mtp.source);
-    try testing.expectEqual(model_settings.Source.model_settings, unfast.acceptance.source);
-    try testing.expectEqual(model_settings.Pick(bool){ .value = !p.mtp_greedy_tail.?, .source = .model_settings }, unfast.greedy_tail);
-    try testing.expectEqualStrings("model-settings.json", unfast.kv.sourceName());
-
-    model_settings.fast = true;
-    for ([_]ModelConfig{ .{}, file }) |cfg| {
-        const got = LaunchPicks.of(null, null, &cfg);
-        try testing.expectEqual(p.mtp.?, got.mtp.on);
-        try testing.expectEqualStrings("--fast", got.mtp.sourceName());
-        try testing.expect(std.meta.eql(p.mtp_acceptance.?, got.acceptance.value));
-        try testing.expectEqualStrings("--fast", model_settings.sourceLabel(got.acceptance.source, model_settings.acceptanceFlagName(got.acceptance.value)));
-        try testing.expectEqual(model_settings.Pick(bool){ .value = p.mtp_greedy_tail.?, .source = .fast }, got.greedy_tail);
-        try testing.expectEqual(p.kv_quant.?, got.kv.config);
-        try testing.expectEqualStrings("--fast", got.kv.sourceName());
-    }
+    const unflagged = LaunchPicks.of(null, null, &file);
+    try testing.expect(!unflagged.mtp.on);
+    try testing.expectEqual(model_settings.Source.model_settings, unflagged.mtp.source);
+    try testing.expectEqual(model_settings.Source.model_settings, unflagged.acceptance.source);
+    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .model_settings }, unflagged.greedy_tail);
+    try testing.expectEqualStrings("model-settings.json", unflagged.kv.sourceName());
 
     generate_mod.mtp_acceptance_default = .{ .typical = .{ .delta = 0.1 } };
     generate_mod.mtp_acceptance_explicit = true;
     generate_mod.mtp_greedy_tail_explicit = true;
-    const flagged = LaunchPicks.of(false, transformer_mod.KVQuantConfig.affine(4), &file);
-    try testing.expect(!flagged.mtp.on);
-    try testing.expectEqualStrings("--no-mtp", flagged.mtp.sourceName());
+    const flagged = LaunchPicks.of(true, transformer_mod.KVQuantConfig.affine(4), &file);
+    try testing.expect(flagged.mtp.on);
+    try testing.expectEqualStrings("--mtp", flagged.mtp.sourceName());
     try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
     try testing.expectEqual(model_settings.Source.flag, flagged.acceptance.source);
     try testing.expectEqual(model_settings.Source.flag, flagged.greedy_tail.source);
@@ -2808,22 +2752,12 @@ test "--fast: its preset, named --fast, outranks model-settings.json; an explici
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
 
-test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp keeps the head" {
-    const saved = LaunchGlobals.save();
-    defer saved.restore();
-    model_settings.fast = true;
-    const gate = mtpChoiceFor(true, false, &ModelConfig{});
-    try testing.expect(gate.on);
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate, true));
-    var streamed = ModelConfig{};
-    streamed.expert_streaming = true;
-    const loaded = mtpChoiceFor(true, false, &streamed);
-    try testing.expect(!loaded.on);
-    try testing.expectEqualStrings("--fast", loaded.sourceName());
-    try testing.expect(!loaded.forced());
+test "an explicit --mtp keeps the head on a streamed load, or refuses when it cannot" {
     const asked = mtpChoiceFor(true, true, &ModelConfig{});
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked, true));
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked, false));
+    var streamed = ModelConfig{};
+    streamed.expert_streaming = true;
     try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
@@ -2834,7 +2768,7 @@ pub const SsdBudgetChoice = struct {
 };
 
 /// The launch flag wins over the per-model setting; a non-streaming model ignores the
-/// setting (warned once). `--expert-cache-gb` is decided earlier, in `resolveExpertCache`.
+/// setting (warned once).
 pub fn resolveSsdBudget(flag_bytes: u64, setting_gb: u32, streaming: bool) SsdBudgetChoice {
     if (!streaming) return .{ .bytes = 0, .from_setting = false, .setting_ignored = setting_gb > 0 };
     if (flag_bytes > 0) return .{ .bytes = flag_bytes, .from_setting = false, .setting_ignored = false };
@@ -2912,7 +2846,7 @@ pub const StreamingPlan = struct {
 
 /// What the pack's tower costs a streamed load: its weights in the budget, its largest image
 /// encode beside it. Slot counts come from the ssd-budget ledger: `slots_without` 0 = no
-/// ledger (`--expert-cache-gb`), `slots_with` null = the budget cannot hold the tower.
+/// ledger, `slots_with` null = the budget cannot hold the tower.
 pub const VisionCost = struct {
     on: bool = false,
     tower_bytes: u64 = 0,
@@ -2923,7 +2857,7 @@ pub const VisionCost = struct {
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the
 /// on-disk layout, what stays resident, and the expert cache the budget leaves.
-pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, explicit_cache_bytes: u64, budget_bytes: u64, vision: bool) !StreamingPlan {
+pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget_bytes: u64, vision: bool) !StreamingPlan {
     const geometry = config.expertGeometry();
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
@@ -2936,7 +2870,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const picked = resolveStreamedVision(explicit_cache_bytes, budget_bytes, config, split, per_expert, vision) catch |err| {
+    const picked = resolveStreamedVision(budget_bytes, config, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
             budget_bytes >> 30,
             @as(f64, @floatFromInt(split.vision)) / 1e9,
@@ -2950,12 +2884,12 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 
 /// PURE: the expert cache with the pack's tower (`split.vision`) kept or left off, and what
 /// keeping it costs. Asked for on a budget that cannot hold it, it is refused by name.
-pub fn resolveStreamedVision(explicit_bytes: u64, budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
+pub fn resolveStreamedVision(budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
     var text = split;
     text.vision = 0;
-    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, config.stream_mtp_head, per_expert);
+    const without = try resolveExpertCache(budget_bytes, config, text, config.stream_mtp_head, per_expert);
     if (split.vision == 0) return .{ .resolved = without, .cost = .{} };
-    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
+    const with: ?ExpertCacheResolution = resolveExpertCache(budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
         error.SsdBudgetBelowResident => null,
         else => return err,
     };
@@ -3014,24 +2948,19 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
 pub const ExpertCacheResolution = struct {
     cache_bytes: u64,
     ledger: ?expert_stream_mod.BudgetLedger,
-    overridden: bool,
 };
 
-/// PURE: the expert-cache byte budget for this load. `--expert-cache-gb` wins outright;
-/// otherwise `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
+/// PURE: the expert-cache byte budget for this load. `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
 /// after the resident trunk, the MTP head (only when it stays resident), the vision tower the
 /// split carries, the whole-layer prefill union, the selected-expert slab and the fill bounce buffers.
 pub fn resolveExpertCache(
-    explicit_bytes: u64,
     budget_bytes: u64,
     config: *const model_mod.ModelConfig,
     split: model_mod.ResidentSplit,
     mtp_resident: bool,
     per_expert: u64,
 ) !ExpertCacheResolution {
-    const overridden = expert_stream_mod.budgetOverriddenByExplicitCache(explicit_bytes, budget_bytes);
-    if (explicit_bytes > 0 or budget_bytes == 0)
-        return .{ .cache_bytes = explicit_bytes, .ledger = null, .overridden = overridden };
+    if (budget_bytes == 0) return .{ .cache_bytes = 0, .ledger = null };
     const ledger = try expert_stream_mod.budgetLedger(
         budget_bytes,
         split.trunk,
@@ -3043,7 +2972,7 @@ pub fn resolveExpertCache(
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
     );
-    return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger, .overridden = false };
+    return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
 }
 
 /// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it
@@ -3077,7 +3006,7 @@ test "mimo_v2 expert cache budget excludes the dense prefix" {
         .num_experts_per_tok = 2,
     };
     const fixed = per_expert + 8 * per_expert + 2 * per_expert + expert_stream_mod.BOUNCE_BYTES;
-    const result = try resolveExpertCache(0, fixed + 9 * per_expert, &config, .{ .trunk = per_expert, .mtp = 0 }, false, per_expert);
+    const result = try resolveExpertCache(fixed + 9 * per_expert, &config, .{ .trunk = per_expert, .mtp = 0 }, false, per_expert);
     try std.testing.expectEqual(@as(u16, 3), result.ledger.?.slots_per_layer);
     try std.testing.expectEqual(9 * per_expert, result.cache_bytes);
 }
@@ -3357,7 +3286,6 @@ pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?LoadServingBill
 
 fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
-    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0' and dflash_mod.probeIsDflash(io, allocator, directory)) return 0;
     return @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
 }
 
@@ -3366,7 +3294,7 @@ fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
     const head_bytes = split.mtp +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
     const coarse_bits = mtp_mod.rerankCoarseBits();
-    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
+    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0)
         mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
     else
         0;
@@ -3497,7 +3425,7 @@ test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to it
     try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
 }
 
-test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is explicit" {
+test "the expert cache resolves from --ssd-budget-gb" {
     const t = testing;
     var cfg = model_mod.ModelConfig{};
     cfg.num_hidden_layers = 48;
@@ -3509,25 +3437,19 @@ test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is
     const GiB: u64 = 1 << 30;
     const fused: u64 = 9_830_400;
 
-    const from_budget = try resolveExpertCache(0, 60 * GiB, &cfg, split, false, fused);
+    const from_budget = try resolveExpertCache(60 * GiB, &cfg, split, false, fused);
     try t.expect(from_budget.ledger != null);
     try t.expectEqual(@as(u16, 103), from_budget.ledger.?.slots_per_layer);
     try t.expectEqual(from_budget.ledger.?.cache_bytes, from_budget.cache_bytes);
-    try t.expect(!from_budget.overridden);
 
-    const with_mtp = try resolveExpertCache(0, 60 * GiB, &cfg, split, true, fused);
+    const with_mtp = try resolveExpertCache(60 * GiB, &cfg, split, true, fused);
     try t.expectEqual(@as(u16, 92), with_mtp.ledger.?.slots_per_layer);
 
-    const explicit = try resolveExpertCache(60_000_000_000, 60 * GiB, &cfg, split, false, fused);
-    try t.expectEqual(@as(u64, 60_000_000_000), explicit.cache_bytes);
-    try t.expect(explicit.ledger == null);
-    try t.expect(explicit.overridden);
+    const no_budget = try resolveExpertCache(0, &cfg, split, false, fused);
+    try t.expectEqual(@as(u64, 0), no_budget.cache_bytes);
+    try t.expect(no_budget.ledger == null);
 
-    const no_budget = try resolveExpertCache(60_000_000_000, 0, &cfg, split, false, fused);
-    try t.expectEqual(@as(u64, 60_000_000_000), no_budget.cache_bytes);
-    try t.expect(!no_budget.overridden);
-
-    try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(0, 14 * GiB, &cfg, split, false, fused));
+    try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(14 * GiB, &cfg, split, false, fused));
 }
 
 test "streamed vision: the tower comes out of the ssd budget only when asked, refused by name when it does not fit" {
@@ -3554,10 +3476,10 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
     const encode = @import("server.zig").largestImageEncodeBytes(&cfg);
     try t.expect(encode > 0);
 
-    const off = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, false);
+    const off = try resolveStreamedVision(60 * GiB, &cfg, split, fused, false);
     try t.expect(!off.cost.on);
     try t.expectEqual(@as(u64, 0), off.resolved.ledger.?.vision_bytes);
-    const on = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, true);
+    const on = try resolveStreamedVision(60 * GiB, &cfg, split, fused, true);
     try t.expect(on.cost.on);
     try t.expectEqual(split.vision, on.resolved.ledger.?.vision_bytes);
     try t.expectEqual(encode, on.cost.encode_bytes);
@@ -3569,17 +3491,13 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
 
     const fixed = split.trunk + 522 * fused + expert_stream_mod.BOUNCE_BYTES;
     const tight = fixed + 2 * 48 * fused;
-    try t.expectEqual(@as(?u16, null), (try resolveStreamedVision(0, tight, &cfg, split, fused, false)).cost.slots_with);
-    try t.expectError(error.SsdBudgetBelowVision, resolveStreamedVision(0, tight, &cfg, split, fused, true));
-    try t.expectError(error.SsdBudgetBelowResident, resolveStreamedVision(0, 14 * GiB, &cfg, split, fused, true));
+    try t.expectEqual(@as(?u16, null), (try resolveStreamedVision(tight, &cfg, split, fused, false)).cost.slots_with);
+    try t.expectError(error.SsdBudgetBelowVision, resolveStreamedVision(tight, &cfg, split, fused, true));
+    try t.expectError(error.SsdBudgetBelowResident, resolveStreamedVision(14 * GiB, &cfg, split, fused, true));
 
-    // --expert-cache-gb sizes the cache itself; the tower is resident beside it.
-    const explicit = try resolveStreamedVision(60_000_000_000, 0, &cfg, split, fused, true);
-    try t.expect(explicit.cost.on);
-    try t.expectEqual(@as(u64, 60_000_000_000), explicit.resolved.cache_bytes);
     var bare = split;
     bare.vision = 0;
-    try t.expect(!(try resolveStreamedVision(0, 60 * GiB, &cfg, bare, fused, true)).cost.on);
+    try t.expect(!(try resolveStreamedVision(60 * GiB, &cfg, bare, fused, true)).cost.on);
 }
 
 test "the vision load line names its source, and what --vision would cost a streamed load" {
@@ -3635,11 +3553,8 @@ test "the ssd budget falls back to the per-model setting, and a non-streaming mo
     cfg.hidden_size = 2560;
     cfg.moe_intermediate_size = 640;
     const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 5_200_000_000 };
-    const via_setting = try resolveExpertCache(0, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
+    const via_setting = try resolveExpertCache(resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
     try t.expectEqual(@as(u16, 103), via_setting.ledger.?.slots_per_layer);
-    const cache_flag = try resolveExpertCache(60_000_000_000, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
-    try t.expectEqual(@as(u64, 60_000_000_000), cache_flag.cache_bytes);
-    try t.expect(cache_flag.overridden);
 }
 
 test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the per-model setting warns" {
@@ -3667,7 +3582,6 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     try t.expect(!expert_stream_mod.expertStreamingEngaged(
         moe.supportsExpertStreaming(),
         moe.expertStreamingRequired(),
-        60_000_000_000,
         from_flag.bytes,
     ));
     try t.expect(!moe.expert_streaming);
@@ -3678,7 +3592,6 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     try t.expect(expert_stream_mod.expertStreamingEngaged(
         q4.supportsExpertStreaming(),
         q4.expertStreamingRequired(),
-        0,
         resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming()).bytes,
     ));
 }
@@ -3701,7 +3614,7 @@ test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
     const budget = resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming());
     try t.expect(!budget.setting_ignored);
     try t.expectEqual(@as(u64, 60 << 30), budget.bytes);
-    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), 0, budget.bytes));
+    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), budget.bytes));
 }
 
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
@@ -3717,9 +3630,8 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
         "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
         "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
-        "prefix_cache_mem_resolver", "expert_cache_bytes",    "expert_cache_fit_resolver",
-        "ssd_budget_bytes",          "kv_quant_explicit",     "mtp_explicit",
+        "no_drafter",                "prefix_cache_mem_resolver", "expert_cache_fit_resolver",
+        "ssd_budget_bytes",          "kv_quant_explicit",         "mtp_explicit",
         "prefix_cache_disk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
@@ -3808,9 +3720,12 @@ fn settleAvailableBytes(first: u64, needed: u64, reader: anytype) u64 {
     return avail;
 }
 
-/// A resident Sushi load shares the working-set cap with already active model buffers.
-fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64) u64 {
-    const available = effectiveAvailableBytes(host_avail, proc_avail, gpu_limit);
+/// A resident Sushi load shares the working-set cap with already active model buffers. A declared
+/// wired limit (`wired_floor`, 0 = none) lifts the free-RAM figure to what that limit leaves the
+/// GPU, the same floor request admission reads.
+fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit: u64, active: u64, wired_floor: u64) u64 {
+    const host = if (wired_floor > 0) @max(host_avail, wired_floor -| active) else host_avail;
+    const available = effectiveAvailableBytes(host, proc_avail, gpu_limit);
     return if (gpu_limit > 0) @min(available, gpu_limit -| active) else available;
 }
 
@@ -3838,10 +3753,23 @@ test "load preflight waits for a prior process's memory to come back, and only w
 
 test "Sushi quant memory subtracts existing resident buffers from the GPU limit" {
     const gib: u64 = 1 << 30;
-    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib));
-    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib));
+    try testing.expectEqual(@as(u64, 54 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 30 * gib), effectiveSushiAvailableBytes(30 * gib, 0, 94 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 0), effectiveSushiAvailableBytes(88 * gib, 0, 40 * gib, 40 * gib, 0));
+    try testing.expectEqual(@as(u64, 88 * gib), effectiveSushiAvailableBytes(88 * gib, 0, 0, 40 * gib, 0));
+}
+
+test "a declared wired limit lifts the load preflight's free-RAM figure, never past the working set" {
+    const gib: u64 = 1 << 30;
+    // 32 GB box, iogpu.wired_limit_mb raised: file cache and other apps' pages read as gone,
+    // but the declared limit says the GPU may claim the floor.
+    try testing.expectEqual(@as(u64, 28 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 28 * gib));
+    // Resident buffers come off the floor, as they come off the working set.
+    try testing.expectEqual(@as(u64, 18 * gib), effectiveSushiAvailableBytes(15 * gib, 0, 29 * gib, 10 * gib, 28 * gib));
+    // More free RAM than the floor keeps the larger figure; the working set still caps it.
+    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(40 * gib, 0, 29 * gib, 0, 28 * gib));
+    // A floor above the working set never raises the cap.
+    try testing.expectEqual(@as(u64, 29 * gib), effectiveSushiAvailableBytes(25 * gib, 0, 29 * gib, 0, 31 * gib));
 }
 
 test "effectiveAvailableBytes is capped by the GPU working-set limit" {
@@ -3877,11 +3805,11 @@ fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak
     return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES;
 }
 
-/// Free memory a load demands: its billed weights, then the larger of the warmup transient and the requested
-/// context's admission bill (the warmup ends before any request allocates), then the safety net.
+/// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
+/// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
     if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, config.expert_fill_peak_bytes, config.expert_bounce_bytes);
-    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on), context_bill) +| LOAD_SAFETY_NET_BYTES;
+    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
 }
 
 /// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
@@ -3892,7 +3820,6 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: 
 
 fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
-    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0') return 0;
     if (!dflash_mod.probeIsDflash(io, allocator, directory)) return error.GlmDflashAssistantRequired;
     var cfg = try dflash_mod.parseConfig(io, allocator, directory);
     defer cfg.deinit(allocator);
@@ -3955,7 +3882,7 @@ const LoadBillFixtures = struct {
     }
 };
 
-test "a load bills weights, the measured warmup or the context bill, and a 1 GiB net" {
+test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
     const gib: u64 = 1 << 30;
     var f = try LoadBillFixtures.init();
     defer f.deinit();
@@ -3966,9 +3893,11 @@ test "a load bills weights, the measured warmup or the context bill, and a 1 GiB
     const glm_state = f.glm.ssmCheckpointBytes() + f.glm.qsaRingBytes() + (f.glm.kvBytesPerToken() + f.glm.qsaHistoryBytesPerToken()) * 1024;
     try testing.expect(glm_state > 0);
     try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8 + gib, loadRequirementBytes(&f.glm, 90 * gib, false, 0));
-    // A requested context's admission bill replaces the warmup once it is the larger; the net rides on either.
-    try testing.expectEqual(44 * gib + 6 * gib + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    // A requested context's admission bill replaces warmup and net once it is the larger: no request has allocated
+    // during the warmup, and request admission bills that context again.
+    try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
+    try testing.expectEqual(44 * gib + gib * 9 / 4, loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
 }
 
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
@@ -4010,9 +3939,8 @@ test "the eviction gate bills weights plus 10% headroom" {
 /// `params` is duck-typed (`anytype`): both `LoadParams` (startup) and
 /// `*LoadRequest` (on-demand) supply the same field set — `entry`,
 /// `config`/`tok`/`chat_config` (heap pointers), `model_dir`,
-/// `drafter_dir`, `load_vision`, `warmup_eager`, `draft_block_size`,
-/// `draft_block_size_explicit`, `kv_quant_config`, `prefix_cache_capacity`,
-/// `prefix_cache_mem_bytes`. The function reads them by name.
+/// `drafter_dir`, `load_vision`, `warmup_eager`, `kv_quant_config`,
+/// `prefix_cache_capacity`, `prefix_cache_mem_bytes`. The function reads them by name.
 ///
 /// On any error the partial state has already been freed via errdefer; the
 /// caller decides how to surface (startup → recordLoadError + signal
@@ -4035,7 +3963,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
         params.config.expertStreamingRequired(),
-        params.expert_cache_bytes,
         streaming_budget.bytes,
     );
     const vision_choice = visionChoiceFor(params.config, streamed);
@@ -4043,9 +3970,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var vision_cost: VisionCost = .{};
     if (streamed) {
         const budget = streaming_budget;
-        if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
+        if (budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
-        if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
         const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
         switch (verdict) {
             .refuse => {
@@ -4064,13 +3990,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         if (budget.from_setting)
             log.info("[expert-stream] ssd budget {d} GiB from model-settings.json\n", .{budget.bytes >> 30});
-        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, params.expert_cache_bytes, budget.bytes, load_vision);
+        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision);
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
-        if (plan.resolved.overridden)
-            log.info("[expert-stream] --expert-cache-gb overrides --ssd-budget-gb: cache {d:.2} GB\n", .{
-                @as(f64, @floatFromInt(plan.resolved.cache_bytes)) / 1e9,
-            });
         if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
@@ -4131,20 +4053,21 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             io: std.Io,
             gpu_limit: usize,
             sushi: bool,
+            wired_floor: u64,
             fn read(r: *@This()) u64 {
                 if (!r.sushi) return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit);
                 var active: usize = 0;
                 _ = mlx.mlx_get_active_memory(&active);
-                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active);
+                return effectiveSushiAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), r.gpu_limit, active, r.wired_floor);
             }
             fn sleep(r: *@This()) void {
                 std.Io.sleep(r.io, .fromMilliseconds(500), .real) catch {};
             }
         };
-        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
+        var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config), .wired_floor = @import("server.zig").wiredCeilingFloorFor(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
-        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         if (memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
@@ -4152,17 +4075,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             avail_bytes = settleAvailableBytes(avail_bytes, needed, &reader);
-            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         var active: usize = 0;
         if (reader.sushi) _ = mlx.mlx_get_active_memory(&active);
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup/context ~{d:.2} GB + {d:.2} GB net)\n", .{
+        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB)\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(needed -| weights_bytes -| LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
         if (weights_bytes > 0 and (memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {
@@ -4309,24 +4231,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    // Phase 2 experiment: opt-in full-forward Metal fusion via
-    // SUSHI_COMPILE_FORWARD=1. This wraps the entire forward pass in
-    // mlx_compile so the chunked-prefill loop dispatches a fused graph
-    // instead of ~hundreds of separate ops per chunk. Gated because
-    // (a) the compiled closure captures `xfm.cache` / `xfm.ssm_entries`
-    // as state, and any path that swaps those (multi-slot scheduler,
-    // future re-entrant callers) must verify they're not racing the
-    // compiled call; (b) mlx_compile with shapeless=false recompiles
-    // per unique input shape, which thrashes if the prefill loop sees
-    // many different chunk sizes.
-    if (std.c.getenv("SUSHI_COMPILE_FORWARD") != null) {
-        const raw = std.c.getenv("SUSHI_COMPILE_FORWARD").?;
-        const slice = std.mem.sliceTo(raw, 0);
-        if (std.mem.eql(u8, slice, "1")) {
-            xfm_ptr.compileForward();
-        }
-    }
-
     if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
     if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (xfm_ptr.glm5) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
 
@@ -4360,7 +4264,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 n_widths = @max(n_widths, 1);
             }
-            const profile_pass = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_PROFILE") != null;
+            const profile_pass = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_PROFILE");
             const kv_pre: usize = blk: {
                 const r = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
@@ -4384,10 +4288,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             }
             // SUSHI_DECODE_FWD_UBENCH_ROW_ARMS=1: a MiMo verify width runs twice, the
             // prefill-shaped forward first, then the verify rows (decode arithmetic per row).
-            const row_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS") != null;
+            const row_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS");
             // SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1: every width runs the GDN chain and the fused
             // decode step (`gdn_decode.step`) as off, on, on, off passes in this one process.
-            const gdn_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS") != null;
+            const gdn_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS");
             defer transformer_mod.gdn_decode_recur_override = null;
             const fold_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS");
             defer transformer_mod.gdn_verify_fold_override = null;
@@ -4597,59 +4501,46 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // DFlash block-drafter (any `*_assistant` family); anything else is refused.
     var dflash_ptr: ?*DflashModel = null;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
-        const env_off = if (std.c.getenv("SUSHI_DFLASH")) |v| v[0] == '0' else false;
-        if (env_off) {
-            log.info("[dflash] sidecar at {s} skipped (SUSHI_DFLASH=0)\n", .{drafter_dir});
-        } else {
-            const d = try sch.allocator.create(DflashModel);
-            d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
-                sch.allocator.destroy(d);
-                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
-                return err;
-            };
-            if (params.config.isGlm5()) {
-                d.native_glm_serving = true;
-                log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
-                if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
-            } else d.bind(xfm_ptr) catch |err| {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err(
-                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
-                        "  (assistant+target must share hidden_size, the mask token and\n" ++
-                        "  target_layer_ids must exist in the target, and the target must\n" ++
-                        "  run the standard dense-attention forward path)\n",
-                    .{ drafter_dir, @errorName(err) },
-                );
-                return err;
-            };
-            dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
-            sch.drafter_block_size = dflash_mod.resolveBlockSize(
-                d.config.block_size,
-                params.draft_block_size,
-                params.draft_block_size_explicit,
-                wide_lane,
-                block_cap.cap,
+        const d = try sch.allocator.create(DflashModel);
+        d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
+            sch.allocator.destroy(d);
+            log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+            return err;
+        };
+        if (params.config.isGlm5()) {
+            d.native_glm_serving = true;
+            log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
+            if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+        } else d.bind(xfm_ptr) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err(
+                "DFlash assistant at {s} is incompatible with target: {s}\n" ++
+                    "  (assistant+target must share hidden_size, the mask token and\n" ++
+                    "  target_layer_ids must exist in the target, and the target must\n" ++
+                    "  run the standard dense-attention forward path)\n",
+                .{ drafter_dir, @errorName(err) },
             );
-            var cap_note_buf: [96]u8 = undefined;
-            const cap_note: []const u8 = if (params.draft_block_size_explicit)
-                ", user-clamped"
-            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
-                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
-                    block_cap.label,
-                    block_cap.cap,
-                }) catch ", capped"
-            else
-                "";
-            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
-                sch.drafter_block_size,
-                cap_note,
-                wide_lane,
-                d.config.target_layer_ids,
-            });
-        }
+            return err;
+        };
+        dflash_ptr = d;
+        const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+        const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
+        sch.drafter_block_size = dflash_mod.resolveBlockSize(d.config.block_size, wide_lane, block_cap.cap);
+        var cap_note_buf: [96]u8 = undefined;
+        const cap_note: []const u8 = if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+            std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                block_cap.label,
+                block_cap.cap,
+            }) catch ", capped"
+        else
+            "";
+        log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
+            sch.drafter_block_size,
+            cap_note,
+            wide_lane,
+            d.config.target_layer_ids,
+        });
     } else if (drafter_dir.len > 0) {
         log.err("Drafter at {s} is not a DFlash assistant (its config lacks block_size, mask_token_id and target_layer_ids)\n", .{drafter_dir});
         return error.UnsupportedDrafter;
@@ -4847,7 +4738,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // so every bill reads the same answer as `--prefix-cache-disk off`.
     var disk_tier: ?kv_disk_cache.DiskTier = null;
     if (cache_applies and params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-        const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+        const fp = kv_disk_cache.modelFingerprintWithLayout(sch.allocator, sch.io, entry.path, params.config.cacheLayoutNamespace()) catch |err| {
             log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
         };
@@ -5792,11 +5683,11 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
 /// `req.entry`, mark ready, and broadcast `req.done_cond` so the conn
 /// thread wakes. On failure, mark `.error_state` so future ensureLoaded
 /// calls fail fast; the conn thread surfaces a 500.
-fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
-    if (r.target) |t| {
-        log.info("[wired] mode={s} limit={d} MB\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+fn logWiredPolicy(limit: ?usize) void {
+    if (limit) |bytes| {
+        log.info("[wired] limit={d} MB\n", .{bytes / (1024 * 1024)});
     } else {
-        log.debug("[wired] mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+        log.debug("[wired] declined (no gpu)\n", .{});
     }
 }
 
@@ -5828,22 +5719,9 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on
     // the failure path).
+    const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
-        log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
-        sch.registry.mutex.lockUncancelable(sch.io);
-        if (err == error.InsufficientMemory) {
-            // A memory-preflight refusal is transient, not a property of the
-            // checkpoint: the 503 tells the user to free memory and retry, so
-            // the entry must go back to .unloaded — stuck in .error_state the
-            // retry would fail fast until a server restart (#144).
-            sch.registry.markUnloadedLocked(req.entry);
-        } else {
-            // markErrorLocked dupes the error name onto the entry; the
-            // conn thread reads it back from the entry, not from req.
-            sch.registry.markErrorLocked(req.entry, @errorName(err));
-        }
-        sch.registry.mutex.unlock(sch.io);
-        finishLoadRequest(sch, req, @errorName(err));
+        failLoadRequest(sch, req, err, had_error);
         return;
     };
 
@@ -5855,6 +5733,26 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // (MTP head / drafter / vision land after the mid-load apply).
     logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
+}
+
+fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error: bool) void {
+    log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+    // The load's own MLX error is reported here; latched, it would fail the next request.
+    mlx.dropLatchedErrorUnless(had_error);
+    sch.registry.mutex.lockUncancelable(sch.io);
+    if (err == error.InsufficientMemory) {
+        // A memory-preflight refusal is transient, not a property of the
+        // checkpoint: the 503 tells the user to free memory and retry, so
+        // the entry must go back to .unloaded — stuck in .error_state the
+        // retry would fail fast until a server restart (#144).
+        sch.registry.markUnloadedLocked(req.entry);
+    } else {
+        // markErrorLocked dupes the error name onto the entry; the
+        // conn thread reads it back from the entry, not from req.
+        sch.registry.markErrorLocked(req.entry, @errorName(err));
+    }
+    sch.registry.mutex.unlock(sch.io);
+    finishLoadRequest(sch, req, @errorName(err));
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -6012,7 +5910,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // of the capacity buffer (the slot is torn down right after). A failure commits the
     // entry history-less, which a QSA arch treats as a miss.
     if (ssm_cps_opt) |cps| {
-        if (transformer_mod.qsaHistoryShareEnabled() and !transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
+        if (!transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
             if (slot.ssm_entries) |ents| {
                 if (slot.model.transformer) |xf| {
                     transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
@@ -6312,8 +6210,6 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
         gen.mtp != null,
         slot.enable_drafter,
         gen.dflash != null,
-        slot.enable_pld,
-        gen.pld_enabled,
     );
     const ids = gen.generated_ids.items;
     const decoded: ?[]u8 = if (slot.model.tokenizer) |tok|
@@ -6574,7 +6470,7 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelC
             };
             if (iter > 0) times[iter - 1] = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
         }
-        std.mem.sort(f64, times, {}, std.sort.asc(f64));
+        std.mem.sortUnstable(f64, times, {}, std.sort.asc(f64));
         log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s)\n", .{
             if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
             @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0,
@@ -6678,7 +6574,7 @@ const InterleaveCtx = struct {
 /// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
 /// so a cancelled or killed prefill leaves a restorable chunk-aligned prefix. Armed only with
 /// a live background writer, so the inference thread never pays the file write.
-fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
+fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []transformer_mod.SSMCheckpoint) void {
     const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
     const slot = wc.slot;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
@@ -6689,6 +6585,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
+    if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, cps, s);
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     _ = d.appendCommitBounded(
@@ -6711,6 +6608,8 @@ pub const WRITE_THROUGH_FLUSH_BOUND_BYTES: u64 = 1;
 const WriteThroughCtx = struct {
     slot: *Slot,
     chunks: u32 = 0,
+    /// GLM: the SSD entry this prefill is writing.
+    entry_id: ?u64 = null,
 };
 
 /// The write-through only pays when this turn's prefill produces at least one whole disk
@@ -6721,38 +6620,10 @@ fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
 }
 
 var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
-var write_through_off_logged = std.atomic.Value(bool).init(false);
-var write_through_env_cached: ?bool = null;
-
-/// `SUSHI_SSD_WRITE_THROUGH=0` takes the write-through out of the prefill loop; the
-/// end-of-request commit then persists the whole turn. A real two-arm tradeoff (crash-safe
-/// prefix vs TTFT) and the only way to A/B its cost.
-pub fn writeThroughEnabledFromEnv(raw: ?[]const u8) bool {
-    const v = raw orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
-
-/// Read on the inference thread only.
-fn writeThroughEnabled() bool {
-    if (write_through_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_SSD_WRITE_THROUGH") orelse break :blk writeThroughEnabledFromEnv(null);
-        break :blk writeThroughEnabledFromEnv(std.mem.sliceTo(raw, 0));
-    };
-    write_through_env_cached = v;
-    return v;
-}
-
 /// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
 /// worth at least one chunk.
 fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
-    if (!writeThroughEnabled()) {
-        if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
-            log.info("  [disk-cache] prefill write-through disabled by SUSHI_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
-        }
-        return false;
-    }
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
@@ -6764,6 +6635,12 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
         return false;
     }
     return true;
+}
+
+/// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
+/// from this answer and the prefill arms its hook from the same one.
+fn glmCheckpointsRelease(slot: *Slot, new_span: usize) bool {
+    return slot.glm5_request != null and writeThroughArmed(slot, new_span);
 }
 
 /// Context for `Generator.InitOptions.chunk_width_hook`. `cfg` is optional (embedded engines).
@@ -6972,13 +6849,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.mtp != null,
         slot.enable_drafter,
         slot.dflash != null,
-        slot.enable_pld,
     );
     const use_mtp = wiring.use_mtp;
     const use_dflash = wiring.use_dflash or glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
-    const use_pld = wiring.use_pld;
-    log.debug("[spec-wiring] mtp={} dflash={} pld={} (slot: drafter_flag={} dflash_handle={})\n", .{
-        use_mtp,             use_dflash,          use_pld,
+    log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
+        use_mtp,             use_dflash,
         slot.enable_drafter, slot.dflash != null,
     });
 
@@ -7141,15 +7016,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 warm_will_donate: bool,
                 enable_mtp: bool,
                 /// The KDA checkpoints a GLM request keeps: billed here only, and fewer where they do not fit.
-                checkpoints: u32,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, u32) bool,
+                checkpoints: CheckpointPlan,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool, CheckpointPlan) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
                     return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp, self.checkpoints);
                 }
                 fn keeping(ctx: ?*anyopaque, n: u32) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    self.checkpoints = n;
+                    self.checkpoints.keep = n;
                     return call(ctx);
                 }
             };
@@ -7163,7 +7038,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
                 .enable_mtp = slot.enable_mtp,
-                .checkpoints = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
+                .checkpoints = .{
+                    .keep = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
+                    .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
+                },
                 .fits = fits_fn,
             };
             var fits = Probe.call(&probe);
@@ -7288,7 +7166,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld,
             .drafter_block_size = slot.drafter_block_size,
             .dflash_enabled = use_dflash,
             .dflash = if (use_dflash) slot.dflash else null,
@@ -7313,8 +7190,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Regular path: skip the lazy preforward so cache.step lands at
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
-            // PLD/drafter/MTP init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_pld and !use_mtp and !use_dflash,
+            // DFlash/MTP init paths already skip preforward unconditionally.
+            .skip_lazy_preforward = !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -7640,7 +7517,6 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 pub const SpecInitWiring = struct {
     use_mtp: bool,
     use_dflash: bool,
-    use_pld: bool,
 };
 
 /// Per-site spec gating for one slot, as a pure function.
@@ -7657,24 +7533,19 @@ pub fn specInitWiring(
     has_mtp: bool,
     enable_drafter: bool,
     has_dflash: bool,
-    enable_pld: bool,
 ) SpecInitWiring {
     if (owns_module_state) return .{
         // A module-owned arch that CAN rewind its state across a verify runs
-        // its own MTP head like any other target. PLD and the drafters
-        // stay off regardless: the drafters need a bound sidecar (DflashModel
-        // .bind refuses these archs anyway), and PLD's win case is
-        // echo-shaped traffic the n-gram gate rarely opens on a
-        // head this cheap — neither has been measured on this family, and an
-        // unmeasured spec mode is worse than none. Image requests ride the
+        // its own MTP head like any other target. The drafters stay off
+        // regardless: they need a bound sidecar (DflashModel
+        // .bind refuses these archs anyway). Image requests ride the
         // head too: `qwen4MtpForward` takes the slot's M-RoPE table.
         .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
         .use_dflash = false,
-        .use_pld = false,
     };
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
-    // loaded per model. Priority: dflash > MTP > PLD — a
+    // loaded per model. Priority: dflash > MTP — a
     // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
     // own `drafter/`) while the MTP head ships with the checkpoint;
     // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
@@ -7683,7 +7554,6 @@ pub fn specInitWiring(
     return .{
         .use_mtp = use_mtp,
         .use_dflash = use_dflash,
-        .use_pld = !use_mtp and !use_dflash and enable_pld,
     };
 }
 
@@ -7711,30 +7581,23 @@ test "assistant sidecar is refused for image requests" {
 }
 
 /// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { mtp, dflash, pld, regular };
+pub const SpecTickMode = enum { mtp, dflash, regular };
 
 /// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
 /// wish; the generator-side values carry what `Generator.initWithOptions`
-/// actually armed. Every arm must require BOTH: dispatching on the slot flag
-/// alone put PLD verify forwards through a trunk init had disarmed — mtp/drafter
-/// had their generator-state conjunct (`gen.mtp != null`), model-less PLD did
-/// not, so runPrefill's `use_pld=false` shaped init options while every tick
-/// still called `gen.nextPld`.
+/// actually armed. Every arm must require BOTH.
 pub fn specTickMode(
     slot_enable_mtp: bool,
     gen_has_mtp: bool,
     slot_enable_drafter: bool,
     gen_has_dflash: bool,
-    slot_enable_pld: bool,
-    gen_pld_enabled: bool,
 ) SpecTickMode {
     if (slot_enable_drafter and gen_has_dflash) return .dflash;
     if (slot_enable_mtp and gen_has_mtp) return .mtp;
-    if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
 }
 
-/// Drive one Generator step (regular / PLD / drafter) and push emitted
+/// Drive one Generator step (regular / DFlash / MTP) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
@@ -7801,6 +7664,7 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
                 .refused => {},
             }
         }
+        if (try closeThoughtOnLoop(sch, slot, gen)) return true;
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
         // Never cut silently: the 2026-07-14 php.html post-mortem took log
@@ -7819,6 +7683,37 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     return thinkBoundTick(sch, slot, gen);
 }
 
+const LoopAction = enum { cut, close_thought };
+
+/// A loop convicted INSIDE an open think block is recoverable once per request: the
+/// bound's early-stop line and closer are committed and the model answers. Anything else
+/// (answer-side loop, a second loop, no room before `max_tokens`) keeps the ordinary cut.
+fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32, recovered: bool) LoopAction {
+    tb.observe(ids);
+    if (recovered or tb.fired or !tb.in_think) return .cut;
+    if (!generate_mod.forcedBoundaryCanContinue(completion_tokens, max_tokens, tb.forced.len + 1)) return .cut;
+    return .close_thought;
+}
+
+/// The thought a loop was convicted in is closed instead of the turn ending. The closing line
+/// is built here, not at request start: a request carrying a `think_bound` is refused DFlash2.
+/// True = the slot's tick is spent.
+fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    var lazy: ?generate_mod.ThinkBound = null;
+    defer if (lazy) |b| slot.allocator.free(b.forced);
+    const tb: *generate_mod.ThinkBound = gen.sampling.think_bound orelse blk: {
+        const tok = slot.model.tokenizer orelse return false;
+        lazy = @import("server.zig").loopCloseBound(slot.allocator, slot.model, tok, slot.full_prompt, slot.enable_thinking) orelse return false;
+        break :blk &lazy.?;
+    };
+    if (loopRecoveryAction(tb, gen.generated_ids.items, gen.completion_tokens, gen.max_tokens, gen.think_closed_by_loop) == .cut) return false;
+    log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
+    tb.fired = true;
+    gen.think_closed_by_loop = true;
+    _ = try commitThoughtClose(sch, slot, gen, tb.forced);
+    return true;
+}
+
 /// A thinking budget at its limit: commit the early-stop line and the closer
 /// through the model this tick, and decode the answer regular from here on
 /// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
@@ -7831,7 +7726,16 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
-    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    if (!try commitThoughtClose(sch, slot, gen, tb.forced)) {
+        log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    }
+    return true;
+}
+
+/// Commits `forced` (early-stop line, closer, separator) through the model and decodes the rest
+/// regular. True = the slot finished on the way.
+fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32) !bool {
+    const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
     for (r.emitted) |t| {
         slot.pushToken(t);
@@ -7845,11 +7749,11 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     }
     gen.spec_disabled_runtime = true;
     gen.spec_disable_reason = .think_bound;
-    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
-    return true;
+    return false;
 }
 
 fn thinkBoundFired(gen: *const Generator) bool {
+    if (gen.think_closed_by_loop) return true;
     const tb = gen.sampling.think_bound orelse return false;
     return tb.fired;
 }
@@ -7886,17 +7790,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
-    // generators handle the disabled fallback internally, and `nextPld`'s
-    // disabled branch is also where the mid-request RE-ENABLE check lives
-    // (bypassing it pinned PLD off for the rest of the request even when the
-    // generated tail turned echo-heavy).
+    // generators handle the disabled fallback internally.
     const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
         gen.dflash != null,
-        slot.enable_pld,
-        gen.pld_enabled,
     );
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
@@ -7912,17 +7811,6 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     if (tick_mode == .dflash) {
         const result = try gen.nextDflash(slot.allocator);
-        if (result == null) {
-            finishSlot(sch, slot, gen.finish_reason);
-            return;
-        }
-        defer slot.allocator.free(result.?.tokens);
-        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
-        return;
-    }
-
-    if (tick_mode == .pld) {
-        const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
             return;
@@ -8236,7 +8124,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
         calls += 1;
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+            std.mem.indexOf(u8, line, ", false, false, use_drafter") != null);
     }
     try testing.expectEqual(@as(usize, 4), calls);
 }
@@ -8262,14 +8150,13 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// A MiMo MTP slot that may drop to plain batched ticks when crowded (`mtpCrowdThresholdFor`);
 /// its rounds otherwise stay solo, and no grouped verify ever takes it.
 fn slotMimoMtpCrowdable(slot: *const Slot) bool {
-    if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null, slot.enable_pld, gen.pld_enabled) == .mtp;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 /// Step costs of a grouped GLM forward in ms (rows ubench, glm5-arch#concurrency): fixed, per
@@ -8321,7 +8208,6 @@ fn slotGlmRowable(slot: *const Slot) bool {
 }
 
 fn slotMtpGroupable(slot: *const Slot) bool {
-    if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.mtp.?.moduleOwned()) return false;
@@ -8330,7 +8216,7 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null, slot.enable_pld, gen.pld_enabled) == .mtp;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 const Planner = @import("mtp_group_planner.zig");
@@ -8720,28 +8606,6 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     return true;
 }
 
-var mtp_group_env: ?bool = null;
-fn mtpGroupEnabled() bool {
-    if (mtp_group_env) |v| return v;
-    const on = if (std.c.getenv("SUSHI_MTP_BATCHED")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
-    mtp_group_env = on;
-    return on;
-}
-
-/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
-/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
-var mtp_batched_qwen4_env: ?bool = null;
-fn mtpBatchedQwen4Enabled() bool {
-    if (mtp_batched_qwen4_env) |v| return v;
-    const on = if (std.c.getenv("SUSHI_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
-    mtp_batched_qwen4_env = on;
-    return on;
-}
-
-fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
-    return has_qwen4 and !env_on;
-}
-
 /// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape that
 /// may: a qwen4 trunk's batched sub-paths are decode-shaped and uncertified past width 1.
 pub fn mergedVerifyDeclineReason(has_qwen4: bool, width: u32) ?[]const u8 {
@@ -8763,7 +8627,8 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A MiMo verify keeps each row's decode arithmetic only in its own solo forward.
     if (t.config.isMimo()) return true;
-    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
+    // qwen4_exp verify rows are expert bytes, so a batched verify measured no better than solo rounds.
+    return t.qwen4 != null;
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -9303,8 +9168,9 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
         const gen = &slot.legacy_gen.?;
         if (gen.glm_dflash_native) taps = gen.dflash.?.config.target_layer_ids;
         const request = gen.ctx.glm5_request orelse return error.GlmRequestMissing;
+        // Plain rows take the policy when their slot samples them (`thinkShifted`).
         groups[i] = if (tree_at == i)
-            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count] }
+            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = gen.glmPenalty() }
         else
             .{ .request = request, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
     }
@@ -9604,6 +9470,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 }
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
     const src = @embedFile("scheduler.zig");
@@ -9954,13 +9821,6 @@ test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw k
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
 }
 
-test "mtpQwen4StaySolo is opt-in" {
-    try testing.expect(mtpQwen4StaySolo(true, false));
-    try testing.expect(!mtpQwen4StaySolo(true, true));
-    try testing.expect(!mtpQwen4StaySolo(false, false));
-    try testing.expect(!mtpQwen4StaySolo(false, true));
-}
-
 test "a GDN trunk is batchable AND is not clamped by the server's concurrency gate" {
     // The two sites that decide "does this model batch?" must agree. They
     // disagreed once: the scheduler batched qwen4_exp while server.zig still
@@ -9976,39 +9836,16 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
     try testing.expect(configBatchesDecode(&cfg));
 }
 
-test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
-    // `slotTicksRegular` admits a generator whose speculation turned itself off
-    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
-    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
-    // batched tick does not call `nextPld`, so its periodic re-enable check
-    // cannot run while the slot is batched. Both halves are load-bearing, so
-    // both are stated here — if the re-enable check ever moves onto the batched
-    // path, or the clause is dropped, this is the note to revisit.
-    const src = @embedFile("scheduler.zig");
-    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
-    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
-    const hbody = src[hs..he];
-    // The clause that admits it...
-    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
-    // ...and the trade it makes, written down where it is made.
-    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
-}
-
 test "the batched gate reads DISPATCH, not the armed spec flags" {
-    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
-    // batched decode forever, even after PLD's own yield gate disabled itself
-    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
-    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
-    // are the REQUEST's wish; specTickMode is what the tick actually
-    // dispatches, and spec_disabled_runtime is what recovered the throughput.
+    // The armed flags are the REQUEST's wish; specTickMode is what the tick actually
+    // dispatches, and spec_disabled_runtime is what recovered the throughput of a
+    // slot whose speculation turned itself off.
     const src = @embedFile("scheduler.zig");
     const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
     const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
     // No armed-flag read may come back into the gate.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
     try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
     try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
 
@@ -10022,8 +9859,8 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
 
     // The dispatch answer itself: a live MTP slot never ticks regular, an
     // unarmed one always does.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, true));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, true, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
 }
 
 test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not model" {
@@ -10628,76 +10465,70 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // draft and the shell's snapshot/truncate run over an EMPTY entries array.
     // The predicate is per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
     // Args: (owns_module_state, module_spec_rollback,
-    //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
-    //        enable_pld)
+    //        enable_mtp, has_mtp, enable_drafter, has_dflash)
 
-    // Plain arch: today's precedence, unchanged.
+    // Plain arch: MTP wins over a missing sidecar.
     {
-        const w = specInitWiring(false, false, true, true, true, false, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
-    }
-    {
-        const w = specInitWiring(false, false, false, false, false, false, true);
-        try testing.expect(!w.use_mtp and w.use_pld);
+        const w = specInitWiring(false, false, true, true, true, false);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // A flag with no loaded handle never arms.
     {
-        const w = specInitWiring(false, false, true, false, false, false, false);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(false, false, true, false, false, false);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
 
-    // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
+    // DFlash rides the enable_drafter switch: dflash > MTP.
     {
-        const w = specInitWiring(false, false, false, false, true, true, true);
-        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_pld);
+        const w = specInitWiring(false, false, false, false, true, true);
+        try testing.expect(!w.use_mtp and w.use_dflash);
     }
     // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
     // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
     // ships with every pack; `--no-drafter` restores MTP by not loading it.
     {
-        const w = specInitWiring(false, false, true, true, true, true, true);
-        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+        const w = specInitWiring(false, false, true, true, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp);
     }
     // enable_drafter:false on the request hands the round back to MTP.
     {
-        const w = specInitWiring(false, false, true, true, false, true, true);
+        const w = specInitWiring(false, false, true, true, false, true);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
-    // enable_drafter:false opts BOTH sidecar kinds out.
+    // enable_drafter:false opts the sidecar out.
     {
-        const w = specInitWiring(false, false, false, false, false, true, true);
-        try testing.expect(!w.use_dflash and w.use_pld);
+        const w = specInitWiring(false, false, false, false, false, true);
+        try testing.expect(!w.use_dflash);
     }
 
     // Module-owned with NO rollback: everything off.
     {
-        const w = specInitWiring(true, false, true, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, false, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
 
     // Module-owned WITH rollback: its own MTP head arms; the shell
     // spec modes stay off because none has been measured on this family.
     {
-        const w = specInitWiring(true, true, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // Rollback capability alone never arms a head that is not loaded.
     {
-        const w = specInitWiring(true, true, true, false, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, false, true, true);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
     // ...nor one the request opted out of.
     {
-        const w = specInitWiring(true, true, false, true, true, false, true);
+        const w = specInitWiring(true, true, false, true, true, false);
         try testing.expect(!w.use_mtp);
     }
     // An image request keeps the head (the qwen4 head takes the slot's
     // M-RoPE table); the drafters stay off.
     {
-        const w = specInitWiring(true, true, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
-
 }
 
 test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
@@ -10706,7 +10537,7 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     const src = @embedFile("scheduler.zig");
     // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
     // this test's own arms would satisfy.
-    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_pld = wiring" ++ ".use_pld;" }) |needle| {
+    inline for (.{"const use_mtp = wiring" ++ ".use_mtp;"}) |needle| {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
     // The exclusion must come from the shared predicate, not a new arch list.
@@ -10718,6 +10549,9 @@ test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained
     const t = testing;
     try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 0));
     try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 1 }, 0));
+    // tool_choice "none" bans the call opener; the verifier honours the bias.
+    const none_ban = [_]@import("logit_bias.zig").Bias{.{ .id = 5, .delta = -100 }};
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_penalty = .{ .biases = &none_ban } }, 0));
 
     try t.expect(!glmNativeDflashArmed(false, true, true, .{ .temperature = 0 }, 0));
     try t.expect(!glmNativeDflashArmed(true, false, true, .{ .temperature = 0 }, 0));
@@ -10732,44 +10566,22 @@ test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
-    // runPrefill's per-site guard can compute use_pld=false and wire it into
-    // Generator init options; a decode tick dispatching on `slot.enable_pld`
-    // alone would still call `gen.nextPld`. mtp/drafter are saved by their
-    // generator-state conjunct (`gen.mtp != null`); PLD has no model handle,
-    // so its conjunct must be the generator's post-init `pld_enabled`.
-
-    // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
-    // flipped it off) → the tick must run the regular path.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false));
-    // Slot wants PLD and init armed it → PLD runs.
-    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true));
-    // Generator armed but the slot never asked (stale generator state must
-    // not resurrect spec either) → regular.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true));
-
-    // mtp/drafter keep their existing both-sides contract.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false));
-
-    // Priority: MTP > drafter > PLD (the spec-dispatch rule).
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, true));
-
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false));
+    // mtp and dflash each need the slot's wish AND the generator's handle.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false));
     // Generator armed but the request opted enable_mtp off → serial.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false));
 
-    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
-    // gemma drafter AND the MTP head (a loaded sidecar is the explicit
-    // choice). Generator handle alone never resurrects it,
-    // and a dflash generator with the slot flag off stays regular (the
-    // specTickMode both-sides contract) — or MTP when that is armed.
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true, false, false));
+    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the MTP
+    // head (a loaded sidecar is the explicit choice). A generator handle alone never
+    // resurrects it, and a dflash generator with the slot flag off stays regular, or
+    // MTP when that is armed.
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true));
 }
 
 test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
@@ -10798,14 +10610,6 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
     const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
     try testing.expect(boot != cold);
-}
-
-test "SUSHI_SSD_WRITE_THROUGH=0 takes mechanism 3 out of the prefill, and only that" {
-    try testing.expect(writeThroughEnabledFromEnv(null));
-    try testing.expect(writeThroughEnabledFromEnv(""));
-    try testing.expect(writeThroughEnabledFromEnv("1"));
-    try testing.expect(writeThroughEnabledFromEnv("true"));
-    try testing.expect(!writeThroughEnabledFromEnv("0"));
 }
 
 test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
@@ -10956,9 +10760,7 @@ test "retained position: a padded row can never take the full-accept arm" {
     try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
 }
 
-test "MiMo crowded MTP respects the batching kill switch" {
-    const saved = mtp_group_env;
-    defer mtp_group_env = saved;
+test "MiMo crowded MTP takes an eligible slot" {
     var xfm: Transformer = undefined;
     xfm.config = .{ .model_type = "mimo_v2" };
     xfm.moe_layers = &.{};
@@ -10973,19 +10775,14 @@ test "MiMo crowded MTP respects the batching kill switch" {
     gen.mtp_serial_left = 0;
     gen.mtp_serial_exit = .none;
     gen.dflash = null;
-    gen.pld_enabled = false;
     var slot: Slot = undefined;
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;
-    slot.enable_pld = false;
     slot.sampling = .{};
     slot.logprobs_n = 0;
-    mtp_group_env = true;
     try testing.expect(slotMimoMtpCrowdable(&slot));
-    mtp_group_env = false;
-    try testing.expect(!slotMimoMtpCrowdable(&slot));
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
@@ -10996,11 +10793,11 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
+    gen.think_closed_by_loop = false;
     gen.mtp = .{ .qwen4 = &xfm };
     gen.mtp_cache = .{ .qwen = undefined };
     gen.has_last_hidden = true;
     gen.dflash = null;
-    gen.pld_enabled = false;
     gen.done = false;
     gen.sampling = .{};
     gen.logprobs_n = 1;
@@ -11010,7 +10807,6 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;
-    slot.enable_pld = false;
     slot.finished = false;
     slot.error_code = null;
     defer if (slot.error_code) |code| testing.allocator.free(code);
@@ -11310,13 +11106,13 @@ test "every real streamed pack and source on this box plans a streamed load" {
         const path = try @import("test_models.zig").packPath(&path_buf, case.name);
         var config = model_mod.parseConfig(t.io, t.allocator, path) catch continue;
         defer config.deinit(t.allocator);
-        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, false);
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 60 << 30, false);
         try t.expectEqual(case.layout, plan.layout);
         try t.expect(plan.cache.slots_per_layer > 1);
         try t.expect(plan.split.trunk > 0 and plan.split.trunk < 40 << 30);
         try t.expectEqual(@as(u64, 0), plan.split.vision);
         try t.expectEqual(case.tower, plan.vision.tower_bytes);
-        const seen = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, true);
+        const seen = try planExpertStreaming(t.io, t.allocator, &config, path, 60 << 30, true);
         try t.expectEqual(case.tower, seen.split.vision);
         try t.expectEqual(plan.split.trunk, seen.split.trunk);
         try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
@@ -11806,7 +11602,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     model.transformer = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(4) });
-    try testing.expectError(error.GlmKvQuantUnsupported, result);
+    try expectError(error.GlmKvQuantUnsupported, result);
 }
 
 test "an empty prompt is refused at submit, before any slot reaches the inference thread" {
@@ -11836,7 +11632,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
     model.transformer = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 4 });
-    try testing.expectError(error.EmptyPrompt, result);
+    try expectError(error.EmptyPrompt, result);
     try testing.expectEqual(@as(usize, 0), sch.pending.items.len);
 }
 
@@ -12067,9 +11863,6 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
     return @min(v, PREFILL_DECODE_SHARE_MAX);
 }
-pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    return parseDecodeShare(flag orelse env orelse return 0);
-}
 /// The decode share's prefill width cap for this model. GLM prefill numerics depend on the chunk
 /// boundaries, so its chunks stay whole whatever else decodes: it yields only between chunks.
 pub fn prefillShareCapFor(cfg: *const ModelConfig, decoding: usize, share: f32) u32 {
@@ -12130,11 +11923,6 @@ test "decode share: parse clamps above 0.9 and rejects anything that is not a sh
     for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
         try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
     }
-    // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
-    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
-    try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
-    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
 }
 
 test "decode share: the budget is chunk * S / (1 - S), zero when off" {
@@ -12216,7 +12004,6 @@ test "decode share: the kill switch disables the effective share and only live s
     slots[0].finished = true;
     try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0", "invalid"));
 }
 
 
@@ -12657,4 +12444,92 @@ test "a queued vision encode is refused when its bill no longer fits, and an ear
         _ = mlx.mlx_array_free(r);
     };
     try testing.expect(unbilled.error_name == null);
+}
+
+test "a failed cold load drops the MLX error it latched and keeps one latched before it" {
+    mlx.installErrorHandler();
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/m", 1);
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
+    defer if (req.error_name) |name| testing.allocator.free(name);
+
+    try testing.expect(!mlx.errorPending());
+    mlx.latchErrorForTest("[load] the load's own failure");
+    failLoadRequest(&sch, &req, error.LoadFailed, false);
+    try testing.expect(!mlx.errorPending());
+
+    mlx.latchErrorForTest("[decode] another request's failure");
+    failLoadRequest(&sch, &req, error.LoadFailed, true);
+    try testing.expect(mlx.errorPending());
+    mlx.dropLatchedErrorUnless(false);
+}
+
+test "loop recovery: a loop inside an open think block closes the thought once" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, 31, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &.{ 5, 6 });
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &.{ 101, 102, 103 });
+
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&tb, ids.items, 400, 4096, false));
+    // No room to close the thought: the ordinary cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 4095, 4096, false));
+    // Once recovered, a second loop is cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 400, 4096, true));
+}
+
+test "loop recovery: an answer-side loop is still cut, a thought the prompt opened is recoverable" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096, false));
+
+    var reopened = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = false };
+    const inside = [_]u32{ 7, OPEN, 5, 6 };
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&reopened, &inside, 4, 4096, false));
+}
+
+test "ensureLoaded: a load refused because every other resident model is pinned leaves the registry unlocked and unpinned" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const resident = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(resident, 10);
+    reg.mutex.unlock(io);
+    _ = resident.refcount.fetchAdd(1, .acq_rel); // an in-flight request
+
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = testing.allocator;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp_enabled = true;
+    sch.mtp_explicit = false;
+
+    try testing.expectError(error.NotEnoughMemory, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+    try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
+    // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
+    try testing.expect(reg.mutex.tryLock());
+    reg.mutex.unlock(io);
+    resident.refcount.store(0, .release);
 }

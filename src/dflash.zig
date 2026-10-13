@@ -407,23 +407,16 @@ pub fn blockCapForMachine(chip: []const u8) BlockCap {
 
 /// Resolve the effective block size: the config's value, capped by what the
 /// machine's verify lanes serve (`no_lane_cap` from `blockCapForMachine`
-/// when there is no wide lane), then clamped DOWNWARD by an explicit
-/// `--draft-block-size` (never raised past the config — the assistant was
-/// trained at its config block). Floor 2 (1 draft + t1).
-pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, wide_verify_lane: bool, no_lane_cap: u32) u32 {
-    const base = if (cli_explicit)
-        @min(config_block, cli_block)
-    else if (wide_verify_lane)
-        config_block
-    else
-        @min(config_block, no_lane_cap);
+/// when there is no wide lane). Floor 2 (1 draft + t1).
+pub fn resolveBlockSize(config_block: u32, wide_verify_lane: bool, no_lane_cap: u32) u32 {
+    const base = if (wide_verify_lane) config_block else @min(config_block, no_lane_cap);
     return @max(base, 2);
 }
 
 /// True when this machine has a verify lane for widths past the split-K
 /// ceiling (the NAX m16 tile, M5-class + macOS >= 26.2).
 pub fn wideVerifyLaneAvailable() bool {
-    return transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable();
+    return transformer_mod.verifyQmmNaxAvailable();
 }
 
 // ── Weight precision ──
@@ -435,17 +428,6 @@ pub fn wideVerifyLaneAvailable() bool {
 /// a bad width can do is cost acceptance.
 pub const DEFAULT_QUANT_BITS: u32 = 8;
 
-/// Draft-only lm_head width — DEFAULT OFF (drafts use the trunk's own head).
-/// A narrower head shrinks a read the round barely notices and pays for it in
-/// ACCEPTANCE, which is the scarce resource: measured on Muse 4-bit at the
-/// resolved block (5), 160-token generations, same serial reference —
-///   3-bit draft head: 55.4 tok/s, 2.19 accepted/round
-///   trunk head:       57.8 tok/s, 2.37 accepted/round
-/// The lever was defaulted on at block 16, where the head was 10 ms of a
-/// 175 ms round; at block 5 it is under 2 ms of ~60 and the acceptance it
-/// costs is worth more than the bytes it saves. `SUSHI_DFLASH_DRAFT_HEAD_BITS`
-/// still selects a width for the A/B.
-pub const DEFAULT_DRAFT_HEAD_BITS: u32 = 0;
 /// Preferred affine group size, narrowed to 32 when 64 does not divide the
 /// contraction dim, dense when neither does.
 pub const QUANT_GROUP: u32 = 64;
@@ -689,15 +671,6 @@ pub const DflashModel = struct {
     final_norm: mlx.mlx_array, // norm [hidden]
     layers: []DflashLayer,
 
-    /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`SUSHI_DFLASH_DRAFT_HEAD_BITS`; `DEFAULT_DRAFT_HEAD_BITS` is 0, off).
-    /// Only the block's draft argmax projects through it — VERIFICATION is a
-    /// trunk forward and never touches it, so the emitted distribution is
-    /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
-    draft_head: ?mtp_mod.QLinear = null,
-    draft_head_bits: u32 = 0,
-    draft_head_group: u32 = 0,
-
     /// DFlash2 path selector — null on a v1 assistant.
     selector: ?Selector = null,
 
@@ -708,7 +681,6 @@ pub const DflashModel = struct {
         const allocator = self.allocator;
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
-        if (self.draft_head) |*dh| dh.deinit();
         self.fc.deinit();
         _ = mlx.mlx_array_free(self.enc_norm);
         _ = mlx.mlx_array_free(self.final_norm);
@@ -752,114 +724,15 @@ pub const DflashModel = struct {
                 return error.DflashTargetMismatch;
             }
         }
-        self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
-            log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
-        };
     }
 
-    /// `bind` with the draft-head width passed explicitly (0 = no draft head).
-    pub fn bindWithDraftBits(self: *DflashModel, target: *Transformer, bits: u32) !void {
-        try self.bind(target);
-        if (self.draft_head) |*dh| {
-            dh.deinit();
-            self.draft_head = null;
-            self.draft_head_bits = 0;
-            self.draft_head_group = 0;
-        }
-        try self.buildDraftHead(target, bits);
-    }
-
-    /// `SUSHI_DFLASH_DRAFT_HEAD_BITS`: absent → DEFAULT_DRAFT_HEAD_BITS,
-    /// a supported affine width → that, anything else ("0", "off") → disabled.
-    pub fn draftHeadBitsFromEnv() u32 {
-        const p = std.c.getenv("SUSHI_DFLASH_DRAFT_HEAD_BITS") orelse return DEFAULT_DRAFT_HEAD_BITS;
-        const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
-        return switch (v) {
-            2, 3, 4, 6, 8 => v,
-            else => 0,
-        };
-    }
-
-    /// Requantize the trunk lm_head down to `draftHeadBitsFromEnv()` for the
-    /// draft projection only. A quantized trunk head is re-encoded from its
-    /// TRUE per-weight params (a mixed checkpoint's head routinely differs
-    /// from the trunk global); a dense bf16 head is quantized outright. Never
-    /// built when it would not shrink the read.
-    fn buildDraftHead(self: *DflashModel, target: *Transformer, bits: u32) !void {
-        if (bits == 0) {
-            log.info("[dflash] draft lm_head: trunk head (no requantization)\n", .{});
-            return;
-        }
-        // A dense head has a NULL scales handle — every quant-param resolver
-        // dereferences it, so the dense arm must be decided first.
-        const dense_head = target.lm_head_s.ctx == null;
-        const head_qp: transformer_mod.QuantParams = if (dense_head)
-            .{ .bits = 0, .group_size = 0, .mode = .affine }
-        else
-            transformer_mod.computeQuantParams(
-                &target.config,
-                target.lm_head_w,
-                target.lm_head_s,
-                target.config.hidden_size,
-            );
-        // 16 bits is what a dense bf16 head costs per weight.
-        const src_bits: u32 = if (dense_head) 16 else head_qp.bits;
-        if (bits >= src_bits) return; // no byte saving over the trunk head
-        const group = quantGroupFor(target.config.hidden_size) orelse return;
-
-        var dh = try mtp_mod.requantizeRows(
-            self.s,
-            target.lm_head_w,
-            target.lm_head_s,
-            target.lm_head_b,
-            head_qp.group_size,
-            head_qp.bits,
-            head_qp.mode.cstr(),
-            group,
-            bits,
-            32768,
-        );
-        errdefer dh.deinit();
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.w);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.s);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.b);
-            try mlx.check(mlx.mlx_eval(eval_vec));
-        }
-        self.draft_head = dh;
-        self.draft_head_bits = bits;
-        self.draft_head_group = group;
-        log.info("[dflash] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
-    }
-
-    /// Draft logits for the block hidden: the low-bit draft head when one was
-    /// built, else the trunk's own head. Both are the bare Linear; when the
-    /// sidecar DECLARES a softcap / output_multiplier (muse DFlash2) they are
+    /// Draft logits for the block hidden: the trunk's own head, the bare
+    /// Linear; when the sidecar DECLARES a softcap / output_multiplier (muse DFlash2) they are
     /// applied here — argmax drafts are invariant (monotone), but the
     /// selector sums these logits with codebook edges and the sampled arm
     /// softmaxes them, neither of which survives a scale change.
     pub fn draftLogits(self: *const DflashModel, target: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        var out: mlx.mlx_array = undefined;
-        if (self.draft_head) |*dh| {
-            out = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(out);
-            try mlx.check(mlx.mlx_quantized_matmul(
-                &out,
-                x,
-                dh.w,
-                dh.s,
-                dh.b,
-                true,
-                mlx.mlx_optional_int.some(@intCast(self.draft_head_group)),
-                mlx.mlx_optional_int.some(@intCast(self.draft_head_bits)),
-                "affine",
-                self.s,
-            ));
-        } else {
-            out = try target.lmHeadForDraft(x);
-        }
+        const out = try target.lmHeadForDraft(x);
         if (self.config.output_multiplier == 1.0 and self.config.logit_softcap <= 0) return out;
         defer _ = mlx.mlx_array_free(out);
         return applyLogitTransforms(out, self.config.output_multiplier, self.config.logit_softcap, self.s);
@@ -2399,15 +2272,11 @@ test "dflash: out-of-range target_layer_ids rejected by name" {
     try testing.expectError(error.DflashTargetLayerOutOfRange, validateTargetLayers(&[_]u32{60}, 52));
 }
 
-test "dflash: block size resolves from config, clamped downward by explicit CLI" {
+test "dflash: block size resolves from config" {
     // A machine WITH a wide verify lane keeps the checkpoint's own block.
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 4, false, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit smaller CLI clamps down.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, true, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit LARGER CLI never raises past the config (training contract).
-    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, 32, true, true, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 16), resolveBlockSize(16, true, NO_WIDE_LANE_BLOCK_CAP));
     // Floor 2.
-    try testing.expectEqual(@as(u32, 2), resolveBlockSize(16, 1, true, true, NO_WIDE_LANE_BLOCK_CAP));
+    try testing.expectEqual(@as(u32, 2), resolveBlockSize(1, true, NO_WIDE_LANE_BLOCK_CAP));
 }
 
 test "dflash: an assistant merged into the checkpoint is found without a flag" {
@@ -2481,16 +2350,10 @@ test "dflash: dflash2 folder is preferred with valid legacy fallback" {
 test "dflash: no wide verify lane caps the block at the split-K width" {
     // Without an M 8..16 verify lane the trunk forward falls off a cliff at
     // width 8, so the block is capped even though the checkpoint asks for 16.
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, 4, false, false, NO_WIDE_LANE_BLOCK_CAP));
-    // The cap is a CEILING, never a floor: an explicit smaller CLI still wins,
-    // and a checkpoint whose own block is already narrow is left alone.
-    try testing.expectEqual(@as(u32, 3), resolveBlockSize(16, 3, true, false, NO_WIDE_LANE_BLOCK_CAP));
-    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
-    // Explicit CLI is the escape hatch for a wider block on capped hardware:
-    // it clamps against the CONFIG block, not the cap.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 8, true, false, NO_WIDE_LANE_BLOCK_CAP));
-    // An explicit CLI also bypasses a per-silicon cap entirely.
-    try testing.expectEqual(@as(u32, 10), resolveBlockSize(16, 10, true, false, 8));
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, resolveBlockSize(16, false, NO_WIDE_LANE_BLOCK_CAP));
+    // The cap is a CEILING, never a floor: a checkpoint whose own block is
+    // already narrow is left alone.
+    try testing.expectEqual(@as(u32, 4), resolveBlockSize(4, false, NO_WIDE_LANE_BLOCK_CAP));
 }
 
 test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
@@ -2506,8 +2369,8 @@ test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" 
     try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("").cap);
     // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
     // block-8 one is left alone.
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
-    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, 4, false, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, false, ultra.cap));
+    try testing.expectEqual(@as(u32, 8), resolveBlockSize(8, false, ultra.cap));
 }
 
 // ── Hermetic fixtures: tiny llama trunk + tiny DFlash assistant ──

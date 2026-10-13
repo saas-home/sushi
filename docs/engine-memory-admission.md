@@ -23,12 +23,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 - The preflight's available figure is free RAM CAPPED at Metal's working-set limit (`effectiveAvailableBytes`): a
   lowered `iogpu.wired_limit_mb` binds below free RAM, and a load past it failed warmup, then every request.
+- **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative) plus file-backed pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **The file-backed share is grantable slowly, not at once.**
+  - **Slow climb, clean:** MiMo's BF16 KV filled to 550K with no swap while the file cache drained to 3 GiB.
+  - **Fast large load, swap:** a 24 GB streamed load beside an idle resident GLM read 32 GiB available, then swapped
+    17 GB as macOS compressed the idle model.
+  - Both runs: `e8c9c47e`, 2026-10-11.
+  - Kept as is: under a declared `iogpu.wired_limit_mb` the wired-limit floor, not this figure, sets the request ceiling.
+- **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
 - **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
-  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient and the requested
-  context's admission bill (the warmup ends before any request allocates) + a fixed 1 GiB net. No proportional term,
+  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient plus a fixed 1 GiB net
+  and the requested context's admission bill (the warmup ends before any request allocates). No proportional term,
   no flat headroom. The cold-load registry gates (`residentColdLoadBillBytes`, `glmColdLoadBillBytes`) call the same
   function, so gate and preflight read one number.
 - **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
@@ -39,7 +47,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.
   `loadServingBill` uses `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch.
   It prices an explicit prefill width at that width after the architecture's cap; otherwise it proves the per-request
-  floor. A refusal reports the largest context that fits the same bill (net included) and available memory, capped at
+  floor. A refusal reports the largest context that fits the same bill and available memory, capped at
   the model's context limit. Existing active MLX buffers are subtracted from the GPU working-set limit before this
   check. Cold-load HTTP 503 responses retain the numeric maximum through the transient unloaded reset; retry and
   successful load clear it.
@@ -53,7 +61,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
-  from the capture schedule the generator runs), one assistant window and the RAM tier's row copy (the SSD writer's
+  from the capture schedule the generator runs; 2 where SSD-only storage writes them through and frees their RAM
+  copy, `WarmPrefix.released`), one assistant window and the RAM tier's row copy (the SSD writer's
   1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
   ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
@@ -93,20 +102,24 @@ Flash-Next's transient is its MTP head load: peak less resident bytes is 1.11 Gi
 is its KDA state, rings and latent rows (0.15) plus 0.25 of activations.
 
 The bill against the same peaks (this change; `--mtp` where the arch has it; the context row is the request-time
-admission bill at 1248 tokens, which replaces the warmup once it is larger):
+admission bill at 1248 tokens, which replaces warmup and net once it is larger):
 
 | pack, settings | weights | warmup or context | net | bill | peak | slack |
 |---|---:|---:|---:|---:|---:|---:|
 | Flash-Next 2.6bpw, auto or `--ctx-size 1248` | 44.20 | 1.25 | 1.00 | 46.45 | 44.53 | 1.93 |
 | Flash-Next 2.6bpw, `--no-vision` | 43.37 | 1.25 | 1.00 | 45.62 | 44.53 | 1.09 |
 | MiMo 2.3bpw, auto | 89.65 | 0.25 | 1.00 | 90.90 | 89.88 | 1.02 |
-| MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | 1.00 | 92.44 | 89.88 | 2.56 |
+| MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | — | 91.44 | 89.88 | 1.56 |
 | GLM 2.4bpw, auto or `--ctx-size 1248` | 89.76 | 0.52 | 1.00 | 91.28 | 90.16 | 1.12 |
-| Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
+| Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000 --qwen-gdn 16` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
 
 Flash-Next's extra slack is the vision tower: it is billed at load for the first image and not resident until then.
 MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. The streamed warmup is its cache, fill
 union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
+The net does not stack on a context bill: no request allocates during the warmup. The 64 GB recipe (2.6bpw, kv8, 250000,
+59,000 MB wired) runs `--qwen-gdn 16` and has 5.1 GiB of slack at load and 1.83 GiB for a cold 250k request at the 4096
+width admission picks; the f32 default leaves 4.0 and 0.77 GiB, and 0.8 GiB more drops that request to the 2048 width
+(bill arithmetic on the shipped config fixture, 2927817e against 3adb8002).
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.
@@ -116,6 +129,10 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - **Auto-context is PINNED at load** (`pinAutoContext`, one 93% margin on the memory ceiling for every model, then
   capped at the checkpoint's own maximum, un-margined); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED
   width and activations ONCE.
+- **Flash-Next's auto-context is the largest context its request bill admits at the floor rung** (`memoryContextAtChunk`
+  inverts `prefillNeededAtChunk` over the headroom admission reads: ceiling less resident bytes, less the SSD writer's
+  1 GiB permit while the tier is on), then the 93% margin. Sizer and admission were two formulas: a 32 GB M1 Max
+  advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
@@ -125,6 +142,11 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   bills its restore's coexistence (`oldBuffersInEvalWindow`) ([engine-prefix-cache](engine-prefix-cache.md#defaults)). Context sizing reserves nothing
   for an idle cache (`ctxSizingCacheReserve` is 0 with RAM off). A model whose tier did not come up bills as without one
   (`server.diskTierOn`).
+- A ringed (MiMo) hot entry bills its ring checkpoints at their real bytes in `kv_bytes`: up to eight until its flush, the
+  newest two after it when an SSD tier holds the rest ([engine-prefix-cache](engine-prefix-cache.md#basics)). The
+  eight-checkpoint term in `oneSessionEntryBytes` sizes only a RAM tier with no SSD tier (a ringed arch with one sizes
+  through `ssdFirstSessionKvBytes`: the session plus `slotRingBytes`, the slot's own six). SSD-only retains none, and
+  the writer's ring files ride its ~1 GiB permit below.
 - **Admission bills the SSD writers' host bytes** (`prefillAdmissionBill` -> `admissionAvailable`): the writer holds its
   backlog, up to its ~1 GiB permit, outside `mlx_get_active_memory`, so every resident model's `writerHostBytes` (the
   larger of the backlog and the permit) is taken off the headroom BEFORE the width and the cache reservation are chosen,
@@ -147,6 +169,38 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   its chunk size rather than assume the auto-sized chunk fits a fixed deadline.
 - Admission-bill tests pin synthetic contexts and use request shapes that fit them, never the test host's auto-context.
 
+<a id="bill-net"></a>
+### The request bill's net
+
+- `prefillMemoryNeeded` sums its terms and adds a net: a quarter (`uplift_16ths` 20) for every arch, a sixteenth (17)
+  for Flash-Next up to `MEASURED_NET_MAX_TOKENS` (65,536). Past it the terms were fitted at 300k+ against measured
+  steps (`the deployed pack's 8192 step...` and the 364k and 64 GB recipe tests), so the quarter stays and the README
+  tables and recipes at 128k and above do not move.
+- Within the range the summed terms ran 4% to 13% over the live peak, which is why a sixteenth is enough. **The SSD
+  tier's checkpoints are real memory**: 34k tokens at the 512 rung peaked 2,284 MiB with the tier on and 1,318 off,
+  the billed 897 MiB of checkpoints. Measure with the default tier; off is a dev-only reading.
+- The forward is not at the gate's width: it starts at 2048, steps down by headroom, and its peak was flat at
+  1,287 MiB from 2.8k to 16.9k tokens, while the engine priced that first chunk at 2,631 MiB.
+
+Ternary pack (`Qwen3.8-Flash-Next-Sushi-Ternary`), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
+preflight commit with the diagnostic counters, ReleaseFast, `taskpolicy -a`, GPU lock, no baseline rerun. `--qwen-gdn 16
+--no-vision --no-mtp --prefill-chunk 512`, SSD tier on, one fresh prompt per boot, 16 new tokens; peak = `peak_bytes` less
+`active_bytes`, MiB:
+
+| tokens | live peak | summed terms | quarter net (before) | sixteenth net (now) |
+|---:|---:|---:|---:|---:|
+| 2,857 | 1,117 | 1,265 | 1,581 | 1,347 |
+| 8,505 | 1,774 | 1,946 | 2,433 | 2,075 |
+| 16,874 | 2,043 | 2,125 | 2,656 | 2,272 |
+| 33,958 | 2,228 | 2,496 | 3,120 | 2,682 |
+| 59,314 | 2,822 | 3,036 | 3,795 | 3,278 |
+
+Final binary, no flags but `--no-vision --no-mtp --qwen-gdn 16` (1,842 MiB available): advertised 26,624 tokens, a
+26,426-token prompt admitted at a bill of 1,781 and peaking 1,542 over the weights; `--kv-quant 4` advertised 32,768, a
+32,556-token prompt billed 1,723 and peaking 1,430. A prompt past the advertised context is refused by name. The
+tests `Flash-Next's request bill brackets the peaks measured...` and `the advertised Flash-Next context is the
+largest one the request bill admits` hold both.
+
 <a id="recipe-64gb"></a>
 ### The 48 GB and 64 GB recipe contexts
 
@@ -168,11 +222,13 @@ The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, 
 |---|---:|---:|---:|---:|---:|---:|
 | Sushi-2bpw, kv8 | 131072 | 5905 | 512 | 6163 | 40.7 | 141072 |
 
-The README memory table's "needed" row is the weights plus this full-context bill at the 512 rung plus a 1 GiB hot
-cache. At `eab60060` the bill is the same for every Flash-Next pack and for `--max-tokens` 32000 or 64000: 5905 /
-8825 / 14025 / 24425 MiB at 128k / 256k / 512k / 1M tokens (KV 2080 / 4160 / 8320 / 16640 of it).
-Its max-context column is the largest multiple of 8192 tokens whose weights + 512-rung bill + 1 GiB hot cache + 256
-MiB spare fits each wired limit, capped at 1M (same probe, kv8 and kv4).
+The README memory table is the billed resident weights (trunk, vision tower, MTP head and its rerank copy; GLM with its
+assistant) plus this full-context bill at the 512 rung (`--max-tokens 0`, `--ctx-size` the context); the prompt cache is
+not counted. The bill is the same for every Flash-Next pack: 5905 / 8825 / 14025 / 24425 MiB at 128k / 256k / 512k /
+1M tokens at `--qwen-gdn 16` (KV 2080 / 4160 / 8320 / 16640 of it; the probe at `eab60060`, reproduced at 4b919abb),
+and 1080 MiB more at each size at the f32 default. Its max-context column is the largest multiple of 8192 tokens whose
+weights + 512-rung bill + 256 MiB spare fits each wired limit, capped at 1M (kv8 and kv4); the 48 and 64 GB rows run at
+`--qwen-gdn 16`, the 96 and 128 GB rows at the f32 default.
 
 The ladder widens the chunk until the bill nearly fills what is available, so the spare in a row is small by
 construction; "largest admitted" (2000-token steps) is where even the 512 rung stops fitting. The ceiling assumes
@@ -184,7 +240,7 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
   below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
   the bill and the scheduler, `generate.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
-  load prove that floor (`perRequestFloorWidth`). `SUSHI_PREFILL_CHUNK_PER_REQUEST=0` restores the pin.
+  load prove that floor (`perRequestFloorWidth`).
 - A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`) on every arch where
   `admissionEvictsHotCache` holds (qwen4_exp and the ringed mimo_v2; the connection thread's `creditedAdmissionBill`
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only

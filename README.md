@@ -13,6 +13,7 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
+* [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
 * [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
 ## Quality
@@ -21,6 +22,7 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
 * GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%)
+* GLM-5.3-Flash-Sushi-2bpw scores KLD 0.1037 (top-1 agreement 88.18%)
 
 ## Install
 
@@ -38,24 +40,29 @@ Update with `brew upgrade sushi`.
 
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
+The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 1 GiB off each Qwen cell.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
-|---|---:|---:|---:|---:|---:|
-| weights only | 35.0 | 44.0 | 63.7 | 83.6 | 90.0 |
-| 128k | 40.7 | 49.7 | 69.4 | 87.3 | 93.2 |
-| 256k | 43.6 | 52.6 | 72.3 | 89.2 | 94.3 |
-| 512k | 48.7 | 57.6 | 77.4 | 92.9 | 96.5 |
-| 1M | 58.8 | 67.8 | 87.5 | 100.4 | 101.0 |
+| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+|---|---:|---:|---:|---:|---:|---:|
+| weights only | 35.2 | 44.2 | 63.9 | 89.7 | 78.3 | 89.8 |
+| 128k | 42.1 | 51.0 | 70.8 | 93.7 | 82.6 | 94.1 |
+| 256k | 44.9 | 53.9 | 73.6 | 95.8 | 83.8 | 95.2 |
+| 512k | 50.0 | 59.0 | 78.7 | 99.9 | 86.0 | 97.5 |
+| 1M | 60.1 | 69.1 | 88.9 | 108.2 | 90.5 | 102.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
-the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no 4-bit KV):
+the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
+4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
-|---|---|---|---|---|---|---|
-| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — | — |
-| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — | — |
-| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 880k / 1M | — | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — |
+| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+|---|---|---|---|---|---|---|---|
+| 48 GB † | 43,000 MB (42.0 GiB) | 160k / 240k | — | — | — | — | — |
+| 64 GB † | 59,000 MB (57.6 GiB) | 936k / 1M | 480k / 768k | — | — | — | — |
+| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 960k / 1M | — | 696k / — | — |
+| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
+
+† At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
+less: 112k / 168k at 48 GB, and 880k / 1M and 432k / 680k at 64 GB.
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
@@ -68,8 +75,11 @@ Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
 ```bash
 sudo sysctl iogpu.wired_limit_mb=27000
 sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
-  --expert-pick-tolerance 0.3
+  --qwen-gdn 16 --expert-pick-tolerance 0.3
 ```
+
+`--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, which halves the state in every cache
+checkpoint (about 54 MB each) and is what the 32, 48 and 64 GB recipes run.
 
 `--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
 the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
@@ -79,20 +89,23 @@ identical to a resident load. The plan may come within 1 GiB of the GPU limit
 
 ## Benchmarks
 
-| Sushi 🍣 1.2.1 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
+| Sushi 🍣 1.2.2 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **GLM 5.3 Flash-2.4bpw** | Prefill | 922 | 822 | 809 | 805 | 807 | 756 | 673 |
-| | Decode | 48.0 | 46.2 | 46.9 | 45.9 | 45.7 | 47.2 | 45.5 |
-| | TTFT (s) | 2.26 | 4.98 | 10.2 | 20.3 | 40.6 | 86.9 | 194.8 |
-| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,221 | 1,209 | 1,205 | 1,143 | 1,037 | 901 | 712 |
-| | Decode | 49.1 | 54.4 | 59.3 | 62.4 | 64.9 | 56.2 | 51.5 |
-| | TTFT (s) | 1.72 | 3.38 | 6.87 | 14.3 | 31.6 | 72.9 | 184.1 |
-| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 1,932 | 2,116 | 2,180 | 2,165 | 2,149 | 2,123 | 2,003 |
-| | Decode | 92.1 | 95.5 | 91.9 | 90.4 | 85.3 | 85.7 | 70.5 |
-| | TTFT (s) | 1.09 | 1.93 | 3.80 | 7.52 | 15.3 | 30.8 | 65.5 |
-| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,954 | 2,312 | 2,305 | 2,340 | 2,395 | 2,275 | 2,115 |
-| | Decode | 78.5 | 89.4 | 84.3 | 86.1 | 82.1 | 81.0 | 73.4 |
-| | TTFT (s) | 1.08 | 1.77 | 3.59 | 6.96 | 13.7 | 28.8 | 62.0 |
+| **GLM 5.3 Flash-2bpw** | Prefill | 883 | 780 | 739 | 724 | 713 | 649 | 570 |
+| | Decode | 47.5 | 48.8 | 47.7 | 47.1 | 43.8 | 44.8 | 44.5 |
+| | TTFT (s) | 2.35 | 5.24 | 11.2 | 22.5 | 46.0 | 101.1 | 229.9 |
+| **GLM 5.3 Flash-2.4bpw** | Prefill | 859 | 833 | 821 | 816 | 805 | 737 | 645 |
+| | Decode | 50.1 | 51.8 | 48.7 | 46.4 | 47.4 | 46.6 | 44.2 |
+| | TTFT (s) | 2.42 | 4.91 | 10.1 | 20.0 | 40.7 | 89.1 | 203.3 |
+| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,308 | 1,227 | 1,225 | 1,144 | 994 | 891 | 679 |
+| | Decode | 56.7 | 55.4 | 56.2 | 65.5 | 54.9 | 57.2 | 50.2 |
+| | TTFT (s) | 1.61 | 3.33 | 6.75 | 14.3 | 33.0 | 73.7 | 193.0 |
+| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 2,144 | 2,355 | 2,413 | 2,414 | 2,399 | 2,348 | 2,255 |
+| | Decode | 92.3 | 86.1 | 88.8 | 89.2 | 90.9 | 83.1 | 79.6 |
+| | TTFT (s) | 0.98 | 1.73 | 3.43 | 6.74 | 13.7 | 27.9 | 58.2 |
+| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,871 | 2,113 | 2,192 | 2,187 | 2,262 | 2,225 | 2,178 |
+| | Decode | 77.9 | 72.8 | 85.2 | 90.3 | 82.6 | 78.3 | 71.3 |
+| | TTFT (s) | 1.13 | 1.93 | 3.77 | 7.44 | 14.5 | 29.4 | 60.2 |
 
 Community reports, using llmprobe `--bench-only`:
 

@@ -45,7 +45,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
-- Scoped file/request logit biases share these prefix-dependent shifts for MTP, PLD and prompt lookup; active
+- Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
   rewards and penalties bypass the target head shortlist. The think-penalty preset retains its original arithmetic.
 - logprobs>0, grammar and a repeat/presence penalty disable spec.
 
@@ -63,23 +63,22 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
   `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
   head's KV whenever it runs by default (`server.mtpHeadDefaultOn`).
-- **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default, `SUSHI_MTP_GROUP_PLANNER`;
+- **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
   tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`;
-  `SUSHI_MTP_BATCHED_QWEN4` opts in; `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
+  `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
   aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
   2-3. Measure before any code.
 - <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**
   (`lmHeadShortlistFor`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
   re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
   exists with MTP or without, so MTP == serial holds by construction. Gate `generate.argmaxOnlyRequest` (greedy or
-  top-1; no penalty, logprobs, grammar, forced call or PLD); `kld` reads the full head. Not certified: a full argmax
+  top-1; no penalty, logprobs, grammar, forced call); `kld` reads the full head. Not certified: a full argmax
   outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
   reads the full head ([perf-baselines](mimo2-perf.md#mimo-lmhead-shortlist)).
 - **Drafts shortlist on a coarse lm_head copy and re-score exactly** from the MIXER output
-  (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`; `SUSHI_MTP_DRAFT_RERANK=0`
-  restores the full readout). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
+  (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
   from the re-scored top-32 (`mtpDraftStepPath`); draft temperature is per family.
 
 <a id="depth-range"></a>
@@ -88,7 +87,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **`--mtp-min-depth N` / `--mtp-max-depth N` bound every depth the planner picks** (`src/mtp_depth_bounds.zig`): the
   EV plan's base and extension (`mtpPlanInBounds`), the windowed controller, the grouped planner's row widths
   (`plannerWidth`; a plain tick is not a depth and stays), the width trial, and a prompt lookup's draft count. Both are
-  1..8; `min > max` and the removed `--mtp-depth` exit at startup. The boot logs `[mtp] depth range lo..hi (source)`.
+  1..8; `min > max` exits at startup. The boot logs `[mtp] depth range lo..hi (source)`.
 - **Defaults are the planner's own**: min 1, max the cost profile's cap (8 on an eligible M5 NAX target, else 6, lower on
   a measured per-silicon row, 3 under `SUSHI_MTP_ADAPTIVE=0`). An explicit max is also the table's ceiling (no
   trusted-width climb past it), and a min above the default cap lifts it. A MiMo head count or verify row budget below
@@ -105,7 +104,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 
 - **A lookup stands in for the chain when the output copies its context** (`mtpLookupChain`, ported from mlx-serve
   #523/#533): the last 3 committed tokens plus t1 matched earlier in the prompt or output, agreeing back 8+ tokens,
-  make the drafts with no head forward. On by default for the qwen4 and MiMo heads; `--no-mtp-lookup` turns it off (and GLM DFlash2's lookup chains with it; standalone PLD, `--pld`/`--no-pld`, is a separate switch that neither implies nor is implied by it).
+  make the drafts with no head forward. On by default for the qwen4 and MiMo heads; `--no-mtp-lookup` turns it off (and GLM DFlash2's lookup chains with it).
 - **An ordinary match (suffix under 32) must agree past the start of a line**: a unified diff echoes the file's
   lines behind a `-`/`+`/space prefix, so its matches agree to the end of one line and fail at the next (-4.8% on
   the diff before the rule, -1.6% after). A line's own last token (`):\n`) agrees whatever the next line starts
@@ -165,7 +164,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   `=0` on BOTH arms. A round's wall is between round ENDS, so an interleaved prefill chunk drops the round clock too.
 - **The EV seed lives on `Qwen4Mtp`** (`ev_seed_accept`/`ev_seed_m_lo`), per loaded model; publish AND consume
   decline under a pinned depth. `MtpCostProfile` comes from the runtime fingerprint
-  (`g17_nax_qwen4_q4_gs64`; `SUSHI_MTP_QWEN4_PROFILE=0` revokes it); unmeasured = generic/cap-6.
+  (`g17_nax_qwen4_q4_gs64`); unmeasured = generic/cap-6.
 - EXL3 packs take the chip's generic depth row (6 on M5 Max). A deeper round pays only on predictable text: at the
   MCG K3 round costs (31.2 / 36.0 / 42.4 ms at depth 1 / 2 / 3, ~5 ms per row after) and a ~20 ms serial token,
   depth 2 breaks even at ~0.53 per-draft acceptance, depth 3 at ~0.60, depth 4 at ~0.63; depth 4-6 wins only above
@@ -209,10 +208,8 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   depth's proposal is resolved). Those verify rows carry a one-hot q, so `exact` stays distribution-exact and
   `typical` judges the argmax against the target's floor; a greedy request is untouched. A chain that carries q
   drafts every depth as a `[1]` id: the accept graph concatenates them.
-- `--fast` turns on MTP with `typical` and the greedy tail (plus kv8) in one flag
-  ([server-lifecycle](server-lifecycle.md#settings)).
-- Sampled output under `typical` acceptance, and so under `--fast`, has been seen looping (2026-09-28): the README and
-  pack cards recommend neither until the cause is known.
+- Sampled output under `typical` acceptance has been seen looping (2026-09-28): the README and
+  pack cards do not recommend it until the cause is known.
 - **The greedy tail pays only beside `typical`, and pulls sampled text toward the argmax.** Sushi-2.6bpw at T=1.0 /
   top_k 20 / top_p 0.95, 16 fixture prompts x 512, 2 seeds, binary 506efc5b: typical 0.2 + tail decoded 95.9 / 92.6
   tok/s vs typical 84.0 / 89.0 and exact 74.3 / 74.6 (2.7-2.9 vs 2.5 vs 2.1 tokens per round). Its emitted-text NLL

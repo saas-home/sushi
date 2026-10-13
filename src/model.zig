@@ -1,6 +1,20 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+
+/// `--qwen-gdn`: whether the GatedDeltaNet recurrent state is stored f32 (the default) or bf16 between
+/// tokens. A launch decision, not a per-model one: `parseConfig` reads it so every load path (serve,
+/// run, kld) resolves the same state width.
+pub var qwen_gdn_f32: bool = true;
+
+/// The `--qwen-gdn` value: `32` stores the state f32, `16` bf16; anything else is a usage error the
+/// caller reports by name.
+pub fn parseQwenGdn(value: []const u8) ?bool {
+    if (std.mem.eql(u8, value, "32")) return true;
+    if (std.mem.eql(u8, value, "16")) return false;
+    return null;
+}
+
 const model_discovery = @import("model_discovery.zig");
 const expert_quant = @import("expert_quant.zig");
 const expert_io = @import("expert_io.zig");
@@ -237,6 +251,8 @@ pub const ModelConfig = struct {
     linear_key_head_dim: u32 = 128,
     linear_value_head_dim: u32 = 128,
     linear_conv_kernel_dim: u32 = 4,
+    /// Store the recurrent state in f32 between tokens; `--qwen-gdn 16` keeps bf16.
+    gdn_state_f32: bool = true,
 
     // KDA (Kimi Delta Attention, bailing_hybrid) variations on the
     // GatedDeltaNet recurrence:
@@ -763,11 +779,39 @@ pub const ModelConfig = struct {
         const linear_layers: u64 = @as(u64, self.num_hidden_layers) -| self.attnCacheLayerCount();
         if (linear_layers == 0) return 0;
         const state: u64 = @as(u64, self.linear_num_value_heads) *
-            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * @as(u64, if (self.isGlm5()) 4 else 2);
+            @as(u64, self.linear_value_head_dim) * @as(u64, self.linear_key_head_dim) * self.recurrentStateBytes();
         const conv_dim: u64 = 2 * @as(u64, self.linear_num_key_heads) * self.linear_key_head_dim +
             @as(u64, self.linear_num_value_heads) * self.linear_value_head_dim;
         const conv: u64 = @as(u64, self.linear_conv_kernel_dim) -| 1;
         return linear_layers * (state + conv * conv_dim * 2);
+    }
+
+    /// The one place that names the GatedDeltaNet state's storage dtype; the recurrence computes in f32 either way.
+    /// Qwen's arm only: GLM's recurrent state is KDA, f32 by construction, and never reaches the GDN chain
+    /// this speaks for.
+    pub fn gdnStateDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.gdn_state_f32) .float32 else .bfloat16;
+    }
+
+    /// Names a stored-state layout the weight files do not tell apart, for the SSD cache namespace; null
+    /// is no GDN state. A restored state of the other width would be cast, and one written under a bf16
+    /// gate continues differently, so neither is restored.
+    pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.linear_num_value_heads == 0 or self.isGlm5()) return null;
+        return if (self.gdnStateDtype() == .float32) "gdn-f32-state-v1" else "gdn-gate-f32-v1";
+    }
+
+    /// The GatedDeltaNet decay gate's dtype, f32 whatever the state's width: a bf16 gate near one is
+    /// exactly 1.0 and that head never forgets. GLM's gate is KDA's own and never reaches the GDN
+    /// producers this speaks for.
+    pub fn gdnGateDtype(self: *const ModelConfig) mlx.mlx_dtype {
+        return if (self.isGlm5()) .bfloat16 else .float32;
+    }
+
+    /// Bytes one recurrent-state element holds on this arch. GLM's KDA state is f32 whatever
+    /// `--qwen-gdn` says; every other linear arch follows it.
+    fn recurrentStateBytes(self: *const ModelConfig) u64 {
+        return if (self.isGlm5() or self.gdnStateDtype() == .float32) 4 else 2;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1140,6 +1184,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
+    config.gdn_state_f32 = qwen_gdn_f32;
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (std.c.getenv("SUSHI_NGRAM_BF16_DIR")) |raw| {
@@ -2912,21 +2957,6 @@ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool
     return ndim == 1;
 }
 
-/// Kill switch for the 1-D arm (`SUSHI_F16_NARROW_1D=0`). A load-time
-/// dtype normalization is invisible once the model is up, so a one-boot A/B
-/// switch is the only way to attribute a future f16-checkpoint regression to
-/// it. The side-tensor arm predates this and is not switchable.
-var narrow_1d_env: ?bool = null;
-fn narrow1dEnabled() bool {
-    if (narrow_1d_env) |v| return v;
-    const on = blk: {
-        const raw = std.c.getenv("SUSHI_F16_NARROW_1D") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    narrow_1d_env = on;
-    return on;
-}
-
 /// Count of 1-D f16 tables narrowed this load — reported once per model so a
 /// declined normalization is nameable from the log instead of silently
 /// reading as "this checkpoint just isn't f16".
@@ -2934,7 +2964,7 @@ var narrowed_1d: usize = 0;
 
 pub fn reportF16Narrowing() void {
     if (narrowed_1d == 0) return;
-    log.info("[dtype] narrowed {d} 1-D f16 tables to bf16 (SUSHI_F16_NARROW_1D=0 disables)\n", .{narrowed_1d});
+    log.info("[dtype] narrowed {d} 1-D f16 tables to bf16\n", .{narrowed_1d});
     narrowed_1d = 0;
 }
 
@@ -3193,9 +3223,7 @@ fn loadSafetensorsFileMode(
         errdefer if (final_value.ctx != null) {
             _ = mlx.mlx_array_free(final_value);
         };
-        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
-            (ndim != 1 or narrow1dEnabled()))
-        {
+        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value))) {
             var cast = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(cast);
             try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
@@ -4463,7 +4491,6 @@ test "the quantized streaming loader drops the nine routed banks and keeps every
 
 test "qwen4 streaming loader materializes only transformed resident tensors" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});
@@ -4497,7 +4524,6 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
 
 test "a streamed load that fails mid-transform frees the tensor it was holding" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});
@@ -4537,7 +4563,6 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
 
 test "the streamed load drops the MTP head the ledger bills at zero" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});
@@ -5590,8 +5615,8 @@ test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default
     const c = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 48, .first_k_dense_replace = 1, .num_experts = 256, .num_experts_per_tok = 8, .hidden_size = 4096, .moe_intermediate_size = 2048, .expert_layout = .exl3_k4 };
     try testing.expect(c.supportsExpertStreaming());
     try testing.expectEqual(@as(u32, 47), c.expertLayerCount());
-    try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 0));
-    try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 20 << 30));
+    try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0));
+    try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 20 << 30));
     try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true, false));
@@ -5720,6 +5745,60 @@ test "the shipped packs' configs parse to the geometry they serve (src/fixtures/
         try t.expectEqual(c.rate_n, meta.expert_quant_rate.?.n);
         try t.expectEqual(@as(u32, 48), meta.num_hidden_layers);
     }
+}
+
+test "--qwen-gdn takes 16 or 32 and nothing else" {
+    try testing.expectEqual(@as(?bool, true), parseQwenGdn("32"));
+    try testing.expectEqual(@as(?bool, false), parseQwenGdn("16"));
+    for ([_][]const u8{ "fp32", "bf16", "f32", "8", "64", "" }) |bad| try testing.expectEqual(@as(?bool, null), parseQwenGdn(bad));
+}
+
+test "--qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is the default; GLM keeps its own gate" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.createDirPath(t.io, "glm");
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "glm/config.json", .data = @embedFile("fixtures/glm5_config.json") });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(t.io, &path_buf);
+    const path = path_buf[0..n];
+    var glm_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const glm_path = try std.fmt.bufPrint(&glm_buf, "{s}/glm", .{path});
+
+    const saved = qwen_gdn_f32;
+    defer qwen_gdn_f32 = saved;
+
+    try t.expect(qwen_gdn_f32);
+    var wide = try parseConfig(t.io, t.allocator, path);
+    defer wide.deinit(t.allocator);
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), wide.gdnStateDtype());
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), wide.gdnGateDtype());
+    try t.expectEqualStrings("gdn-f32-state-v1", wide.cacheLayoutNamespace().?);
+
+    qwen_gdn_f32 = false;
+    var narrow = try parseConfig(t.io, t.allocator, path);
+    defer narrow.deinit(t.allocator);
+    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), narrow.gdnStateDtype());
+    // The gate is f32 at either width: only the state narrows.
+    try t.expectEqual(@as(mlx.mlx_dtype, .float32), narrow.gdnGateDtype());
+    try t.expectEqualStrings("gdn-gate-f32-v1", narrow.cacheLayoutNamespace().?);
+
+    var glm = try parseConfig(t.io, t.allocator, glm_path);
+    defer glm.deinit(t.allocator);
+    try t.expectEqual(@as(mlx.mlx_dtype, .bfloat16), glm.gdnGateDtype());
+    try t.expectEqual(@as(?[]const u8, null), glm.cacheLayoutNamespace());
+}
+
+test "the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GLM's KDA state is f32 always" {
+    const t = std.testing;
+    var c = ModelConfig{ .num_hidden_layers = 48, .full_attention_interval = 4, .linear_num_key_heads = 16, .linear_num_value_heads = 48 };
+    const conv: u64 = 3 * (2 * 16 * 128 + 48 * 128) * 2;
+    try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
+    c.gdn_state_f32 = false;
+    try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 2 + conv)), c.ssmCheckpointBytes());
+    c.model_type = "glm5_next";
+    try t.expectEqual(@as(u64, 36 * (48 * 128 * 128 * 4 + conv)), c.ssmCheckpointBytes());
 }
 
 test "GLM config maps compressed MLA and FP32 recurrent state without Qwen assumptions" {

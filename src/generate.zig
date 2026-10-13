@@ -10,7 +10,6 @@ const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const io_util = @import("io_util.zig");
-const pld_index = @import("pld_index.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtp_mod = @import("mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
@@ -52,33 +51,27 @@ pub var prefill_chunk_override: usize = 8192;
 /// without this flag the default 8192 is indistinguishable from a request.
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
-pub var prefill_trace_force: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
 /// override it through InitOptions; exact remains the library default.
 pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
-/// `--mtp-typical` / `--mtp-tokenv3` (or their env twins) chose the default above.
+/// `--mtp-typical` / `--mtp-tokenv3` chose the default above.
 pub var mtp_acceptance_explicit: bool = false;
 
-/// THIS model's acceptance mode: the launch flag > `--fast` > its `mtp_acceptance` > exact.
+/// THIS model's acceptance mode: the launch flag > its `mtp_acceptance` > exact.
 pub fn mtpAcceptanceFor(setting: ?mtp_acceptance.Mode) model_settings.Pick(mtp_acceptance.Mode) {
-    return model_settings.pickLaunch(mtp_acceptance.Mode, .mtp_acceptance, model_settings.launchFlag(mtp_acceptance.Mode, mtp_acceptance_default, mtp_acceptance_explicit), setting, mtp_acceptance_default);
+    return model_settings.pick(mtp_acceptance.Mode, model_settings.launchFlag(mtp_acceptance.Mode, mtp_acceptance_default, mtp_acceptance_explicit), setting, mtp_acceptance_default);
 }
 
 /// `--mtp-greedy-tail` was given.
 pub var mtp_greedy_tail_explicit: bool = false;
 
-/// `--no-mtp-lookup`: no prompt-lookup drafts in MTP rounds or GLM DFlash2 chains (standalone PLD is its own flag).
+/// `--no-mtp-lookup`: no prompt-lookup drafts in MTP rounds or GLM DFlash2 chains .
 pub var mtp_lookup_disabled: bool = false;
 
-/// THIS model's greedy tail: the launch flag > `--fast` > its `mtp_greedy_tail` > off.
+/// THIS model's greedy tail: the launch flag > its `mtp_greedy_tail` > off.
 pub fn mtpGreedyTailFor(setting: ?bool) model_settings.Pick(bool) {
-    return model_settings.pickLaunch(bool, .mtp_greedy_tail, model_settings.launchFlag(bool, true, mtp_greedy_tail_explicit), setting, false);
-}
-
-/// The width `SUSHI_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
-pub fn envPrefillChunk() usize {
-    return readEnvUsize("SUSHI_PREFILL_CHUNK", 0);
+    return model_settings.pick(bool, model_settings.launchFlag(bool, true, mtp_greedy_tail_explicit), setting, false);
 }
 
 pub fn tickUbenchN(raw: ?[*:0]const u8) u32 {
@@ -169,14 +162,6 @@ pub const AdaptiveWidthState = struct {
     width_max: u32 = 0,
 };
 
-/// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
-/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
-/// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
-/// stock Qwen3.6-27B head, window 8192 cost 14 acceptance points (68.2% ->
-/// 54.0%) and 4.2 decode tok/s for ZERO prefill benefit (184.7 vs 185.1
-/// tok/s); at 32K it was a wash. Qwen's stock head drafts from deep history.
-pub var mtp_history_window_override: usize = 0;
-
 /// `--max-mtp-ctx N`: MTP stays off past N context tokens (0 = unlimited). Read by the HTTP
 /// admission gate and by `nextMtp` per round (`mtp.mtpCtxWithinLimit`).
 pub var max_mtp_ctx: u32 = 0;
@@ -192,24 +177,6 @@ pub const SpecDisableReason = enum {
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
 };
-
-/// Effective MTP history window for a prefill forwarding `prefix_len`
-/// positions: 0 (capture everything) unless windowing is on AND the tail is
-/// past the threshold — short/medium prompts keep byte-identical behavior.
-pub fn effectiveMtpHistoryWindow(prefix_len: usize, window: usize) usize {
-    if (window == 0 or prefix_len <= mtp_mod.HISTORY_WINDOW_THRESHOLD) return 0;
-    return window;
-}
-
-/// Does prefill chunk [pos, end) contribute MTP history? Zero window = all
-/// chunks; otherwise only chunks overlapping the last `window` positions of
-/// the prefix (a boundary chunk contributes whole — the window is a floor,
-/// never an exact cut, so acceptance never loses mid-chunk context).
-pub fn chunkNeedsMtpHistory(pos: usize, end: usize, prefix_len: usize, window: usize) bool {
-    _ = pos;
-    if (window == 0) return true;
-    return end > prefix_len - @min(window, prefix_len);
-}
 
 /// One layer's materialized-score budget for unfused-SDPA prefill (see
 /// boundedPrefillChunk). 4 GiB keeps the full 8K chunk for every context up
@@ -283,7 +250,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
         // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
-    // Composed-causal fallback (SUSHI_FUSED_256_CAUSAL=0): SMALL chunks
+    // Composed-causal fallback (the parity oracle, `fused256_override = false`): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
@@ -303,14 +270,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 }
 
 /// The prefill chunk `initWithOptions` will actually use for a request:
-/// SUSHI_PREFILL_CHUNK env (explicit tuning knob — honored verbatim,
-/// never safety-capped) > --prefill-chunk / default, capped by
-/// boundedPrefillChunk. Exported so server.zig's admission guard
+/// --prefill-chunk / default, capped by boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
 pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    const env_chunk = readEnvUsize("SUSHI_PREFILL_CHUNK", 0);
-    if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
     // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
     // the widest chunk whose one-off transient reserve still leaves this box a
@@ -339,16 +302,6 @@ fn readEnvUsize(name: [:0]const u8, default: usize) usize {
     const slice = std.mem.sliceTo(raw.?, 0);
     if (slice.len == 0) return default;
     return std.fmt.parseInt(usize, slice, 10) catch default;
-}
-
-/// Read a finite, non-negative float from an environment variable, else `default`.
-fn readEnvFloat(name: [:0]const u8, default: f32) f32 {
-    const raw = std.c.getenv(name.ptr);
-    if (raw == null) return default;
-    const slice = std.mem.sliceTo(raw.?, 0);
-    if (slice.len == 0) return default;
-    const v = std.fmt.parseFloat(f32, slice) catch return default;
-    return if (std.math.isFinite(v) and v >= 0) v else default;
 }
 
 /// Truthy if the env var is exactly "1". Anything else (unset, "0", "true",
@@ -605,6 +558,8 @@ pub const MtpHeadRef = union(enum) {
         }
     }
 };
+
+var mtp_trace_sync_env: ?bool = null;
 
 /// `SUSHI_MTP_HEAD_PERSIST=0`: the qwen4_exp head's committed history is neither
 /// snapshotted into a prefix-cache entry nor restored from one.
@@ -1026,15 +981,14 @@ pub const SamplingParams = struct {
 };
 
 /// Whether a request consumes only each position's argmax: greedy (or top-1), no logit-moving
-/// penalty, no logprobs, no grammar or forced call choosing among ids, no PLD. Only then may a
+/// penalty, no logprobs, no grammar or forced call choosing among ids. Only then may a
 /// forward serve pruned or shortlisted logits.
-pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32, pld_enabled: bool) bool {
+pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32) bool {
     return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
         !penaltyActive(sampling) and
         !sampling.think_penalty.active() and
         sampling.constraint == null and
         sampling.call_force == null and
-        !pld_enabled and
         logprobs_n == 0;
 }
 
@@ -1077,17 +1031,10 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// Derive + install the reserved-token suppression mask on a freshly-built
 /// Transformer (both the serve load path and the CLI run path call this).
 /// The id set is `tokenizer.reservedOutputIds`: `special: true` added tokens
-/// minus EOS/stop ids minus template-emitted markers. Kill switch
-/// `SUSHI_SUPPRESS_RESERVED=0`. Never fails a load — any error logs and
+/// minus EOS/stop ids minus template-emitted markers. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
 pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
-    if (std.c.getenv("SUSHI_SUPPRESS_RESERVED")) |v| {
-        if (v[0] == '0') {
-            log.info("[suppress] reserved-token suppression disabled by env\n", .{});
-            return;
-        }
-    }
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;
@@ -1195,11 +1142,11 @@ fn verifyArgmax(logits: mlx.mlx_array, mask: ?mlx.mlx_array, s: mlx.mlx_stream) 
     return .{ .arr = out };
 }
 
-/// A speculative decode step (PLD / drafter / MTP) cannot honor a grammar
+/// A speculative decode step (DFlash / MTP) cannot honor a grammar
 /// constraint — the drafts bypass the per-token grammar mask — nor per-token
 /// logprobs, which the draft path never captures. The scheduler and server
-/// already select a spec mode only when both are absent, but `nextPld` /
-/// `nextDrafter` / `nextMtp` only *documented* that with `std.debug.assert`,
+/// already select a spec mode only when both are absent, but `nextDflash` /
+/// `nextMtp` only *documented* that with `std.debug.assert`,
 /// which compiles out in the ReleaseFast build users actually run (issue #97).
 /// A future dispatch bug that let a constrained request reach a spec step would
 /// then read the constrained branch's placeholder token as a real commit and
@@ -1216,9 +1163,9 @@ pub fn draftsRefused(sampling: SamplingParams) bool {
     return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
 }
 
+/// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
 pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
-    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null and
-        !sampling.think_penalty.active();
+    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
 }
 
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
@@ -1513,7 +1460,7 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 /// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
 /// long prefill pays, at the price of allocating generation headroom early. Gated on
 /// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `SUSHI_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+/// `server.prefillRequestTerms` bills it.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -1655,7 +1602,6 @@ test "every speculative decoder caps accepted drafts before commit" {
     // usage. Output-only clipping in the scheduler is already too late.
     const source = @embedFile("generate.zig");
     const names = [_][]const u8{
-        "nextPld",
         "nextDflash",
         "mtpRoundFinish",
     };
@@ -1731,44 +1677,28 @@ pub const Generator = struct {
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
 
-    // ── Spec-decode shared state (PLD + drafter) ──
+    // ── Spec-decode shared state (DFlash) ──
     // Post-final-norm hidden state at the last produced token's position.
     // Owned by the Generator (freed in `deinit`). Captured by
     // `forwardCaptureHidden` during prefill final-token forward and every
-    // verify forward — used by drafter as h_prev seed and by PLD verify
-    // partial-accept rollback.
+    // verify forward; the drafter's h_prev seed.
     last_hidden: mlx.mlx_array = .{},
     has_last_hidden: bool = false,
-    /// PRNG for PLD / drafter stochastic-verify accept test (probability-
+    /// PRNG for the DFlash stochastic-verify accept test (probability-
     /// ratio requires a uniform draw per draft step). Seeded from
     /// `sampling.seed` when set, otherwise from system time at init.
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
 
-    // ── PLD (Prompt Lookup Decoding) state ──
-    // Owned copy of the input prompt ids — needed because PLD's n-gram lookup
-    // table is `prompt + generated_ids`, and the caller-supplied `prompt_ids`
-    // slice is freed after `init` returns. `generated_ids` (above) tracks
-    // post-prefill tokens; `prompt_ids_owned` is the immutable prefix.
+    // Owned copy of the lookup prompt ids: the MTP prompt-lookup index extends from
+    // `prompt_ids_owned ++ generated_ids`, and the caller-supplied `prompt_ids` slice is freed after
+    // `init` returns. `generated_ids` (above) tracks post-prefill tokens; `prompt_ids_owned` is the
+    // immutable prefix.
     prompt_ids_owned: []u32 = &.{},
     /// Allocator that owns `prompt_ids_owned`. Stored so `deinit` can free it
     /// without requiring callers to thread the allocator a second time. (Other
     /// owned slices are freed via the `allocator` argument to `deinit` for
     /// historical reasons; this one is set during `initWithOptions`.)
     prompt_ids_alloc: ?std.mem.Allocator = null,
-    /// Did init actually arm PLD for this generator (`InitOptions.pld_enabled`
-    /// AFTER the GLM guard)? `nextPld` declines to the
-    /// plain serial step when false, and the scheduler's tick dispatch
-    /// (`specTickMode`) requires it alongside `slot.enable_pld` — the caller's
-    /// flag alone must never put a verify forward through the trunk. This is
-    /// PLD's counterpart of the `gen.mtp != null` / `gen.drafter != null`
-    /// conjuncts; PLD has no model handle, so the bit has to be explicit.
-    pld_enabled: bool = false,
-    /// Stats for PLD benchmark logging. `pld_attempted` counts every step
-    /// where lookup found a candidate (so a verify forward ran);
-    /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
-    /// (not including the always-accepted t1) that were successfully verified.
-    pld_attempted: u64 = 0,
-    pld_accepted_tokens: u64 = 0,
     /// Tokens proposed per round (the DFlash-resolved block size).
     drafter_block_size: u32 = 4,
 
@@ -1790,16 +1720,13 @@ pub const Generator = struct {
     glm_prefill_window: ?GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
-    /// Effective block size (assistant config, clamped by --draft-block-size).
+    /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
     /// Request-class break-even yield, normalized by the scheduler to the
     /// effective draft width. Thinking requests use the lower calibration
     /// because their less-predictable reasoning preamble pays back later.
     dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
-    /// Per-round width chooser over the model's round-cost table (null =
-    /// SUSHI_DFLASH_CHOOSER=0, the fixed block + sticky yield gate).
-    dflash_chooser: ?round_cost.WidthChooser = null,
     /// Drafts this round ran (0 = serial), read by the table feed.
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
@@ -1997,8 +1924,8 @@ pub const Generator = struct {
     // ── Runtime acceptance gate ──
     // Set to true mid-request when the per-request acceptance rate
     // (`*_accepted_tokens / *_attempted`) falls below
-    // `RUNTIME_GATE_MIN_RATE` after `RUNTIME_GATE_WARMUP` attempts. When set,
-    // `nextPld`, `nextDrafter`, and `nextDflash` short-circuit to `next()` for the
+    // the DFlash gate threshold after its warmup attempts. When set,
+    // `nextDflash` and `nextMtp` short-circuit to `next()` for the
     // remainder of the request — the prompt-time gate could not foresee that
     // the workload's *runtime* draft acceptance rate wasn't paying for the
     // per-step verify overhead. The flag is sticky for the rest of the
@@ -2006,6 +1933,8 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
     spec_disable_reason: SpecDisableReason = .none,
+    /// A loop convicted inside the thought already closed it: one recovery per request.
+    think_closed_by_loop: bool = false,
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
     /// This request has released the module-owned MTP head (sticky serial arm reached a serial
@@ -2022,66 +1951,6 @@ pub const Generator = struct {
     mtp_serial_giveup_logged: bool = false,
     /// Inter-tick wall clock feeding the table's serial cell. Null = the next read seeds.
     mtp_serial_clock: ?io_util.Stopwatch = null,
-    /// Yield-gate counters: enabled-mode `nextPld` steps and drafted tokens
-    /// accepted since the last (re-)enable. Reset on mid-request re-enable so
-    /// a fresh workload region (e.g. file echo after a novel preamble) gets a
-    /// fresh economic evaluation instead of inheriting the bad early yield.
-    yield_steps: u64 = 0,
-    yield_accepted: u64 = 0,
-    /// Steps spent in disabled mode since the gate tripped (drives the
-    /// periodic `specShouldReenable` re-check).
-    disabled_steps: u64 = 0,
-    /// Number of attempts before the runtime gate considers disabling.
-    /// Below this we trust the prompt-time gate.
-    ///
-    /// Override at runtime via `SPEC_GATE_WARMUP` env var (parsed in `runtimeGateWarmup()`
-    /// once per request). Lower values make the gate trip sooner,
-    /// reducing regression-tail damage at the cost of fewer chances for slow-warmup
-    /// workloads to amortize spec overhead.
-    pub const RUNTIME_GATE_WARMUP: u64 = 5;
-
-    /// Read the warmup threshold for this call. Env-overridable so we can A/B
-    /// without rebuilding. Anything outside `[1, 64]` falls back to the default.
-    pub fn runtimeGateWarmup() u64 {
-        const n = readEnvUsize("SPEC_GATE_WARMUP", @intCast(RUNTIME_GATE_WARMUP));
-        if (n < 1 or n > 64) return RUNTIME_GATE_WARMUP;
-        return @intCast(n);
-    }
-    /// Minimum per-draft acceptance probability. Below this after warmup,
-    /// speculation is disabled for the rest of the request.
-    ///
-    /// History: pre-v5 this gate compared `accepted/attempted` (per-round
-    /// average) against 0.30 — but with `block_size=4` the max value of that
-    /// ratio is 3.0, so the 0.30 threshold corresponded to ~10% per-draft
-    /// probability, well below where verify+draft overhead actually breaks
-    /// even. Empirically creative-content workloads regress at 22-47% per-draft
-    /// acceptance
-    /// while the gate stayed off (per-round avg 0.66-1.58, all above 0.30).
-    /// Switching to a per-draft probability with threshold 0.50 cleanly cuts
-    /// off the regressing tail while leaving heavy-echo workloads (84-97%
-    /// per-draft) running unmolested.
-    pub const RUNTIME_GATE_MIN_PER_DRAFT_RATE: f32 = 0.50;
-
-    /// Pure helper: should the runtime gate disable speculation given the
-    /// observed per-request stats? `drafts_per_round` is the number of
-    /// drafted tokens proposed in each verify (= `block_size - 1` for the
-    /// drafter, or `pld_draft_len` for PLD); we divide accepts by attempts ×
-    /// drafts_per_round to get the per-draft acceptance probability.
-    /// Returns true iff `attempted >= warmup` AND per-draft probability is
-    /// below `RUNTIME_GATE_MIN_PER_DRAFT_RATE`.
-    ///
-    /// `drafts_per_round == 0` is treated as "no speculative work happens
-    /// per round" → never trip (defensive — current callers always pass
-    /// >= 1).
-    pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round: u32) bool {
-        if (attempted < runtimeGateWarmup()) return false;
-        if (drafts_per_round == 0) return false;
-        const drafts_proposed = attempted * @as(u64, drafts_per_round);
-        const rate = @as(f32, @floatFromInt(accepted)) /
-            @as(f32, @floatFromInt(drafts_proposed));
-        return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
-    }
-
     // DFlash has different economics from sequential-token drafters: one
     // assistant call proposes the whole block and the M5 NAX verify lane makes
     // wide blocks cheap. Per-draft percentage therefore penalizes block 16
@@ -2102,108 +1971,25 @@ pub const Generator = struct {
     /// break-even acceptance is several times a dense trunk's.
     pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
-    /// Width chooser — OPT-IN (SUSHI_DFLASH_CHOOSER=1) until measured on
-    /// the five peer cells; default is the fixed block + sticky yield gate.
-    var dflash_chooser_cache: ?bool = null;
-    fn dflashChooserEnabled() bool {
-        if (dflash_chooser_cache) |v| return v;
-        const raw = std.c.getenv("SUSHI_DFLASH_CHOOSER");
-        const on = raw != null and std.mem.eql(u8, std.mem.span(raw.?), "1");
-        dflash_chooser_cache = on;
-        return on;
-    }
-
-    pub fn dflashGateWarmup() u64 {
-        const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
-        if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
-        return @intCast(n);
-    }
-
     pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
-        if (attempted < dflashGateWarmup()) return false;
+        if (attempted < DFLASH_GATE_WARMUP) return false;
         const avg = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(attempted));
         return avg < min_avg;
-    }
-
-    // ── PLD yield gate (cold-path economics) ──
-    // The per-draft gate above only counts verify ROUNDS, so a workload where
-    // the n-gram lookup rarely matches never accumulates enough "attempts" to
-    // trip it — yet every no-match step pays PLD's unpipelined cold forward
-    // (measured −14% vs the async-pipelined `next()` on creative content).
-    // The yield gate instead counts EVERY enabled-mode nextPld step: if the
-    // speculation is yielding fewer than YIELD_GATE_MIN_YIELD extra (drafted,
-    // accepted) tokens per step after YIELD_GATE_WARMUP steps, the cold-path
-    // tax outweighs the wins → disable. Paired with `specShouldReenable`,
-    // which flips PLD back on when the generated tail turns repetitive.
-    // Warmup 32 (not higher): the re-enable check bounds the cost of a
-    // premature trip to ≤SPEC_REENABLE_INTERVAL pipelined-fallback steps,
-    // so we can gate early and recover the pipeline sooner on novel content.
-    /// Steps of enabled-mode PLD before the yield gate may trip. See the
-    /// `yield-gate warmup is 8` test for the sweep this was picked from and
-    /// why it moved from 32.
-    pub const YIELD_GATE_WARMUP: u64 = 8;
-    pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
-
-    /// Read the yield-gate warmup for this call. Env-overridable
-    /// (`SPEC_YIELD_WARMUP`) so the threshold can be swept without a rebuild,
-    /// exactly like `runtimeGateWarmup`. Outside `[1, 256]` falls back.
-    ///
-    /// This number is pure economics, and the economics moved: every warmup
-    /// step pays PLD's UNPIPELINED cold forward (plus a synchronous host read
-    /// of the sampled token) against `next()`'s async-pipelined step, so the
-    /// tax is a fraction of the AR step cost — and the AR step got ~3x cheaper
-    /// when the Laguna mscale promotion was fixed, which makes the same
-    /// absolute tax a ~3x larger share. 32 was calibrated before that.
-    pub fn yieldGateWarmup() u64 {
-        const n = readEnvUsize("SPEC_YIELD_WARMUP", @intCast(YIELD_GATE_WARMUP));
-        if (n < 1 or n > 256) return YIELD_GATE_WARMUP;
-        return @intCast(n);
-    }
-
-    pub fn yieldGateShouldDisable(steps_total: u64, accepted: u64) bool {
-        if (steps_total < yieldGateWarmup()) return false;
-        const yield_rate = @as(f32, @floatFromInt(accepted)) /
-            @as(f32, @floatFromInt(steps_total));
-        return yield_rate < YIELD_GATE_MIN_YIELD;
-    }
-
-    // ── Mid-request spec re-enable ──
-    // While the yield gate has PLD disabled, the COMMITTED sequence (prompt +
-    // generated) is re-scored every SPEC_REENABLE_INTERVAL steps: what
-    // fraction of the recent generated positions would have had a PLD lookup
-    // hit (their key-gram appears earlier in committed)? This catches the
-    // echo workload where the model repeats PROMPT content (file edits, tool
-    // results) — self-repetition scoring misses it because the echoed tail
-    // never repeats itself. Above the threshold, PLD is worth re-engaging at
-    // the cost of one pipeline drain.
-    pub const SPEC_REENABLE_INTERVAL: u64 = 32;
-    pub const SPEC_REENABLE_WINDOW: usize = 32;
-    pub const SPEC_REENABLE_MIN_FRACTION: f32 = 0.25;
-    pub const SPEC_REENABLE_MIN_TOKENS: usize = 16;
-
-    pub fn specShouldReenable(committed: []const u32, generated_len: usize) bool {
-        if (generated_len < SPEC_REENABLE_MIN_TOKENS) return false;
-        const window = @min(SPEC_REENABLE_WINDOW, generated_len);
-        const frac = pld_index.tailMatchFraction(committed, window, 3);
-        return frac >= SPEC_REENABLE_MIN_FRACTION;
     }
 
     /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
     /// for this request. External tooling parses the `[spec-stats]` prefix;
     /// keep the format stable.
     ///
-    /// No-op when this Generator never ran a speculative path. Drafter and
-    /// PLD are mutually exclusive within a single request (drafter > PLD per
-    /// dispatch), so the branching here is unambiguous.
+    /// No-op when this Generator never ran a speculative path.
     ///
     /// Field semantics:
     /// - `attempts` = number of speculative rounds (one verify forward each).
     /// - `accepts` = total drafted tokens accepted across all rounds (excludes
     ///   the always-committed t1 token at the start of each round).
     /// - `avg_per_round` = accepts/attempts. Bounded by `(block_size - 1)` for
-    ///   drafter and `pld_draft_len` for PLD. Equals the metric the runtime
-    ///   gate compares against `RUNTIME_GATE_MIN_RATE`.
+    ///   the drafter.
     /// - `per_draft_pct` (drafter only) = accepts / (attempts × (block_size-1)),
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
@@ -2228,7 +2014,6 @@ pub const Generator = struct {
 
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
-        var hist_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
@@ -2296,23 +2081,21 @@ pub const Generator = struct {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dflash_attempted));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-            // Under the chooser the width varies per round: drafts proposed
-            // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else self.dflash_attempted * @as(u64, drafts_per_round);
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
-                    if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                    self.dflash_block_size,
                     self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
@@ -2321,9 +2104,6 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
                     self.xfm.round_cost.dropped_implausible,
-                    if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
-                    if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
-                    if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 },
             );
             if (self.glm_dflash_native) {
@@ -2339,19 +2119,6 @@ pub const Generator = struct {
                 });
             }
             return;
-        }
-        if (self.pld_attempted > 0) {
-            const avg_per_round: f64 = @as(f64, @floatFromInt(self.pld_accepted_tokens)) /
-                @as(f64, @floatFromInt(self.pld_attempted));
-            log.info(
-                "  [spec-stats] mode=pld attempts={d} accepts={d} avg_per_round={d:.2} runtime_disabled={s}\n",
-                .{
-                    self.pld_attempted,
-                    self.pld_accepted_tokens,
-                    avg_per_round,
-                    if (self.spec_disabled_runtime) "true" else "false",
-                },
-            );
         }
     }
 
@@ -2398,17 +2165,6 @@ pub const Generator = struct {
     };
 
     pub const InitOptions = struct {
-        /// Skip the lazy pre-forward of the first sampled token. When set,
-        /// init samples t1 synchronously and leaves `pending_logits/pending_token`
-        /// empty — the cache lands at exactly `prompt_len` with t1 NOT in cache.
-        /// `nextPld` v2 (mirroring `nextDrafter`) drives every step from that
-        /// invariant: verify input is `[t1, draft[0..m-1]]` length `1+m`; full
-        /// accept commits `1+m` tokens with cache landing at `prompt_len + TE_new`
-        /// and NO post-step forward. Saves one decode-step forward per accepted
-        /// PLD step at the cost of losing the lazy-pipeline overlap on cold
-        /// (no-match) steps. The prompt-time gate disables PLD on novel content
-        /// where cold-path dominates.
-        pld_enabled: bool = false,
         /// The machine-sized prefill chunk frozen at load
         /// (`ModelConfig.pinned_prefill_chunk`, resolved by
         /// `server.resolvePrefillChunk`). 0 = unpinned, keep the launch width.
@@ -2429,12 +2185,12 @@ pub const Generator = struct {
         /// non-null and `bind()`-ed to `xfm`. Prefill captures the trunk's
         /// target_layer_ids outputs chunk-by-chunk into the per-request
         /// assistant context cache (`Generator.dflash_ctx`). Same
-        /// lazy-pre-forward skip semantics as PLD/drafter/MTP.
+        /// lazy-pre-forward skip semantics as drafter/MTP.
         dflash_enabled: bool = false,
         /// Non-owning pointer to the loaded DFlash assistant.
         dflash: ?*DflashModel = null,
         /// Effective DFlash block size (loader-resolved: assistant config
-        /// clamped by --draft-block-size). 0 → the assistant config's value.
+        /// capped by the machine's verify lanes). 0 → the assistant config's value.
         dflash_block_size: u32 = 0,
         /// Accepted drafts/round required after warmup. Scheduler scales the
         /// M5/block-16 calibration to the effective draft width and lowers it
@@ -2444,7 +2200,7 @@ pub const Generator = struct {
         /// and `bind()`-ed to `xfm`. Prefill builds the head's committed-
         /// history KV cache chunk-by-chunk (full-hidden capture) and the
         /// final-token forward captures `last_hidden`, exactly like the
-        /// drafter path. Same lazy-pre-forward skip semantics as PLD/drafter.
+        /// drafter path. Same lazy-pre-forward skip semantics as drafter.
         mtp_enabled: bool = false,
         /// Explicit verifier selected by the caller at construction.
         mtp_acceptance: mtp_acceptance.Mode = .exact,
@@ -2460,9 +2216,9 @@ pub const Generator = struct {
         /// fixed mode. Explicit depths remain unchanged.
         mtp_depth: u32 = 0,
         /// When set, this slice (rather than `prompt_ids`) becomes the
-        /// `prompt_ids_owned` source for PLD's n-gram lookup. Used by the
+        /// `prompt_ids_owned` source for the MTP prompt-lookup index. Used by the
         /// server's KV-cache-reuse path to forward only the trailing tokens
-        /// while still giving PLD the full prompt for matching.
+        /// while still giving the lookup the full prompt for matching.
         lookup_prompt: ?[]const u32 = null,
         /// Per-slot forward context (Phase 2 concurrent batching). When null,
         /// `initWithOptions` builds one from `xfm.defaultCtx()` so the legacy
@@ -2480,7 +2236,7 @@ pub const Generator = struct {
         /// the start of every decode tick). PLD / drafter paths already skip
         /// the lazy pre-forward unconditionally; this flag generalizes that
         /// behavior to the regular sampling path. Has no effect when
-        /// `pld_enabled` or `drafter_enabled` is true.
+        /// `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
         /// Phase 1 (performance-plan): during prefill, capture an SSM
         /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
@@ -2557,7 +2313,7 @@ pub const Generator = struct {
         /// runs atomically (pre-interleave behavior, and the
         /// SUSHI_PREFILL_INTERLEAVE=0 kill switch).
         interleave_hook: ?InterleaveHook = null,
-        /// SSD-first write-through (qwen4_exp only; see `WriteThroughHook`).
+        /// SSD-first write-through (qwen4_exp and GLM; see `WriteThroughHook`).
         write_through_hook: ?WriteThroughHook = null,
         /// The per-chunk prefill width, asked at every chunk boundary after that chunk's
         /// `mlx_clear_cache` and before the interleave tick. Null keeps the admitted width.
@@ -2575,9 +2331,10 @@ pub const Generator = struct {
 
     /// SSD-first write-through: called at every completed prefill chunk with the absolute KV
     /// position and the SSM checkpoints so far, so a cancelled prefill leaves a restorable prefix.
+    /// The hook may `release` a checkpoint whose state it has put on SSD; its position stays listed.
     pub const WriteThroughHook = struct {
         ctx: *anyopaque,
-        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []const SSMCheckpoint) void,
+        call: *const fn (ctx: *anyopaque, abs_kv_pos: usize, cps: []SSMCheckpoint) void,
     };
 
     /// Returns the width the next chunk should run at (`cur` unchanged = no change).
@@ -2591,7 +2348,7 @@ pub const Generator = struct {
 
     /// Selects the source slice that `initWithOptions` will dupe into
     /// `prompt_ids_owned`. When `lookup_prompt` is non-null it wins (server
-    /// cache-reuse path: full original prompt for PLD lookup); otherwise the
+    /// cache-reuse path: full original prompt for the MTP lookup); otherwise the
     /// caller's `prompt_ids` is used (back-compat path).
     pub fn pickLookupPromptSource(prompt_ids: []const u32, lookup_prompt: ?[]const u32) []const u32 {
         return lookup_prompt orelse prompt_ids;
@@ -2612,7 +2369,7 @@ pub const Generator = struct {
         if (prompt_ids.len == 0) return error.EmptyPrompt;
         // Reserved-token suppression rides the sampling params from HERE —
         // the one chokepoint every init site funnels through — so every
-        // sampling path (serial, PLD/drafter/MTP corrections, draft heads,
+        // sampling path (serial, DFlash/MTP corrections, draft heads,
         // stochastic-verify filters, batched decode via `gen.sampling`)
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
@@ -2624,7 +2381,6 @@ pub const Generator = struct {
         var options = options_in;
         const glm_dflash_native = xfm.glm5 != null and options.dflash_enabled and options.dflash != null and glmDflashEligible(sampling, options.logprobs_n);
         if (xfm.glm5 != null) {
-            options.pld_enabled = false;
             options.mtp_enabled = false;
             options.dflash_enabled = glm_dflash_native;
         }
@@ -2639,7 +2395,7 @@ pub const Generator = struct {
         // lm_head gate: the certified prune and MiMo's coarse shortlist serve
         // the ARGMAX, not the tail distribution, so they engage only when this
         // request consumes nothing else (`argmaxOnlyRequest`).
-        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n, options.pld_enabled);
+        ctx.argmax_only = argmaxOnlyRequest(sampling, options.logprobs_n);
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -2647,11 +2403,11 @@ pub const Generator = struct {
             ids_i32[i] = @intCast(id);
         }
 
-        // Clone the lookup prompt for the lifetime of the Generator. PLD's
-        // n-gram lookup needs `prompt + generated`, and the caller-owned
-        // slice can be freed before `nextPld` runs. When `options.lookup_prompt`
+        // Clone the lookup prompt for the lifetime of the Generator. The MTP
+        // lookup index needs `prompt + generated`, and the caller-owned
+        // slice can be freed after init. When `options.lookup_prompt`
         // is set (server cache-reuse path), it carries the full original prompt
-        // so PLD's match coverage isn't gutted when only a trailing tail was
+        // so the match coverage isn't gutted when only a trailing tail was
         // forwarded into the KV cache. Defaults to `prompt_ids` otherwise.
         // Allocated up front so init's errdefer paths don't have to track
         // partial state.
@@ -2672,10 +2428,8 @@ pub const Generator = struct {
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
-        // PREFILL_CHUNK overridable via env SUSHI_PREFILL_CHUNK for tuning,
-        // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
-        // CLI flag in main.zig). Env var wins if both are set (and skips the
-        // safety cap below — it's the explicit escape hatch).
+        // PREFILL_CHUNK comes from the module-level `prefill_chunk_override`
+        // (set by --prefill-chunk in main.zig).
         //
         // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
         // the composed SDPA materializes [heads, chunk, total_kv] scores per
@@ -2693,12 +2447,8 @@ pub const Generator = struct {
             xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
         ), options.decode_share_width_cap);
-        // Phase-level prefill instrumentation. Enabled at debug level OR via
-        // SUSHI_PREFILL_TRACE=1 (which forces the trace line at info).
-        // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
-        // time goes (chunked-forward vs eval vs last-token-forward).
-        const trace_force: bool = prefill_trace_force or readEnvBool("SUSHI_PREFILL_TRACE");
-        const trace_enabled = log.isDebug() or trace_force;
+        // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
+        const trace_enabled = log.isDebug();
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -2769,7 +2519,6 @@ pub const Generator = struct {
             .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
         };
         if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
-            if (!mtpBatchCorrEnabled()) return error.MtpLossyRequiresBatchedCorrections;
             switch (options.mtp_acceptance) {
                 .typical => |cfg| log.info("  [mtp-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact\n", .{ cfg.delta, cfg.eps }),
                 .tokenv3 => |alpha| log.info("  [mtp-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),
@@ -2866,10 +2615,6 @@ pub const Generator = struct {
             adapt_state.width_min = @intCast(default_chunk);
             adapt_state.width_max = @intCast(default_chunk);
             var cur_chunk: usize = default_chunk;
-            // Last-window MTP history: chunks entirely before the window skip
-            // the full-hidden capture AND the head forward (see
-            // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
-            const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
             // Reserve the whole request's cache capacity before the first chunk writes: a grow
             // is not in place, so a long prefill's peak carried a second copy of everything so
@@ -2921,7 +2666,7 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    transformer_mod.attachQsaHistoryOnHandoff(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    transformer_mod.handoffQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
@@ -2956,28 +2701,6 @@ pub const Generator = struct {
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-                // Phase 2 experiment: when SUSHI_COMPILE_FORWARD=1 wired a
-                // compiled closure at load time, route this chunk through it.
-                // The compiled closure uses xfm.defaultCtx (xfm.cache + xfm.ssm_entries),
-                // which matches the prefill `ctx` when the scheduler has swapped
-                // the slot's cache onto the Transformer (the single-slot legacy
-                // and Phase-2-swapped path both satisfy this). Hidden-capture
-                // and vision splice paths don't pass through this chunk loop
-                // (they take the last_input branch), so they're already safe.
-                // Optional-slice equality: same-ness here means both null or
-                // both point at the same backing memory. We accept ssm_entries
-                // null↔null too because plain-attn models legitimately have
-                // both ctx and xfm carry null.
-                const ssm_match = blk: {
-                    if (ctx.ssm_entries == null and xfm.ssm_entries == null) break :blk true;
-                    if (ctx.ssm_entries == null or xfm.ssm_entries == null) break :blk false;
-                    break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
-                        ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
-                };
-                // History windowing: a chunk before the window needs no
-                // capture, which ALSO re-qualifies it for the compiled
-                // trunk forward (capture is what disqualifies MTP chunks).
-                const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
                 if (dflash_active) {
@@ -2987,15 +2710,7 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
-                const chunk_logits = if (xfm.compiled_forward != null and
-                    !mtp_capture and
-                    !dflash_active and
-                    ctx.cache == &xfm.cache and
-                    ssm_match and
-                    ctx.capture_hidden == null and
-                    ctx.vision_embeddings == null)
-                    try xfm.forwardCompiled(chunk_input)
-                else if (mtp_capture) blk: {
+                const chunk_logits = if (mtp_active) blk: {
                     var last_unused = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -3012,7 +2727,7 @@ pub const Generator = struct {
                 if (trace_enabled) {
                     const dt = prefill_sw.read() - chunk_start_ns;
                     chunked_ns += dt;
-                    std.debug.print(
+                    log.debug(
                         "  [prefill-trace] chunk pos={d} end={d} width={d} ms={d}\n",
                         .{ pos, end, end - pos, dt / std.time.ns_per_ms },
                     );
@@ -3022,7 +2737,7 @@ pub const Generator = struct {
                 // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                 // the chunk loop spans [0, prefix_len) and prompt_ids has
                 // prefix_len + 1 entries.
-                if (mtp_capture) {
+                if (mtp_active) {
                     if (!mtp_history_started) {
                         std.debug.assert(mtp_cache.?.step() == 0);
                         mtp_position_base = ssm_cp_offset + pos;
@@ -3090,13 +2805,14 @@ pub const Generator = struct {
                     };
                     _ = mlx.mlx_eval(eval_vec);
                 }
+                // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
                     eval_ns += eval_dt;
                     var mem_buf: [256]u8 = undefined;
                     const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, mlxPrefillMem());
-                    std.debug.print("{s}", .{line});
+                    log.debug("{s}", .{line});
                 }
 
                 // This chunk's latch, read before anything persists it, snapshots it or yields
@@ -3253,13 +2969,6 @@ pub const Generator = struct {
                         dropped.deinit(allocator);
                     }
                 }
-                // One copy of the QSA key history on the latest snap. Stride
-                // captures skipped it so a 400k prefill is not 32× the
-                // indexer buffer. With the share switch on nothing is attached here: the newest
-                // snap takes a view of the live buffer at commit (`handoffQsaHistoryToLatest`).
-                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) if (ctx.ssm_entries) |entries| {
-                    try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, entries, xfm.s);
-                };
             }
         }
 
@@ -3286,7 +2995,6 @@ pub const Generator = struct {
         // length. When the span holds backed-off tokens the head's history must
         // also cover them (a hole right before the generation point is
         // acceptance-critical), so capture ALL positions and append.
-        const pld_active = options.pld_enabled;
         const need_capture = mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
@@ -3368,8 +3076,8 @@ pub const Generator = struct {
             const last_ns = prefill_sw.read() - last_start_ns;
             const total_ns = prefill_sw.read();
             const ms = std.time.ns_per_ms;
-            std.debug.print(
-                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunk_widths={d}..{d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
+            log.debug(
+                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunk_widths={d}..{d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}\n",
                 .{
                     prompt_ids.len,
                     n_chunks,
@@ -3381,7 +3089,6 @@ pub const Generator = struct {
                     last_ns / ms,
                     total_ns / ms,
                     if (need_capture) " [capture-hidden]" else "",
-                    if (pld_active) " [pld]" else "",
                 },
             );
         }
@@ -3457,13 +3164,13 @@ pub const Generator = struct {
             }
         }
 
-        // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
-        // pre-forward the sampled token. The first nextDrafter / nextPld /
+        // DFlash / MTP path: sample synchronously and DO NOT
+        // pre-forward the sampled token. The first nextDflash /
         // nextMtp call needs the cache at exactly prompt_len (last prompt
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (sampling.call_force == null and (pld_active or mtp_active or dflash_active)) {
+        if (sampling.call_force == null and (mtp_active or dflash_active)) {
             const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -3511,17 +3218,12 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
-                .pld_enabled = pld_active,
                 .drafter_block_size = options.drafter_block_size,
                 .dflash = if (dflash_active) options.dflash else null,
                 .dflash_ctx = dflash_ctx,
                 .glm_dflash_native = glm_dflash_native,
                 .glm_prefill_window = glm_window,
                 .dflash_block_size = dflash_bs,
-                .dflash_chooser = if (dflash_active and !glm_dflash_native and dflashChooserEnabled())
-                    round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
-                else
-                    null,
                 .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_accept_graph = accept_route.graph,
@@ -3532,7 +3234,7 @@ pub const Generator = struct {
                 .mtp_position_base = mtp_position_base,
                 .mtp_depth = mtp_cap,
                 .mtp_depth_free = if (xfm.mtp_depth_free != 0) xfm.mtp_depth_free else mtpDepthCapFree(options.mtp_depth),
-                .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
+                .mtp_ev_costs = mtpEvCostsForProfile(mtp_cost_profile),
                 // Start at the floor (depth 1 by default) and climb with evidence:
                 // the cheap depth is the safe default (1.11x on cold/creative
                 // content), and hot workloads promote within ~8 rounds.
@@ -3542,7 +3244,7 @@ pub const Generator = struct {
             dflash_ctx = null; // ownership transferred to the Generator
             glm_window = null;
             // pending_logits/pending_token left empty — the lazy pipeline is
-            // skipped under PLD / drafter / MTP. The speculative `next*` paths
+            // skipped under drafter / MTP. The speculative `next*` paths
             // drive every subsequent step with predictable cache offset.
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
@@ -3550,8 +3252,8 @@ pub const Generator = struct {
 
         // Phase 2: scheduler-managed slots ask init to sample t1 synchronously
         // and skip the lazy pre-forward. Cache lands at prompt_len with t1 NOT
-        // in cache — matches `forwardBatchedDecode`'s expectation and the
-        // PLD / drafter init path's invariant. Generator.next's transition
+        // in cache — matches `forwardBatchedDecode`'s expectation and
+        // the drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
         if (options.skip_lazy_preforward) {
             const sample_lazy = try firstTokenSample(xfm, logits, sampling, s);
@@ -3668,7 +3370,7 @@ pub const Generator = struct {
     }
 
     /// The ONE place `step` and `completion_tokens` advance — every decode path
-    /// (plain, constrained, PLD, drafter, MTP, batched) routes through here.
+    /// (plain, constrained, drafter, MTP, batched) routes through here.
     ///
     /// Advancing them by hand is how three paths — `nextDrafter`, `nextMtp` and
     /// `scheduler.runBatchedDecodeTick` — ended up never calling
@@ -3878,8 +3580,7 @@ pub const Generator = struct {
             idx.deinit();
             self.mtp_lookup_idx = null;
         }
-        // Publish the EV surface for the next request when the experimental
-        // cross-request seed is explicitly enabled.
+        // Publish the EV surface for the next request's seed.
         // Only healthy runs qualify — a runtime-disabled or barely-sampled
         // run would poison the next request's plans (inference thread only,
         // same discipline as every other head-state write).
@@ -3887,7 +3588,7 @@ pub const Generator = struct {
             // A pinned-depth run never consulted the EV plan, so its surface
             // is not one the controller chose — publishing it would hand a
             // later ordinary request a diagnostic's numbers.
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
+            if (mtpAdaptiveEnabled() and mtpPinnedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8 and
                 (!group_planner.enabled() or !self.mtp_planner_owned))
             {
@@ -4213,22 +3914,6 @@ pub const Generator = struct {
         return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
     }
 
-    /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
-    /// Caller owns `tokens` (must `allocator.free` it).
-    pub const PldStepResult = struct {
-        /// Tokens to emit this step (always at least the already-decided t1).
-        /// On a full-accept, contains [t1, ...all_drafts]. On partial accept j,
-        /// contains [t1, draft[0..j]] (the corrected fallback is stored as the
-        /// generator's pending `next_token_id`, NOT included here — same
-        /// "pending becomes next-step's first" convention as `nextDrafter`).
-        tokens: []const u32,
-        /// Number of *drafted* tokens accepted (not counting t1). 0..=draft_len.
-        accepted_tokens: u32,
-        /// Whether n-gram lookup found a candidate this step. False means PLD
-        /// degraded to a single regular forward (no speculative work done).
-        used_lookup: bool,
-    };
-
     /// The ONE place a partial accept rolls recurrent state back from the verify capture:
     /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
     /// rollback without being counted.
@@ -4239,495 +3924,7 @@ pub const Generator = struct {
         }
     }
 
-    /// PLD draft+verify decode step. The draft comes from an n-gram lookup
-    /// over `prompt_ids_owned ++ generated_ids`, NOT a model call — that's
-    /// what makes PLD model-agnostic and cheap.
-    ///
-    /// `key_len` is the n-gram size used for matching (default 3). `draft_len`
-    /// is the maximum number of speculative tokens to verify per step (default
-    /// 5). Both are clamped to safe upper bounds internally.
-    ///
-    /// Returns `null` only when generation is already done. When no n-gram
-    /// match exists (cold start, novel output), falls back to the regular
-    /// `next()` path and returns a single-token result with `used_lookup=false`.
-    pub fn nextPld(
-        self: *Generator,
-        allocator: std.mem.Allocator,
-        draft_len: u32,
-        key_len: u32,
-    ) !?PldStepResult {
-        if (self.done) return null;
-        // Init never armed PLD for this generator (GLM, or a caller that simply
-        // didn't ask). The dispatching caller's flag alone must never put a
-        // verify forward through the trunk. Unlike `spec_disabled_runtime`
-        // below this is permanent: no re-enable check can ever resurrect it.
-        if (!self.pld_enabled) {
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return PldStepResult{
-                .tokens = tokens,
-                .accepted_tokens = 0,
-                .used_lookup = false,
-            };
-        }
-        // Release-enforced guard (issue #97): PLD cannot honor a grammar
-        // constraint or logprobs. These were std.debug.asserts, compiled out in
-        // ReleaseFast; fail loud instead of streaming off-schema output if a
-        // dispatch bug ever routes such a request here.
-        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
-
-        // Runtime acceptance gate: if a prior step set the flag, fall back
-        // to the regular `next()` path. Under v2, PLD's exit invariant has
-        // `t1 NOT in cache` (matches `nextDrafter`) — `next()`'s transition
-        // shim seeds `pending_logits` synchronously via `forward([t1])` when
-        // it sees `!has_pending_logits and !has_pending_token`. So the
-        // hand-off works even though pending state is empty.
-        if (self.spec_disabled_runtime) {
-            self.disabled_steps += 1;
-            // Periodic re-enable check: when the generated tail turns
-            // repetitive (file/tool echo after a novel preamble), PLD pays
-            // again. Drain the `next()` pipeline back to the spec entry
-            // invariant; the drained token (if any) is this step's emit and
-            // speculation resumes on the following call.
-            if (self.disabled_steps % SPEC_REENABLE_INTERVAL == 0) reenable: {
-                const gen = self.generated_ids.items;
-                const prompt_toks = self.prompt_ids_owned;
-                const committed_check = try allocator.alloc(u32, prompt_toks.len + gen.len);
-                defer allocator.free(committed_check);
-                @memcpy(committed_check[0..prompt_toks.len], prompt_toks);
-                @memcpy(committed_check[prompt_toks.len..], gen);
-                //if (log.isDebug()) {
-                //    const dbg_frac = pld_index.tailMatchFraction(committed_check, @min(SPEC_REENABLE_WINDOW, gen.len), 3);
-                //    log.debug("  pld re-enable check: disabled_steps={d} gen={d} tail_match={d:.2}\n", .{ self.disabled_steps, gen.len, dbg_frac });
-                //}
-                if (!specShouldReenable(committed_check, gen.len)) break :reenable;
-                switch (try self.drainPipelineForSpec(allocator)) {
-                    .stay_disabled => break :reenable,
-                    .stopped => return null,
-                    .already_clean => {
-                        //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
-                        self.spec_disabled_runtime = false;
-                        self.disabled_steps = 0;
-                        self.yield_steps = 0;
-                        self.yield_accepted = 0;
-                        // Invariant already holds — fall through to the
-                        // enabled flow below in this same call.
-                    },
-                    .drained => |drained_tok| {
-                        //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
-                        self.spec_disabled_runtime = false;
-                        self.disabled_steps = 0;
-                        self.yield_steps = 0;
-                        self.yield_accepted = 0;
-                        const tokens = try allocator.alloc(u32, 1);
-                        tokens[0] = drained_tok;
-                        return PldStepResult{
-                            .tokens = tokens,
-                            .accepted_tokens = 0,
-                            .used_lookup = false,
-                        };
-                    },
-                }
-            }
-            if (self.spec_disabled_runtime) {
-                const tok_opt = try self.next(allocator);
-                if (tok_opt == null) return null;
-                const tokens = try allocator.alloc(u32, 1);
-                tokens[0] = tok_opt.?;
-                return PldStepResult{
-                    .tokens = tokens,
-                    .accepted_tokens = 0,
-                    .used_lookup = false,
-                };
-            }
-        }
-
-        if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
-
-        const xfm = self.xfm;
-        const s = xfm.s;
-
-        // ── INVARIANT going INTO this call (mirrors `nextDrafter`) ──
-        //   cache.step = prompt_len + tokens_emitted   (NOT + 1)
-        //   t1 = next_token_id (= "this step's first emit"); NOT in cache yet.
-        //   pending_logits / pending_token are empty (init's PLD branch and
-        //   every nextPld exit leave them empty under v2).
-        //
-        // Cold path (no n-gram match): forward([t1]) length 1 advances cache
-        // by 1, produces logits at position +1 → sample lookahead → emit t1,
-        // set next_token_id = lookahead. Loses A's lazy pipeline overlap on
-        // cold steps; the prompt-time n-gram gate disables PLD on novel
-        // content where cold-path dominates.
-        //
-        // Verify path: input = `[t1, draft[0..m-1]]` length 1+m. Walk
-        // verify_logits[i] vs draft[i] for i=0..m-1; full accept commits 1+m
-        // tokens and exits with cache at prompt_len + TE_new (no post-step
-        // forward — that is the per-step saving over v1).
-        const t1: u32 = self.next_token_id;
-
-        // Cap draft_len so the verify forward stays a small fixed cost.
-        const is_mimo = xfm.config.isMimo();
-        // MiMo verifies with each row's decode arithmetic, which serves at most MIMO_VERIFY_ROWS_MAX rows.
-        const max_draft: u32 = @min(draft_len, if (is_mimo) @as(u32, transformer_mod.MIMO_VERIFY_ROWS_MAX - 1) else 15);
-        const klen: u32 = @max(@as(u32, 1), key_len);
-
-        // ── Phase 1: Lookup ──
-        // committed = prompt + generated_ids + [t1]. Key = trailing klen tokens
-        // (ends at t1). The lookup returns candidates for "what comes after t1".
-        const prompt = self.prompt_ids_owned;
-        const generated = self.generated_ids.items;
-        const total_len = prompt.len + generated.len + 1;
-
-        var committed = try allocator.alloc(u32, total_len);
-        defer allocator.free(committed);
-        @memcpy(committed[0..prompt.len], prompt);
-        @memcpy(committed[prompt.len .. prompt.len + generated.len], generated);
-        committed[total_len - 1] = t1;
-
-        var draft_slice: ?[]const u32 = null;
-        if (klen <= total_len - 1) {
-            const key_start = total_len - klen;
-            const key = committed[key_start..total_len];
-            const lookup = pld_index.PldLookup{ .committed = committed, .key_len = klen };
-            draft_slice = lookup.findMatch(key, max_draft);
-        }
-        if (draft_slice) |d| {
-            if (d.len == 0) draft_slice = null;
-        }
-
-        const stochastic = !isGreedyTemperature(self.sampling.temperature);
-
-        // ── Phase 2: Cold path (no n-gram match) ──
-        // Forward([t1]) length 1: cache.step += 1, produces logits at that
-        // position. Sample the lookahead, emit t1, set next_token_id =
-        // lookahead. Cache exits at prompt_len + TE_new where TE_new = TE + 1.
-        if (draft_slice == null) {
-            const t1_i32: i32 = @intCast(t1);
-            const t1_shape = [_]c_int{ 1, 1 };
-            const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
-            defer _ = mlx.mlx_array_free(t1_input);
-
-            const cold_logits = try xfm.forwardWith(&self.ctx, t1_input); // cache.step += 1
-            defer _ = mlx.mlx_array_free(cold_logits);
-
-            const lazy = try self.sampleLazy(cold_logits, .{ .decided = &.{t1} });
-            try mlx.check(mlx.mlx_array_eval(lazy));
-            var lv: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&lv, lazy));
-            _ = mlx.mlx_array_free(lazy);
-            const new_t1: u32 = @intCast(lv);
-
-            try self.generated_ids.append(allocator, t1);
-            self.advanceStep(1);
-            self.next_token_id = new_t1;
-
-            // Yield gate: cold steps pay the unpipelined forward; if the
-            // workload isn't yielding accepted drafts to pay for it, fall
-            // back to the pipelined `next()` (re-enable check above can
-            // bring PLD back when the tail turns repetitive).
-            self.yield_steps += 1;
-            if (yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
-                log.info(
-                    "  pld=disabled (yield gate: {d} drafted tokens over {d} steps < {d:.2}/step)\n",
-                    .{ self.yield_accepted, self.yield_steps, YIELD_GATE_MIN_YIELD },
-                );
-                self.spec_disabled_runtime = true;
-                self.disabled_steps = 0;
-            }
-
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = t1;
-            return PldStepResult{
-                .tokens = tokens,
-                .accepted_tokens = 0,
-                .used_lookup = false,
-            };
-        }
-
-        const draft = draft_slice.?;
-        const m: u32 = @intCast(draft.len);
-
-        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset ──
-        // Cache enters at cache.step = prompt_len + TE.
-        //
-        // The snapshots below are the FALLBACK rollback path (pure-attention,
-        // Mamba2, LFM2). On a GatedDeltaNet trunk the verify forward instead
-        // CAPTURES per-position SSM/conv state (capture_ssm_seq), and partial
-        // accept rolls back by slicing that capture + truncating the KV cache —
-        // no re-forward of the accepted prefix, which on this arch re-runs the
-        // expensive 48-layer sequential recurrence.
-        //
-        // The KV-cache truncate length is anchored on `moe_seq_offset`, NOT
-        // `cache.step`: on a GDN trunk layer 0 is a linear-attention layer that
-        // never calls `cache.update`, and `cache.step` only advances under
-        // `if (layer == 0)` — so it stays stale (~0) for this family. The
-        // full-attention KV entries instead track `moe_seq_offset` (both advance
-        // by seq_len per forward), so that is the real KV length to roll back to.
-        // MiMo is attention-only: a truncate IS its rollback, rings included. A snapshot
-        // shares the KV buffers, so every verify write would copy each global layer's whole cache.
-        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (is_mimo) null else try self.ctx.cache.snapshot();
-        defer if (kv_snap) |*snap| snap.deinit();
-        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
-        defer if (ssm_snaps) |snaps| {
-            for (snaps) |*sn| ssmSnapshotDeinit(sn);
-            xfm.allocator.free(snaps);
-        };
-        if (self.ctx.ssm_entries) |entries| {
-            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
-            for (entries, 0..) |*entry, i| out[i] = ssmSnapshot(entry);
-            ssm_snaps = out;
-        }
-        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
-
-        // ── Phase 4: Verify forward `[t1, draft[0..m-1]]` length 1+m ──
-        // cache.step at start = prompt_len + TE; after = prompt_len + TE + 1 + m.
-        //   verify_logits[0]   predicts the slot AFTER t1     → candidate for draft[0]
-        //   verify_logits[i]   predicts the slot AFTER draft[i-1] (i = 1..m-1)
-        //                                                     → candidate for draft[i]
-        //   verify_logits[m]   predicts the slot AFTER draft[m-1]
-        //                                                     → "bonus" position (full-accept new_t1)
-        const seq_len: c_int = @intCast(1 + m);
-        const verify_input_buf = try allocator.alloc(i32, 1 + m);
-        defer allocator.free(verify_input_buf);
-        verify_input_buf[0] = @intCast(t1);
-        for (draft, 0..) |d, i| verify_input_buf[1 + i] = @intCast(d);
-        const verify_shape = [_]c_int{ 1, seq_len };
-        const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(verify_input);
-
-        // Enable per-position SSM capture for the verify pass on a GDN trunk so
-        // partial accept can roll back without a re-forward. Self-detecting:
-        // only GatedDeltaNet layers actually populate `spec_state_seq`, so
-        // pure-attention / Mamba2 / LFM2 fall through to the snapshot fallback.
-        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-        // Each MiMo row attends the packed cache as its own decode tick would, never through a
-        // dense rebuild of every global layer's whole cache.
-        self.ctx.verify_rows = is_mimo;
-        defer self.ctx.verify_rows = false;
-        var verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
-        errdefer _ = mlx.mlx_array_free(verify_logits);
-        _ = try self.thinkShiftRows(&verify_logits, verify_input);
-        self.ctx.capture_ssm_seq = false;
-        // Always free the transient capture buffers before returning, however
-        // we exit this round (full accept, partial accept, or error).
-        defer if (self.ctx.ssm_entries) |entries| {
-            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
-        };
-        // verify_logits shape [1, 1+m, V]. Sliced and freed below.
-        self.pld_attempted += 1;
-
-        const vl_shape = mlx.getShape(verify_logits);
-        const slice_strides = [_]c_int{ 1, 1, 1 };
-
-        // Slice all 1+m per-position logits up front so we can sample the
-        // correction from the original verify forward (cache state aligned)
-        // without re-running forward, and re-use them for both stochastic
-        // accept tests and the correction sample.
-        const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
-        var per_pos_logits_n: usize = 0;
-        defer {
-            for (per_pos_logits[0..per_pos_logits_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(per_pos_logits);
-        }
-        for (per_pos_logits, 0..) |*slot, idx| {
-            slot.* = mlx.mlx_array_new();
-            per_pos_logits_n = idx + 1;
-            const start = [_]c_int{ 0, @intCast(idx), 0 };
-            const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
-            try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
-        }
-        _ = mlx.mlx_array_free(verify_logits);
-        verify_logits = .{ .ctx = null };
-
-        // ── Phase 5: Walk drafts. accepted ∈ [0, m]. Full accept = m. ──
-        // verify_logits[i] is the prediction for draft[i] (i = 0..m-1).
-        // No separate "first-position" test under v2 — the verify forward
-        // covers it.
-        var accepted: u32 = 0;
-        if (stochastic) {
-            var i: u32 = 0;
-            while (i < m) : (i += 1) {
-                const target_p = try probsAtLastPos(per_pos_logits[i], self.sampling, s);
-                defer _ = mlx.mlx_array_free(target_p);
-                const p_draft = try probAt(target_p, draft[i], s);
-                const accept_prob: f32 = @min(1.0, p_draft);
-                const u: f32 = self.prng.random().float(f32);
-                if (u >= accept_prob) break;
-                accepted += 1;
-            }
-        } else {
-            var i: u32 = 0;
-            while (i < m) : (i += 1) {
-                var argmax_arr = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(argmax_arr);
-                try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[i], 2, false, s));
-                try mlx.check(mlx.mlx_array_eval(argmax_arr));
-                var argmax_val: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
-                if (@as(u32, @intCast(argmax_val)) != draft[i]) break;
-                accepted += 1;
-            }
-        }
-        accepted = capAcceptedForTokenBudget(
-            accepted,
-            self.completion_tokens,
-            self.max_tokens,
-        );
-        const full_accept = accepted == m;
-
-        // ── Phase 6: Sample new_t1 from per_pos_logits[accepted] ──
-        //   - full accept (accepted == m): per_pos_logits[m] predicts the slot
-        //     after the last accepted draft (= "bonus" token).
-        //   - partial (accepted < m):  per_pos_logits[accepted] is the model's
-        //     prediction at the rejected slot. Stochastic samples from the
-        //     residual `max(target_p − one_hot(draft[accepted]), 0)` to preserve
-        //     the marginal distribution conditional on "not draft[accepted]"
-        //     (Leviathan et al). Greedy: argmax of the rejected slot's logits.
-        //
-        // This indexing differs from v1: v1 sampled from `verify_logits[accepted-1]`
-        // because t1 occupied no input slot; v2 has t1 at index 0 of the verify
-        // input, so the "prediction one past the last accepted" lives at
-        // index `accepted`. Off-by-one here would silently corrupt output.
-        const correction_logits = per_pos_logits[accepted];
-        const new_t1: u32 = blk: {
-            if (stochastic) {
-                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
-                defer _ = mlx.mlx_array_free(probs);
-                if (!full_accept) {
-                    const onehot = try pldOneHotRow(draft[accepted], vl_shape[2], s);
-                    defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
-                } else {
-                    break :blk try sampleFromProbs(probs, s);
-                }
-            } else {
-                const lazy = try self.sampleLazy(correction_logits, .none);
-                try mlx.check(mlx.mlx_array_eval(lazy));
-                var v: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
-                _ = mlx.mlx_array_free(lazy);
-                break :blk @intCast(v);
-            }
-        };
-
-        // ── Phase 7: Cache rollback on partial accept ──
-        // After verify (length 1+m), cache.step = prompt_len + TE + 1 + m.
-        // Full accept: TE_new = TE + 1 + m → no rollback.
-        // Partial: must land at prompt_len + TE + 1 + accepted = prompt_len + TE_new
-        // (TE_new = TE + 1 + accepted). Rollback then re-forward
-        // `[t1, draft[0..accepted-1]]` length 1+accepted (with hidden capture
-        // not needed here — just the cache advance).
-        //
-        // The accepted=0 case (= first draft rejected) MUST still re-forward
-        // [t1] length 1: in v1 the t1 forward had been done eagerly before
-        // verify; v2 includes t1 IN the verify forward, so rollback rolls
-        // both t1 AND the drafts. Skipping the re-forward here would leave
-        // the cache at prompt_len + TE — one short of the post-emit invariant.
-        if (!full_accept) {
-            // Fast GatedDeltaNet path: the verify forward captured per-position
-            // SSM/conv state, so roll back by truncating the KV cache to the
-            // accepted length (keeping verify's already-correct K/V for those
-            // positions) and slicing the captured state — NO re-forward of the
-            // accepted prefix. Detect via a populated capture on the first SSM
-            // entry; absent it (pure-attention / Mamba2 / LFM2) we take the
-            // proven restore + re-forward fallback below. Byte-identical either
-            // way (pinned by tests/test_pld_equivalence.sh).
-            const gdn_captured = if (self.ctx.ssm_entries) |entries|
-                entries.len > 0 and entries[0].spec_state_seq.ctx != null
-            else
-                false;
-
-            if (is_mimo) {
-                const accepted_len: usize = 1 + @as(usize, accepted);
-                try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
-                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
-            } else if (gdn_captured) {
-                const accepted_len: usize = 1 + @as(usize, accepted);
-                // `truncate` overwrites cache.step with its length arg; on this
-                // family cache.step is a stale counter the model never reads
-                // (positioning is moe_seq_offset), so preserve the snapshot's
-                // value to keep the prefix cache's kv_step bookkeeping identical
-                // to the restore-based fallback.
-                const step_keep = kv_snap.?.step;
-                try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
-                self.ctx.cache.step = step_keep;
-                try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, 1 + m, s);
-                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
-            } else {
-                try self.ctx.cache.restore(&kv_snap.?);
-                if (ssm_snaps) |snaps| {
-                    for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
-                }
-                self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
-
-                const re_seq_len: c_int = @intCast(1 + accepted);
-                const re_input_buf = try allocator.alloc(i32, 1 + accepted);
-                defer allocator.free(re_input_buf);
-                re_input_buf[0] = @intCast(t1);
-                for (draft[0..accepted], 0..) |d, i| re_input_buf[1 + i] = @intCast(d);
-                const re_shape = [_]c_int{ 1, re_seq_len };
-                const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
-                defer _ = mlx.mlx_array_free(re_input);
-                const re_logits = try xfm.forwardWith(&self.ctx, re_input);
-                _ = mlx.mlx_array_free(re_logits);
-            }
-        }
-
-        // ── Phase 8: Commit emitted tokens ──
-        // Tokens emitted: [t1, draft[0..accepted]] = 1 + accepted.
-        const num_emit: u32 = 1 + accepted;
-        const tokens = try allocator.alloc(u32, num_emit);
-        tokens[0] = t1;
-        for (draft[0..accepted], 0..) |d, i| tokens[1 + i] = d;
-
-        try self.generated_ids.append(allocator, t1);
-        for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
-
-        self.pld_accepted_tokens += accepted;
-        self.advanceStep(num_emit);
-
-        // No post-step forward — `next_token_id = new_t1` and exit. The next
-        // nextPld call sees t1 NOT in cache (new invariant).
-        self.next_token_id = new_t1;
-
-        // Yield-gate accounting for verify steps (cold steps update in their
-        // own branch above).
-        self.yield_steps += 1;
-        self.yield_accepted += accepted;
-
-        // Runtime acceptance gate: after warmup, if the per-draft acceptance
-        // probability is below the threshold, disable speculation for the rest
-        // of this request (the re-enable check can bring it back when the
-        // generated tail turns repetitive). PLD's `drafts_per_round` is the
-        // upper-bound draft length (`max_draft`); matches with shorter accepts
-        // still divide by this max so a workload with consistently-short
-        // n-gram matches DOES get throttled.
-        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
-            const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
-            const rate: f32 = if (drafts_proposed > 0)
-                @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
-                    @as(f32, @floatFromInt(drafts_proposed))
-            else
-                0.0;
-            log.info(
-                "  pld=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
-                .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted },
-            );
-            self.spec_disabled_runtime = true;
-            self.disabled_steps = 0;
-        }
-
-        return PldStepResult{
-            .tokens = tokens,
-            .accepted_tokens = accepted,
-            .used_lookup = true,
-        };
-    }
-
-    /// Result of one `nextDrafter` step. Same shape as PLD's result so the
-    /// outer wrapper can share token-emit / EOS-check logic.
+    /// Result of one speculative step: the tokens to emit and how many drafts landed.
     pub const DrafterStepResult = struct {
         /// Tokens to emit this step. On a full accept this is
         /// `[t1, ...all_drafts]` (length `block_size`); on partial accept j
@@ -4756,7 +3953,7 @@ pub const Generator = struct {
     ///
     /// Drafts are greedy (argmax over the trunk lm_head on assistant
     /// hiddens, anchor row DROPPED — reference `[:, 1:]`); sampled requests
-    /// use the same one-hot Leviathan acceptance the drafter/PLD paths use.
+    /// use the same one-hot Leviathan acceptance.
     const GlmSampleContext = struct { generator: *Generator, logits: mlx.mlx_array };
 
     fn sampleGlmNode(raw: *anyopaque, row: usize) !u32 {
@@ -4812,10 +4009,13 @@ pub const Generator = struct {
         timer.reset();
         const request = self.ctx.glm5_request.?;
         // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-        var layerwise = try @import("glm5_dflash_model.zig").verify(self.xfm.glm5.?, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], self.dflash.?.config.target_layer_ids, .affine_rows_ffn);
+        const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
+        var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
+        try @import("glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
+        const layerwise = &verified[0];
         defer layerwise.deinit();
         const verify_ns = timer.read();
-        const result = try self.glmRoundEnd(allocator, &proposal, &layerwise, draft_ns, verify_ns, lookup != null);
+        const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
         if (lookup != null) {
             self.glm_lookup.rounds += 1;
             self.glm_lookup.landed += result.accepted_tokens;
@@ -4836,6 +4036,15 @@ pub const Generator = struct {
         const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
         if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
         return chain;
+    }
+
+    /// The logit policy this request's DFlash2 tree rows take in the verifier; null = none.
+    pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
+        const tp = &self.sampling.think_penalty;
+        if (!tp.active()) return null;
+        tp.observe(self.generated_ids.items);
+        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
+        return .{ .state = tp.*, .markers = self.xfm.think_marker_mask };
     }
 
     /// A DFlash2 GLM round may run: not done, no stop due.
@@ -4914,18 +4123,16 @@ pub const Generator = struct {
         // it is the ONLY source.
         const dflash_kv_watch = io_util.Stopwatch.init(self.timer.io);
         // The round-cost table sees the same round: drafts = block - 1, or
-        // 0 when the runtime gate fell back to serial (a serial sample is
-        // the "no spec" candidate a width chooser needs).
+        // 0 when the runtime gate fell back to serial.
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
-        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
+        const dflash_rounds_before: u64 = self.dflash_attempted;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
-            const post_warmup = dflash_rounds_before >= dflashGateWarmup();
+            const post_warmup = dflash_rounds_before >= DFLASH_GATE_WARMUP;
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
-            if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -4946,39 +4153,8 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
 
-        // Per-round width: the chooser's argmax over measured tokens/ms
-        // (serial = width 0 is a candidate, so "serial wins" is the gate),
-        // the fixed block until it has data.
-        var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-        if (self.dflash_chooser) |*ch| {
-            if (ch.rounds >= dflashGateWarmup()) {
-                const d = ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
-                round_width = d.width;
-                // Serial is sticky: a plain decode round does not extend the
-                // assistant context, so there is no way back this request.
-                if (round_width == 0) self.spec_disabled_runtime = true;
-                if (ch.logged != ch.current) {
-                    if (self.xfm.round_cost.bucketToRead(self.mtpKvLen())) |b| {
-                        ch.logged = ch.current;
-                        var buf: [256]u8 = undefined;
-                        log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
-                            ch.current,
-                            if (ch.current == 0) "serial" else "block",
-                            round_cost.bucketName(self.xfm.round_cost.layout, b),
-                            self.xfm.round_cost.formatBucket(b, &buf),
-                        });
-                    }
-                }
-            }
-        }
+        const round_width: u32 = @max(self.dflash_block_size, 2) - 1;
         self.dflash_round_width = round_width;
-        if (round_width == 0) {
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
-        }
 
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
@@ -5056,16 +4232,14 @@ pub const Generator = struct {
         // selector draft only survives verify if it IS the trunk argmax);
         // stochastic requests sample the selector's own candidate softmax and
         // accept through min(1, p/q) with q read off the traced path —
-        // exact by construction. `SUSHI_DFLASH_SELECTOR=0` forces the v1
-        // arms for A/Bs.
-        const use_selector = model.selector != null and dflashSelectorEnabled();
+        // exact by construction.
+        const use_selector = model.selector != null;
         // DSpark: the block's base logits are position-parallel, but each
         // position's draft is picked from logits CORRECTED by the token
         // drafted at the previous one (the Markov bigram bias). Chaining it
         // is what the head is for — dropping it drafts every position from
         // an uncorrected distribution the sidecar was never trained to emit.
-        const use_markov = model.markov != null and dflashMarkovEnabled();
-        const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
+        const use_markov = model.markov != null;
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
@@ -5163,21 +4337,6 @@ pub const Generator = struct {
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(host_arr);
             try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
-        } else if (sample_drafts) {
-            draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
-            var logq = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(logq);
-            try mlx.check(mlx.mlx_log(&logq, draft_q, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
-            var sampled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-            var as_i32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(as_i32);
-            try mlx.check(mlx.mlx_astype(&as_i32, sampled, .int32, s));
-            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
-            try mlx.check(mlx.mlx_reshape(&draft_ids, as_i32, &row_shape, 2, s));
         } else {
             var draft_amax = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(draft_amax);
@@ -5424,9 +4583,6 @@ pub const Generator = struct {
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
-        if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
-        // The calibrated sticky gate stays as the bootstrap that gets serial
-        // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
@@ -6675,27 +5831,14 @@ pub const Generator = struct {
         return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q, .accept_defer = accept_defer };
     }
 
-    /// Batched-corrections kill switch — SUSHI_MTP_BATCH_CORR=0
-    /// restores the per-position accept/correction graphs for A/Bs.
-    var mtp_batch_corr_cache: ?bool = null;
-    pub fn mtpBatchCorrEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpBatchCorrEnabled() bool {
-        if (mtp_batch_corr_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_BATCH_CORR")) |p| std.mem.span(p) else null;
-        const on = mtpBatchCorrEnabledFromEnv(raw);
-        mtp_batch_corr_cache = on;
-        return on;
-    }
-
     /// A pre-draft chain is only worth its cost when a later round reads it: a request whose
     /// budget is spent, or whose pending token ends it, keeps no reader.
     fn mtpPreDraftOpenAllows(completion_tokens: u32, max_tokens: u32, pending_is_eos: bool) bool {
         return completion_tokens < max_tokens and !pending_is_eos;
     }
+
+    /// Test seam: `false` leaves a completed round's stash unconsumed by a successor pre-draft.
+    pub var mtp_predraft_enabled: bool = true;
 
     /// Cross-round pre-draft (round pipelining): at the round's tail — the
     /// accept decision made, trunk committed/rolled back, EV updated,
@@ -6709,7 +5852,7 @@ pub const Generator = struct {
     /// round's entry would compute.
     fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
         if (!mtpPreDraftOpenAllows(self.completion_tokens, self.max_tokens, isEosId(self.next_token_id, self.eos_token_ids))) return;
-        if (!mtpPredraftEnabled() or self.spec_disabled_runtime or self.mtp_batch_head or self.mtp_planner_pending) return;
+        if (!mtp_predraft_enabled or self.spec_disabled_runtime or self.mtp_batch_head or self.mtp_planner_pending) return;
         std.debug.assert(self.mtp_pre_draft == null);
         const plan = self.mtpRoundPlan();
         // The plan itself can end speculation or park the request on a serial probe.
@@ -6805,7 +5948,7 @@ pub const Generator = struct {
         if (!self.mtpAdaptiveModelOk()) return false;
         // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
         if (!self.model_has_mtp) return false;
-        return mtpAdaptiveKvEligible(self.mtpKvLen(), self.mtpAdaptiveMinKv());
+        return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKvFor(self.xfm.config.isMimo()));
     }
 
     /// Drop the serial cell's pending interval: something ran between two decode ticks that
@@ -6939,7 +6082,6 @@ pub const Generator = struct {
         chain: MtpPreDraft,
         tracing: bool,
         ph: io_util.Stopwatch,
-        livecost: bool,
         round_watch: io_util.Stopwatch,
         kv_step_snap: usize,
         kv_snap: ?transformer_mod.KVCacheSnapshot,
@@ -7030,7 +6172,6 @@ pub const Generator = struct {
         chain: MtpPreDraft,
         tracing: bool,
         ph: io_util.Stopwatch,
-        livecost: bool,
         round_watch: io_util.Stopwatch,
     };
 
@@ -7078,7 +6219,7 @@ pub const Generator = struct {
         {
             const prev_bucket = self.mtp_adaptive.bucket;
             const prev_arm = self.mtp_adaptive.arm;
-            const action = mtpAdaptiveSerialTickFor(&self.mtp_adaptive, &self.xfm.round_cost, self.mtpKvLen(), mtpAdaptiveReentryTokens());
+            const action = mtpAdaptiveSerialTickFor(&self.mtp_adaptive, &self.xfm.round_cost, self.mtpKvLen());
             self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
             // Re-entry only when the head can prove it is in sync (else `qwen4MtpForward` returns
             // `error.MtpPositionGap`). A decline latches: the drift cannot shrink on its own.
@@ -7125,7 +6266,7 @@ pub const Generator = struct {
         // mode: every round drafts exactly n and the controller never plans, so a
         // seed must not be applied (nor, at deinit, published).
         if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-            mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
+            mtpAdaptiveEnabled() and mtpPinnedDepth() == null and
             (!group_planner.enabled() or !self.mtp_planner_owned))
         {
             if (head.evSeed()) |seed| {
@@ -7144,7 +6285,6 @@ pub const Generator = struct {
         }
         // Always-on round wall-clock for the live-cost round EMA (the
         // denominator of the sync fraction). Read at both commit exits.
-        const livecost = mtpLiveCostEnabled();
         const round_watch = io_util.Stopwatch.init(self.timer.io);
 
         // ── Phase 0/1: acquire this round's draft chain ──
@@ -7158,7 +6298,7 @@ pub const Generator = struct {
         // Either the PREVIOUS round built + dispatched chunk A at its tail
         // (cross-round pipelining, `mtpMaybePreDraft` — the drafts are
         // already materializing on the GPU) or we build it here (round 1,
-        // SUSHI_MTP_PREDRAFT=0, or a round with no successor state).
+        // or a round with no successor state).
         //
         // No head-cache snapshot in either case: a snapshot refcount-shares
         // the head's KV buffer, which forces every draft append's
@@ -7182,17 +6322,16 @@ pub const Generator = struct {
                     .chain = c,
                     .tracing = tracing,
                     .ph = ph,
-                    .livecost = livecost,
                     .round_watch = round_watch,
                 } };
             }
             const chain_lap = SubLap.start(tracing, self.timer.io);
             try self.mtpChainBuild(&c, 0, plan_now.m_lo);
-            if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
+            try mtpChainDispatch(&c, 0, plan_now.m_lo);
             chain_lap.stop(&self.mtp_trace, .chain);
             break :blk c;
         };
-        return .{ .verify = try self.mtpRoundAfterChain(allocator, chain, tracing, ph, livecost, round_watch) };
+        return .{ .verify = try self.mtpRoundAfterChain(allocator, chain, tracing, ph, round_watch) };
     }
 
     pub fn mtpRoundContinue(self: *Generator, allocator: std.mem.Allocator, open: MtpRoundOpen) !MtpRoundState {
@@ -7205,7 +6344,7 @@ pub const Generator = struct {
             };
             chain_lap.stop(&self.mtp_trace, .chain);
         }
-        return self.mtpRoundAfterChain(allocator, chain, open.tracing, open.ph, open.livecost, open.round_watch);
+        return self.mtpRoundAfterChain(allocator, chain, open.tracing, open.ph, open.round_watch);
     }
 
     fn mtpRoundAfterChain(
@@ -7214,7 +6353,6 @@ pub const Generator = struct {
         chain_in: MtpPreDraft,
         tracing: bool,
         ph_in: io_util.Stopwatch,
-        livecost: bool,
         round_watch: io_util.Stopwatch,
     ) !MtpRoundState {
         var chain = chain_in;
@@ -7244,7 +6382,7 @@ pub const Generator = struct {
             const sync_ns = sync_watch.read();
             // Live sync-cost EMA: measured only on considered rounds, so it
             // holds the true per-sync cost (not the suppressed-round average).
-            if (livecost) self.mtp_ev_sync_ms = mtpEmaMs(self.mtp_ev_sync_ms, sync_ns);
+            self.mtp_ev_sync_ms = mtpEmaMs(self.mtp_ev_sync_ms, sync_ns);
             if (tracing) {
                 self.mtp_trace.add(.sync, sync_ns);
                 ph.reset();
@@ -7254,7 +6392,7 @@ pub const Generator = struct {
                 self.mtp_ext_rounds += 1;
                 self.mtp_ext_dry_streak = 0;
                 try self.mtpChainBuild(&chain, m_lo, m_max);
-                if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&chain, m_lo, m_max);
+                try mtpChainDispatch(&chain, m_lo, m_max);
             } else {
                 // Considered but the gate didn't clear — feeds the
                 // dry-spell policy (mtpExtDryAllows).
@@ -7320,7 +6458,6 @@ pub const Generator = struct {
             .chain = chain,
             .tracing = tracing,
             .ph = ph,
-            .livecost = livecost,
             .round_watch = round_watch,
             .kv_step_snap = kv_step_snap,
             .kv_snap = kv_snap,
@@ -7341,14 +6478,14 @@ pub const Generator = struct {
         errdefer _ = mlx.mlx_array_free(verify_hidden_all);
         // Enable per-position SSM capture for the verify pass on a GDN trunk
         // so partial accept can roll back without re-forwarding the accepted
-        // prefix (mirrors nextPld — the re-forward re-runs the 48-layer
+        // prefix (mirrors the serial path — the re-forward re-runs the 48-layer
         // sequential recurrence AND a full trunk weight read, and at depth > 1
         // MOST rounds are partial, so it dominated the round cost).
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         // DIAGNOSTIC (SUSHI_MTP_TRACE_SYNC=1): drain the GPU before the
         // verify build so the `sync` lap shows the pending lazy work (draft
         // chain, rollback, commit) and `verify` the forward alone.
-        if (tracing and std.c.getenv("SUSHI_MTP_TRACE_SYNC") != null) {
+        if (tracing and transformer_mod.diagEnvOnCached(&mtp_trace_sync_env, "SUSHI_MTP_TRACE_SYNC")) {
             var sync_watch = io_util.Stopwatch.init(self.timer.io);
             try mlx.check(mlx.mlx_array_eval(st.verify_input));
             self.mtp_trace.add(.sync, sync_watch.read());
@@ -7506,7 +6643,6 @@ pub const Generator = struct {
         eval_vec: mlx.mlx_vector_array,
         s: mlx.mlx_stream,
     ) !void {
-        if (!mtpBatchCorrEnabled()) return;
         var rows: [MTP_GROUP_ROWS_MAX]usize = undefined;
         var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
         var k: usize = 0;
@@ -7594,7 +6730,6 @@ pub const Generator = struct {
         const xfm = self.xfm;
         const s = xfm.s;
         const tracing = st.tracing;
-        const livecost = st.livecost;
         var ph = st.ph;
         var round_watch = st.round_watch;
         const chain = &st.chain;
@@ -7645,12 +6780,6 @@ pub const Generator = struct {
         const stochastic = !isGreedyTemperature(self.sampling.temperature);
         const vl_shape = mlx.getShape(verify_logits);
 
-        var per_pos_probs: ?[]mlx.mlx_array = null;
-        var per_pos_probs_n: usize = 0;
-        defer if (per_pos_probs) |slots| {
-            for (slots[0..per_pos_probs_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(slots);
-        };
         var accept_p_vec = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(accept_p_vec);
         var accept_q_vec: mlx.mlx_array = .{ .ctx = null };
@@ -7661,14 +6790,7 @@ pub const Generator = struct {
         defer if (accept_defer_vec.ctx != null) {
             _ = mlx.mlx_array_free(accept_defer_vec);
         };
-        var corr_samples: ?[]mlx.mlx_array = null;
-        var corr_samples_n: usize = 0;
-        defer if (corr_samples) |slots| {
-            for (slots[0..corr_samples_n]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(slots);
-        };
-        // Batched-corrections path: ONE [1+m] pre-sampled correction array
-        // instead of the per-position corr_samples slots.
+        // ONE [1+m] pre-sampled correction array, indexed at the realized accept.
         var corr_batch: mlx.mlx_array = .{ .ctx = null };
         defer if (corr_batch.ctx != null) {
             _ = mlx.mlx_array_free(corr_batch);
@@ -7687,7 +6809,7 @@ pub const Generator = struct {
             st.accept_q = .{ .ctx = null };
             st.accept_defer = .{ .ctx = null };
             st.corr = .{ .ctx = null };
-        } else if (stochastic and mtpBatchCorrEnabled()) {
+        } else if (stochastic) {
             // A group-padded row filters only the 1+m positions it reads.
             var live_logits = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(live_logits);
@@ -7708,121 +6830,6 @@ pub const Generator = struct {
             accept_p_vec = bg.accept_p;
             accept_q_vec = bg.accept_q;
             accept_defer_vec = bg.accept_defer;
-        } else if (stochastic) {
-            const slice_strides = [_]c_int{ 1, 1, 1 };
-            // Filtered + softmaxed target probs for ALL 1+m positions in one
-            // batched kernel set, then per-position slice VIEWS (no copies).
-            const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
-            defer _ = mlx.mlx_array_free(probs_all);
-            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
-            per_pos_probs = slots;
-            for (slots, 0..) |*slot, idx| {
-                slot.* = mlx.mlx_array_new();
-                per_pos_probs_n = idx + 1;
-                const start = [_]c_int{ 0, @intCast(idx), 0 };
-                const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
-                try mlx.check(mlx.mlx_slice(slot, probs_all, &start, 3, &stop, 3, &slice_strides, 3, s));
-            }
-
-            // accept_p_vec[k] = target_p[k][draft_k], gathered with the LAZY
-            // draft id array → [m] f32 after one eval.
-            {
-                const taken = try allocator.alloc(mlx.mlx_array, m);
-                var taken_n: usize = 0;
-                defer {
-                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
-                    allocator.free(taken);
-                }
-                for (0..m) |k| {
-                    taken[k] = mlx.mlx_array_new();
-                    taken_n = k + 1;
-                    try mlx.check(mlx.mlx_take_axis(&taken[k], slots[k], draft_arrs[k], -1, s));
-                }
-                const vec = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(vec);
-                for (taken) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-                var cat = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(cat);
-                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
-                try mlx.check(mlx.mlx_astype(&accept_p_vec, cat, .float32, s));
-            }
-
-            // accept_q_vec[k] = q_k[draft_k] — the proposal's own density at
-            // the sampled draft, for the Leviathan ratio (sharp drafts only).
-            if (q_probs) |qslots| {
-                const taken = try allocator.alloc(mlx.mlx_array, m);
-                var taken_n: usize = 0;
-                defer {
-                    for (taken[0..taken_n]) |arr| _ = mlx.mlx_array_free(arr);
-                    allocator.free(taken);
-                }
-                for (0..m) |k| {
-                    taken[k] = mlx.mlx_array_new();
-                    taken_n = k + 1;
-                    try mlx.check(mlx.mlx_take_axis(&taken[k], qslots[k], draft_arrs[k], -1, s));
-                }
-                const vec = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(vec);
-                for (taken) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-                var cat = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(cat);
-                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
-                accept_q_vec = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_astype(&accept_q_vec, cat, .float32, s));
-            }
-
-            // Candidate correction for every possible reject position a<m
-            // (residual sample) plus the full-accept bonus at a=m. Only the
-            // one at the realized `accepted` is read; the rest are a few
-            // vocab-length ops of throwaway GPU work — far cheaper than a
-            // second synchronous softmax+categorical round-trip.
-            var indices = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(indices);
-            try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vl_shape[2])), 1, .int32, s));
-
-            const corrs = try allocator.alloc(mlx.mlx_array, 1 + m);
-            corr_samples = corrs;
-            for (corrs, 0..) |*slot, a| {
-                slot.* = mlx.mlx_array_new();
-                corr_samples_n = a + 1;
-                if (a < m) {
-                    // residual = max(target_p − proposal, 0): the proposal is
-                    // the FULL sharpened q distribution under sharp drafts
-                    // (exact Leviathan residual), the one-hot of the lazy
-                    // draft id under greedy drafts (arange == id).
-                    var diff = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(diff);
-                    if (q_probs) |qslots| {
-                        try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], qslots[a], s));
-                    } else {
-                        var onehot_b = mlx.mlx_array_new();
-                        defer _ = mlx.mlx_array_free(onehot_b);
-                        try mlx.check(mlx.mlx_equal(&onehot_b, indices, draft_arrs[a], s));
-                        var onehot = mlx.mlx_array_new();
-                        defer _ = mlx.mlx_array_free(onehot);
-                        try mlx.check(mlx.mlx_astype(&onehot, onehot_b, .float32, s));
-                        try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], onehot, s));
-                    }
-                    const zero = mlx.mlx_array_new_float(0.0);
-                    defer _ = mlx.mlx_array_free(zero);
-                    var residual = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(residual);
-                    try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
-                    var log_res = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(log_res);
-                    try mlx.check(mlx.mlx_log(&log_res, residual, s));
-                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
-                    defer _ = mlx.mlx_array_free(key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, key, s));
-                } else {
-                    var log_p = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(log_p);
-                    try mlx.check(mlx.mlx_log(&log_p, per_pos_probs.?[m], s));
-                    const key = seedKey(self.mtpSamplingDraw(self.sampling));
-                    defer _ = mlx.mlx_array_free(key);
-                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, key, s));
-                }
-            }
         }
 
         const group_argmax = st.verify_argmax.present();
@@ -7850,11 +6857,7 @@ pub const Generator = struct {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
                 if (accept_q_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
                 if (accept_defer_vec.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_defer_vec);
-                if (corr_batch.ctx != null) {
-                    _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
-                } else {
-                    for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
-                }
+                _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
             } else {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax.lazy());
             }
@@ -7919,20 +6922,11 @@ pub const Generator = struct {
         const next_pending: u32 = blk: {
             if (stop_prefix.stop) |stop| break :blk stop;
             if (stochastic) {
-                if (corr_batch.ctx != null) {
-                    // Pre-sampled [1+m] batch; index at the realized accept.
-                    try mlx.check(mlx.mlx_array_eval(corr_batch));
-                    const d = mlx.mlx_array_data_int32(corr_batch) orelse {
-                        return error.MlxArrayDataNull;
-                    };
-                    break :blk @intCast(d[accepted]);
-                }
-                // Pre-sampled in the round batch; realized already.
-                const corr = corr_samples.?[accepted];
-                try mlx.check(mlx.mlx_array_eval(corr));
-                var v: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&v, corr));
-                break :blk @intCast(v);
+                try mlx.check(mlx.mlx_array_eval(corr_batch));
+                const d = mlx.mlx_array_data_int32(corr_batch) orelse {
+                    return error.MlxArrayDataNull;
+                };
+                break :blk @intCast(d[accepted]);
             } else {
                 break :blk greedy_next_pending;
             }
@@ -8034,7 +7028,7 @@ pub const Generator = struct {
             self.mtpTraceRoundEnd(m, m, m_lo);
             if (times_round) {
                 self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-                if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+                self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
             } else {
                 if (chain.lookup) self.mtpLookupObserve(m, m + 1);
                 self.mtpRoundUntimed();
@@ -8048,7 +7042,7 @@ pub const Generator = struct {
         // Partial accept: roll back the trunk. On a GDN trunk the verify pass
         // captured per-position SSM/conv state, so roll back by truncating the
         // KV cache to the accepted length and slicing the capture — NO
-        // re-forward of the accepted prefix (mirrors nextPld's fast path; the
+        // re-forward of the accepted prefix (mirrors the serial fast path; the
         // re-forward is a full trunk weight read, and at depth > 1 most rounds
         // are partial, so it dominated the round cost). The next round's
         // h_prev is the TRUE verify hidden at the last committed position
@@ -8076,7 +7070,7 @@ pub const Generator = struct {
             // family cache.step is a stale counter the model never reads
             // (positioning is moe_seq_offset), so preserve the pre-verify
             // value — keeps prefix-cache kv_step bookkeeping identical to
-            // the restore-based fallback (same rule as nextPld).
+            // the restore-based fallback (same rule as the serial path).
             try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
             self.ctx.cache.step = kv_step_snap;
             try self.rollbackSsmFromCapture(self.ctx.ssm_entries.?, accepted, st.verify_len, s);
@@ -8146,7 +7140,7 @@ pub const Generator = struct {
         self.mtpTraceRoundEnd(m, accepted, m_lo);
         if (times_round) {
             self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-            if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+            self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
             if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
             self.mtpRoundUntimed();
@@ -8185,26 +7179,6 @@ pub const Generator = struct {
     pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
     pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
 
-    /// Draft-proposal mode is a property of the REQUEST, not of the process.
-    /// A greedy target keeps the argmax proposal (the temp-0 identity
-    /// contract); a sampled target proposes from the draft sampler, where
-    /// `min(1, p[argmax])` no longer collapses on a flat row.
-    /// SUSHI_MTP_DRAFT_GREEDY overrides for A/Bs: 1 = always greedy,
-    /// 0 = always sampled, absent = the per-request rule.
-    pub const DraftProposal = enum { greedy, sampled, per_request };
-    var mtp_draft_proposal_cache: ?DraftProposal = null;
-    fn mtpDraftProposalEnv() DraftProposal {
-        if (mtp_draft_proposal_cache) |v| return v;
-        var mode: DraftProposal = .per_request;
-        if (std.c.getenv("SUSHI_MTP_DRAFT_GREEDY")) |p| {
-            const val = std.mem.span(p);
-            if (val.len > 0 and val[0] == '0') mode = .sampled;
-            if (val.len > 0 and val[0] == '1') mode = .greedy;
-        }
-        mtp_draft_proposal_cache = mode;
-        return mode;
-    }
-
     /// Target temperature at or below which the GREEDY proposal still wins:
     /// the argmax accepts with `p_target[argmax]`, high only while the target
     /// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
@@ -8212,13 +7186,10 @@ pub const Generator = struct {
 
     /// Greedy drafts for THIS request. `top_k == 1` is a deterministic target
     /// whose filtered p is one-hot, so its argmax proposal is already optimal.
-    pub fn mtpDraftGreedyFor(target: SamplingParams, mode: DraftProposal) bool {
-        return switch (mode) {
-            .greedy => true,
-            // The temp-0 guard in `mtpDraftSamplingFor` still applies.
-            .sampled => false,
-            .per_request => target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1,
-        };
+    /// A greedy target keeps the argmax proposal (the temp-0 identity contract); a sampled
+    /// target proposes from the draft sampler, where `min(1, p[argmax])` collapses on a flat row.
+    pub fn mtpDraftGreedyFor(target: SamplingParams) bool {
+        return target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1;
     }
 
     // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
@@ -8237,25 +7208,9 @@ pub const Generator = struct {
 
     /// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
     /// over, and Flash Next drafts best at the target's own temperature.
-    /// SUSHI_MTP_DRAFT_TEMP is the sweep lever for the next head.
     pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
 
-    /// Only the ENV read is cached; the value is per loaded model.
-    var mtp_draft_temp_env: ??f32 = null;
-    fn mtpDraftTempEnv() ?f32 {
-        if (mtp_draft_temp_env) |v| return v;
-        var parsed: ?f32 = null;
-        if (std.c.getenv("SUSHI_MTP_DRAFT_TEMP")) |p| {
-            if (std.fmt.parseFloat(f32, std.mem.span(p)) catch null) |v| {
-                if (v > 0.01 and v <= 4.0) parsed = v;
-            }
-        }
-        mtp_draft_temp_env = parsed;
-        return parsed;
-    }
-
     pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
-        if (mtpDraftTempEnv()) |v| return v;
         return if (std.mem.eql(u8, config.model_type, "qwen4_exp")) MTP_DRAFT_TEMP_QWEN4 else MTP_DRAFT_TEMP;
     }
 
@@ -8279,8 +7234,8 @@ pub const Generator = struct {
 
     /// Greedy drafts at chain depth `step` (0 = the round's first draft). The
     /// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
-    pub fn mtpDraftGreedyAt(target: SamplingParams, mode: DraftProposal, greedy_tail: bool, step: u32) bool {
-        return mtpDraftGreedyFor(target, mode) or (greedy_tail and step > 0);
+    pub fn mtpDraftGreedyAt(target: SamplingParams, greedy_tail: bool, step: u32) bool {
+        return mtpDraftGreedyFor(target) or (greedy_tail and step > 0);
     }
 
     /// This request's draft sampler at chain depth `step`: the per-request
@@ -8290,7 +7245,7 @@ pub const Generator = struct {
     pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
         return mtpDraftSamplingFor(
             self.sampling,
-            mtpDraftGreedyAt(self.sampling, mtpDraftProposalEnv(), self.mtp_greedy_tail, step),
+            mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
             mtpDraftTempFor(&self.xfm.config),
         );
     }
@@ -8446,10 +7401,6 @@ pub const Generator = struct {
     /// The old linear ~1.5 ms/pos model came from a depth-6 run whose
     /// windowed controller was silently demoting underneath — never fit
     /// costs from a run whose realized m_avg you didn't check.
-    /// Override for live tuning (an explicit override selects the generic
-    /// two-region surface even on M5, so all four values remain the
-    /// complete backwards-compatible contract):
-    /// SUSHI_MTP_EV_COSTS="draft,per_pos_lo,per_pos_hi,sync".
     pub const MtpEvCosts = struct {
         draft: f32, // one sequential MTP-head step (fwd + draft lm_head)
         per_pos_lo: f32, // marginal verify+capture per position, flat region
@@ -8736,10 +7687,15 @@ pub const Generator = struct {
     /// table OBSERVING (its `[spec-stats]` fields stay comparable across an
     /// A/B) but the plan reads only the fitted prior and no width trial runs.
     var mtp_cost_table_cache: ?bool = null;
+    pub fn mtpCostTableEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
     fn mtpCostTableEnabled() bool {
         if (mtp_cost_table_cache) |v| return v;
         const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_COST_TABLE")) |p| std.mem.span(p) else null;
-        const on = mtpLiveCostEnabledFromEnv(raw);
+        const on = mtpCostTableEnabledFromEnv(raw);
         mtp_cost_table_cache = on;
         return on;
     }
@@ -9228,55 +8184,6 @@ pub const Generator = struct {
         }
     };
 
-    /// Sampled DFlash drafts — DEFAULT OFF, measured negative.
-    /// `SUSHI_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the
-    /// request's own filtered distribution and accepts through the full
-    /// Leviathan ratio; off keeps the argmax draft and its one-hot q.
-    ///
-    /// The theory said this should help: a greedy draft's acceptance is
-    /// p(argmax q), which a flattened target row deflates, while a matched
-    /// proposal accepts at 1 − TV(p, q). Measured on Muse 4-bit at temp 0.7
-    /// (3 reps x 4 prompts, same-boot serial reference), it is a LOSS —
-    /// 52.4 tok/s / 54.5% per-draft against 55.5 / 57.7% greedy. This
-    /// assistant's ARGMAX tracks the trunk well while its distribution SHAPE
-    /// does not, so a one-hot proposal is the better proposal and sampling
-    /// spends the round's budget landing on tokens the trunk would not pick.
-    /// Greedy requests never reach this either way.
-    var dflash_sampled_drafts_cache: ?bool = null;
-    fn dflashSampledDraftsEnabled() bool {
-        if (dflash_sampled_drafts_cache) |v| return v;
-        var on = false;
-        if (std.c.getenv("SUSHI_DFLASH_SAMPLED_DRAFTS")) |p| {
-            const val = std.mem.span(p);
-            if (val.len > 0 and val[0] == '1') on = true;
-        }
-        dflash_sampled_drafts_cache = on;
-        return on;
-    }
-
-    /// `SUSHI_DFLASH_SELECTOR`: default ON when the sidecar ships a
-    /// selector (DFlash2). "0" forces the v1 draft arms (argmax / block
-    /// sampling) for A/Bs — the conv layers stay, they are the checkpoint.
-    var dflash_selector_cache: ?bool = null;
-    /// `SUSHI_DFLASH_MARKOV=0` drafts a DSpark sidecar's block from its
-    /// UNCORRECTED base logits (the v1 arm) — an A/B lever for measuring what
-    /// the Markov chain is worth, never a default.
-    fn dflashMarkovEnabled() bool {
-        const p = std.c.getenv("SUSHI_DFLASH_MARKOV") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(p), "0");
-    }
-
-    fn dflashSelectorEnabled() bool {
-        if (dflash_selector_cache) |v| return v;
-        var on = true;
-        if (std.c.getenv("SUSHI_DFLASH_SELECTOR")) |p| {
-            const val = std.mem.span(p);
-            if (val.len > 0 and val[0] == '0') on = false;
-        }
-        dflash_selector_cache = on;
-        return on;
-    }
-
     var dflash_trace_cache: ?bool = null;
     fn dflashTraceEnabled() bool {
         if (dflash_trace_cache) |v| return v;
@@ -9321,63 +8228,6 @@ pub const Generator = struct {
         return on;
     }
 
-    /// Cross-request EV seeding gate — default ON; set
-    /// SUSHI_MTP_EV_SEED=0 to keep request planning independent.
-    var mtp_ev_seed_cache: ?bool = null;
-    fn mtpEvSeedEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpEvSeedEnabled() bool {
-        if (mtp_ev_seed_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_EV_SEED")) |p| std.mem.span(p) else null;
-        const on = mtpEvSeedEnabledFromEnv(raw);
-        mtp_ev_seed_cache = on;
-        return on;
-    }
-
-    /// Early draft-chain dispatch (round pipelining) — DEFAULT ON. Fires the
-    /// draft-chain graph at the GPU as soon as Phase 1 finishes building it,
-    /// so the head chain runs while the CPU builds the verify/accept graphs
-    /// (~2 ms the GPU used to spend idle each round). Dispatch timing only —
-    /// lazy sampling ops bind their PRNG key at graph BUILD time, so values
-    /// are identical. SUSHI_MTP_EARLY_DISPATCH=0 restores the serial
-    /// round shape for same-boot A/Bs.
-    var mtp_early_dispatch_cache: ?bool = null;
-    pub fn mtpEarlyDispatchEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpEarlyDispatchEnabled() bool {
-        if (mtp_early_dispatch_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_EARLY_DISPATCH")) |p| std.mem.span(p) else null;
-        const on = mtpEarlyDispatchEnabledFromEnv(raw);
-        mtp_early_dispatch_cache = on;
-        return on;
-    }
-
-    /// Cross-round pre-draft (round pipelining) — DEFAULT ON. Builds and
-    /// dispatches the next round's chunk-A draft chain at the current
-    /// round's tail (see mtpMaybePreDraft) so the GPU drafts while the CPU
-    /// does emit/SSE bookkeeping. SUSHI_MTP_PREDRAFT=0 reverts to
-    /// head-of-round drafting for same-boot A/Bs (combine with
-    /// SUSHI_MTP_EARLY_DISPATCH=0 for the fully serial round shape).
-    var mtp_predraft_cache: ?bool = null;
-    pub fn mtpPredraftEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpPredraftEnabled() bool {
-        if (mtp_predraft_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_PREDRAFT")) |p| std.mem.span(p) else null;
-        const on = mtpPredraftEnabledFromEnv(raw);
-        mtp_predraft_cache = on;
-        return on;
-    }
-
     pub fn mtpTraceOn() bool {
         return mtpTraceEnabled();
     }
@@ -9395,39 +8245,8 @@ pub const Generator = struct {
         return on;
     }
 
-    fn parseMtpEvCostsOverride(raw: []const u8) ?MtpEvCosts {
-        var values: [4]f32 = undefined;
-        var it = std.mem.splitScalar(u8, raw, ',');
-        var i: usize = 0;
-        while (i < values.len) : (i += 1) {
-            const part = it.next() orelse return null;
-            const value = std.fmt.parseFloat(f32, std.mem.trim(u8, part, " ")) catch return null;
-            if (!std.math.isFinite(value)) return null;
-            values[i] = value;
-        }
-        if (it.next() != null) return null;
-        if (values[0] <= 0.0 or values[1] <= 0.0 or values[2] <= 0.0 or values[3] < 0.0) return null;
-
-        var c = MTP_EV_DEFAULT_COSTS;
-        c.draft = values[0];
-        c.per_pos_lo = values[1];
-        c.per_pos_hi = values[2];
-        c.sync = values[3];
-        // The override contract is the two-region surface: never inherit a
-        // third region (M5 NAX or the generic k>=7 cliff) the four values
-        // can't express.
-        c.nax_from = 0;
-        c.per_pos_nax = 0.0;
-        return c;
-    }
-
-    /// Pure profile/override selector. A valid explicit four-value override
-    /// starts from DEFAULT (rather than silently inheriting the hardware
-    /// profile), so a value copied from an M1-M4 tuning run means the same
-    /// thing on M5. Empty/partial/malformed values are ignored atomically;
-    /// they must not silently leave an auto-cap-8 target on generic costs.
-    pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile, override: ?[]const u8) MtpEvCosts {
-        const selected = switch (profile) {
+    pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
+        return switch (profile) {
             .generic => MTP_EV_DEFAULT_COSTS,
             .g17_nax_q8_gs32 => MTP_EV_G17_NAX_COSTS,
             .g17_nax_q4_gs32 => MTP_EV_G17_NAX_Q4_GS32_COSTS,
@@ -9439,20 +8258,6 @@ pub const Generator = struct {
             .g17_nax_qwen4_mixed_4_8_gs64 => MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS,
             .mimo_exl3 => MTP_EV_MIMO_EXL3_COSTS,
         };
-        if (override) |raw| {
-            return parseMtpEvCostsOverride(raw) orelse selected;
-        }
-        return selected;
-    }
-
-    /// Legacy q8 boolean selector retained for source compatibility.
-    pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
-        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-        return mtpEvCostsForProfile(profile, override);
-    }
-
-    fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
-        return mtpEvCostsForProfile(profile, if (std.c.getenv("SUSHI_MTP_EV_COSTS")) |p| std.mem.span(p) else null);
     }
 
     /// Extension dry-spell gate constants: after MTP_EXT_DRY_ROUNDS
@@ -9529,22 +8334,6 @@ pub const Generator = struct {
             return false;
         }
         return true;
-    }
-
-    /// Dry-spell gate kill switch — SUSHI_MTP_EXT_DRY=0 restores
-    /// unconditional extension consideration for same-boot A/Bs.
-    var mtp_ext_dry_cache: ?bool = null;
-    pub fn mtpExtDryEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpExtDryEnabled() bool {
-        if (mtp_ext_dry_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_EXT_DRY")) |p| std.mem.span(p) else null;
-        const on = mtpExtDryEnabledFromEnv(raw);
-        mtp_ext_dry_cache = on;
-        return on;
     }
 
     /// EMA weight for the live round/sync cost EMAs. Slower than the
@@ -9749,34 +8538,6 @@ pub const Generator = struct {
         return majority;
     }
 
-    /// Regime gate kill switch — SUSHI_MTP_REGIME=0 leaves every
-    /// two-chunk plan as the EV horizon wrote it (same-boot A/B control arm).
-    var mtp_regime_cache: ?bool = null;
-    fn mtpRegimeGateEnabled() bool {
-        if (mtp_regime_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_REGIME")) |p| std.mem.span(p) else null;
-        const on = mtpLiveCostEnabledFromEnv(raw);
-        mtp_regime_cache = on;
-        return on;
-    }
-
-    /// Live-cost throttle kill switch — SUSHI_MTP_LIVECOST=0 reverts the
-    /// dry-exploration threshold to the fixed MTP_EXT_DRY_ROUNDS (the
-    /// pre-live-cost cadence) for same-boot A/Bs.
-    var mtp_livecost_cache: ?bool = null;
-    pub fn mtpLiveCostEnabledFromEnv(raw: ?[]const u8) bool {
-        const value = raw orelse return true;
-        return value.len == 0 or value[0] != '0';
-    }
-
-    fn mtpLiveCostEnabled() bool {
-        if (mtp_livecost_cache) |v| return v;
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_LIVECOST")) |p| std.mem.span(p) else null;
-        const on = mtpLiveCostEnabledFromEnv(raw);
-        mtp_livecost_cache = on;
-        return on;
-    }
-
     /// Per-round draft plan. Fixed mode (and EV warmup): today's adaptive
     /// depth, no extension — byte-identical round shape to the legacy path.
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
@@ -9835,9 +8596,9 @@ pub const Generator = struct {
     /// rounds beat serial even on prose and a probe could only cost.
     pub const MTP_ADAPTIVE_MIN_KV_MIMO: u32 = 65536;
 
-    /// The switch's floor for this arch; `SUSHI_MTP_ADAPTIVE_MIN_KV` names both.
-    pub fn mtpAdaptiveMinKvFor(is_mimo: bool, env: ?u32) u32 {
-        return env orelse if (is_mimo) MTP_ADAPTIVE_MIN_KV_MIMO else MTP_ADAPTIVE_MIN_KV;
+    /// The switch's floor for this arch.
+    pub fn mtpAdaptiveMinKvFor(is_mimo: bool) u32 {
+        return if (is_mimo) MTP_ADAPTIVE_MIN_KV_MIMO else MTP_ADAPTIVE_MIN_KV;
     }
 
     /// May the adaptive switch run at this context at all? Read before the vote and the probe.
@@ -9853,8 +8614,8 @@ pub const Generator = struct {
     }
 
     /// One serial tick of the adaptive arm at `kv_len`, buckets resolved as the decision resolved them.
-    pub fn mtpAdaptiveSerialTickFor(a: *MtpAdaptive, t: *const round_cost.Table, kv_len: u32, redecide_tokens: u32) MtpAdaptiveAction {
-        return a.serialTickAt(mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout), t.bucketOf(kv_len), redecide_tokens);
+    pub fn mtpAdaptiveSerialTickFor(a: *MtpAdaptive, t: *const round_cost.Table, kv_len: u32) MtpAdaptiveAction {
+        return a.serialTickAt(mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout), t.bucketOf(kv_len));
     }
 
     fn mtpAdaptiveBucket(self: *const Generator, kv_len: u32) usize {
@@ -9982,8 +8743,6 @@ pub const Generator = struct {
         arm: MtpAdaptiveArm = .undecided,
         confirm: u32 = 0,
         bucket: ?usize = null,
-        /// Serial ticks since the arm went serial (or the last re-decision).
-        serial_ticks: u32 = 0,
         /// A re-entry was refused because the head's position bookkeeping is out of sync; latched.
         reentry_declined: bool = false,
         /// The switch left MTP on a module-owned head, so the arm is sticky: no re-entry, probe
@@ -10022,7 +8781,6 @@ pub const Generator = struct {
                     if (self.confirm < @max(@as(u32, 1), need)) return .none;
                     self.confirm = 0;
                     self.arm = .serial;
-                    self.serial_ticks = 0;
                     self.serial_own = null;
                     self.switches += 1;
                     return .to_serial;
@@ -10030,49 +8788,35 @@ pub const Generator = struct {
             }
         }
 
-        /// Serial tokens after which the decision is re-opened inside the same bucket. Default
-        /// OFF: a re-entry resumes a head whose history did not grow across the block.
-        /// `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS` turns it on.
-        pub const REDECIDE_SERIAL_TOKENS_DEFAULT: u32 = 0;
-        /// The value the lever selects when it is enabled without a number.
-        pub const REDECIDE_SERIAL_TOKENS_ON: u32 = 512;
-
         /// Latch a refused re-entry: back to the serial arm, never ask again for this request.
         pub fn declineReentry(self: *MtpAdaptive) void {
             self.arm = .serial;
-            self.serial_ticks = 0;
             self.reentry_declined = true;
         }
 
         /// Make the serial arm permanent for this request (a `to_serial` on a module-owned head).
         pub fn stickSerial(self: *MtpAdaptive) void {
             self.arm = .serial;
-            self.serial_ticks = 0;
             self.sticky_serial = true;
         }
 
         /// `serialTick` plus a crossing of the request's own bucket (`own`).
-        pub fn serialTickAt(self: *MtpAdaptive, bucket: usize, own: usize, redecide_tokens: u32) MtpAdaptiveAction {
+        pub fn serialTickAt(self: *MtpAdaptive, bucket: usize, own: usize) MtpAdaptiveAction {
             if (self.arm == .serial and !self.sticky_serial and !self.reentry_declined) {
                 const at = self.serial_own orelse own;
                 self.serial_own = at;
                 if (own != at) return self.reopen(bucket);
             }
-            return self.serialTick(bucket, redecide_tokens);
+            return self.serialTick(bucket);
         }
 
-        pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
+        pub fn serialTick(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             // Sticky outranks both re-entry triggers, the bucket crossing included.
             if (self.sticky_serial) return .none;
             if (self.reentry_declined) return .none;
             if (self.arm != .serial) return .none;
             if (self.bucket) |b| {
-                if (b == bucket) {
-                    if (redecide_tokens == 0) return .none; // crossing-only
-                    self.serial_ticks +|= 1;
-                    if (self.serial_ticks < redecide_tokens) return .none;
-                    return self.reopen(bucket);
-                }
+                if (b == bucket) return .none; // only a bucket crossing re-opens the decision
             }
             return self.reopen(bucket);
         }
@@ -10080,7 +8824,6 @@ pub const Generator = struct {
         fn reopen(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             self.bucket = bucket;
             self.confirm = 0;
-            self.serial_ticks = 0;
             self.serial_own = null;
             self.arm = .undecided;
             self.switches += 1;
@@ -10103,46 +8846,6 @@ pub const Generator = struct {
         const on = mtpAdaptiveSerialEnabledFromEnv(raw);
         mtp_adaptive_serial_cache = on;
         return on;
-    }
-
-    var mtp_adaptive_margin_cache: ?f32 = null;
-    fn mtpAdaptiveMargin() f32 {
-        if (mtp_adaptive_margin_cache) |v| return v;
-        const v = readEnvFloat("SUSHI_MTP_ADAPTIVE_MARGIN", MTP_ADAPTIVE_MARGIN);
-        mtp_adaptive_margin_cache = v;
-        return v;
-    }
-
-    var mtp_reentry_tokens_cache: ?u32 = null;
-    /// `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only; a bare `1` selects 512.
-    fn mtpAdaptiveReentryTokens() u32 {
-        if (mtp_reentry_tokens_cache) |v| return v;
-        const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS", MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-        const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-        mtp_reentry_tokens_cache = v;
-        return v;
-    }
-
-    var mtp_adaptive_min_kv_env: ?u32 = null;
-    var mtp_adaptive_min_kv_read = false;
-    fn mtpAdaptiveMinKv(self: *const Generator) u32 {
-        if (!mtp_adaptive_min_kv_read) {
-            mtp_adaptive_min_kv_read = true;
-            if (std.c.getenv("SUSHI_MTP_ADAPTIVE_MIN_KV") != null) {
-                const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
-                mtp_adaptive_min_kv_env = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-            }
-        }
-        return mtpAdaptiveMinKvFor(self.xfm.config.isMimo(), mtp_adaptive_min_kv_env);
-    }
-
-    var mtp_adaptive_confirm_cache: ?u32 = null;
-    fn mtpAdaptiveConfirm() u32 {
-        if (mtp_adaptive_confirm_cache) |v| return v;
-        const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_CONFIRM", MTP_ADAPTIVE_CONFIRM);
-        const v: u32 = @intCast(@max(@as(usize, 1), @min(n, 64)));
-        mtp_adaptive_confirm_cache = v;
-        return v;
     }
 
     /// Drift between the head's position bookkeeping and what its next forward demands
@@ -10225,17 +8928,17 @@ pub const Generator = struct {
         // Read after the plan (m_lo is the width it prices) and before the width trial.
         if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
             self.mtpAdaptiveArchEligible() and
-            mtpAdaptiveKvEligible(kv_len, self.mtpAdaptiveMinKv()))
+            mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKvFor(self.xfm.config.isMimo())))
         {
             const t = &self.xfm.round_cost;
             const b = self.mtpAdaptiveBucket(kv_len);
             const table_ms_tok = t.msPerTok(m_lo, b);
             const window_ms_tok = self.mtp_price.msPerTok();
             const serial_ms = t.serialMsPerTok(b);
-            const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, mtpAdaptiveMargin());
+            const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, MTP_ADAPTIVE_MARGIN);
             const prev_bucket = self.mtp_adaptive.bucket;
             const prev_arm = self.mtp_adaptive.arm;
-            const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm());
+            const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, MTP_ADAPTIVE_CONFIRM);
             self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
             if (action == .to_serial) {
                 // The round under construction still runs; the switch takes effect next tick.
@@ -10376,17 +9079,14 @@ pub const Generator = struct {
         self.mtp_ev_m_lo_prev = plan.m_lo;
         // Live-cost lever: shorten dry exploration bursts when the MEASURED
         // chunk-A sync is an expensive fraction of the round (mtpExtDryThresholdFor).
-        const dry_threshold = if (mtpLiveCostEnabled())
-            mtpExtDryThresholdFor(self.mtp_ev_sync_ms, self.mtp_ev_round_ms)
-        else
-            MTP_EXT_DRY_ROUNDS;
-        if (plan.m_hi > plan.m_lo and mtpExtDryEnabled() and
+        const dry_threshold = mtpExtDryThresholdFor(self.mtp_ev_sync_ms, self.mtp_ev_round_ms);
+        if (plan.m_hi > plan.m_lo and
             !mtpExtDryAllows(&self.mtp_ext_dry_streak, &self.mtp_ext_cooldown, dry_threshold))
         {
             plan.m_hi = plan.m_lo;
             plan.tau_ln = 0.0;
         }
-        if (plan.m_hi > plan.m_lo and mtpRegimeGateEnabled()) {
+        if (plan.m_hi > plan.m_lo) {
             const force = mtpRegimeForce(&self.mtp_regime, self.mtp_ev_rounds);
             const worse = self.mtp_regime.sched_verdict;
             if (worse != null and worse != self.mtp_regime_verdict) {
@@ -10608,7 +9308,7 @@ pub const Generator = struct {
         // otherwise crash on the slow path which assumes pending_logits is
         // always lazily seeded). When we observe that state, synchronously
         // forward `[next_token_id]` to seed `pending_logits` so the fast
-        // path picks up cleanly. PLD's exit state already matches `next()`'s
+        // path picks up cleanly. the speculative exit state already matches `next()`'s
         // invariant, so this only fires for drafter→next runtime-gate
         // fallbacks (and any future spec methods that share drafter's shape).
         if (!self.has_pending_logits and !self.has_pending_token and
@@ -11533,7 +10233,7 @@ fn sampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
 }
 
 /// Build a one-hot float32 row vector of shape `[1, vocab]` with 1.0 at
-/// `index` and 0.0 elsewhere. Used by PLD's stochastic-verify reject path,
+/// `index` and 0.0 elsewhere. Used by the DFlash stochastic-verify reject path,
 /// which models the draft (an n-gram lookup, not a probabilistic model) as a
 /// degenerate one-hot distribution. Caller owns the returned array.
 fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -12230,81 +10930,6 @@ pub fn generate(
     };
 }
 
-/// PLD-enabled non-streaming variant of `generate`. Model-agnostic — works on
-/// every supported architecture, no extra weights required. Logprobs and
-/// constrained sampling are unsupported (asserted out by `nextPld`).
-///
-/// `draft_len` and `key_len` come from server config (`--pld-draft-len` /
-/// `--pld-key-len`); typical values are 5 and 3 respectively.
-pub fn generatePld(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    xfm: *Transformer,
-    tok: *const Tokenizer,
-    prompt_ids: []const u32,
-    max_tokens: u32,
-    sampling: SamplingParams,
-    eos_token_ids: []const u32,
-    timeout_ns: u64,
-    draft_len: u32,
-    key_len: u32,
-    lookup_prompt: ?[]const u32,
-) !GenerationResult {
-    var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true, .lookup_prompt = lookup_prompt });
-    gen.timeout_ns = timeout_ns;
-    defer gen.deinit(allocator);
-
-    const prefill_ns = timer.read();
-    const prefill_tps: f64 = if (prefill_ns > 0)
-        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
-    else
-        0.0;
-    log.debug("Prefill (PLD): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
-        prefill_ns / std.time.ns_per_ms,
-        prompt_ids.len,
-        prefill_tps,
-    });
-
-    var output_ids = std.ArrayList(u32).empty;
-    defer output_ids.deinit(allocator);
-
-    timer.reset();
-
-    // Decode loop. Each `nextPld` returns 1..=(1+draft_len) tokens. Stop on
-    // EOS / max_tokens / timeout. We check stop conditions on every emitted
-    // token (drafts can include EOS just like regular sampling) so the early
-    // exit is correct.
-    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
-        const result = (try gen.nextPld(allocator, draft_len, key_len)) orelse break;
-        defer allocator.free(result.tokens);
-        // Match `generate`'s convention: stop tokens are NOT included in
-        // output_ids. Check before appending — the speculative path has to do
-        // this explicitly because `nextPld` emits multiple tokens at once and
-        // can't return-null mid-batch like the single-token `next` does.
-        for (result.tokens) |tok_id| {
-            if (isEosId(tok_id, eos_token_ids)) {
-                gen.done = true;
-                gen.finish_reason = "stop";
-                break :decode;
-            }
-            try output_ids.append(allocator, tok_id);
-            if (output_ids.items.len >= max_tokens) {
-                gen.done = true;
-                gen.finish_reason = "length";
-                break :decode;
-            }
-        }
-        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
-            gen.done = true;
-            gen.finish_reason = "length";
-            break;
-        }
-    }
-
-    return finishPldResult(&gen, &output_ids, allocator, prefill_tps, timer, tok);
-}
-
 /// MTP-enabled non-streaming variant of `generate`. Drives `nextMtp` (the model's own multi-token-prediction head).
 /// `head` must already be `bind()`-ed to `xfm`.
 pub fn generateMtp(
@@ -12389,57 +11014,6 @@ pub fn generateMtp(
         });
     } else {
         log.debug("Decode (mtp): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-        });
-    }
-    gen.logSpecStats();
-    gen.logQsaArms();
-    const strip_leading = tok.tok_type == .sentencepiece_bpe;
-    const text = try tok.decode(allocator, output_ids.items, strip_leading);
-    const token_ids = try output_ids.toOwnedSlice(allocator);
-    return .{
-        .text = text,
-        .token_ids = token_ids,
-        .prompt_tokens = gen.prompt_tokens,
-        .completion_tokens = gen.completion_tokens,
-        .finish_reason = gen.finish_reason,
-        .prefill_tps = prefill_tps,
-        .decode_tps = decode_tps,
-        .logprobs = null,
-    };
-}
-
-fn finishPldResult(
-    gen: *Generator,
-    output_ids: *std.ArrayList(u32),
-    allocator: std.mem.Allocator,
-    prefill_tps: f64,
-    timer: io_util.Stopwatch,
-    tok: *const Tokenizer,
-) !GenerationResult {
-    const decode_ns = timer.read();
-    const num_decoded = output_ids.items.len;
-    const decode_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
-    if (gen.pld_attempted > 0) {
-        // "Tokens saved" = accepted_tokens (drafts that landed) + 0 from
-        // verify forwards that ran. Acceptance ratio is per-position, so we
-        // compute average tokens accepted per attempt for visibility.
-        const avg_acc: f64 = @as(f64, @floatFromInt(gen.pld_accepted_tokens)) / @as(f64, @floatFromInt(gen.pld_attempted));
-        log.info("Decode (PLD): {d}ms ({d} tokens, {d:.3} tok/s; pld accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
-            decode_ns / std.time.ns_per_ms,
-            num_decoded,
-            decode_tps,
-            gen.pld_accepted_tokens,
-            gen.pld_attempted,
-            avg_acc,
-        });
-    } else {
-        log.debug("Decode (PLD): {d}ms ({d} tokens, {d:.3} tok/s; no n-gram matches found)\n", .{
             decode_ns / std.time.ns_per_ms,
             num_decoded,
             decode_tps,
@@ -12750,7 +11324,7 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
 /// ~30 tok/s and was guillotined mid-call by the 300s default, which then
 /// surfaced as a "butchered" path-only tool call. Progress is detected from
 /// the generated-token COUNT at each check, so every decode path (regular,
-/// PLD, drafter, MTP — which don't all share an emit site) resets the clock
+/// drafter, MTP — which don't all share an emit site) resets the clock
 /// without instrumentation; a request that stops producing (hung forward,
 /// deadlock) still times out after `timeout_ns` of silence.
 pub const StallClock = struct {
@@ -13804,8 +12378,8 @@ test "SamplingParams custom values" {
 }
 
 test "specDecodeUnsupported: release-enforced guard for spec + constraint/logprobs (issue #97)" {
-    // Speculative decode (PLD/drafter/MTP) cannot honor a grammar constraint or
-    // per-token logprobs. nextPld/nextDrafter/nextMtp only asserted this, which
+    // Speculative decode (drafter/MTP) cannot honor a grammar constraint or
+    // per-token logprobs. nextDflash/nextMtp only asserted this, which
     // compiles out in ReleaseFast (issue #97) — this is the real check they now
     // use to fail loud instead of streaming silently off-schema output.
     try testing.expect(!specDecodeUnsupported(.{}, 0)); // plain sampling → spec OK
@@ -13846,8 +12420,8 @@ test "a repeat penalty of 0 or below is off" {
     try testing.expect(!penaltyActive(.{ .repeat_penalty = 0 }));
     try testing.expect(!penaltyActive(.{ .repeat_penalty = -1.5 }));
     try testing.expect(penaltyActive(.{ .repeat_penalty = 0, .presence_penalty = 0.3 }));
-    try testing.expect(!argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 1.1 }, 0, false));
-    try testing.expect(argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 0 }, 0, false));
+    try testing.expect(!argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 1.1 }, 0));
+    try testing.expect(argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 0 }, 0));
 }
 
 test "a constrained penalised step picks what sampleToken picks on the same masked logits, penalised once" {
@@ -14348,58 +12922,6 @@ test "sampleToken from prefill logits (seq_len > 1)" {
     try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
 }
 
-test "Generator.runtimeGateShouldDisable below warmup never trips" {
-    // Even with zero accepts, before the warmup count we trust the prompt-time
-    // gate and never disable speculation mid-decode. drafts_per_round is the
-    // typical drafter setting (block_size=4 → 3 drafts per round).
-    try testing.expect(!Generator.runtimeGateShouldDisable(0, 0, 3));
-    try testing.expect(!Generator.runtimeGateShouldDisable(1, 0, 3));
-    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP - 1, 0, 3));
-}
-
-test "Generator.runtimeGateShouldDisable trips at warmup with low per-draft rate" {
-    // Synthetic low-accept scenario: 5 verify attempts, drafts_per_round=3
-    // (drafter at block_size=4). 5 attempts × 3 = 15 drafts proposed.
-    // 0 accepted → 0.00 < 0.50 → trip. Same with 1 accepted (0.067).
-    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 0, 3));
-    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 1, 3));
-    // 7 accepted out of 15 = 0.467 — still below 0.50 → trip.
-    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 7, 3));
-    // 8 accepted out of 15 = 0.533 → keeps running.
-    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 8, 3));
-}
-
-test "Generator.runtimeGateShouldDisable does not trip with high per-draft rate" {
-    // Echo workloads on Gemma drafter: ~93% per-draft acceptance (E4B from
-    // bench: 67/(24*3) = 93.1%). Well above threshold → keeps running.
-    try testing.expect(!Generator.runtimeGateShouldDisable(24, 67, 3));
-    // PLD heavy-echo: ~4 of 5 drafts accepted per attempt = 0.80 per-draft.
-    try testing.expect(!Generator.runtimeGateShouldDisable(20, 80, 5));
-    // Edge case at exactly the threshold (rate == 0.50) — strict less-than,
-    // so does NOT trip.
-    try testing.expect(!Generator.runtimeGateShouldDisable(10, 15, 3)); // 15/30 = 0.50
-}
-
-test "Generator.runtimeGateShouldDisable creative-content regression scenario" {
-    // The Phase 1 bench's exact regression cases on creative prompts:
-    //   E4B drafter (bs=4 → drafts_per_round=3): 39/59 attempts → 22.0% per-draft → trip
-    //   E2B drafter (bs=2 → drafts_per_round=1): 31/66 attempts → 47.0% per-draft → trip
-    //   31B drafter (bs=8 → drafts_per_round=7): 60/(38*7) → 22.6% per-draft → trip
-    try testing.expect(Generator.runtimeGateShouldDisable(59, 39, 3)); // E4B creative
-    try testing.expect(Generator.runtimeGateShouldDisable(66, 31, 1)); // E2B creative
-    try testing.expect(Generator.runtimeGateShouldDisable(38, 60, 7)); // 31B creative
-    // The 26B-A4B@bs=2 creative case: 37/(60*1) = 61.7% → above threshold,
-    // so the runtime gate alone does NOT save it. MoE regressions need the
-    // separate `default_enable_drafter` opt-out at startup.
-    try testing.expect(!Generator.runtimeGateShouldDisable(60, 37, 1));
-}
-
-test "Generator.runtimeGateShouldDisable handles drafts_per_round=0" {
-    // Defensive: if a caller somehow passes a degenerate config (block_size=1
-    // → drafts_per_round=0), don't divide by zero. We return false (no trip).
-    try testing.expect(!Generator.runtimeGateShouldDisable(100, 0, 0));
-}
-
 test "Generator.dflashGateShouldDisable uses accepted yield across block widths" {
     // Never decide from fewer than the DFlash warmup number of paid verifies.
     try testing.expect(!Generator.dflashGateShouldDisable(
@@ -14427,82 +12949,10 @@ test "Generator.dflashGateShouldDisable uses accepted yield across block widths"
     try testing.expect(Generator.dflashGateShouldDisable(w, w - w / 3, Generator.DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND));
 }
 
-test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
-    // The 2026-06-10 baseline regression: PLD forced on for a creative essay
-    // prompt where the n-gram lookup almost never matches. The per-draft gate
-    // never trips (it only counts verify ROUNDS, and there are few), but every
-    // step pays the unpipelined cold forward → −14% measured on E2B. The
-    // yield gate counts ALL enabled-mode steps: accepted-drafted-tokens per
-    // step below the threshold after warmup → disable.
-    // Creative: 128 steps, ~6 drafted tokens accepted → yield 0.047 → trip.
-    try testing.expect(Generator.yieldGateShouldDisable(128, 6));
-    // Heavy echo: 40 steps, 80 accepted (2.0/step) → stay on.
-    try testing.expect(!Generator.yieldGateShouldDisable(40, 80));
-    // Inside warmup: never trip, even at zero yield.
-    try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP - 1, 0));
-    // Exactly at warmup with healthy yield: stay on.
-    try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP, Generator.YIELD_GATE_WARMUP));
-}
-
-test "yield-gate warmup is 8 — the cold-path tax tripled when the AR step got 3x cheaper" {
-    // This constant is pure economics and the economics MOVED. Every warmup
-    // step pays PLD's unpipelined cold forward plus a synchronous host read of
-    // the sampled token, against `next()`'s async-pipelined step — an
-    // ~absolute tax measured as a share of the AR step. Fixing the Laguna
-    // mscale promotion made that AR step ~3x cheaper, so the same tax became a
-    // ~3x larger share and 32 steps of it stopped being affordable.
-    //
-    // Swept on Laguna XS (one boot, serial vs unconstrained alternating per
-    // request, server-reported timings, 5 runs median), against a matrix that
-    // deliberately contains PLD's WIN case as well as its loss cases —
-    // tuning on loss cases alone drives the warmup to zero and throws the win
-    // away:
-    //
-    //   warmup   echo-edit   code-edit  free-form   explain      qa
-    //       32     +76.9%       -4.3%      -1.2%     -1.4%     -7.2%
-    //       16     +70.1%       -3.4%      -0.4%     -0.3%     -0.8%
-    //        8     +77.4%       +0.3%      -0.2%     -0.3%     -1.5%
-    //        4     +76.6%       +3.9%      -0.2%     -0.1%     -1.7%
-    //
-    // 8 recovers essentially the whole loss while leaving the +77% untouched.
-    // 4 measured no worse, but a gate that decides on four observations is
-    // fitting noise, and a short preamble before a file echo is the NORMAL
-    // agent shape — exactly what a too-eager trip would punish. A premature
-    // trip is bounded anyway: `specShouldReenable` re-checks every
-    // SPEC_REENABLE_INTERVAL steps.
-    try testing.expectEqual(@as(u64, 8), Generator.YIELD_GATE_WARMUP);
-
-    // Sweepable without a rebuild, same contract as `runtimeGateWarmup`:
-    // out-of-range values fall back rather than silently disabling the gate.
-    try testing.expectEqual(Generator.YIELD_GATE_WARMUP, Generator.yieldGateWarmup());
-}
-
-test "Generator.specShouldReenable gates mid-request PLD re-activation" {
-    // Disabled-mode periodic check on the COMMITTED sequence (prompt +
-    // generated). The decisive case: the model echoes PROMPT content (file
-    // edit / tool result) after a novel preamble tripped the yield gate. The
-    // echoed tail never repeats ITSELF, so self-repetition scoring misses it;
-    // tailMatchFraction sees the prompt occurrence.
-    var committed: [96]u32 = undefined;
-    // prompt = 48-token "file", generated = 16 novel preamble + 32 echo of the file
-    for (committed[0..48], 0..) |*t, i| t.* = @intCast(i + 100);
-    for (committed[48..64], 0..) |*t, i| t.* = @intCast(i + 9000);
-    for (committed[64..96], 0..) |*t, i| t.* = @intCast(i + 100);
-    try testing.expect(Generator.specShouldReenable(&committed, 48));
-
-    // Fully novel committed sequence → stay disabled.
-    var novel: [96]u32 = undefined;
-    for (&novel, 0..) |*t, i| t.* = @intCast(i * 7 + 1);
-    try testing.expect(!Generator.specShouldReenable(&novel, 48));
-
-    // Too little generated yet → not enough signal, stay disabled.
-    try testing.expect(!Generator.specShouldReenable(&committed, 8));
-}
-
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {
     // When the server's cache-reuse path forwards only a trailing-tail
     // prompt slice but supplies the full original prompt via
-    // `InitOptions.lookup_prompt`, PLD's n-gram buffer must be cloned from
+    // `InitOptions.lookup_prompt`, the lookup buffer must be cloned from
     // the full slice — not the truncated tail.
     const tail = [_]u32{99};
     const full = [_]u32{ 10, 20, 30, 99 };
@@ -15256,7 +13706,7 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // A real hd-256 MoE keeps its own measured 4096 branch.
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 32, 8192, false, true, false));
 
-    // SUSHI_FUSED_256_CAUSAL=0: composed scores are back and so is the
+    // Composed (`fused256_override = false`): scores are back and so is the
     // budget, unchanged — guards and dispatch move on ONE switch.
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
@@ -15269,29 +13719,6 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // 4 GiB / (32 * 38201 * 2) = 1757 -> floored to the 512 grain.
     try testing.expectEqual(@as(usize, 1536), boundedPrefillChunk(8192, 192, 32, 38_201, false, true, false));
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
-}
-
-test "MTP history window: threshold gate and chunk membership" {
-    // Below/at the 16384 threshold the window never engages — behavior (and
-    // temp-0 output) stays byte-identical to full-history capture.
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(1000, 8192));
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(16384, 8192));
-    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(16385, 8192));
-    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(65536, 8192));
-    // 0 = full history at any length (the --mtp-history-window 0 escape).
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(65536, 0));
-
-    // Chunk membership at prefix 32768, window 8192: the window starts at
-    // 24576. Chunks entirely before it skip capture; the boundary chunk
-    // (ending past 24576) captures WHOLE.
-    try testing.expect(!chunkNeedsMtpHistory(0, 8192, 32768, 8192));
-    try testing.expect(!chunkNeedsMtpHistory(16384, 24576, 32768, 8192));
-    try testing.expect(chunkNeedsMtpHistory(24576, 32768, 32768, 8192));
-    try testing.expect(chunkNeedsMtpHistory(20000, 24577, 32768, 8192));
-    // Zero window: every chunk captures.
-    try testing.expect(chunkNeedsMtpHistory(0, 8192, 32768, 0));
-    // Window >= prefix degenerates to full capture (no underflow).
-    try testing.expect(chunkNeedsMtpHistory(0, 512, 4096, 8192));
 }
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
@@ -15338,8 +13765,8 @@ test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, true));
 }
 
-test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
-    // SUSHI_FUSED_256_CAUSAL=0 restores composed causal, where SMALLER
+test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
+    // Composed causal (`fused256_override = false`): SMALLER
     // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and
@@ -15603,7 +14030,7 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
     const near_greedy = SamplingParams{ .temperature = 0.005 };
     try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
 
-    // Explicit greedy override (SUSHI_MTP_DRAFT_GREEDY=1) wins.
+    // An explicit greedy request wins.
     try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true, Generator.MTP_DRAFT_TEMP).temperature);
 
     // The draft temperature is the FAMILY's, passed in, never a global.
@@ -15619,48 +14046,37 @@ test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
     // argmax proposal already accepts with probability 1.
     const one_way = SamplingParams{ .temperature = 1.0, .top_k = 1 };
 
-    // Absent env: sampled targets propose from the shortlist, greedy ones do not.
-    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .per_request));
-    try testing.expect(!Generator.mtpDraftGreedyFor(warm, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(cold, .per_request));
+    // Sampled targets propose from the shortlist, greedy ones do not.
+    try testing.expect(!Generator.mtpDraftGreedyFor(sampled));
+    try testing.expect(!Generator.mtpDraftGreedyFor(warm));
+    try testing.expect(Generator.mtpDraftGreedyFor(cold));
     // Bar: a sharp target keeps the argmax, a flat one samples.
-    try testing.expect(Generator.mtpDraftGreedyFor(.{ .temperature = 0.3 }, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(near_cold, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(one_way, .per_request));
-
-    // SUSHI_MTP_DRAFT_GREEDY=1 forces greedy for every request; =0 leaves
-    // the temp-0 guard in `mtpDraftSamplingFor` to keep a greedy target greedy.
-    try testing.expect(Generator.mtpDraftGreedyFor(sampled, .greedy));
-    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .sampled));
-    try testing.expectEqual(
-        @as(f32, 0.0),
-        Generator.mtpDraftSamplingFor(cold, Generator.mtpDraftGreedyFor(cold, .sampled), 1.0).temperature,
-    );
+    try testing.expect(Generator.mtpDraftGreedyFor(.{ .temperature = 0.3 }));
+    try testing.expect(Generator.mtpDraftGreedyFor(near_cold));
+    try testing.expect(Generator.mtpDraftGreedyFor(one_way));
 }
 
 test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request drafts the same bytes either way" {
     const sampled = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
     for (0..4) |d| {
         const step: u32 = @intCast(d);
-        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, .per_request, false, step));
-        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, .per_request, true, step));
+        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, false, step));
+        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, true, step));
     }
     // A request whose chain is greedy already stays greedy at every depth.
-    try testing.expect(Generator.mtpDraftGreedyAt(.{ .temperature = 0.3 }, .per_request, true, 0));
+    try testing.expect(Generator.mtpDraftGreedyAt(.{ .temperature = 0.3 }, true, 0));
 
     // The byte-identity contract: a greedy target's draft sampler is the same
-    // value at every depth with the tail on as off, under every proposal mode,
-    // so its chain allocates no q and drafts the argmax exactly as before.
+    // value at every depth with the tail on as off, so its chain allocates no q
+    // and drafts the argmax exactly as before.
     for ([_]f32{ 0.0, 0.005 }) |t| {
         const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
-        for ([_]Generator.DraftProposal{ .greedy, .sampled, .per_request }) |mode| {
-            for (0..mtp_mod.MAX_DEPTH) |d| {
-                const step: u32 = @intCast(d);
-                const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, true, step), Generator.MTP_DRAFT_TEMP_QWEN4);
-                const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, false, step), Generator.MTP_DRAFT_TEMP_QWEN4);
-                try testing.expect(std.meta.eql(on, off));
-                try testing.expect(isGreedyTemperature(on.temperature));
-            }
+        for (0..mtp_mod.MAX_DEPTH) |d| {
+            const step: u32 = @intCast(d);
+            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), Generator.MTP_DRAFT_TEMP_QWEN4);
+            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), Generator.MTP_DRAFT_TEMP_QWEN4);
+            try testing.expect(std.meta.eql(on, off));
+            try testing.expect(isGreedyTemperature(on.temperature));
         }
     }
 }
@@ -15716,8 +14132,8 @@ test "spec sampling exactness: a greedy tail (depth 0 sampled, argmax after it, 
     // leaves depth 1 to the next round, i.e. to the target itself. Every emitted
     // pair must follow the target's joint p0(x0) p1(x1 | x0).
     const target = SamplingParams{ .temperature = 1.0 };
-    try testing.expect(!Generator.mtpDraftGreedyAt(target, .per_request, true, 0));
-    try testing.expect(Generator.mtpDraftGreedyAt(target, .per_request, true, 1));
+    try testing.expect(!Generator.mtpDraftGreedyAt(target, true, 0));
+    try testing.expect(Generator.mtpDraftGreedyAt(target, true, 1));
     const V = 4;
     const p0 = [V]f64{ 0.1, 0.2, 0.3, 0.4 };
     const p1 = [V][V]f64{
@@ -16047,38 +14463,6 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     try testing.expectEqualSlices(f32, &zeros, &again.accept);
 }
 
-test "MTP EV seed defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(null));
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(""));
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0-disabled"));
-}
-
-test "MTP early dispatch defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(null));
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(""));
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0-disabled"));
-}
-
-test "MTP cross-round pre-draft defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv(null));
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv(""));
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0-disabled"));
-    // The tail-side pre-draft bills its own trace phase; the round total
-    // stays the honest sum of all phases.
-    var t = Generator.MtpTrace{};
-    t.add(.predraft, 2_000_000);
-    t.add(.eval, 8_000_000);
-    _ = t.endRound(1, 1, false);
-    try testing.expectApproxEqAbs(@as(f64, 2.0), t.avgMs(.predraft), 1e-9);
-    try testing.expectApproxEqAbs(@as(f64, 10.0), t.totalAvgMs(), 1e-9);
-}
-
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
     // 0 = auto (--mtp-max-depth not passed).
     // .generic's auto cap is per-silicon, so the chip must be injected here
@@ -16303,7 +14687,7 @@ test "mtpEvRoundCost: piecewise marginals (flat verify region, then the GDN widt
 }
 
 test "Qwen4 mixed MTP cost prior prices the measured width-seven fallback" {
-    const costs = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_mixed_4_8_gs64, null);
+    const costs = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_mixed_4_8_gs64);
     // The 8k forced-depth echo sweep measures about 5 ms per position
     // through depth 5, then an approximately 8 ms step at depth 6.
     // Width 7 is outside the single-stream verifier's optimized envelope.
@@ -16319,63 +14703,29 @@ test "Qwen4 mixed MTP cost prior prices the measured width-seven fallback" {
     try testing.expectEqual(@as(u32, 5), plan.m_lo);
 }
 
-test "mtpEvCostsFor: G17 profiles are explicit and env tuning stays generic" {
-    const generic = Generator.mtpEvCostsForProfile(.generic, null);
+test "mtpEvCostsForProfile: G17 profiles are explicit" {
+    const generic = Generator.mtpEvCostsForProfile(.generic);
     try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, generic);
 
-    const q8 = Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32, null);
+    const q8 = Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, q8);
     try testing.expectEqual(@as(u32, 7), q8.nax_from);
 
-    const q4 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32, null);
+    const q4 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, q4);
     try testing.expectEqual(@as(u32, 7), q4.nax_from);
 
-    const q4_gs64 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64, null);
+    const q4_gs64 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, q4_gs64);
     try testing.expectEqual(@as(u32, 7), q4_gs64.nax_from);
 
-    const oq4e = Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64, null);
+    const oq4e = Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, oq4e);
     try testing.expectEqual(@as(u32, 7), oq4e.nax_from);
 
-    const qwen4 = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64, null);
+    const qwen4 = Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64);
     try testing.expectEqual(Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, qwen4);
     try testing.expect(!std.meta.eql(generic, qwen4));
-
-    // An explicit four-value override retains its historical meaning instead
-    // of inheriting an implicit hardware-only third region, for every profile.
-    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 }) |profile| {
-        const tuned = Generator.mtpEvCostsForProfile(profile, "0.10, 0.11, 0.22, 0.03");
-        try testing.expectApproxEqAbs(@as(f32, 0.10), tuned.draft, 1e-6);
-        try testing.expectApproxEqAbs(@as(f32, 0.11), tuned.per_pos_lo, 1e-6);
-        try testing.expectApproxEqAbs(@as(f32, 0.22), tuned.per_pos_hi, 1e-6);
-        try testing.expectApproxEqAbs(@as(f32, 0.03), tuned.sync, 1e-6);
-        try testing.expectEqual(@as(u32, 0), tuned.nax_from);
-        try testing.expectApproxEqAbs(@as(f32, 0.0), tuned.per_pos_nax, 1e-6);
-    }
-
-    // Invalid overrides are atomic no-ops. In particular, an empty variable
-    // must not combine cap 8 with the generic costs that previously starved it.
-    const invalid = [_][]const u8{
-        "",
-        "0.10,0.11",
-        "garbage,0.11,0.22,0.03",
-        "nan,0.11,0.22,0.03",
-        "0.10,0.11,0.22,0.03,0.04",
-        "0.10,-0.11,0.22,0.03",
-    };
-    for (invalid) |raw| {
-        try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, Generator.mtpEvCostsForProfile(.generic, raw));
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32, raw));
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32, raw));
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS64_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q4_gs64, raw));
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_oq4e_q4_gs64, raw));
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_qwen4_q4_gs64, raw));
-    }
-
-    try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, Generator.mtpEvCostsFor(false, null));
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsFor(true, null));
 }
 
 test "MTP_EV_G17_NAX_COSTS reproduces the measured M5 depth-6/depth-8 ratio" {
@@ -16458,7 +14808,7 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
     // Conditional per-index acceptance measured with the three heads (forced depth 3).
     const prose = [_]f32{ 0.59, 0.53, 0.42, 0, 0, 0, 0, 0 };
     const code = [_]f32{ 1.0, 0.91, 0.89, 0, 0, 0, 0, 0 };
-    const mimo = Generator.mtpEvCostsForProfile(.mimo_exl3, null);
+    const mimo = Generator.mtpEvCostsForProfile(.mimo_exl3);
     try testing.expectEqual(@as(u32, 1), Generator.mtpEvPlanFor(&prose, 3, mimo, 3).m_lo);
     try testing.expectEqual(@as(u32, 3), Generator.mtpEvPlanFor(&code, 3, mimo, 3).m_lo);
     try testing.expect(Generator.mtpEvPlanFor(&prose, 3, Generator.MTP_EV_DEFAULT_COSTS, 3).m_lo > 1);
@@ -17027,15 +15377,12 @@ test "mtpEmaMs: seeds on the first sample then folds nanoseconds into a ms EMA" 
     const folded = D.mtpEmaMs(45.0, 40_000_000); // 40 ms sample
     try testing.expectApproxEqAbs(45.0 + D.MTP_EV_COST_BETA * (40.0 - 45.0), folded, 1e-3);
     // Env parse: default on, "0" off, "" on.
-    try testing.expect(D.mtpLiveCostEnabledFromEnv(null));
-    try testing.expect(!D.mtpLiveCostEnabledFromEnv("0"));
-    try testing.expect(D.mtpLiveCostEnabledFromEnv(""));
+    try testing.expect(D.mtpCostTableEnabledFromEnv(null));
+    try testing.expect(!D.mtpCostTableEnabledFromEnv("0"));
+    try testing.expect(D.mtpCostTableEnabledFromEnv(""));
 }
 
 test "batched corrections: point-mass residuals sample deterministically, accept vec gathers draft probs" {
-    try testing.expect(Generator.mtpBatchCorrEnabledFromEnv(null));
-    try testing.expect(!Generator.mtpBatchCorrEnabledFromEnv("0"));
-
     const s = mlx.gpuStream();
     // V=4, m=2. Row residuals are POINT MASSES so the batched categorical
     // is deterministic end-to-end (no seed dependence):
@@ -17256,7 +15603,7 @@ test "greedy tail: each depth's verify q is the density its draft came from" {
         _ = mlx.mlx_array_free(p.q);
     };
     for (&props, 0..) |*p, d| {
-        const greedy = Generator.mtpDraftGreedyAt(target, .per_request, true, @intCast(d));
+        const greedy = Generator.mtpDraftGreedyAt(target, true, @intCast(d));
         p.* = try shortlistStepProposal(sl, Generator.mtpDraftSamplingFor(target, greedy, Generator.MTP_DRAFT_TEMP), s);
         built += 1;
         // Every depth drafts the same `[1]` id shape: the verify concatenates them.
@@ -17857,99 +16204,12 @@ fn kvRowsEqual(x: *Transformer, y: *Transformer, layer: usize, rows: usize) !boo
     return true;
 }
 
-/// Greedy PLD against serial decode, each on its own transformer over `weights`: the tokens and
-/// every committed K/V row must match, and a verify round that did not grow the cache must leave
-/// the last global layer's buffer in place.
-fn expectPldMatchesSerial(io: std.Io, config: model_mod.ModelConfig, weights: anytype, prompt: []const u32, kv: transformer_mod.KVQuantConfig, draft_len: u32, greedy: SamplingParams) !void {
-    const a = testing.allocator;
-    var tok_dummy: Tokenizer = undefined;
-    const want: usize = 32;
-
-    var serial_xfm = try pldTestTransformer(io, config, weights, kv);
-    defer serial_xfm.deinit();
-    var serial_gen = try Generator.initWithOptions(io, a, &serial_xfm, &tok_dummy, prompt, want + 16, greedy, &.{}, .{ .skip_lazy_preforward = true });
-    defer serial_gen.deinit(a);
-    var serial: [want + 8]u32 = undefined;
-    for (&serial) |*t| t.* = (try serial_gen.next(a)) orelse return error.ShortSerial;
-
-    // The lookup text holds the serial continuation with every eighth token wrong, so
-    // rounds accept whole drafts, parts of drafts and nothing.
-    const lookup = try a.alloc(u32, prompt.len + serial.len);
-    defer a.free(lookup);
-    @memcpy(lookup[0..prompt.len], prompt);
-    for (serial, 0..) |t, i| lookup[prompt.len + i] = if (i % 8 == 7) (t + 1) % @as(u32, @intCast(config.vocab_size)) else t;
-
-    var xfm = try pldTestTransformer(io, config, weights, kv);
-    defer xfm.deinit();
-    var gen = try Generator.initWithOptions(io, a, &xfm, &tok_dummy, prompt, want + 16, greedy, &.{}, .{
-        .pld_enabled = true,
-        .skip_lazy_preforward = true,
-        .lookup_prompt = lookup,
-    });
-    defer gen.deinit(a);
-    var pld_toks: [want]u32 = undefined;
-    var n: usize = 0;
-    var rounds_in_place: usize = 0;
-    while (n < want) {
-        const before = try globalKeysBuffer(&xfm);
-        const attempted = gen.pld_attempted;
-        const r = (try gen.nextPld(a, draft_len, 3)) orelse break;
-        defer a.free(r.tokens);
-        const after = try globalKeysBuffer(&xfm);
-        if (gen.pld_attempted > attempted and after.cap == before.cap) {
-            try testing.expectEqual(before.ptr, after.ptr);
-            rounds_in_place += 1;
-        }
-        for (r.tokens) |t| {
-            if (n == want) break;
-            pld_toks[n] = t;
-            n += 1;
-        }
-    }
-    try testing.expectEqual(want, n);
-    try testing.expect(rounds_in_place > 0);
-    try testing.expectEqualSlices(u32, serial[0..want], pld_toks[0..]);
-    const layer = try lastGlobalKvLayer(&xfm);
-    const rows = @min(xfm.cache.entries[layer].offset, serial_xfm.cache.entries[layer].offset);
-    try testing.expect(try kvRowsEqual(&serial_xfm, &xfm, layer, rows));
-}
-
 fn pldTestTransformer(io: std.Io, config: model_mod.ModelConfig, weights: anytype, kv: transformer_mod.KVQuantConfig) !Transformer {
     var xfm = try Transformer.init(io, testing.allocator, config, weights);
     errdefer xfm.deinit();
     try xfm.cache.reinit(config.num_hidden_layers, kv);
     xfm.cache.setSwaRing(config.sliding_window);
     return xfm;
-}
-
-test "mimo PLD rounds decode like serial ticks and write the cache in place (MIMO_V2_MODEL)" {
-    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-    defer if (config.ngram_table_path) |p| a.free(p);
-    var weights = try model_mod.loadWeightsForConfig(io, a, std.mem.span(model_dir), &config, false);
-    defer weights.deinit();
-    try transformer_mod.stackMimoFixtureExperts(&weights, config, mlx.gpuStream());
-    model_mod.resolveWeightPrefix(&config, &weights);
-    // A prompt past the sliding window.
-    var prompt: [168]u32 = undefined;
-    for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
-    const entries = [_]logit_bias.Bias{
-        .{ .id = 1, .delta = 2, .scope = .reasoning },
-        .{ .id = 2, .delta = -1, .scope = .answer },
-        .{ .id = 3, .delta = -2, .scope = .all },
-    };
-    const penalties = [_]ThinkPenalty{
-        .{},
-        .{ .biases = &entries, .phase = .inside, .closer_id = std.math.maxInt(u32) },
-        .{ .biases = &entries, .phase = .after },
-    };
-    for ([_]transformer_mod.KVQuantConfig{ transformer_mod.KVQuantConfig.dense, transformer_mod.KVQuantConfig.affine(8) }) |kv| {
-        // Five drafts, and the seven an 8-row verify serves.
-        for (penalties) |penalty| for ([_]u32{ 5, 7 }) |draft_len| try expectPldMatchesSerial(io, config, &weights, &prompt, kv, draft_len, .{ .temperature = 0, .think_penalty = penalty });
-    }
 }
 
 fn arraysBitEqual(x: mlx.mlx_array, y: mlx.mlx_array, s: mlx.mlx_stream) !bool {
@@ -18516,14 +16776,14 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     var osc = G.MtpAdaptive{};
     _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv, .long), .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv)));
 
     var ok = G.MtpAdaptive{};
     const b = G.mtpAdaptiveBucketOf(own + 1, kv, .long);
     _ = ok.round(0, b, .serial, 1);
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long), 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long)));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
@@ -18542,9 +16802,9 @@ test "adaptive serial re-enters when the request crosses into a bucket nothing h
 
     var kv: u32 = kv_switch + 1;
     while (kv < 65_536) : (kv += 61) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&a, &t, kv, 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&a, &t, kv));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&a, &t, 65_536, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&a, &t, 65_536));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
 
     // A switch that read a neighbour (own bucket unmeasured) must not re-enter on its next tick (H6).
@@ -18554,9 +16814,9 @@ test "adaptive serial re-enters when the request crosses into a bucket nothing h
     _ = n.round(0, G.mtpAdaptiveBucketOf(lo.bucketToRead(40_000), 40_000, lo.layout), .serial, 1);
     kv = 40_001;
     while (kv < 65_536) : (kv += 61) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&n, &lo, kv, 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&n, &lo, kv));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&n, &lo, 65_536, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&n, &lo, 65_536));
 }
 
 test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the price window" {
@@ -18578,12 +16838,12 @@ test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the pric
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0); // crossing: re-opens the decision
+    _ = a.serialTick(6); // crossing: re-opens the decision
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     // A tick that changes nothing must not drop the window, or it can never fill.
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0);
+    _ = a.serialTick(6);
     try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
 }
 
@@ -18700,49 +16960,16 @@ test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
-test "MtpAdaptive: crossing always re-opens; the periodic re-open is OFF by default" {
+test "MtpAdaptive: only a bucket crossing re-opens the serial decision" {
     const G = Generator;
-    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
-    try testing.expectEqual(@as(u32, 0), G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-
     var off = G.MtpAdaptive{};
     _ = off.round(0, 3, .serial, 1);
     var i: u32 = 0;
-    while (i < N * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3, 0));
+    while (i < 1024) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4, 0));
-
-    var a = G.MtpAdaptive{};
-    _ = a.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N - 1) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N)); // not twice
-
-    var top = G.MtpAdaptive{};
-    const b_top = round_cost.bucketFor(300_000);
-    try testing.expectEqual(b_top, round_cost.bucketFor(900_000));
-    _ = top.round(0, b_top, .serial, 1);
-    var fired: u32 = 0;
-    i = 0;
-    while (i < N * 3) : (i += 1) {
-        if (top.serialTick(b_top, N) == .to_mtp) {
-            fired += 1;
-            _ = top.round(i, b_top, .serial, 1);
-        }
-    }
-    try testing.expectEqual(@as(u32, 3), fired);
-
-    var d = G.MtpAdaptive{};
-    _ = d.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N / 2) : (i += 1) _ = d.serialTick(3, N);
-    _ = d.round(1, 3, .mtp, 1);
-    _ = d.round(2, 3, .serial, 1);
-    try testing.expectEqual(@as(u32, 0), d.serial_ticks);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4));
 }
 
 test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in sync" {
@@ -18758,9 +16985,9 @@ test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in 
     a.declineReentry();
     try testing.expect(a.reentry_declined);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 512)); // crossing
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4)); // crossing
     var i: u32 = 0;
-    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, 512));
+    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted" {
@@ -18808,12 +17035,11 @@ test "S21: a to_serial on a per-request head is not sticky; the release stays a 
     try testing.expect(a.sticky_serial);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
 
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 0));
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5, 0));
-    const on = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5));
     var i: u32 = 0;
-    while (i < on * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, on));
+    while (i < 1024) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
     }
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(1, 3, .mtp, 1));
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(2, 4, .serial, 1));
@@ -18833,7 +17059,7 @@ test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes
     var b = G.MtpAdaptive{};
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(0, 3, .serial, 1));
     try testing.expect(!b.sticky_serial);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
 
     try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
@@ -18988,12 +17214,10 @@ test "mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial,
     try testing.expect(!G.mtpAdaptiveHeadEligible(.qwen));
 }
 
-test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k, and the env names both" {
+test "mtpAdaptiveMinKvFor: MiMo's switch starts at 64k, qwen4's at 32k" {
     const G = Generator;
-    try testing.expectEqual(@as(u32, 65536), G.mtpAdaptiveMinKvFor(true, null));
-    try testing.expectEqual(G.MTP_ADAPTIVE_MIN_KV, G.mtpAdaptiveMinKvFor(false, null));
-    try testing.expectEqual(@as(u32, 8192), G.mtpAdaptiveMinKvFor(true, 8192));
-    try testing.expectEqual(@as(u32, 8192), G.mtpAdaptiveMinKvFor(false, 8192));
+    try testing.expectEqual(@as(u32, 65536), G.mtpAdaptiveMinKvFor(true));
+    try testing.expectEqual(G.MTP_ADAPTIVE_MIN_KV, G.mtpAdaptiveMinKvFor(false));
 }
 
 test "mtpAdaptiveModelEligible: the serial row and its price window are the module head's, not every MTP model's" {
@@ -19249,7 +17473,6 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .chain = chain,
         .tracing = false,
         .ph = undefined,
-        .livecost = false,
         .round_watch = undefined,
     };
     try expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
@@ -19391,16 +17614,16 @@ const MtpChainTestSlot = struct {
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const predraft = Generator.mtp_predraft_cache;
+    const predraft = Generator.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        Generator.mtp_predraft_cache = predraft;
+        Generator.mtp_predraft_enabled = predraft;
         depth_bounds.active = bounds_before;
         group_planner.enabled_override = planner;
     }
     // Observe the completed-round stash before any successor consumes it.
-    Generator.mtp_predraft_cache = false;
+    Generator.mtp_predraft_enabled = false;
     group_planner.enabled_override = true;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -19538,15 +17761,15 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
 test "greedy tail on real qwen4 chains: depth 0 hands the verify its density, every later depth a one-hot at its draft (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const predraft = Generator.mtp_predraft_cache;
+    const predraft = Generator.mtp_predraft_enabled;
     const bounds_before = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        Generator.mtp_predraft_cache = predraft;
+        Generator.mtp_predraft_enabled = predraft;
         depth_bounds.active = bounds_before;
         group_planner.enabled_override = planner;
     }
-    Generator.mtp_predraft_cache = false;
+    Generator.mtp_predraft_enabled = false;
     group_planner.enabled_override = false;
     const depth: u32 = 3;
     depth_bounds.active = .{ .min = depth, .max = depth };
@@ -20863,13 +19086,6 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
-
-    _ = setenv("SUSHI_PREFILL_CHUNK", "8192", 1);
-    defer _ = unsetenv("SUSHI_PREFILL_CHUNK");
-    prefill_chunk_explicit = false;
-    const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), env);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
 }
 
 /// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.
@@ -20932,18 +19148,17 @@ test "mimoStepOut: logits consume the row once; a rerank step hands it over" {
 
 test "argmax-only requests: greedy with nothing that reads past the argmax" {
     const greedy: SamplingParams = .{ .temperature = 0.0 };
-    try std.testing.expect(argmaxOnlyRequest(greedy, 0, false));
-    try std.testing.expect(argmaxOnlyRequest(.{ .temperature = 0.8, .top_k = 1 }, 0, false));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }, 0, false));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0, false));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0, false));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .think_penalty = .{ .lambda = 1 } }, 0, false));
-    try std.testing.expect(!argmaxOnlyRequest(greedy, 5, false));
-    try std.testing.expect(!argmaxOnlyRequest(greedy, 0, true));
+    try std.testing.expect(argmaxOnlyRequest(greedy, 0));
+    try std.testing.expect(argmaxOnlyRequest(.{ .temperature = 0.8, .top_k = 1 }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .think_penalty = .{ .lambda = 1 } }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(greedy, 5));
     var cf: CallForce = undefined;
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }, 0));
     var c: Constraint = undefined;
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }, 0, false));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }, 0));
 }
 
 test "a lazy penalty allocation failure fails the request instead of sampling unpenalized" {
@@ -20958,9 +19173,8 @@ test "a lazy penalty allocation failure fails the request instead of sampling un
 }
 
 pub fn installLogitBias(io: std.Io, xfm: *Transformer, tok: *const Tokenizer) !void {
-    const settings = @import("model_settings.zig");
     const setting = if (xfm.config.logit_bias_file_override) |*p| p.slice() else null;
-    const path = settings.pick(?[]const u8, settings.logit_bias_file_flag, setting, null).value orelse return;
+    const path = setting orelse return;
     const body = try std.Io.Dir.cwd().readFileAlloc(io, path, xfm.allocator, .limited(16 << 20));
     defer xfm.allocator.free(body);
     const logits_dim: usize = xfm.config.vocab_size;
@@ -20977,15 +19191,15 @@ test "logit bias CPU: rewards and penalties require the full head while zero sta
     for ([_]f32{ -2, 2 }) |delta| {
         const entries = [_]logit_bias.Bias{.{ .id = 1, .delta = delta }};
         const sampling = SamplingParams{ .temperature = 0, .think_penalty = .{ .biases = &entries } };
-        try t.expect(!argmaxOnlyRequest(sampling, 0, false));
+        try t.expect(!argmaxOnlyRequest(sampling, 0));
         var from_file = sampling;
         from_file.think_penalty.biases = &.{};
         from_file.think_penalty.file_biases = &entries;
-        try t.expect(!argmaxOnlyRequest(from_file, 0, false));
+        try t.expect(!argmaxOnlyRequest(from_file, 0));
     }
     const zero = [_]logit_bias.Bias{.{ .id = 1, .delta = 0 }};
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }, 0, false));
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }, 0, false));
+    try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }, 0));
+    try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }, 0));
 }
 
 
@@ -21007,7 +19221,10 @@ test "GLM serving DFlash2 arms only requests the native verifier can reproduce" 
     try testing.expect(glmDflashEligible(.{ .temperature = 1 }, 0));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
-    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1 } }, 0));
+    const ban = [_]logit_bias.Bias{.{ .id = 7, .delta = -100 }};
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .biases = &ban } }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1, .think_penalty = .{ .file_biases = &ban } }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1, .closer_id = 3, .phase = .inside } }, 0));
 }
 
 test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
@@ -21169,6 +19386,65 @@ test "the GLM prefill holds as many checkpoints as its schedule says, and ends o
         try testing.expectEqual(sched.peak, gen.ssm_cp_peak);
         try testing.expectEqual(@min(sched.events, cap), @as(u32, @intCast(gen.ssm_checkpoints.items.len)));
         try testing.expectEqual(sched.newest, gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].pos);
+    };
+}
+
+const GlmReleasing = struct {
+    peak: usize = 0,
+
+    fn call(raw: *anyopaque, _: usize, cps: []SSMCheckpoint) void {
+        const self: *GlmReleasing = @ptrCast(@alignCast(raw));
+        var held: usize = 0;
+        var newest: ?usize = null;
+        for (cps, 0..) |cp, i| {
+            if (cp.isReleased()) continue;
+            held += 1;
+            newest = i;
+        }
+        self.peak = @max(self.peak, held);
+        for (cps, 0..) |*cp, i| if (i != newest) cp.release();
+    }
+};
+
+test "a GLM prefill whose hook releases landed checkpoints holds at most two states and lists every restore point" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
+    glm_checkpoint_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    for ([_]usize{ 14, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
+        var kept_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer kept_xfm.deinit();
+        const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 1, .ssm_checkpoint_max = cap };
+        var kept = try Generator.initWithOptions(testing.io, a, &kept_xfm, &tok, prompt[0..len], 2, greedy, &.{}, base);
+        defer kept.deinit(a);
+
+        var xfm = try Transformer.init(testing.io, a, cfg, &weights);
+        defer xfm.deinit();
+        var releasing = GlmReleasing{};
+        var opts = base;
+        opts.write_through_hook = .{ .ctx = &releasing, .call = GlmReleasing.call };
+        var gen = try Generator.initWithOptions(testing.io, a, &xfm, &tok, prompt[0..len], 2, greedy, &.{}, opts);
+        defer gen.deinit(a);
+
+        const sched = glmCaptureSchedule(64, cap, 0, len);
+        try testing.expect(releasing.peak <= @min(sched.peak, 2));
+        if (len >= 300) try testing.expectEqual(@as(usize, 2), releasing.peak);
+        try testing.expectEqual(kept.ssm_checkpoints.items.len, gen.ssm_checkpoints.items.len);
+        var held: usize = 0;
+        for (kept.ssm_checkpoints.items, gen.ssm_checkpoints.items) |want, got| {
+            try testing.expectEqual(want.pos, got.pos);
+            held += @intFromBool(!got.isReleased());
+        }
+        try testing.expect(held <= 2);
+        try testing.expect(!gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].isReleased());
     };
 }
 

@@ -1,16 +1,16 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 # DFlash block-drafter integration test — env-gated on a local target +
-# assistant pair (Muse-Glimmer-30B + its DFlash assistant today):
+# assistant pair (GLM-5.3-Flash Sushi pack + its DFlash2 drafter today):
 #
-#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
-#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
+#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw \
+#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw/dflash2 \
 #       ./tests/test_dflash.sh
 #
 # Pins the live contract: the sidecar probe classifies the assistant as
 # DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —
 # engagement COUNTS, never output shape), greedy dflash-on equals greedy
-# dflash-off byte-for-byte over reasoning+content (always-thinking target),
+# dflash-off over reasoning+content (byte-for-byte at 8-bit or wider),
 # per-request enable_drafter:false opts out, and tool calls still parse with
 # the drafter engaged.
 
@@ -36,7 +36,8 @@ LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 # --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head
 # (Qwen3.8 packs) since 26.9.2, so this is belt and braces — it keeps the
 # MTP head out of the boot lines and pins the arm on older builds too.
-"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
+# --prefix-cache-mem: the RAM tier is opt-in (SSD-only by default), and [11] needs it.
+"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-mem 1GB --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -160,7 +161,7 @@ fi
 # argmax flips between them — the sanctioned INT4 divergence class. Measured on
 # Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
 # diverges reproducibly while each arm stays perfectly self-consistent, and the
-# divergence is unchanged with SUSHI_SLIDING_BLOCK_TRIM=0.
+# divergence is unchanged without the sliding block trim.
 #
 # So: byte-equality at 8-bit or wider; at narrower widths assert what must still
 # hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run
@@ -305,22 +306,14 @@ else
     bad "tool call parses with dflash engaged" "$(echo "$TOOLS" | head -c 400)"
 fi
 
-# [9] Weight-precision levers ENGAGED, read off the boot log — both are
-# load-time decisions, so there is no same-boot A/B for them; the numeric
+# [9] Weight precision ENGAGED, read off the boot log — it is a
+# load-time decision, so there is no same-boot A/B for it; the numeric
 # guard is the hermetic greedy-equivalence test, which runs default-on.
 WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | head -1)
 if [ -n "$WLINE" ]; then
     ok "assistant quantized at load ($WLINE)"
 else
     bad "assistant quantized at load" "$(grep '\[dflash\] loaded' "$LOG" | head -1)"
-fi
-# The draft head defaults OFF: a narrower head buys bytes the round barely
-# notices and costs acceptance (see DEFAULT_DRAFT_HEAD_BITS). The build path
-# itself is covered hermetically (draft-head geometry + build policy).
-if grep -q "draft lm_head: trunk head" "$LOG"; then
-    ok "drafts route through the trunk lm_head by default"
-else
-    bad "drafts route through the trunk lm_head by default" "$(grep -i 'draft.*lm_head' "$LOG" | head -2)"
 fi
 
 # [10] The block is capped to what this machine's verify lanes serve. The
@@ -349,12 +342,14 @@ fi
 CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
+RESTORES_COLD=$(grep -c "dflash context restored" "$LOG" || true)
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-if grep -q "dflash context restored" "$LOG" && [ "$RATE_COLD" = "$RATE_HIT" ]; then
+RESTORES_HIT=$(grep -c "dflash context restored" "$LOG" || true)
+if [ "$RESTORES_HIT" -gt "$RESTORES_COLD" ] && [ "$RATE_COLD" = "$RATE_HIT" ]; then
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
-    bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$(grep -c 'dflash context restored' "$LOG")"
+    bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$RESTORES_COLD->$RESTORES_HIT"
 fi
 
 # [12] The assistant context also survives the SSD tier (v4 spec sidecar):

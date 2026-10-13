@@ -120,7 +120,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   ([engine-prefix-cache](engine-prefix-cache.md#basics)). `swaRingCheckpointBytes` bills each of the slot's
   `SLOT_RING_CHECKPOINTS` = 6 copies beside the ring (its restore, up to four message marks, its prompt end; 158
   rows: 30 MiB bf16, 16 MiB kv8, `server.slotRingBytes`); each entry bills its own in `kv_bytes`, up to eight with
-  those it inherits from the entry it forked off (`bestRingDonor`). `slotRingBytes` also bills the global-layer
+  those it inherits from the entry it forked off (`bestRingDonor`) until its flush; with an SSD tier it then keeps the
+  newest two and `kv_bytes` drops by the rest (`RING_CHECKPOINT_RAM_KEEP`). One is 16 MiB at kv8, so the entry holds
+  at most 128 MiB for eight and 32 MiB for two. `slotRingBytes` also bills the global-layer
   decode rebuilds the other rows of a batched decode hold below the packed arms' floor (`batchedDecodeRowsBytes`).
 - **A hot entry holds a ringed layer's RETAINED ROWS, never the ring's capacity** (`KVCache.snapshotRetained`): the
   buffer is allocated at `ringCap` from token one, so a plain share billed and pinned rows no restore can read.
@@ -131,7 +133,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **Every layer PREFILLS FUSED** (`sushi_attn_pd`, qk 192 / v 128). A sliding layer's learned sink joins the online
   max and sum with no value row (template flag `SINK`; `SINK=0` compiles the global layers' code unchanged, proven
   byte-identical); `slidingPrefillFused` gates the dispatch AND `server.slidingBandScoreBytes`, so the band sheet is
-  billed only where it still composes (chunks under 16 rows, `SUSHI_FUSED_256=0`). A quantized cache is read one
+  billed only where it still composes (chunks under 16 rows). A quantized cache is read one
   DISPATCH at a time (`fusedSdpaPrefillKv`; `kr` = {begin, end, koff, kL_abs} puts every causal comparison in CACHE
   coordinates), never rebuilt whole; the sliding ring view is window + chunk rows, dequantized per view.
   Landed 2026-09-23 (668278c): 39-layer band attention 39.5 -> 20.3 ms at chunk 512, 603 -> 95.5 at 2048, 2439 -> 181
@@ -143,16 +145,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;
   each row is its serial decode tick bit for bit.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
-  `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
+  the SIMD kernel elsewhere): global attention ~3x faster per layer
   ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](mimo2-perf.md#mimo-attn-kernels)).
 - **A packed-cache global-layer DECODE reads in place** (`mimoGlobalDecodeArm`): with matrix units (M5) the matmul2d
   `sushi_qkv_mpp` (`qkvMppDecodeServes`, from `QKV_MPP_DECODE_MIN_TK` = 4096 keys); without them (M4) the QSA split-K
   body over the whole causal range (`qkvAttnSplitKKernel`, from `QKV_SPLITK_DECODE_MIN_TK` = 4096 keys; 512 keys per
-  split, 64-128 splits, split count a runtime value); else the dense rebuild. `SUSHI_KVQ_FORCE_SPLITK=1` takes
-  the split-K arm on an M5 for A/B.
+  split, 64-128 splits, split count a runtime value); else the dense rebuild. `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  takes the split-K arm on an M5 for A/B.
 - **The arm is chosen per decode STEP from the cache's current key count**, never from the request's admission-time
   `kv_attn_fused` (`auto` resolves that from the PROMPT, so a short prompt that grew long stayed on the rebuild,
-  unbilled, and at 256k drove wired memory to the limit). `--kv-attn-mode` and the per-request field no longer reach
+  unbilled, and at 256k drove wired memory to the limit). The per-request `kv_attn_mode` field no longer reaches
   these layers; `SUSHI_KV_ATTN_FUSED=0` still does, and `kvDequantScratchBytes` then bills the whole-cache rebuild
   (`mimoGlobalDecodeRebuildMaxKeys`). The older SIMD `qkvAttnDecodeKernel` cannot stage gqa 16 x qk 192.
   Attention-only microbench (9 layers, kv8) vs the per-call dequant+SDPA rebuild: split-K 0.62x at 4k, 0.50x at 16k,
@@ -206,21 +208,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
   (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
   plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
-  `SUSHI_MTP_BATCHED=0` disables this MTP crowd policy.
 - Measured against interleaved MTP streams: [perf-baselines](mimo2-perf.md#mimo-batched-decode).
 
 ## Prompt lookup decoding
 
-- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
+- **A lookup verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
   row reads the packed cache as its own decode tick would, a partial accept truncates, and no `KVCache.snapshot` is
-  taken, so greedy PLD is serial byte for byte. The prefill-shaped verify it replaced declined the fused kernel below
-  16 rows, rebuilt every global layer's whole cache dense, copied the cache on every write under the snapshot and
-  re-forwarded partial accepts.
-- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP; an MTP request copies its
-  context through prompt lookup inside the round instead ([engine-mtp](engine-mtp.md#lookup)).
-- PLD stays on by default: it pays on echo workloads (a code edit that echoes the context). The prompt n-gram gate
-  passes ordinary prompts too (score 0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what bound
-  the loss on text that does not echo.
+  taken, so a greedy lookup round is serial byte for byte. An MTP request copies its context through prompt lookup
+  inside the round ([engine-mtp](engine-mtp.md#lookup)). The standalone PLD decoder is gone with its `--pld` flags.
 
 <a id="vision"></a>
 ## Vision (MiMo-ViT)
@@ -283,8 +278,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
-  hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback
-  (`SUSHI_PREFILL_CHUNK_PER_REQUEST=0`), and the load line says so.
+  hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback,
+  and the load line says so.
 - **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
   global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
   copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill

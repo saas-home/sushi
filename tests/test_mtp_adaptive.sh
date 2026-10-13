@@ -130,12 +130,12 @@ start_server() { # $1 = log path, $2 = value for SUSHI_MTP_ADAPTIVE_SERIAL ("" =
         SUSHI_ROUND_COST_PERSIST=0 SUSHI_MTP_TRACE=1 \
         SUSHI_MTP_ADAPTIVE_SERIAL="$adapt" \
         "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
             --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
     else
         SUSHI_ROUND_COST_PERSIST=0 SUSHI_MTP_TRACE=1 \
         "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
             --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
     fi
     SERVER_PID=$!
@@ -308,34 +308,6 @@ else
     ok "kill switch: no probe ran (serial_cell=$B_CELL, informational)"
 fi
 
-# Boot R: re-entry, only when `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS` is set (default off). A
-# switch followed by a re-entry must come back cleanly or decline in the log, never `MtpPositionGap`.
-if [ -n "${SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS:-}" ] &&
-   [ "${SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS:-0}" != "0" ]; then
-    echo "== boot R: re-entry enabled (REENTRY_TOKENS=$SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS) =="
-    LOG_R=/tmp/mtp_adaptive_reentry.log
-    start_server "$LOG_R" "" || bad "re-entry boot" "server did not become ready"
-    # Teach the bucket a serial cell, then a long MTP reply with room to
-    # switch AND to re-enter at least once.
-    req "$WORK/long_serial.json" "$LOG_R" "$WORK/r_serial.slice" >/dev/null ||
-        bad "re-entry boot" "serial request failed"
-    req "$WORK/long_mtp.json" "$LOG_R" "$WORK/r_long.slice" >/dev/null ||
-        bad "re-entry boot" "long MTP request failed"
-    stop_server
-    if grep -q "MtpPositionGap" "$LOG_R"; then
-        bad "re-entry" "error.MtpPositionGap surfaced — the head resumed out of sync"
-        grep -n "MtpPositionGap" "$LOG_R" | head -3 | sed 's/^/      /'
-    else
-        ok "re-entry produced no MtpPositionGap"
-    fi
-    if grep -q "re-entry declined" "$LOG_R"; then
-        echo "      (re-entry was DECLINED — head out of sync, which is the safe arm)"
-        grep -- "re-entry declined" "$LOG_R" | head -2 | sed 's/^/      /'
-    fi
-else
-    echo "== boot R: SKIPPED (set SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS to exercise re-entry) =="
-fi
-
 # Boot C: a model that never speculates must not write a round-cost table.
 echo "== boot C: --no-mtp, persistence ON, isolated HOME =="
 LOG_C=/tmp/mtp_adaptive_nomtp.log
@@ -345,7 +317,7 @@ require_free_port
 : > "$LOG_C"
 HOME="$ISO_HOME" SUSHI_MTP_TRACE=1 SUSHI_ROUND_COST_PERSIST=1 \
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+    --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
     --prefix-cache-entries 2 --log-level info >"$LOG_C" 2>&1 &
 SERVER_PID=$!
 c_model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')

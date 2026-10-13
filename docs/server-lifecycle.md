@@ -14,7 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
   pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).
-- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling, PLD, `--kv-attn-mode`,
+- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling,
   context, timeout): a flag one mode parses and the other drops is the class. `--no-drafter`/`--drafter` reach both too.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
@@ -52,8 +52,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Daily check**: a serving process (`serve`, `--serve`, `run`) asks GitHub at most once a day on a detached thread,
   with the in-process HTTPS client and the cached ETag (`~/.sushi/update-check.json`); a failure is one debug line and
   a retry an hour later. A newer release logs `sushi X is available: run \`sushi update\`` and shows in `/props` and the
-  `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > `SUSHI_NO_UPDATE_CHECK`
-  (`diagEnvOn`) > off for a source build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
+  `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > off for a source
+  build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
 - **Update and restart** (`/v1/update`, the REPL's `/update`): the server shuts down through its SIGTERM path, then
   main's last defer REPLACES the process (`posix_spawn` with `SETEXEC | CLOEXEC_DEFAULT`, fds 0-2 kept) with
   `sushi update --relaunch -- <argv>`, which in turn replaces itself with `<install>/sushi <argv>`, new or restored.
@@ -71,7 +71,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   off|low|medium|xhigh, MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
   nonzero exit. Omission keeps the model default, one-shot and REPL alike. A model loaded on demand takes the word where it can, else keeps its own
   default ([server-http-apis](server-http-apis.md)).
-- `--fast`, MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including
+- MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including
   model-settings precedence. One-shot sampling retains its defaults: 100 output tokens, temperature 0, top-p 1, top-k 0.
 - `--stream` flushes the same reply incrementally; otherwise it buffers until success. Stdout contains only the reply,
   with reasoning in `<think>` tags; diagnostics go to stderr. HTTP/decode errors and incomplete streams exit nonzero.
@@ -110,32 +110,25 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
+- **A cold load pins its model at the claim** (`tryBeginLoadLocked` takes the requester's reference), so the entry cannot be another load's eviction victim between `markReady` and the requester waking; an unload that wins that window is a 503 (`NotLoaded`). A failed load drops the MLX error it latched (`failLoadRequest`), or the next request fails on it.
 
 <a id="settings"></a>
 ## Settings precedence
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
+  `--mtp-greedy-tail`, `--ssd-budget-gb`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
-  `model-settings.json` key; a removed `--mtp-depth` exits naming the two
-  ([engine-mtp](engine-mtp.md#depth-range)).
+  `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
 - **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
-  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains. Standalone PLD keeps `--pld`/`--no-pld`; neither implies the other.
-- **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
-  `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
-  `model_settings.fast_preset`: MTP, typical acceptance, greedy tail, kv8). Its values report source `--fast` in the
-  load lines, `/props` and the boot line `[args] fast: ...`. It asks only for what applies: an SSD-streamed load drops
-  its MTP (`[mtp] off: unsupported under streaming (--fast)`, `MtpChoice.streamed`), where an explicit `--mtp` refuses (a Sushi EXL3 Qwen pack keeps its head instead).
+  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains.
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
   settings.mtp.source`). Guard: `tests/test_cold_load_launch_flags.sh`, `tests/test_model_settings.sh`.
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
-- `[pld] on|off (source)` and `/props settings.pld` report what a slot runs (`server.pldReport`): a module-wired arch
-  (qwen4_exp) reads `off (module spec wiring)` whatever `--pld` says, since `scheduler.specInitWiring` never runs it.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
   `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
@@ -143,7 +136,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
 - **The prefix cache's tiers are launch flags only** (no `model-settings.json` key): RAM retention is off unless
-  `--prefix-cache-mem` is given (`--no-prefix-cache-ram` wins over it), and the SSD tier is on unless `--prefix-cache-disk 0`
+  `--prefix-cache-mem` is given with a size (`off` or `0` keeps it off), and the SSD tier is on unless `--prefix-cache-disk 0`
   or `--prefix-cache-entries 0`, sized per model at load ([engine-prefix-cache](engine-prefix-cache.md#defaults)).
 - A new per-model setting or launch flag follows this order, carries an `*_explicit` bit through both load sites and
   cold loads, and logs its resolved value with its source at load.
@@ -167,7 +160,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
-- `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
+- `--prefill-decode-share S` (default 0) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
   decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.
