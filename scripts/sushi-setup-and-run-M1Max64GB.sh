@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-setup-and-run-M1Max64GB.sh
 # Complete setup, source build, prebuilt deployment, and background service
-# for Sushi LLM server (Qwen3.8-Flash-Next-Sushi-3bpw)
+# for Sushi LLM server (Qwen3.8-Flash-Next-Sushi-2.6bpw)
 # Optimized for coding, software design, and architecture workloads on Apple Silicon M1 Max (64 GB)
 
 set -e  # Exit on error
@@ -84,6 +84,7 @@ MTP_DEPTH="${MTP_DEPTH:-3}"
 MTP_MIN_DEPTH="${MTP_MIN_DEPTH:-${MTP_DEPTH}}"
 MTP_MAX_DEPTH="${MTP_MAX_DEPTH:-${MTP_DEPTH}}"
 MTP_TYPICAL="${MTP_TYPICAL:-0.2}"
+MTP_GREEDY_TAIL="${MTP_GREEDY_TAIL:-true}"  # Optimizes draft acceptance beside typical MTP
 PRESERVE_THINKING="${PRESERVE_THINKING:-off}"
 
 # Production & Reliability settings
@@ -226,8 +227,12 @@ build_and_deploy_from_source() {
     fi
 
     # 4. Deploy and rewire dynamic libraries
-    mkdir -p "${BIN_DIR}"
+    mkdir -p "${BIN_DIR}/lib"
     cp -f "${REPO_DIR}/zig-out/bin/sushi" "${BIN_DIR}/sushi"
+    if [ -d "${REPO_DIR}/lib/mlx/lib" ]; then
+        cp -f "${REPO_DIR}/lib/mlx/lib/"*.dylib "${BIN_DIR}/lib/" 2>/dev/null || true
+        cp -f "${REPO_DIR}/lib/mlx/lib/mlx.metallib" "${BIN_DIR}/lib/" 2>/dev/null || true
+    fi
     if command -v install_name_tool >/dev/null 2>&1; then
         install_name_tool -change @rpath/libmlxc.dylib @executable_path/lib/libmlxc.dylib "${BIN_DIR}/sushi" 2>/dev/null || true
         install_name_tool -change /opt/homebrew/opt/webp/lib/libwebp.7.dylib @executable_path/lib/libwebp.dylib "${BIN_DIR}/sushi" 2>/dev/null || true
@@ -1116,6 +1121,9 @@ run_service() {
     if [ -n "${REASONING_EFFORT}" ]; then
         extra_args+=(--think "${REASONING_EFFORT}")
     fi
+    if [ "${MTP_GREEDY_TAIL}" = "true" ]; then
+        extra_args+=(--mtp-greedy-tail)
+    fi
 
     local prod_args=()
     if [ "${METRICS_ENABLED}" = "true" ]; then
@@ -1242,6 +1250,9 @@ start_server() {
     fi
     if [ -n "${REASONING_EFFORT}" ]; then
         extra_args+=(--think "${REASONING_EFFORT}")
+    fi
+    if [ "${MTP_GREEDY_TAIL}" = "true" ]; then
+        extra_args+=(--mtp-greedy-tail)
     fi
 
     local prod_args=()
