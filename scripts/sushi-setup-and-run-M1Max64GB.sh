@@ -13,7 +13,7 @@ set -e  # Exit on error
 # Directories
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
-MODELS_DIR="${SUSHI_DIR}/model-3.0bpw"
+MODELS_DIR="${SUSHI_DIR}/model-2.6bpw"
 LOGS_DIR="${SUSHI_DIR}/logs"
 CACHE_DIR="${SUSHI_DIR}/kv-cache"
 PID_DIR="${SUSHI_DIR}/pids"
@@ -44,7 +44,7 @@ RELEASES_API_URL="https://api.github.com/repos/beamivalice/sushi/releases/latest
 
 # Model configuration
 DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next"
-DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-3.0bpw"
+DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw"
 MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
 MODEL_REPO="${MODEL_REPO:-${DEFAULT_MODEL_REPO}}"
 MODEL_PATH="${MODEL_PATH:-}"
@@ -77,15 +77,14 @@ GPU_WARM_SECS="${GPU_WARM_SECS:-120}"
 # Cache and performance configuration (optimized for 64 GB M1 Max)
 PREFIX_CACHE_ENTRIES="${PREFIX_CACHE_ENTRIES:-12}"
 PREFIX_CACHE_MEM="${PREFIX_CACHE_MEM:-2GB}"
-PREFIX_CACHE_DISK="${PREFIX_CACHE_DISK:-20GB}"
-SSM_CHECKPOINT_STRIDE="${SSM_CHECKPOINT_STRIDE:-2048}"
+PREFIX_CACHE_DISK="${PREFIX_CACHE_DISK:-64GB}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-2048}"
+QWEN_GDN="${QWEN_GDN:-16}"  # 16 (bf16) halves GDN state in cache checkpoints (~54 MB saved each)
 MTP_DEPTH="${MTP_DEPTH:-3}"
 MTP_MIN_DEPTH="${MTP_MIN_DEPTH:-${MTP_DEPTH}}"
 MTP_MAX_DEPTH="${MTP_MAX_DEPTH:-${MTP_DEPTH}}"
 MTP_TYPICAL="${MTP_TYPICAL:-0.2}"
 PRESERVE_THINKING="${PRESERVE_THINKING:-off}"
-TOKENIZE_CACHE_ENTRIES="${TOKENIZE_CACHE_ENTRIES:-16}"
 
 # Production & Reliability settings
 TIMEOUT="${TIMEOUT:-300}"                  # Stall timeout in seconds
@@ -1161,8 +1160,7 @@ run_service() {
         --top-k "${TOP_K}" \
         --max-concurrent "${MAX_CONCURRENT}" \
         --mtp-typical "${MTP_TYPICAL}" \
-        --ssm-checkpoint-stride "${SSM_CHECKPOINT_STRIDE}" \
-        --tokenize-cache-entries "${TOKENIZE_CACHE_ENTRIES}" \
+        --qwen-gdn "${QWEN_GDN}" \
         --log-level info \
         --log-file "${LOG_FILE}"
 }
@@ -1216,7 +1214,7 @@ start_server() {
     echo "  MTP typical: ${MTP_TYPICAL}"
     echo "  GPU warm: ${GPU_WARM_SECS} s"
     echo "  Prefix cache: RAM=${PREFIX_CACHE_MEM}, SSD=${PREFIX_CACHE_DISK}, entries=${PREFIX_CACHE_ENTRIES}"
-    echo "  Tokenize cache: ${TOKENIZE_CACHE_ENTRIES} entries"
+    echo "  Qwen GDN state: ${QWEN_GDN}-bit (bf16 checkpoint memory savings)"
     echo "  Timeout: ${TIMEOUT} s"
     echo "  Prometheus Metrics: http://${HOST}:${PORT}/metrics (enabled=${METRICS_ENABLED})"
     if [ -n "${API_KEY}" ]; then
@@ -1289,8 +1287,7 @@ start_server() {
         --top-k "${TOP_K}" \
         --max-concurrent "${MAX_CONCURRENT}" \
         --mtp-typical "${MTP_TYPICAL}" \
-        --ssm-checkpoint-stride "${SSM_CHECKPOINT_STRIDE}" \
-        --tokenize-cache-entries "${TOKENIZE_CACHE_ENTRIES}" \
+        --qwen-gdn "${QWEN_GDN}" \
         --log-level info \
         --log-file "${LOG_FILE}" \
         >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
@@ -1516,7 +1513,7 @@ Configuration:
   Sampling: ${PROFILE_NAME} (temp=${TEMP}, top_p=${TOP_P}, top_k=${TOP_K}, min_p=${MIN_P}, presence_penalty=${PRESENCE_PENALTY}, repetition_penalty=${REPEAT_PENALTY})
   Reasoning effort: ${REASONING_EFFORT}
   Preserve thinking: ${PRESERVE_THINKING}
-  Performance: prefill_chunk=${PREFILL_CHUNK}, ssm_stride=${SSM_CHECKPOINT_STRIDE}, mtp_min_depth=${MTP_MIN_DEPTH}, mtp_max_depth=${MTP_MAX_DEPTH}, mtp_typical=${MTP_TYPICAL}
+  Performance: prefill_chunk=${PREFILL_CHUNK}, qwen_gdn=${QWEN_GDN}, mtp_min_depth=${MTP_MIN_DEPTH}, mtp_max_depth=${MTP_MAX_DEPTH}, mtp_typical=${MTP_TYPICAL}
   Prefix cache: RAM=${PREFIX_CACHE_MEM}, SSD=${PREFIX_CACHE_DISK}, entries=${PREFIX_CACHE_ENTRIES}
   Production: timeout=${TIMEOUT}s, metrics=${METRICS_ENABLED}, max_log=${LOG_MAX_MB}MB
   Log file: ${LOG_FILE}
