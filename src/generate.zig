@@ -1273,6 +1273,27 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// from HBM — the dominant cold-prefill cost. A too-small stride therefore
 /// silently tanks MoE prefill throughput (~25% on 35B-class models for an
 /// 850-token prompt at stride 256). Keeping typical prompts single-chunk is what
+/// Which checkpoint a capped list drops. An SSD record carries its media identity and persists
+/// whole, so a checkpoint past the first media row restores like any other and the generic
+/// span-preserving thinning decides; protecting the boundary's checkpoint instead dropped every
+/// one above it, which is exactly the state an image-bearing turn restores from next time.
+fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy) usize {
+    return transformer_mod.ssmCheckpointDropIndex(items, policy, null);
+}
+
+test "a capped list thins span-preserving whether or not the prompt carries media" {
+    // The SSD record no longer ends at the first media row, so there is no boundary to protect:
+    // a checkpoint above the media is a restore point like any other.
+    var list = [_]SSMCheckpoint{
+        .{ .pos = 512, .layers = &.{} },
+        .{ .pos = 768, .layers = &.{} },
+        .{ .pos = 1536, .layers = &.{} },
+    };
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+    list = .{ .{ .pos = 768, .layers = &.{} }, .{ .pos = 1536, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+}
+
 /// `ssm_checkpoint_stride`'s default guards.
 /// A trailing remainder smaller than this merges into the preceding chunk
 /// instead of becoming its own chunk. Chat-templated prompts routinely land a
@@ -2847,7 +2868,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            checkpointDropIndex(ssm_checkpoints.items, cp_thin),
                         );
                         dropped.deinit(allocator);
                     }
@@ -2964,7 +2985,7 @@ pub const Generator = struct {
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)
                     {
                         var dropped = ssm_checkpoints.orderedRemove(
-                            transformer_mod.ssmCheckpointDropIndex(ssm_checkpoints.items, cp_thin, null),
+                            checkpointDropIndex(ssm_checkpoints.items, cp_thin),
                         );
                         dropped.deinit(allocator);
                     }

@@ -218,10 +218,6 @@ pub const SubmitParams = struct {
     mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
-    /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
-    /// instead of dequant + dense SDPA. No effect when the cache scheme
-    /// isn't `.affine`. Default false → unchanged behavior.
-    kv_attn_fused: bool = false,
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
@@ -482,8 +478,6 @@ pub const Slot = struct {
     allow_batch_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
-    /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
-    kv_attn_fused: bool,
     cached_tokens: u32,
     logprobs_n: u32,
     serial_reason_logged: bool = false,
@@ -695,7 +689,6 @@ pub const Slot = struct {
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
-            .kv_attn_fused = params.kv_attn_fused,
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
@@ -740,7 +733,6 @@ pub const Slot = struct {
             .mrope_total = slot.mrope_total,
             .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
-            .kv_attn_fused = params.kv_attn_fused,
         };
 
         return slot;
@@ -1300,9 +1292,6 @@ pub const Scheduler = struct {
     /// inference-thread state, freed on every model switch, so the guard reads this number
     /// and never the pointer.
     resident_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Host bytes every resident model's SSD writer holds or may hold (`LoadedModel.disk_stats`
-    /// summed), outside MLX's accounting; read through `diskWriterHostBytes`.
-    disk_writer_host_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// KV + recurrent state the live slots own beyond what the hot caches bill, once per tick (`/props`).
     resident_live_kv_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
@@ -1866,7 +1855,7 @@ pub const Scheduler = struct {
                 .drop_default, .off => {},
             }
             const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, settings_budget, coldLoadVision(owned.config, true));
-            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
+            break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, billedFillPeakBytes(owned.config, plan.cache.prefill_peak_bytes), plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
         else if (model_mod.usesSushiQuantMemoryBill(owned.config) or owned.config.usesMimoSourceTrunk())
@@ -2932,6 +2921,12 @@ pub fn fp8ExpertScratchBytes(layout: expert_stream_mod.quant.Layout, geometry: e
     return @as(u64, geometry.experts) *| codes *| (2 + 1);
 }
 
+/// The expert fill peak a streamed load and its requests bill. Flash-Next's streamed prefill peaked no higher than
+/// its resident one, the union workspace and bounce already inside the budget (engine-expert-streaming.md#budget).
+pub fn billedFillPeakBytes(config: *const ModelConfig, prefill_peak_bytes: u64) u64 {
+    return if (config.longCtxGated()) 0 else prefill_peak_bytes;
+}
+
 /// Marks the config streamed: the fields every streamed forward and bill reads.
 pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_bytes: u64) void {
     config.expert_layout = plan.layout;
@@ -2940,7 +2935,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
     config.expert_bounce_bytes = plan.cache.bounce_bytes;
-    config.expert_fill_peak_bytes = plan.cache.prefill_peak_bytes;
+    config.expert_fill_peak_bytes = billedFillPeakBytes(config, plan.cache.prefill_peak_bytes);
     config.expert_vision_tower_bytes = plan.split.vision;
     config.expert_vision_encode_bytes = if (plan.vision.on) plan.vision.encode_bytes else 0;
 }
@@ -3900,6 +3895,16 @@ test "a load bills weights, then the larger of the measured warmup plus a 1 GiB 
     try testing.expectEqual(44 * gib + gib * 9 / 4, loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
 }
 
+test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs" {
+    const fill: u64 = 1_848_000_000;
+    const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
+    const mimo = ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
+    const glm = ModelConfig{ .model_type = "glm5_next", .expert_streaming = true };
+    try testing.expectEqual(@as(u64, 0), billedFillPeakBytes(&qwen, fill));
+    try testing.expectEqual(fill, billedFillPeakBytes(&mimo, fill));
+    try testing.expectEqual(fill, billedFillPeakBytes(&glm, fill));
+}
+
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
     const gib: u64 = 1 << 30;
     const cfg = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
@@ -4358,6 +4363,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw = io_u.Stopwatch.init(tio);
             var build_ns: u64 = 0;
             var eval_ns: u64 = 0;
+            var submit_ns: u64 = 0;
+            var submit_cpu_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
@@ -4369,6 +4376,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 build_ns += swb.read();
                 ops_total += mlx.op_count.load(.monotonic) - ops_before;
                 var swe = io_u.Stopwatch.init(tio);
+                const lg_vec = mlx.mlx_vector_array_new_value(lg);
+                var cpu0: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.THREAD_CPUTIME_ID, &cpu0);
+                _ = mlx.mlx_async_eval(lg_vec);
+                var cpu1: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.THREAD_CPUTIME_ID, &cpu1);
+                submit_cpu_ns += @intCast((cpu1.sec - cpu0.sec) * std.time.ns_per_s + (cpu1.nsec - cpu0.nsec));
+                _ = mlx.mlx_vector_array_free(lg_vec);
+                submit_ns += swe.read();
                 _ = mlx.mlx_array_eval(lg);
                 eval_ns += swe.read();
                 _ = mlx.mlx_array_free(lg);
@@ -4377,11 +4393,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (fold_arms) log.info("[fwd-ubench] gdn fold launches: {d}\n", .{transformer_mod.gdn_verify_fold_calls});
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU of which submit {d:.3} ms ({d:.3} ms thread CPU), {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(submit_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(submit_cpu_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
             });
             // SUSHI_DECODE_FWD_GRAPH=<abs path>: one forward's unevaluated tape, one primitive per
@@ -4810,7 +4828,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             ram_prefix_cache,
         );
         // Every tier writes off the inference thread, so a commit lands whole after the response.
-        if (entry.prefix_cache.?.disk) |*d| d.enableBackgroundWriter();
+        if (entry.prefix_cache.?.disk) |*d| {
+            d.writer_permit_bytes = @import("server.zig").disk_writer_permit_bytes;
+            d.enableBackgroundWriter();
+        }
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
@@ -6077,13 +6098,16 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // than the media position, the cache re-keys the pure-text entry to the
     // null vision key (a kept pixel key with no boundary is the
     // conservative-rejection poison shape; live 2026-09-07).
-    const media_start = slot.media_start;
+    // A cancelled prefill stopped mid-prompt, so the entry claims only the media blocks it
+    // forwarded (`truncatedMediaKey`), not the whole request's chain.
+    const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, len);
+    const media_start: ?usize = if (media.start) |v| @as(usize, v) else null;
     // Ownership of the checkpoints transfers to the cache unconditionally —
     // its error paths free them (#330 adjacent) — so detach from the slot
     // BEFORE the call or Slot.deinit frees them a second time.
     slot.cancelled_prefill = .{};
     if (slot.glm5_request) |*request| return commitGlmSlot(hc, slot, request, slot.full_prompt[0..len], cps, null, len);
-    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, slot.vision_key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
+    const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, media.key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -6328,10 +6352,9 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     _ = mlx.mlx_clear_cache();
 }
 
-/// Publish every resident model's SSD tier (budget, bytes in use, entries, writer bytes) onto its own
-/// `LoadedModel`, and the writers' total for admission. Inference thread.
+/// Publish every resident model's SSD tier (budget, bytes in use, entries) onto its own `LoadedModel`.
+/// Inference thread.
 fn publishDiskStats(sch: *Scheduler) void {
-    var writer_total: u64 = 0;
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
     var it = sch.registry.entries.valueIterator();
@@ -6340,19 +6363,11 @@ fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .writer_bytes = d.writerHostBytes() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount() };
             };
         }
         entry.disk_stats.publish(snap);
-        writer_total +|= snap.writer_bytes;
     }
-    sch.disk_writer_host_bytes.store(writer_total, .monotonic);
-}
-
-/// The one reading admission bills for the SSD writers: host bytes every resident model's writer
-/// holds or may hold, which `mlx_get_active_memory` never counts. Safe from any thread.
-pub fn diskWriterHostBytes(sch: *const Scheduler) u64 {
-    return sch.disk_writer_host_bytes.load(.monotonic);
 }
 
 /// One `[disk-cache] usage` line per finished turn, from the finishing model's own tier.
@@ -6581,25 +6596,24 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
-    if (slot.vision_key != 0) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
-    if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, cps, s);
+    // A chunk record covers a prefix, so it may claim only the media blocks inside it.
+    const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
+    if (slot.glm5_request) |*request| return hc.writeThroughGlm(&wc.entry_id, request, slot.full_prompt[0..abs_kv_pos], slot.has_tools, media, cps, s);
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
-    _ = d.appendCommitBounded(
+    hc.writeThroughHybrid(
         slot.cache.entries,
-        abs_kv_pos,
         slot.cache.config,
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
-        if (cps.len > 0) cps else null,
-        s,
+        media,
+        cps,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
-    ) catch |err| {
-        log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
-    };
+        s,
+    );
 }
 
 /// The write-through hook's per-call flush bound: one byte, so the chunk loop stops after the first chunk it writes.
@@ -6626,8 +6640,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
-    const writer_up = d.writer != null;
-    if (!writer_up or slot.vision_key != 0) return false;
+    if (d.writer == null) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
@@ -6635,6 +6648,22 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
         return false;
     }
     return true;
+}
+
+/// The checkpoints a Qwen request may list when no write-through frees them as they land: with an SSD tier
+/// behind the cache it holds at most `SSM_RESIDENT_MAX` states, which is what `server.ssmResidentCap` bills.
+/// A write-through request holds two whatever it lists (`HotPrefixCache.writeThroughHybrid`).
+fn qwenCheckpointCap(slot: *Slot, cp_max: u32, write_through: bool) u32 {
+    if (!qwenCheckpointCapped(slot, write_through)) return cp_max;
+    const cap = transformer_mod.SSM_RESIDENT_MAX - 1;
+    return if (cp_max == 0) cap else @min(cp_max, cap);
+}
+
+fn qwenCheckpointCapped(slot: *Slot, write_through: bool) bool {
+    const cfg = slot.model.config orelse return false;
+    if (write_through or !cfg.isQwen4()) return false;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    return hc.disk != null;
 }
 
 /// Does this GLM request's prefill move each KDA checkpoint to SSD and free its RAM copy? Admission bills
@@ -6830,7 +6859,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.mrope_total = slot.mrope_total;
     slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
-    slot.ctx.kv_attn_fused = slot.kv_attn_fused;
     if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run
@@ -7120,6 +7148,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // out of prefill_ns below (the decoding slots got the time).
     var interleave_ctx = InterleaveCtx{ .sch = sch, .slot = slot, .cancelled = &slot.cancelled, .chunk_sw = io_util.Stopwatch.init(sch.io) };
     var write_through_ctx = WriteThroughCtx{ .slot = slot };
+    const write_through_on = writeThroughArmed(slot, prefill_tokens.len);
+    cp_max = qwenCheckpointCap(slot, cp_max, write_through_on);
     // Per-chunk prefill width context. Stack-scoped like `interleave_ctx`.
     var width_ctx = ChunkWidthCtx{
         .sch = sch,
@@ -7221,7 +7251,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else
                 null,
-            .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
+            .write_through_hook = if (write_through_on)
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,

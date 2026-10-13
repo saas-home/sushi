@@ -30,6 +30,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     17 GB as macOS compressed the idle model.
   - Both runs: `e8c9c47e`, 2026-10-11.
   - Kept as is: under a declared `iogpu.wired_limit_mb` the wired-limit floor, not this figure, sets the request ceiling.
+- **Under a declared `iogpu.wired_limit_mb` the ceiling IS the limit less `--wired-margin-gib`** (`gpuCeilingWithWiredFloor`),
+  however much RAM is free. It was the larger of that and the free-RAM term, whose working set is the limit itself: a
+  streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
+  each request then refused.
 - **A declared `iogpu.wired_limit_mb` lifts the resident Sushi preflight's available figure to the same floor request admission reads** (`effectiveSushiAvailableBytes`: wired limit less `--wired-margin-gib`, less resident buffers, still under the working set). Free RAM alone read file cache and other apps' pages as gone and refused a 32 GB box whose declared limit admitted the load.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
@@ -63,7 +67,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   prefix cache on, the inference thread's bill adds the KDA checkpoints a prefill holds (up to 9 x 147,619,840 bytes,
   from the capture schedule the generator runs; 2 where SSD-only storage writes them through and frees their RAM
   copy, `WarmPrefix.released`), one assistant window and the RAM tier's row copy (the SSD writer's
-  1 GiB permit is the shared headroom term below, for every arch), and keeps fewer checkpoints where they do not fit, never refusing for them
+  host bytes are not billed, below), and keeps fewer checkpoints where they do not fit, never refusing for them
   ([engine-prefix-cache](glm5-prefix-cache.md#glm)).
 - `modelDiskBytes` bills the shards the INDEX names; an index that names NO shard on disk is STALE (every shard
   loads, one warning). Every size sum stats THROUGH symlinks (HF-cache models).
@@ -118,8 +122,10 @@ MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. T
 union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
 The net does not stack on a context bill: no request allocates during the warmup. The 64 GB recipe (2.6bpw, kv8, 250000,
 59,000 MB wired) runs `--qwen-gdn 16` and has 5.1 GiB of slack at load and 1.83 GiB for a cold 250k request at the 4096
-width admission picks; the f32 default leaves 4.0 and 0.77 GiB, and 0.8 GiB more drops that request to the 2048 width
-(bill arithmetic on the shipped config fixture, 2927817e against 3adb8002).
+width admission picks; the f32 default leaves 4.0 and 0.77 GiB (bill arithmetic on the shipped config fixture,
+2927817e against 3adb8002). With the SSD tier up the request holds 3 checkpoints, not 16
+([Checkpoints in the bill](#bill-checkpoints)): its 4096-width bill is 10,954 MiB at bf16 and 11,157 at f32, which
+leaves 2.7 and 2.5 GiB.
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.
@@ -130,9 +136,9 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   capped at the checkpoint's own maximum, un-margined); ask `getEffectiveContextLength`. It bills KV at the CONFIGURED
   width and activations ONCE.
 - **Flash-Next's auto-context is the largest context its request bill admits at the floor rung** (`memoryContextAtChunk`
-  inverts `prefillNeededAtChunk` over the headroom admission reads: ceiling less resident bytes, less the SSD writer's
-  1 GiB permit while the tier is on), then the 93% margin. Sizer and admission were two formulas: a 32 GB M1 Max
-  advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
+  inverts `prefillNeededAtChunk` over the headroom admission reads: ceiling less resident bytes; `billedAdvertisedContext`). Within `MEASURED_NET_MAX_TOKENS` that is the advertised
+  context, no 93% margin on top: the bill is the one reserve. Past it the 93% margin stays. Sizer and admission were
+  two formulas: a 32 GB M1 Max advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
   budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - GLM's load-time pin, the width its advertised context is billed at, is the widest rung up to 2048 that advertises
@@ -146,12 +152,13 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   newest two after it when an SSD tier holds the rest ([engine-prefix-cache](engine-prefix-cache.md#basics)). The
   eight-checkpoint term in `oneSessionEntryBytes` sizes only a RAM tier with no SSD tier (a ringed arch with one sizes
   through `ssdFirstSessionKvBytes`: the session plus `slotRingBytes`, the slot's own six). SSD-only retains none, and
-  the writer's ring files ride its ~1 GiB permit below.
-- **Admission bills the SSD writers' host bytes** (`prefillAdmissionBill` -> `admissionAvailable`): the writer holds its
-  backlog, up to its ~1 GiB permit, outside `mlx_get_active_memory`, so every resident model's `writerHostBytes` (the
-  larger of the backlog and the permit) is taken off the headroom BEFORE the width and the cache reservation are chosen,
-  an explicit `--prefill-chunk` included. The ONE reading is `scheduler.diskWriterHostBytes`, for Qwen, MiMo and GLM
-  alike; GLM's `glmPrefixStateBytes`/`glmCommitStateBytes` carry no writer term, so the permit is billed exactly once.
+  the writer's ring files ride its permit, outside the wired limit (below).
+- **Admission does not bill the SSD writers' host bytes** (`admissionAvailable` = ceiling less MLX's bytes): they are
+  pageable host memory, outside the wired limit a Metal OOM is measured against, and the ceiling's 1 GiB margin under
+  that limit is the one reserve. Billing them too took 1 GiB of context off every request for no crash it prevented.
+- **The writer's permit is a 128th of host RAM, 128 MiB to 1 GiB** (`kv_disk_writer.permitForRam`, set once at startup
+  into `server.disk_writer_permit_bytes`, which arms every writer). A prefill stages one blob per chunk and the SSD
+  drains it before the next, so a larger permit buys no speed and on a small Mac crowds macOS's share of RAM.
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next) prefills every request
@@ -172,17 +179,19 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 <a id="bill-net"></a>
 ### The request bill's net
 
-- `prefillMemoryNeeded` sums its terms and adds a net: a quarter (`uplift_16ths` 20) for every arch, a sixteenth (17)
-  for Flash-Next up to `MEASURED_NET_MAX_TOKENS` (65,536). Past it the terms were fitted at 300k+ against measured
-  steps (`the deployed pack's 8192 step...` and the 364k and 64 GB recipe tests), so the quarter stays and the README
-  tables and recipes at 128k and above do not move.
+- `prefillMemoryNeeded` sums its terms and adds a net: a quarter (`uplift_16ths` 20) for every arch, none (16) for
+  Flash-Next up to `MEASURED_NET_MAX_TOKENS` (86,016), where its summed terms alone measured at least 1.1x the live
+  peak (the bracket test's floor). Past it the terms were fitted at 300k+ against measured
+  steps (`the deployed pack's 8192 step...` and the 364k and 64 GB recipe tests), so the quarter stays; the README
+  tables and recipes at 128k and above move only by the checkpoint share below.
 - Within the range the summed terms ran 4% to 13% over the live peak, which is why a sixteenth is enough. **The SSD
-  tier's checkpoints are real memory**: 34k tokens at the 512 rung peaked 2,284 MiB with the tier on and 1,318 off,
-  the billed 897 MiB of checkpoints. Measure with the default tier; off is a dev-only reading.
+  tier's checkpoints were real memory**: 34k tokens at the 512 rung peaked 2,284 MiB with the tier on and 1,318 off,
+  the billed 897 MiB of checkpoints. A landed checkpoint now leaves RAM ([below](#bill-checkpoints)); the table's live
+  peaks are from before that. Measure with the default tier; off is a dev-only reading.
 - The forward is not at the gate's width: it starts at 2048, steps down by headroom, and its peak was flat at
   1,287 MiB from 2.8k to 16.9k tokens, while the engine priced that first chunk at 2,631 MiB.
 
-Ternary pack (`Qwen3.8-Flash-Next-Sushi-Ternary`), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
+A lean Flash-Next pack (27.4 GB resident), M1 Max 32 GB, `iogpu.wired_limit_mb=30000`, 4a1f1f1b plus the
 preflight commit with the diagnostic counters, ReleaseFast, `taskpolicy -a`, GPU lock, no baseline rerun. `--qwen-gdn 16
 --no-vision --no-mtp --prefill-chunk 512`, SSD tier on, one fresh prompt per boot, 16 new tokens; peak = `peak_bytes` less
 `active_bytes`, MiB:
@@ -201,6 +210,65 @@ Final binary, no flags but `--no-vision --no-mtp --qwen-gdn 16` (1,842 MiB avail
 tests `Flash-Next's request bill brackets the peaks measured...` and `the advertised Flash-Next context is the
 largest one the request bill admits` hold both.
 
+On 5cd9f946 (checkpoints leave RAM) the same five lengths peaked 935, 984, 1,196, 1,381 and 1,976 MiB against bills
+of 1,168, 1,300, 1,497, 1,907 and 2,503 (the sixteenth net; the terms alone are 1.18x to 1.30x): the bracket test's
+pins. On 5cd9f946 plus the unbilled writer, no net to 86,016 and no margin on top (2,866 MiB available), the same
+recipe with no `--prefill-chunk` advertises 80,896 tokens; a cold 80,638-token prompt was admitted at a bill of 2,855
+and peaked 2,189 over the weights (1.30x), the writer never waiting. A cold 74,734 peaked 2,112 against 2,722. Warm
+turns extending a cached prefix to 70k, 84k and 90k added 1,270 to 1,300 MiB over their start against bills of 2,322
+to 2,542. The bill's slack is in its transient terms (the QSA score sheet, 439 MiB at 75k, the KV dequant, the MLP
+envelope, the 512 MiB floor), and grows with the prompt: 330 MiB at 59k, 600 at 75k.
+
+<a id="bill-checkpoints"></a>
+### Checkpoints in the bill
+
+A Qwen request's GDN checkpoints are stored on the SSD tier once their file lands, so the bill counts the states the
+request holds, not the ones it captures (`server.ssmResidentCap`, `transformer.SSM_RESIDENT_MAX`):
+
+| storage | held per request | why |
+|---|---:|---|
+| SSD tier up, with or without a RAM tier (the default) | 3 | a write-through prefill holds 2 (the previous newest until its file is written, and the one just taken); a request it cannot serve is thinned to 2 and holds a third while one is captured |
+| RAM only, or the tier declined | up to `--ssm-checkpoint-max` | nowhere else to restore from |
+
+The write-through frees the older state the way GLM's does (`DiskTier.settleCheckpoints`: wait out its file, then
+`release`), so the bound is hard, not "whatever has landed". The scheduler thins a request the write-through cannot
+serve (a span under one disk chunk) to two listed checkpoints (`qwenCheckpointCap`) rather than
+under-bill it. A RAM tier's hot entry keeps the newest two of those held states, so it adds nothing to the request's.
+
+An image-bearing request arms the write-through like any other since media-aware persistence
+([engine-prefix-cache](engine-prefix-cache.md#checkpoints-on-ssd)). Qwen's bill does not move -- it was already 3 --
+but such a request now really holds two states instead of three. GLM's bill DROPS: `glmCheckpointsRelease` rides the
+same gate, so a media turn bills `glm5_prefix.checkpoint_ram_held` (2) KDA checkpoints where it billed the prefill's
+peak (up to 9), about 1.2 GiB less at and above ~18,432 tokens once the branch's 5/4 is applied. No model's advertised
+or auto context moves: context sizing bills checkpoints from an EMPTY `WarmPrefix`, where Qwen's term is the resident
+cap already and GLM's is zero.
+
+Bill at the 512 rung, kv8, 16 new tokens, no MTP, the lean Flash-Next geometry (`qwen4MeasuredTestConfig`), MiB, before
+this change (RAM only is that bill: the main before it ignored the tier) against after (one scratch test, ReleaseFast). Stride is the default chunk, so a
+prompt captures a checkpoint every 8192 tokens up to 16:
+
+| tokens | `--qwen-gdn` | RAM only | RAM + SSD, SSD only |
+|---:|---|---:|---:|
+| 8,192 | 16 / 32 | 1,234 / 1,348 | 1,234 / 1,348 |
+| 32,768 | 16 / 32 | 1,998 / 2,285 | 1,879 / 2,051 |
+| 65,536 | 16 / 32 | 3,007 / 3,523 | 2,649 / 2,821 |
+| 131,072 | 16 / 32 | 5,704 / 6,784 | 4,792 / 4,995 |
+
+The advertised auto-context of the 32 GB recipe (wired 30,000 MiB, `--no-vision --no-mtp --qwen-gdn 16`, kv8, that lean
+pack's 27,378,205,274 resident bytes) went from a raw 28,995 tokens to 31,532 (advertised after the 93% margin and the
+1,024 step: 26,624 to 28,672). With the writer unbilled and no net or margin within the measured range it advertises
+80,896 ([above](#bill-net)).
+
+Measured on the M5 Max (Sushi-2.6bpw, `--qwen-gdn 16 --no-mtp --no-vision --prefill-chunk 512`, SSD tier on, one fresh
+prompt per boot, 16 new tokens, `taskpolicy -a`, GPU lock; peak = the request's `peak_bytes` less idle `active_bytes`,
+MB; 8k reads the sampled `active_bytes`, the load peak hiding the request's; the before column is one run of the main
+before this change, not repeated): 8,227 tokens 1,629 before and 799 after, 36,152 tokens 2,259 and 1,371, 66,902
+tokens 2,770 and 1,882. That is 830 to 888 MB, 14 to 15 checkpoints, more than the 13 the bill drops at those
+lengths, so the bill's lower bracket against the live peaks holds after it (the bracket test subtracts only the billed
+share from the M1 peaks). The upper bracket moves from a quarter to 30%: the freed share was billed exactly, so the
+bill's fixed slack is a larger part of what is left. At the step-0 shape (`--prefill-chunk 256`, 11,402 tokens, 16
+checkpoints captured) the request peaked 105 MB above a run with the SSD tier off, 988 MB before.
+
 <a id="recipe-64gb"></a>
 ### The 48 GB and 64 GB recipe contexts
 
@@ -208,25 +276,29 @@ The README's 64 GB `--ctx-size` values are checked with the engine's own full-co
 (`prefillNeededAtChunk` through the per-request ladder) at a 59,000 MB ceiling: a prompt that fills the context, MTP
 on, `--mtp-head-kv-quant`, the 1 GiB hot cache pinned (not evictable). No live boot: the wired limit has only test
 seams (`wired_limit_mb_override`, `static_ceiling_override`), so the bill was computed in a scratch test at `ad5e6be8`.
+The rows below are re-derived for the checkpoint release: the bill at the same width less 13 checkpoints (912 MiB at
+bf16), the largest admitted by the same scratch (2000-token steps, 32000 new tokens) with the SSD tier on. The widths
+are not re-picked.
 
 | pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
 |---|---:|---:|---:|---:|---:|---:|
-| Sushi-2.6bpw, kv8 | 250000 | 11866 | 4096 | 12975 | 55.5 | 470000 |
-| Sushi-2.6bpw, kv4 | 450000 | 12719 | 4096 | 12975 | 56.4 | 786000 |
-| Sushi-3bpw, kv8 | 128000 | 7329 | 2048 | 7463 | 56.5 | 200000 |
-| Sushi-3bpw, kv4 | 248000 | 6987 | 1024 | 7463 | 56.2 | 322000 |
+| Sushi-2.6bpw, kv8 | 250000 | 10954 | 4096 | 12975 | 54.6 | 516000 |
+| Sushi-2.6bpw, kv4 | 450000 | 11807 | 4096 | 12975 | 55.5 | 862000 |
+| Sushi-3bpw, kv8 | 128000 | 6417 | 2048 | 7463 | 55.6 | 242000 |
+| Sushi-3bpw, kv4 | 248000 | 6075 | 1024 | 7463 | 55.3 | 398000 |
 
 The 48 GB recipe is the same check at a 43,000 MB ceiling (probe at `eab60060`, weights 37,552,413,730 bytes):
 
 | pack, KV | `--ctx-size` | bill (MiB) | width | available (MiB) | weights + bill (GiB) | largest admitted |
 |---|---:|---:|---:|---:|---:|---:|
-| Sushi-2bpw, kv8 | 131072 | 5905 | 512 | 6163 | 40.7 | 141072 |
+| Sushi-2bpw, kv8 | 131072 | 4993 | 512 | 6163 | 39.8 | 182000 |
 
 The README memory table is the billed resident weights (trunk, vision tower, MTP head and its rerank copy; GLM with its
 assistant) plus this full-context bill at the 512 rung (`--max-tokens 0`, `--ctx-size` the context); the prompt cache is
-not counted. The bill is the same for every Flash-Next pack: 5905 / 8825 / 14025 / 24425 MiB at 128k / 256k / 512k /
-1M tokens at `--qwen-gdn 16` (KV 2080 / 4160 / 8320 / 16640 of it; the probe at `eab60060`, reproduced at 4b919abb),
-and 1080 MiB more at each size at the f32 default. Its max-context column is the largest multiple of 8192 tokens whose
+not counted. The bill is the same for every Flash-Next pack: 4993 / 7913 / 13113 / 23513 MiB at 128k / 256k / 512k /
+1M tokens at `--qwen-gdn 16` (KV 2080 / 4160 / 8320 / 16640 of it), and 203 MiB more at each size at the f32 default;
+with the tier up the request holds 3 checkpoints ([above](#bill-checkpoints)). Before that it was 5905 / 8825 / 14025 /
+24425 and 1080 more (the probe at `eab60060`, reproduced at 4b919abb). Its max-context column is the largest multiple of 8192 tokens whose
 weights + 512-rung bill + 256 MiB spare fits each wired limit, capped at 1M (kv8 and kv4); the 48 and 64 GB rows run at
 `--qwen-gdn 16`, the 96 and 128 GB rows at the f32 default.
 

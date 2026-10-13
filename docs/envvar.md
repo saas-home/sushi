@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 167 vars. By kind: tradeoff levers 13, diagnostics 39, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 5.
+**Summary.** 163 vars. By kind: tradeoff levers 13, diagnostics 38, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (13)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5868` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (39)
+## Diagnostics (38)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -61,7 +61,6 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_PROFILE_ATTN` | `qwen4_forward.zig:2992` | `1` logs synced indexer/projection/QSA/tail laps per Qwen4 forward | once | yes: qwen4-qsa-long-context |
 | `SUSHI_RAW_DUMP_FILE` | `server.zig:11999, server.zig:17261` | `<abs path>` appends the full pre-parse buffer of every tools request (corpus harvest) | per tool request | yes: server-tool-calling |
 | `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` | `exl3/expert_exl3_kernels.zig` | prefill GEMM window rows (default 32) and `0` unaligns it; the window-geometry parity tests drive both | once | yes: engine-exl3-experts |
-| `SUSHI_KV_ATTN_MIN_TK` | `transformer.zig:14257` | per-layer kv-length floor for the fused quantized-attention kernel (default 2048); `tests/test_kv_quant_fused_equivalence.sh` sets 1 to force the arms | once | yes: tests/CLAUDE |
 | `SUSHI_MTP_COST_TABLE` | `generate.zig:8369` | `0` uses the prior only, no measured round costs; `tests/test_mtp_equivalence.sh` needs it for a seeded sampled byte comparison | once | yes: engine-mtp, tests/CLAUDE |
 | `SUSHI_MTP_HEAD_PERSIST` | `generate.zig:600` | default on: Qwen4 MTP head history rides the prefix cache; `0` turns it off for `tests/test_qwen4_mtp_head_persist.sh` | once | yes: tests/CLAUDE |
 | `SUSHI_PREFILL_INTERLEAVE` | `scheduler.zig:6630` | default on: a cold prefill yields to decode streams; `0` is the byte-identity reference of `tests/test_prefill_interleave.sh` | once | yes: server-lifecycle, tests/CLAUDE |
@@ -89,7 +88,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_GLM_DECODE_UBENCH`, `SUSHI_GLM_DECODE_UBENCH_CTX`, `SUSHI_GLM_KDA_PREFILL_UBENCH` | `glm5_attention.zig`, `glm5_model.zig` | GLM serial-decode MLA attention stages per context list; KDA prefill layer components | test | yes: glm5-kernels |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
-| `SUSHI_KVQ_MPP_UBENCH`, `SUSHI_KVQ_MPP_UBENCH_KV4`, `SUSHI_KVQ_SPLITK_UBENCH`, `SUSHI_KVQ_UBENCH` | `transformer.zig`, `kv_quant.zig` | quantized-KV attention meters (`_KV4` switches the 8-bit meter to 4-bit) | test | no |
+| `SUSHI_KVQ_MPP_UBENCH`, `SUSHI_KVQ_MPP_UBENCH_KV4`, `SUSHI_KVQ_SPLITK_UBENCH`, `SUSHI_KVQ_UBENCH` | `transformer.zig`, `kv_quant.zig` | quantized-KV attention meters: MiMo matmul2d and split-K decode (`_KV4` switches the 8-bit meter to 4-bit), the composed-read meter | test | no |
 | `SUSHI_MIMO_ROWS_UBENCH`, `SUSHI_MIMO_VISION_UBENCH`, `SUSHI_QWEN_VISION_UBENCH` | `transformer.zig`, `mimo_vision.zig`, `qwen_vision.zig` | MiMo verify-rows attention meter, MiMo-ViT and Qwen vision encoder meters (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `scheduler.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_SWA_FUSED_UBENCH`, `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `transformer.zig` | sliding-window fused kernel and QSA prefill/wide meters | test | no |
@@ -124,14 +123,12 @@ A path, a credential or an output location.
 | `SUSHI_IMATRIX_OUT` | `imatrix.zig:34` | `<abs>.safetensors` enables expert-imatrix capture | boot | yes: engine-expert-streaming, quality-kld |
 | `SUSHI_NGRAM_BF16_DIR` | `model.zig:1174` | serves a Flash-Next pack with the original bf16 n-gram table (KLD isolation) | load | yes: engine-expert-streaming, quality-kld, qwen4-arch |
 
-## Flag twins that are not equivalents (5)
+## Flag twins that are not equivalents (2)
 
 Kept because the launch flag cannot express what the env does.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_KV_ATTN_FUSED` | `transformer.zig:14248` | `0` disables fused quantized-KV attention. The only switch for MiMo's global-layer decode: a request's `kv_attn_mode` does not reach it | once | yes: mimo2-arch |
-| `SUSHI_KV_ATTN_KERNEL`, `SUSHI_KV_ATTN_VERIFY` | `transformer.zig` | `0` drops the decode / verify kernel and falls to the composed packed-qmm chain, which `kv_attn_mode: "dense"` (a dense rebuild) is not | once | yes: engine-kv-cache |
 | `SUSHI_MTP_ADAPTIVE` | `generate.zig:8895` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
 | `SUSHI_PREFIX_CACHE_DIR` | `kv_disk_cache.zig:4332` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
 
@@ -156,6 +153,11 @@ Cut from the code with the arm only they reached; the defaults are unchanged.
 - *Kill switches of adopted arms*: `SUSHI_FUSED_256` (the hd-256 `sushi_attn_p256` kernel; the composed path still serves declined shapes and is the tests' parity oracle) and `SUSHI_SSD_WRITE_THROUGH` (the prefill write-through to the SSD tier, always on once its gates pass).
 - *Measured, then adopted or dropped*: `SUSHI_GDN_PIPELINED` (the software-pipelined GDN prefill kernel is the NAX Qwen route, +3.8% prefill at 32K) and `SUSHI_QSA_ATTN_BALANCED` (the balanced split-K arm: no gain, not bit-identical; [qwen4-perf](qwen4-perf.md#gdn-pipelined)).
 - *Dead or leftover*: `CODEX_SANDBOX`, `HY3_MODEL_DIR`, `MINICPM5_MODEL_DIR`, `PERF_REPORT`, `REAL_BLOB`, `SUSHI_DSV4_DSPARK`, and the `--dspark` flag that only set it.
+
+## Removed 2026-10-13
+
+- *Kill switches of a dead arm*: `SUSHI_KV_ATTN_KERNEL` and `SUSHI_KV_ATTN_VERIFY` (the SIMD packed decode / verify kernels; Flash-Next's gqa 12 x dk 256 never fit their threadgroup budget, and no other served model reached them).
+- *Packed-read switches MiMo never moves at its default*: `SUSHI_KV_ATTN_FUSED` (`0` sent every MiMo global decode to the whole-cache rebuild and turned batched decode off) and `SUSHI_KV_ATTN_MIN_TK` (replaced the 4096-key floors; no test set it). The floors are constants now.
 
 ## Tooling-only variables
 

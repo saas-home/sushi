@@ -6,17 +6,37 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next decodes long prompts faster with the same output**: decode without MTP runs about 5% faster
+  from 4k to 32k tokens of context.
+- **Image conversations keep their prompt cache across a restart**: an SSD prefix-cache record now carries the images
+  it was computed under, so a text -> image -> text conversation restores past its images instead of re-reading
+  everything after the first one, and a changed image still invalidates only what follows it.
+- **Quoted control tokens in a message no longer end the turn**: `<think>`, `</think>` or `<|im_end|>` written as text
+  in a user, system or tool message (a source file Claude Code read) stays text instead of reading as a real boundary.
+
+## v1.2.3 — Faster GLM, 32-bit Qwen GDN state
+
 - **GLM-5.3-Flash is faster with the same output**: decode without DFlash2 runs about 9% faster and prompt processing
   about 5% faster, token for token identical to before.
 - **Qwen3.8-Flash-Next forgets at its true rate**: the linear-attention decay gate and recurrent state are now f32,
   which a bf16 gate rounded to "never forget" for the slowest heads. A cached checkpoint grows by 54 MB and four-stream
   throughput drops about 2%, so `--qwen-gdn 16` keeps the bf16 state (the gate stays f32) to save memory on smaller
-  Macs, and the 32 GB, 48 GB and 64 GB launch lines use it. The Qwen SSD prefix cache starts empty on the first boot after this
+  Macs, and the 32 GB, 48 GB and 64 GB launch lines use it. `--qwen-gdn` now takes `32` or `16`: drop a v1.2.2
+  `--qwen-gdn fp32`, which is the default now. The Qwen SSD prefix cache starts empty on the first boot after this
   change, since older entries hold a bf16 gate.
 - **64 GB Macs boot the recommended context again**: the load check no longer asks for 1 GB more than the requested
   context needs, which could refuse the documented 64 GB launch (`--ctx-size 250000`) in v1.2.2.
 - **GLM keeps its speed in `sushi run`**: DFlash2 now stays on for requests that carry `logit_bias` or
   `tool_choice: "none"`, which every `sushi run` turn sends, so thinking answers there decode about 40% faster.
+- **Less memory per request with the SSD prefix cache**: Qwen and GLM write each prefill checkpoint to the SSD as they
+  go and keep only the newest two in memory, where they held up to 16 and 9. A long Qwen request bills about 1.7 GiB
+  less (0.9 GiB at `--qwen-gdn 16`) and a GLM one about 1.3 GB less, so a 48 GB Mac now reaches 200k tokens on
+  Sushi-2bpw (was 160k) and a 64 GB Mac 528k on Sushi-2.6bpw (was 480k). With a RAM prefix cache beside the SSD,
+  Qwen, GLM and MiMo keep only an entry's newest two restore points in RAM. Restores from the SSD give the same output,
+  and a long GLM prompt sent again restores from its very end instead of re-reading its last 2k tokens.
+- **Small Macs get the context they advertise**: Qwen's auto context is now the largest one its request admission
+  accepts, so a prompt within the advertised context is no longer refused on a tight Mac, and the load check honors a
+  raised `iogpu.wired_limit_mb` instead of refusing a model that limit fits.
 
 ---
 
