@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-setup-and-run-M1Max64GB.sh
 # Complete setup, source build, prebuilt deployment, and background service
-# for Sushi LLM server (Qwen3.8-Flash-Next-Sushi-2.6bpw)
+# for Sushi LLM server (Qwen3.8-Flash-Next-Sushi-3.0bpw)
 # Optimized for coding, software design, and architecture workloads on Apple Silicon M1 Max (64 GB)
 
 set -e  # Exit on error
@@ -13,7 +13,7 @@ set -e  # Exit on error
 # Directories
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
-MODELS_DIR="${SUSHI_DIR}/model-2.6bpw"
+MODELS_DIR="${SUSHI_DIR}/model-3.0bpw"
 LOGS_DIR="${SUSHI_DIR}/logs"
 CACHE_DIR="${SUSHI_DIR}/kv-cache"
 PID_DIR="${SUSHI_DIR}/pids"
@@ -33,9 +33,9 @@ else
 fi
 
 # Primary script path
-PRIMARY_SCRIPT="/Users/localadmin/github-sources/sushi/scripts/sushi-setup-and-run-M1Max64GB.sh"
-if [ ! -f "${PRIMARY_SCRIPT}" ] && [ -n "${SCRIPT_DIR}" ]; then
-    PRIMARY_SCRIPT="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+PRIMARY_SCRIPT="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+if [ ! -f "${PRIMARY_SCRIPT}" ]; then
+    PRIMARY_SCRIPT="/Users/localadmin/github-sources/sushi/scripts/sushi-setup-and-run-M1Max64GB.sh"
 fi
 
 # Release URLs for prebuilt binary auto-update and installation
@@ -44,7 +44,7 @@ RELEASES_API_URL="https://api.github.com/repos/beamivalice/sushi/releases/latest
 
 # Model configuration
 DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next"
-DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw"
+DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-3.0bpw"
 MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
 MODEL_REPO="${MODEL_REPO:-${DEFAULT_MODEL_REPO}}"
 MODEL_PATH="${MODEL_PATH:-}"
@@ -153,6 +153,7 @@ install_latest_sushi() {
             cp -Rf "${temp_dir}/"* "${BIN_DIR}/"
         fi
         rm -rf "${temp_dir}"
+        xattr -dr com.apple.quarantine "${BIN_DIR}" 2>/dev/null || true
         chmod +x "${BIN_DIR}/sushi" 2>/dev/null || true
         cp -f "${BIN_DIR}/sushi" "${BIN_DIR}/sushi.release"
         SUSHI_BIN="${BIN_DIR}/sushi"
@@ -290,7 +291,7 @@ switch_to_release_binary() {
 
     SUSHI_BIN="${BIN_DIR}/sushi"
     local ver
-    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.1.1")
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
 
     cat << EOF > "${BIN_DIR}/.sushi_flavor"
 FLAVOR_TYPE=release
@@ -378,7 +379,7 @@ switch_to_main_binary() {
     local head_commit
     head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "main")
     local ver
-    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.1.1")
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
 
     cat << EOF > "${BIN_DIR}/.sushi_flavor"
 FLAVOR_TYPE=main
@@ -450,7 +451,7 @@ except Exception:
         upstream_commit=$(cd "${REPO_DIR}" && git rev-parse --short origin/main 2>/dev/null || echo "unknown")
         behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         local ahead_release_count
-        ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver:-1.1.1}..HEAD" 2>/dev/null || echo 0)
+        ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver:-1.2.3}..HEAD" 2>/dev/null || echo 0)
         
         echo "  Git Local Commit:       ${local_commit}"
         echo "  Git Upstream Commit:    ${upstream_commit} (origin/main)"
@@ -515,7 +516,7 @@ ensure_latest_sushi_binary() {
     fi
 
     local current_ver
-    current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.1.1")
+    current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
 
     # Read flavor metadata if available
     local flavor_type="unknown"
@@ -568,7 +569,7 @@ ensure_latest_sushi_binary() {
                         [yY][eE][sS]|[yY])
                             print_info "Rebuilding and deploying latest binary from source..."
                             build_and_deploy_from_source || return 1
-                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.1.1")
+                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
                             current_binary_commit="${repo_head_commit}"
                             ;;
                         *)
@@ -855,8 +856,13 @@ check_running() {
             return 0
         else
             rm -f "${PID_FILE}"
-            return 1
         fi
+    fi
+    local pgrep_pid
+    pgrep_pid=$(pgrep -f "sushi serve" 2>/dev/null | head -1 || echo "")
+    if [ -n "${pgrep_pid}" ] && kill -0 "${pgrep_pid}" 2>/dev/null; then
+        echo "${pgrep_pid}" > "${PID_FILE}"
+        return 0
     fi
     return 1
 }
@@ -964,6 +970,9 @@ install_service() {
 start_service() {
     print_info "Starting Sushi under macOS launchd supervision (auto-restart if stopped)..."
     
+    # Verify GPU memory limit (59000 MB for 64 GB Mac)
+    set_gpu_memory_limit
+
     # 1. Identify active binary and display delta / version banner in console
     ensure_latest_sushi_binary
 
@@ -1181,6 +1190,9 @@ start_server() {
 
     # Set file descriptor limit for production concurrency
     ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true
+
+    # Verify GPU memory limit (59000 MB for 64 GB Mac)
+    set_gpu_memory_limit
 
     # Rotate logs before starting if threshold reached
     rotate_logs
@@ -1416,11 +1428,16 @@ test_api() {
         auth_header=(-H "Authorization: Bearer ${API_KEY}")
     fi
     
+    # Detect the actual model ID from the server
+    local active_model
+    active_model=$(curl -s "${auth_header[@]}" "http://${connect_host}:${PORT}/v1/models" 2>/dev/null | grep -o '"id": *"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+    local model_id="${active_model:-${MODEL_NAME:-Qwen3.8-Flash-Next}}"
+    
     RESPONSE=$(curl -s -X POST "http://${connect_host}:${PORT}/v1/chat/completions" \
         "${auth_header[@]}" \
         -H "Content-Type: application/json" \
         -d "{
-            \"model\": \"${MODEL_NAME:-Qwen3.8-Flash-Next}\",
+            \"model\": \"${model_id}\",
             \"messages\": [{\"role\": \"user\", \"content\": \"Hello, what is 2+2?\"}],
             \"max_tokens\": 50,
             \"temperature\": ${TEMP},
@@ -1466,7 +1483,7 @@ Core Lifecycle Commands:
   ${GREEN}status${NC}             - Show server status and health check
 
 Binary Build & Version Switching Options:
-  ${GREEN}use-release${NC}         - Switch / Rollback to official GitHub release binary (v1.1.1)
+  ${GREEN}use-release${NC}         - Switch / Rollback to official GitHub release binary (v1.2.3)
   ${GREEN}use-main${NC}            - Switch to bleeding-edge 'main' branch build (rebuilds if needed)
   ${GREEN}build${NC}               - Fetch latest commits from upstream main, recompile ReleaseFast & deploy
   ${GREEN}check-updates${NC}       - Compare installed binary vs GitHub releases vs upstream git main
@@ -1490,7 +1507,7 @@ Examples:
   # Inspect updates & upstream delta (release vs main branch)
   $0 check-updates
 
-  # Rollback to official GitHub release binary (e.g. v1.1.1)
+  # Rollback to official GitHub release binary (e.g. v1.2.3)
   $0 use-release
 
   # Switch to latest main branch build
