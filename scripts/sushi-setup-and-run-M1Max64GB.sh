@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-setup-and-run-M1Max64GB.sh
 # Complete setup, source build, prebuilt deployment, and background service
-# for Sushi LLM server (Qwen3.8-Flash-Next-Sushi-3.0bpw)
+# for Sushi LLM server (Qwen3.8-Flash-Next)
 # Optimized for coding, software design, and architecture workloads on Apple Silicon M1 Max (64 GB)
 
 set -e  # Exit on error
@@ -10,10 +10,11 @@ set -e  # Exit on error
 # CONFIGURATION
 # ============================================================================
 
-# Directories
+# Model rate & directories (switchable between 2.6bpw and 3.0bpw)
+MODEL_BPW="${MODEL_BPW:-2.6bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
-MODELS_DIR="${SUSHI_DIR}/model-3.0bpw"
+MODELS_DIR="${SUSHI_DIR}/model-${MODEL_BPW}"
 LOGS_DIR="${SUSHI_DIR}/logs"
 CACHE_DIR="${SUSHI_DIR}/kv-cache"
 PID_DIR="${SUSHI_DIR}/pids"
@@ -44,7 +45,7 @@ RELEASES_API_URL="https://api.github.com/repos/beamivalice/sushi/releases/latest
 
 # Model configuration
 DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next"
-DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-3.0bpw"
+DEFAULT_MODEL_REPO="beamster/Qwen3.8-Flash-Next-Sushi-${MODEL_BPW}"
 MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
 MODEL_REPO="${MODEL_REPO:-${DEFAULT_MODEL_REPO}}"
 MODEL_PATH="${MODEL_PATH:-}"
@@ -65,19 +66,23 @@ PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-${REPEAT_PENALTY:-1.0}}"
 REPEAT_PENALTY="${REPETITION_PENALTY}"
 FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0.0}"
-CTX_SIZE="${CTX_SIZE:-262144}"
+# 228k tokens is the safe single-request ceiling for 64 GB Mac with Qwen resident; override with 262144 if needed
+CTX_SIZE="${CTX_SIZE:-228000}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-1}"
 WIRED_MARGIN_GIB="${WIRED_MARGIN_GIB:-2}"
 PREFILL_DECODE_SHARE="${PREFILL_DECODE_SHARE:-0.2}"
 
+# KV Cache Quantization: 4, 6, 8 (6-bit saves 24% memory vs kv8 with 4x precision of kv4)
+KV_QUANT="${KV_QUANT:-6}"
+
 GPU_WARM_SECS="${GPU_WARM_SECS:-120}"
 
 # Cache and performance configuration (optimized for 64 GB M1 Max)
-PREFIX_CACHE_ENTRIES="${PREFIX_CACHE_ENTRIES:-12}"
-PREFIX_CACHE_MEM="${PREFIX_CACHE_MEM:-2GB}"
-PREFIX_CACHE_DISK="${PREFIX_CACHE_DISK:-64GB}"
+PREFIX_CACHE_ENTRIES="${PREFIX_CACHE_ENTRIES:-8}"
+PREFIX_CACHE_MEM="${PREFIX_CACHE_MEM:-1GB}"
+PREFIX_CACHE_DISK="${PREFIX_CACHE_DISK:-128GB}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-2048}"
 QWEN_GDN="${QWEN_GDN:-16}"  # 16 (bf16) halves GDN state in cache checkpoints (~54 MB saved each)
 MTP_DEPTH="${MTP_DEPTH:-3}"
@@ -195,27 +200,33 @@ build_and_deploy_from_source() {
     fi
 
     # 1. Fetch latest upstream commits
-    print_info "Fetching latest commits from upstream (origin/main)..."
+    print_info "Fetching latest commits from upstream (origin)..."
     (cd "${REPO_DIR}" && git fetch origin 2>/dev/null || true)
 
-    # 2. Check delta and merge if needed
-    local behind_count
-    behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
-    if [ "${behind_count}" -gt 0 ]; then
-        print_info "Merging ${behind_count} new upstream commit(s) into local branch..."
-        local has_local_changes=false
-        if [ -n "$(cd "${REPO_DIR}" && git status --porcelain 2>/dev/null | grep -E '^ M|^M ')" ]; then
-            has_local_changes=true
-            print_info "Stashing local customizations..."
-            (cd "${REPO_DIR}" && git stash push -m "sushi-local-customizations")
-        fi
-        (cd "${REPO_DIR}" && git merge origin/main)
-        if [ "${has_local_changes}" = "true" ]; then
-            print_info "Restoring local customizations..."
-            (cd "${REPO_DIR}" && git stash pop 2>/dev/null || true)
+    # 2. Check branch & delta (only auto-merge origin/main when working on main)
+    local current_branch
+    current_branch=$(cd "${REPO_DIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+    if [ "${current_branch}" = "main" ]; then
+        local behind_count
+        behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+        if [ "${behind_count}" -gt 0 ]; then
+            print_info "Merging ${behind_count} new upstream commit(s) into main..."
+            local has_local_changes=false
+            if [ -n "$(cd "${REPO_DIR}" && git status --porcelain 2>/dev/null | grep -E '^ M|^M ')" ]; then
+                has_local_changes=true
+                print_info "Stashing local customizations..."
+                (cd "${REPO_DIR}" && git stash push -m "sushi-local-customizations")
+            fi
+            (cd "${REPO_DIR}" && git merge origin/main)
+            if [ "${has_local_changes}" = "true" ]; then
+                print_info "Restoring local customizations..."
+                (cd "${REPO_DIR}" && git stash pop 2>/dev/null || true)
+            fi
+        else
+            print_success "Main branch is already up to date with origin/main."
         fi
     else
-        print_success "Local repository is already up to date with origin/main."
+        print_info "Building from active feature branch: '${current_branch}' (preserving branch without merging origin/main)."
     fi
 
     # 3. Compile ReleaseFast binary
@@ -291,7 +302,7 @@ switch_to_release_binary() {
 
     SUSHI_BIN="${BIN_DIR}/sushi"
     local ver
-    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
     cat << EOF > "${BIN_DIR}/.sushi_flavor"
 FLAVOR_TYPE=release
@@ -379,7 +390,7 @@ switch_to_main_binary() {
     local head_commit
     head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "main")
     local ver
-    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
     cat << EOF > "${BIN_DIR}/.sushi_flavor"
 FLAVOR_TYPE=main
@@ -451,7 +462,7 @@ except Exception:
         upstream_commit=$(cd "${REPO_DIR}" && git rev-parse --short origin/main 2>/dev/null || echo "unknown")
         behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         local ahead_release_count
-        ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver:-1.2.3}..HEAD" 2>/dev/null || echo 0)
+        ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver:-1.2.4}..HEAD" 2>/dev/null || echo 0)
         
         echo "  Git Local Commit:       ${local_commit}"
         echo "  Git Upstream Commit:    ${upstream_commit} (origin/main)"
@@ -516,7 +527,7 @@ ensure_latest_sushi_binary() {
     fi
 
     local current_ver
-    current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
+    current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
     # Read flavor metadata if available
     local flavor_type="unknown"
@@ -569,7 +580,7 @@ ensure_latest_sushi_binary() {
                         [yY][eE][sS]|[yY])
                             print_info "Rebuilding and deploying latest binary from source..."
                             build_and_deploy_from_source || return 1
-                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.3")
+                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
                             current_binary_commit="${repo_head_commit}"
                             ;;
                         *)
@@ -1157,7 +1168,7 @@ run_service() {
         --mtp \
         --mtp-min-depth "${MTP_MIN_DEPTH}" \
         --mtp-max-depth "${MTP_MAX_DEPTH}" \
-        --kv-quant 4 \
+        --kv-quant "${KV_QUANT}" \
         --mtp-head-kv-quant \
         --skip-mem-preflight \
         --ctx-size "${CTX_SIZE}" \
@@ -1225,6 +1236,7 @@ start_server() {
     echo "  Repetition penalty: ${REPEAT_PENALTY}"
     echo "  Frequency penalty: ${FREQUENCY_PENALTY}"
     echo "  Context: ${CTX_SIZE} tokens"
+    echo "  KV Quantization: ${KV_QUANT}-bit affine"
     echo "  Max concurrent: ${MAX_CONCURRENT}"
     echo "  Wired margin: ${WIRED_MARGIN_GIB} GiB"
     echo "  Prefill decode share: ${PREFILL_DECODE_SHARE}"
@@ -1290,7 +1302,7 @@ start_server() {
         --mtp \
         --mtp-min-depth "${MTP_MIN_DEPTH}" \
         --mtp-max-depth "${MTP_MAX_DEPTH}" \
-        --kv-quant 4 \
+        --kv-quant "${KV_QUANT}" \
         --mtp-head-kv-quant \
         --skip-mem-preflight \
         --ctx-size "${CTX_SIZE}" \
@@ -1483,7 +1495,7 @@ Core Lifecycle Commands:
   ${GREEN}status${NC}             - Show server status and health check
 
 Binary Build & Version Switching Options:
-  ${GREEN}use-release${NC}         - Switch / Rollback to official GitHub release binary (v1.2.3)
+  ${GREEN}use-release${NC}         - Switch / Rollback to official GitHub release binary (v1.2.4)
   ${GREEN}use-main${NC}            - Switch to bleeding-edge 'main' branch build (rebuilds if needed)
   ${GREEN}build${NC}               - Fetch latest commits from upstream main, recompile ReleaseFast & deploy
   ${GREEN}check-updates${NC}       - Compare installed binary vs GitHub releases vs upstream git main
@@ -1507,7 +1519,7 @@ Examples:
   # Inspect updates & upstream delta (release vs main branch)
   $0 check-updates
 
-  # Rollback to official GitHub release binary (e.g. v1.2.3)
+  # Rollback to official GitHub release binary (e.g. v1.2.4)
   $0 use-release
 
   # Switch to latest main branch build
