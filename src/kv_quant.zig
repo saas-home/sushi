@@ -75,11 +75,11 @@ pub const KVQuantConfig = struct {
         }
     }
 
-    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4, kv6).
+    /// GLM's MLA latent bits for this scheme (`glm5_latent.zig`); null = no GLM backend (kv4).
     pub fn glmLatentBits(self: KVQuantConfig) ?u8 {
         return switch (self.scheme) {
             .off => 0,
-            .affine => if (self.bits == 8 and self.group_size == 64) 8 else null,
+            .affine => if ((self.bits == 8 or self.bits == 6) and self.group_size == 64) self.bits else null,
         };
     }
 
@@ -596,7 +596,7 @@ test "quantizeAffine + dequantizeAffine round-trip at 8 bits" {
     try testing.expect(max_err < 0.01);
 }
 
-test "kv6 is a first-class wire value: parsed, named and refused by GLM's latent backend" {
+test "kv6 is a first-class wire value: parsed, named and served by GLM's latent backend" {
     const t = std.testing;
     const six = KVQuantConfig.affine(6);
     try t.expectEqual(six, KVQuantConfig.fromJsonValue(.{ .string = "6" }).?);
@@ -605,7 +605,7 @@ test "kv6 is a first-class wire value: parsed, named and refused by GLM's latent
     try t.expectEqual(@as(?KVQuantConfig, null), KVQuantConfig.fromJsonValue(.{ .integer = 7 }));
     try t.expectEqualStrings("6", six.wireName());
     try t.expectEqualStrings("kv6", (KvCacheChoice{ .config = six, .source = .default }).label());
-    try t.expectEqual(@as(?u8, null), six.glmLatentBits());
+    try t.expectEqual(@as(?u8, 6), six.glmLatentBits());
     // Every wire name parses back to its own config.
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(4), six, KVQuantConfig.affine(8) }) |c| {
         try t.expectEqual(c, KVQuantConfig.fromJsonValue(.{ .string = c.wireName() }).?);
@@ -1292,10 +1292,10 @@ test "every model, GLM included, defaults to kv8 and 16 selects BF16" {
     try std.testing.expectEqual(KVQuantConfig.dense, KvCacheChoice.resolve(null, KVQuantConfig.fromJsonValue(.{ .string = "16" }).?, true).config);
 }
 
-test "GLM latent stores BF16 or kv8 and names kv4 unsupported" {
+test "GLM latent stores BF16, kv8 or kv6 and names kv4 unsupported" {
     try std.testing.expectEqual(@as(?u8, 0), KVQuantConfig.dense.glmLatentBits());
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.affine(8).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(4).glmLatentBits());
-    try std.testing.expectEqual(@as(?u8, null), KVQuantConfig.affine(6).glmLatentBits());
+    try std.testing.expectEqual(@as(?u8, 6), KVQuantConfig.affine(6).glmLatentBits());
     try std.testing.expectEqual(@as(?u8, 8), KVQuantConfig.fromJsonValue(.{ .integer = 8 }).?.glmLatentBits());
 }

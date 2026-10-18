@@ -4600,7 +4600,7 @@ fn manifestQuant(obj: std.json.ObjectMap) ?kv_quant.KVQuantConfig {
     const scheme_v = obj.get("scheme") orelse return null;
     if (scheme_v != .string) return null;
     const scheme = std.meta.stringToEnum(kv_quant.Scheme, scheme_v.string) orelse return null;
-    // A dense entry may still name a width: GLM's disk layout keys its kv8 latent rows so.
+    // A dense entry may still name a width: GLM's disk layout keys its kv8 and kv6 latent rows so.
     if (scheme == .off) return .{ .scheme = .off, .bits = jsonInt(u8, obj, "bits") orelse 0, .group_size = jsonInt(u32, obj, "group_size") orelse 0 };
     if (scheme != .affine) return null;
     const bits = jsonInt(u8, obj, "bits") orelse return null;

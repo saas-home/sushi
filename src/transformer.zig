@@ -3013,6 +3013,7 @@ pub fn qsaNaxEligible(
 var qsa_nax_probe_state: std.atomic.Value(u8) = .init(0);
 pub var qsa_nax_probe_fail_override: bool = false;
 pub var qsa_nax_probe_flip_override: bool = false;
+pub var qsa_nax_probe_flip_packed_bits: ?u8 = null;
 var qsa_nax_kernel_builds: usize = 0;
 pub var qsa_gather_used_nax: bool = false;
 pub var qsa_gather_engaged_stock: u32 = 0;
@@ -3154,9 +3155,10 @@ fn qsaGatherProbeDispatch(
     blocks: mlx.mlx_array,
     ratio: c_int,
     nax: bool,
-    kv8: ?*const [2]kv_quant.QuantizedKV,
+    packed_kv: ?*const [2]kv_quant.QuantizedKV,
+    bits: u8,
 ) ?mlx.mlx_array {
-    const kernel = (if (kv8 != null) getQsaGatherPackedKernel(nax) else if (nax) getQsaNaxKernel() else getAttnQsa256Kernel()) catch return null;
+    const kernel = (if (packed_kv != null) getQsaGatherPackedKernel(nax) else if (nax) getQsaNaxKernel() else getAttnQsa256Kernel()) catch return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
@@ -3178,8 +3180,8 @@ fn qsaGatherProbeDispatch(
     if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "RATIO", ratio) != 0) return null;
     var inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, blocks, .{}, .{}, .{}, .{} };
     var n_inputs: usize = 5;
-    if (kv8) |p| {
-        if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", 8) != 0) return null;
+    if (packed_kv) |p| {
+        if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", bits) != 0) return null;
         if (mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", 64) != 0) return null;
         inputs_arr = .{ q, p[0].q, p[1].q, scl, blocks, p[0].scales, p[0].biases, p[1].scales, p[1].biases };
         n_inputs = inputs_arr.len;
@@ -3222,9 +3224,9 @@ fn qsaNaxRunProbe() bool {
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
     const ratio: c_int = 4;
-    const stock = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, false, null) orelse return false;
+    const stock = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, false, null, 0) orelse return false;
     defer _ = mlx.mlx_array_free(stock);
-    var nax = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, true, null) orelse return false;
+    var nax = qsaGatherProbeDispatch(s, q, k, v, scale, blocks, ratio, true, null, 0) orelse return false;
     defer _ = mlx.mlx_array_free(nax);
     if (qsa_nax_probe_flip_override) {
         const flipped = qsaProbeCorruptFirst(s, nax) orelse return false;
@@ -3246,31 +3248,43 @@ fn qsaNaxRunProbe() bool {
     return qsaNaxRunPackedProbe(s, q, k, v, scale, blocks, ratio);
 }
 
-/// The packed variant is a JIT of its own: the same tile, read from an 8-bit cache.
+/// The packed variant is a JIT of its own per width: the same tile, read from an N-bit cache.
 fn qsaNaxRunPackedProbe(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, blocks: mlx.mlx_array, ratio: c_int) bool {
-    var kv8: [2]kv_quant.QuantizedKV = undefined;
-    kv8[0] = kv_quant.quantizeAffine(s, k, 64, 8) catch return false;
-    defer kv8[0].deinit();
-    kv8[1] = kv_quant.quantizeAffine(s, v, 64, 8) catch return false;
-    defer kv8[1].deinit();
-    const kd = kv_quant.dequantizeAffine(s, kv8[0].q, kv8[0].scales, kv8[0].biases, 64, 8) catch return false;
+    for ([_]u8{ 8, 6 }) |bits| {
+        if (!qsaNaxRunPackedProbeAt(s, q, k, v, scale, blocks, ratio, bits)) return false;
+    }
+    return true;
+}
+
+fn qsaNaxRunPackedProbeAt(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, blocks: mlx.mlx_array, ratio: c_int, bits: u8) bool {
+    var packed_kv: [2]kv_quant.QuantizedKV = undefined;
+    packed_kv[0] = kv_quant.quantizeAffine(s, k, 64, bits) catch return false;
+    defer packed_kv[0].deinit();
+    packed_kv[1] = kv_quant.quantizeAffine(s, v, 64, bits) catch return false;
+    defer packed_kv[1].deinit();
+    const kd = kv_quant.dequantizeAffine(s, packed_kv[0].q, packed_kv[0].scales, packed_kv[0].biases, 64, bits) catch return false;
     defer _ = mlx.mlx_array_free(kd);
-    const vd = kv_quant.dequantizeAffine(s, kv8[1].q, kv8[1].scales, kv8[1].biases, 64, 8) catch return false;
+    const vd = kv_quant.dequantizeAffine(s, packed_kv[1].q, packed_kv[1].scales, packed_kv[1].biases, 64, bits) catch return false;
     defer _ = mlx.mlx_array_free(vd);
-    const stock = qsaGatherProbeDispatch(s, q, kv8[0].q, kv8[1].q, scale, blocks, ratio, false, &kv8) orelse return false;
+    const stock = qsaGatherProbeDispatch(s, q, packed_kv[0].q, packed_kv[1].q, scale, blocks, ratio, false, &packed_kv, bits) orelse return false;
     defer _ = mlx.mlx_array_free(stock);
-    const nax = qsaGatherProbeDispatch(s, q, kv8[0].q, kv8[1].q, scale, blocks, ratio, true, &kv8) orelse return false;
+    var nax = qsaGatherProbeDispatch(s, q, packed_kv[0].q, packed_kv[1].q, scale, blocks, ratio, true, &packed_kv, bits) orelse return false;
     defer _ = mlx.mlx_array_free(nax);
+    if (qsa_nax_probe_flip_packed_bits == bits) {
+        const flipped = qsaProbeCorruptFirst(s, nax) orelse return false;
+        _ = mlx.mlx_array_free(nax);
+        nax = flipped;
+    }
     const ref = qsaGatherF32Reference(q, kd, vd, scale, blocks, ratio, s) catch return false;
     defer _ = mlx.mlx_array_free(ref);
     if (!qsaProbeAllFinite(s, nax) or !qsaProbeAllFinite(s, stock) or !qsaProbeAllFinite(s, ref)) {
-        log.info("[qsa-gather] disabled: packed probe mismatch (non-finite)\n", .{});
+        log.info("[qsa-gather] disabled: packed probe mismatch at {d} bits (non-finite)\n", .{bits});
         return false;
     }
     const max_stock = qsaProbeMaxAbsDiff(s, stock, ref) orelse return false;
     const max_nax = qsaProbeMaxAbsDiff(s, nax, ref) orelse return false;
     if (!(max_nax <= @max(1.5 * max_stock, QSA_NAX_PROBE_FLOOR))) {
-        log.info("[qsa-gather] disabled: packed probe mismatch (nax vs stock)\n", .{});
+        log.info("[qsa-gather] disabled: packed probe mismatch at {d} bits (nax vs stock)\n", .{bits});
         return false;
     }
     return true;
@@ -7019,11 +7033,16 @@ pub const KVCache = struct {
         max_seq: u32,
         use_batched: bool,
     ) !void {
-        if (use_batched and caches.len > 0) {
+        if (use_batched and caches.len > 0 and sameConfig(caches)) {
             try appendBatched(stacked_k, stacked_v, caches, layer, s, max_seq, caches[0].config);
             return;
         }
         try appendBatchedPerSlot(stacked_k, stacked_v, caches, layer, s, max_seq);
+    }
+
+    fn sameConfig(caches: []const *KVCache) bool {
+        for (caches[1..]) |c| if (!std.meta.eql(c.config, caches[0].config)) return false;
+        return true;
     }
 
     fn appendBatchedPerSlot(
@@ -12923,6 +12942,8 @@ pub const ForwardCtx = struct {
     /// and by the LTX text encoder (which wants the residual stream, not a
     /// next token).
     skip_lm_head: bool = false,
+    stream_in: ?mlx.mlx_array = null,
+    skip_ple: bool = false,
     /// Set by the Generator when this request consumes ONLY the argmax of
     /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
     /// no per-token logprobs, no grammar mask). Gates the certified lm_head
@@ -19204,6 +19225,10 @@ pub const Transformer = struct {
             moeDumpTensor(self.s, "w", moe_dump_layer, norm_scores);
         }
         if (cfg.expert_layout == .exl3_k4) {
+            if (routing_override) |given| if (given.imatrix) |tap| {
+                const xs = mlx.getShape(expert_x);
+                try tap.observeInput(self.s, expert_x, xs[0] * xs[1], xs[xs.len - 1]);
+            };
             const shared = if (routing_override) |given| given.shared_gated else null;
             const fold_shared = shared != null and mw.exl3_group_count == 0 and moeDumpDir() == null;
             const tail_shared = routing_override == null and !skip_shared and mw.shared_expert_gate_w != null and !qwen4Standin().moe_shared;
@@ -27281,6 +27306,51 @@ test "mimo_v2 EXL3 sliced real scales and outliers match the f32 oracle" {
     }
 }
 
+test "exl3 MoE taps the layer's input rows and routing for a calibration capture" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const rows: usize = 6;
+    var h = try Exl3MoeHarness.init(arena.allocator(), s, rows, 61);
+    defer h.deinit();
+    const prev_st = qwen4_forward.qwen4_standin_override;
+    defer qwen4_forward.qwen4_standin_override = prev_st;
+    qwen4_forward.qwen4_standin_override = .{};
+    const col = try imatrix_capture.Collector.init(t.allocator, s, "/dev/null", 1, Exl3MoeHarness.E, .qwen4_exp);
+    defer col.deinit();
+    col.armRows(0);
+
+    var ids_host: [rows * Exl3MoeHarness.E]i32 = undefined;
+    var w_host: [rows * Exl3MoeHarness.E]u16 = undefined;
+    for (0..rows) |r| for (0..Exl3MoeHarness.E) |k| {
+        ids_host[r * Exl3MoeHarness.E + k] = @intCast((r + k) % Exl3MoeHarness.E);
+        w_host[r * Exl3MoeHarness.E + k] = expert_exl3.f32ToF16Bits(0.25);
+    };
+    const shape3 = [_]c_int{ 1, rows, Exl3MoeHarness.E };
+    const inds = mlx.mlx_array_new_data(&ids_host, &shape3, 3, .int32);
+    defer _ = mlx.mlx_array_free(inds);
+    const globals = mlx.mlx_array_new_data(&ids_host, &[_]c_int{ rows, Exl3MoeHarness.E }, 2, .int32);
+    defer _ = mlx.mlx_array_free(globals);
+    const scores = mlx.mlx_array_new_data(&w_host, &shape3, 3, .float16);
+    defer _ = mlx.mlx_array_free(scores);
+    const y = try h.xfm.moeMLP2WithRouter(h.x, h.x, &h.mw, null, true, null, .{
+        .inds = inds,
+        .norm_scores = scores,
+        .imatrix = .{ .collector = col, .layer = 0, .global_ids = globals },
+    });
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+
+    const taken = try col.takeRows();
+    defer _ = mlx.mlx_array_free(taken.x);
+    defer t.allocator.free(taken.ids);
+    try t.expectEqualSlices(c_int, &[_]c_int{ rows, Exl3MoeHarness.dim }, mlx.getShape(taken.x));
+    try t.expectEqual(@as(usize, Exl3MoeHarness.E), taken.topk);
+    try t.expectEqualSlices(i32, &ids_host, taken.ids);
+}
+
 test "exl3 MoE answers the shared-expert standin with the routed sum" {
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -29505,6 +29575,40 @@ test "batched KV append: affine-8 N=2/4/8 matches N solo updates at production g
 
 test "batched KV append: affine-6 N=2/4/8 matches N solo updates at production geometry" {
     try batchedAppendMatchesSolo(6);
+}
+
+test "batched KV append: caches of different widths append per slot, byte-equal to solo updates" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const s = mlx.gpuStream();
+    const mixes = [_][3]u8{ .{ 6, 8, 0 }, .{ 8, 6, 0 }, .{ 8, 8, 6 }, .{ 6, 6, 4 } };
+    for (mixes) |mix| {
+        const n: usize = if (mix[2] == 0) 2 else 3;
+        var solo: [3]KVCache = undefined;
+        var batched: [3]KVCache = undefined;
+        var solo_ptrs: [3]*KVCache = undefined;
+        var batched_ptrs: [3]*KVCache = undefined;
+        for (0..n) |i| {
+            const cfg = kv_quant.KVQuantConfig.affine(mix[i]);
+            solo[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            batched[i] = try KVCache.initWithConfig(alloc, 1, cfg);
+            try kvAppendPrefill(&solo[i], 3 + i, @intCast(0xB000 + i), s);
+            try kvAppendPrefill(&batched[i], 3 + i, @intCast(0xB000 + i), s);
+            solo_ptrs[i] = &solo[i];
+            batched_ptrs[i] = &batched[i];
+        }
+        defer for (0..n) |i| {
+            solo[i].deinit();
+            batched[i].deinit();
+        };
+        const stacked_k = try kvAppendPacked(@intCast(n), 1, 0xC0FFE, s);
+        defer _ = mlx.mlx_array_free(stacked_k);
+        const stacked_v = try kvAppendPacked(@intCast(n), 1, 0x0D15EA, s);
+        defer _ = mlx.mlx_array_free(stacked_v);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, solo_ptrs[0..n], 0, s, 0, false);
+        try KVCache.appendFromStacked(stacked_k, stacked_v, batched_ptrs[0..n], 0, s, 0, true);
+        for (0..n) |i| try kvAppendOperandsEqual(&solo[i].entries[0], &batched[i].entries[0], s);
+    }
 }
 
 test "batched KV append: two restored siblings append and truncate independently; the snapshot stays byte-identical" {
@@ -40658,6 +40762,29 @@ test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
     try std.testing.expect(qsaNaxProbeFailed());
     try std.testing.expect(!qsa_gather_used_nax);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(stock, fallback, s));
+}
+
+test "gatherQsa256 NAX: a packed probe mismatch at 8 or at 6 bits latches the stock gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!qsaNaxOsOk()) return error.SkipZigTest;
+    const saved_nax = qsa_nax_override;
+    const saved_fail = qsa_nax_probe_fail_override;
+    const saved_flip = qsa_nax_probe_flip_packed_bits;
+    defer {
+        qsa_nax_override = saved_nax;
+        qsa_nax_probe_fail_override = saved_fail;
+        qsa_nax_probe_flip_packed_bits = saved_flip;
+        qsaNaxProbeReset();
+    }
+    qsa_nax_probe_fail_override = false;
+    qsa_nax_override = true;
+    for ([_]?u8{ 8, 6, null }) |flipped| {
+        qsa_nax_probe_flip_packed_bits = flipped;
+        qsaNaxProbeReset();
+        qsaNaxArm();
+        try std.testing.expectEqual(flipped != null, qsaNaxProbeFailed());
+    }
 }
 
 test "gatherQsa256 NAX: probe passes on this machine" {
@@ -56282,29 +56409,33 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
     defer xfm.deinit();
     var reference = try glm5_mod.Model.load(a, cfg, &weights, xfm.s);
     defer reference.deinit();
-    var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
-    defer request.deinit();
-    request.dense_prefill = true;
-    request.prefill_async = true;
-    try request.setLatentBits(8);
-    try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(8));
-    for ([_]usize{ 3, 1 }) |n| {
-        const ids = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2 }, &[_]c_int{ 1, @intCast(n) }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(ids);
-        const actual = try xfm.forward(ids);
-        defer _ = mlx.mlx_array_free(actual);
-        const expected = try reference.forwardLast(&request, ids, true);
-        defer _ = mlx.mlx_array_free(expected);
-        var equal = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(equal);
-        try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
-        var same = false;
-        try mlx.check(mlx.mlx_array_item_bool(&same, equal));
-        try testing.expect(same);
+    for ([_]u8{ 8, 6 }) |bits| {
+        var request = try glm5_mod.Request.init(a, cfg.num_hidden_layers);
+        defer request.deinit();
+        request.dense_prefill = true;
+        request.prefill_async = true;
+        try request.setLatentBits(bits);
+        try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(bits));
+        try xfm.resetCache();
+        for ([_]usize{ 3, 1 }) |n| {
+            const ids = mlx.mlx_array_new_data(&[_]u32{ 0, 1, 2 }, &[_]c_int{ 1, @intCast(n) }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+            const actual = try xfm.forward(ids);
+            defer _ = mlx.mlx_array_free(actual);
+            const expected = try reference.forwardLast(&request, ids, true);
+            defer _ = mlx.mlx_array_free(expected);
+            var equal = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(equal);
+            try mlx.check(mlx.mlx_array_equal(&equal, actual, expected, true, xfm.s));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, equal));
+            try testing.expect(same);
+        }
+        const stored = &xfm.glm5_request.?;
+        try testing.expectEqual(bits, stored.latent_bits);
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(stored.layers[3].attention.latent));
     }
     const served = &xfm.glm5_request.?;
-    try testing.expectEqual(@as(u8, 8), served.latent_bits);
-    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(served.layers[3].attention.latent));
     const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
     defer _ = mlx.mlx_array_free(ids);
     try xfm.cache.reinit(cfg.num_hidden_layers, KVQuantConfig.affine(4));
@@ -56384,7 +56515,7 @@ test "GLM serving streams EXL3 experts through eviction and the union, bit-ident
     const engine = streamed.expert_stream orelse return error.MissingExpertStream;
     try engine.warmCache();
     var union_seen = false;
-    for ([_]KVQuantConfig{ .dense, KVQuantConfig.affine(8) }) |kv| {
+    for ([_]KVQuantConfig{ .dense, KVQuantConfig.affine(8), KVQuantConfig.affine(6) }) |kv| {
         for ([_]*Transformer{ &resident, &streamed }) |xfm| {
             try xfm.cache.reinit(cfg.num_hidden_layers, kv);
             try xfm.resetCache();
@@ -56403,7 +56534,7 @@ test "GLM serving streams EXL3 experts through eviction and the union, bit-ident
             union_seen = union_seen or engine.breakdown().union_members > 0;
         }
         try testing.expect(logits_moved);
-        try testing.expectEqual(@as(u8, if (kv.isQuant()) 8 else 0), streamed.glm5_request.?.latent_bits);
+        try testing.expectEqual(@as(u8, if (kv.isQuant()) kv.bits else 0), streamed.glm5_request.?.latent_bits);
     }
     try testing.expect(union_seen);
     try testing.expect(engine.fill_experts_total > 4);

@@ -14868,6 +14868,18 @@ test "mtpEvPlanFor: MiMo's surface drafts one on prose and three on code, where 
     try testing.expect(Generator.mtpEvPlanFor(&prose, 3, Generator.MTP_EV_DEFAULT_COSTS, 3).m_lo > 1);
 }
 
+test "the MiMo EXL3 round-cost surface serves every KV width, kv6 included, and other layouts stay generic" {
+    var xfm: Transformer = undefined;
+    const head = MtpHeadRef{ .mimo = undefined };
+    const kv = transformer_mod.KVQuantConfig;
+    xfm.config = .{ .expert_layout = .exl3_k4 };
+    for ([_]kv{ kv.dense, kv.affine(4), kv.affine(6), kv.affine(8) }) |width| {
+        try testing.expectEqual(mtp_mod.MtpCostProfile.mimo_exl3, head.costProfile(&xfm, width));
+    }
+    xfm.config = .{ .expert_layout = .quantized_split };
+    try testing.expectEqual(mtp_mod.MtpCostProfile.generic, head.costProfile(&xfm, kv.affine(6)));
+}
+
 test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     const p = Generator.MTP_EV_PRIOR;
     const a = [_]f32{ 0.97, 0.89, p, p, p, p, p, p };
