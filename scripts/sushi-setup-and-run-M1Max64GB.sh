@@ -11,7 +11,7 @@ set -e  # Exit on error
 # ============================================================================
 
 # Model rate & directories (switchable between 2.6bpw and 3.0bpw)
-MODEL_BPW="${MODEL_BPW:-2.6bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
+MODEL_BPW="${MODEL_BPW:-3.0bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
 MODELS_DIR="${SUSHI_DIR}/model-${MODEL_BPW}"
@@ -69,7 +69,7 @@ FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0.0}"
 # 228k tokens is the safe single-request ceiling for 64 GB Mac with Qwen resident; override with 262144 if needed
 CTX_SIZE="${CTX_SIZE:-228000}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
-REASONING_EFFORT="${REASONING_EFFORT:-medium}"
+REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-2}"
 WIRED_MARGIN_GIB="${WIRED_MARGIN_GIB:-2}"
 PREFILL_DECODE_SHARE="${PREFILL_DECODE_SHARE:-0.2}"
