@@ -43,6 +43,19 @@ meaning:
 | `moeGroups` | the routed SwiGLU over a layer stored as rate groups: one `moe` pass per group, summed in f32 | 4ca5ece4 |
 | `moeWithShared` | `moe` plus an already gated shared expert; at one row the add folds into the decode reduction, rounded as the separate add | 698c4ae8 |
 
+STQ support is additive too: `Spec` gains `rates` and `table`, `format.Decode` gains `table` (null for MCG and MUL1, so
+existing struct literals keep working), `format.Codebook` gains `std1`, `spec1` and `pair1`, and these names are new:
+
+| name | what it does |
+|---|---|
+| `codebook_tables` | the named STQ tables, their digests and rate ranges |
+| `Ragged`, `moeRagged` | a rate-grouped layer as one ragged bank and its routed SwiGLU dispatch, one decode dispatch per stage |
+
+`parseExpertQuant` now admits `format: stq`, so a host must either refuse an STQ `Spec` or pass `Spec.table` in
+`Decode.table` to every `moe` call and check each bank with `trellisAdmitted` against `Spec.rates` as well (`Rate.in`).
+A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3CodebookTableUnknown`) at the dispatch, never
+decoded. A host that only ever sees MCG and MUL1 packs needs no change.
+
 The module's tests run as their own artifact (`exl3-test`) on `zig build test`; a change that
 passes them and keeps the names above is safe to hand over.
 
@@ -73,7 +86,7 @@ mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does
 
 ## Recommended pin
 
-sushi v1.2.4 (0bc61aa6), proposed in ddalcu/mlx-serve#864; mlx-serve main pins v1.2.3 (2c602b9e) until it merges.
+sushi v1.3.0 (8e4c0af1), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
 mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
@@ -83,6 +96,8 @@ mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#76
   `moeClamped` is unchanged, so the bump needs no mlx-serve source change.
 - v1.2.4 adds `moeWithGatedShared`, which folds a gated shared expert into the routed finish reduce on a decode
   row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
+- v1.3.0 adds `moeRagged` over a `Ragged` bank, the STQ format's experts split into rate groups with their own
+  bit rates, and `shardStampAgrees` for the named codebook table; additive, mlx-serve calls none of them yet.
 
 ## Handing a new engine to mlx-serve
 

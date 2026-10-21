@@ -232,6 +232,34 @@ likely because the served 512-expert bank streams from DRAM, where the cache-res
 
 llmprobe (`--mtp`, six boots) did not resolve the change on battery: prefill, whose kernels are unchanged, drifted 26%.
 
+<a id="exl3-rate-groups"></a>
+## EXL3 rate-grouped layers: one dispatch over the layer's rate classes
+
+`SUSHI_EXL3_RG_UBENCH=1` (exl3 test binary): one Flash-Next MoE layer per step (2560 -> 640, E=512, top-10, bf16
+rows, the gated shared expert folded at one row and separate at four), 48 dependent steps, arms interleaved in one
+process, median of 9, ratio to uniform n32 as served. Groups split the 512 experts evenly; each slot draws its group
+from the layout's mix. M5 Max 128 GB, AC power, fans at max, `taskpolicy -a`, GPU lock, quiet window, ReleaseFast,
+measured on the tree this was ported from.
+
+| layout | SPEC1 w15, 1 row | PAIR1, 1 row | SPEC1, 4 rows | PAIR1, 4 rows |
+|---|---|---|---|---|
+| uniform n32, us per step | 55.3 | 54.5 | 154.4 | 166.1 |
+| 2 groups {n24, n48}, 5:5 | 1.047 | 1.041 | 1.033 | 1.018 |
+| 3 pair classes (24,24)x3 (24,48)x2 (48,48)x5 | 1.056 | 1.048 | 1.040 | 1.026 |
+| 20 groups, per-expert mix (an n56-64 slot per row) | 1.114 | 1.078 | 1.174 | 1.088 |
+| the same, that slot at n24-26 | 1.095 | 1.067 | 1.129 | 1.052 |
+| 20 groups (12 classes), every slot in the n32 group | 0.972 | 0.972 | 0.965 | 0.995 |
+| 21 groups n24..n64, every slot in the n32 group | 0.975 | 0.977 | 0.968 | 1.003 |
+| 20 groups all n32, every slot in group 4 (no switch) | 0.959 | 0.949 | 0.952 | 0.972 |
+
+- The masked `moeGroups` this replaces read 1.91-1.94 at 2 groups, 2.47-2.80 at 3 and 16.5-18.7 at 20 in the same run.
+- The switch costs 1.3-3.1% at 12-21 classes, measured against the switch-free twin; that twin routes into 25 experts and
+  is cache-warm, hence under 1.0. The rest of the per-expert cost is the rate mix.
+- A switch inside the pair kernel's projection loop read 1.26-1.29 for the per-expert mix; the class switch is the fix.
+- One pass per group (each pass skipping other groups' slots, then a G-plane reduce) read 1.36 / 1.55 / 9.0 at 2 / 3 /
+  20 groups, one row. Its early exit saved nothing (passes over every slot cost the same): a dispatch costs a fixed
+  ~10 us in this chain. Host-compacted slot lists still read 1.10 / 1.35 / 4.4.
+
 ## v1.2.0-dev release context ladder
 
 [Version summary and full table](bench/v1.2.0-dev/summary.md), commit `73a9659c38f4818f399bdd2cc32309e348a3077c`, ReleaseFast on Apple M5 Max 128 GB, 2026-10-05. llmprobe 0.6.15, `--bench-only --rungs 2k,4k,8k,16k,32k,64k,128k`, GLM 3 runs and subsequent Qwen/MiMo 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, server stop followed by 60 s idle. Prior release reference inherited without rerun or speedup claim; per-model reports retain scenario samples and probe notes.
@@ -260,6 +288,15 @@ before each server. One binary built from `bb9adb6a`.
 - Qwen 2.6bpw and 4bpw come from the first pass.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
+
+## v1.3.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.3.0/summary.md), 2026-10-21, Apple M5 Max 128 GB. llmprobe 0.6.15,
+`--bench-only`, AC power, `iogpu.wired_limit_mb=120000`, `taskpolicy -a`, per-model GPU lock, 3 minutes idle before each server.
+- MiMo 2K–128K, 2 runs, release candidate `dc93b43f` (SHA `607c6eb0`). It started hot after the full suite and prefilled
+  18–24% under 1.2.4; a 2K rerun after fans-max idle read 1,239–1,248 tok/s per request (1.2.4: 1,285–1,353).
+- Qwen 2.6bpw and 4bpw are the MTP arms of the DFlash2 ladders (4K/16K/64K/128K, 3 runs, `--prefix-cache-entries 0`),
+  branch builds `f9393ba6` and `e2912d04`. GLM was not rerun.
 
 ## v1.2.4 release context ladder
 

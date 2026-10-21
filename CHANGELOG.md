@@ -4,15 +4,13 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.3.0 — Qwen EXL3 Quantizer, Adaptive DFlash2, KV6, Dashboard
 
-- **MTP stays on with `presence_penalty` and `repeat_penalty`**: a penalised request used to fall back to ordinary decoding and now runs MTP like any other, with the penalty applied to every verified token. A request that runs without MTP says why in the log.
-- **Web UI Dashboard**: a Chat | Dashboard navigator in the page's top bar, with live throughput, requests, GPU and memory charts plus sessions and models tables (needs `--metrics`; switching never interrupts a chat). Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the dashboard (#55).
-- **Qwen3.8-Flash-Next accepts `high` and `max`**: both are served as `xhigh`, and the server says so in the log and in the response instead of refusing the request.
-- **GLM-5.3-Flash accepts `medium` and `xhigh`**: `medium` is served as `high` and `xhigh` as `max`, with the same notice as Qwen's re-route.
-- **`--kv-quant 6`**: a 6-bit KV cache between kv4 and kv8, with `kv_quant` 6 in `model-settings.json` and per request, on Qwen, MiMo and GLM (GLM stores its MLA latent at 6 bits and keeps DFlash2 and prefix reuse).
-- **`sushi convert exl3` writes a Sushi pack from a source checkpoint**: Qwen3.8-Flash-Next routed experts as EXL3 at a rate you pick, with the trunk in the format its packs serve, resumable, then checkable with `sushi kld`.
-- **`sushi convert exl3` fits its Metal threadgroups to the GPU**: the encoder's kernels use the threads per threadgroup MLX reports each one can take instead of assuming 1024, which crashed it on an M2 Pro. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the report (#57).
+- **Qwen3.8-Flash-Next EXL3 quantizer**: `sushi convert exl3` writes a Sushi pack from the BF16 checkpoint at the rate you pick, with the trunk in the format the packs serve; runs resume where they stopped, keep finished layers and packs, and fit their Metal threadgroups to any Apple GPU. Check the result with `sushi kld`. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the M2 Pro report (#57).
+- **Adaptive DFlash2 for Qwen3.8-Flash-Next**: point `--drafter` at the DFlash2 drafter and Qwen verifies 2 to 8 draft rows per round as the drafter's confidence pays, up to 20% faster than MTP on Sushi-2.6bpw and level with it on Sushi-4bpw (`--drafter-min-depth` / `--drafter-max-depth`); MTP stays the default. Thanks to [@1RAFAL](https://github.com/1RAFAL) for the request (#59).
+- **`--kv-quant 6` on all three models**: a 6-bit KV cache between kv4 and kv8 for Qwen, MiMo and GLM, also as `kv_quant` 6 in `model-settings.json` and per request; GLM stores its MLA latent at 6 bits and keeps DFlash2 and prefix reuse.
+- **Web UI Dashboard**: a Chat | Dashboard switch in the top bar with live throughput, requests, GPU and memory charts plus sessions and models tables (needs `--metrics`); switching never interrupts a chat. Thanks to [@cosmic-quokka](https://github.com/cosmic-quokka) for the dashboard (#55).
+- **Requests that used to fall back now run as asked**: MTP stays on with `presence_penalty` and `repeat_penalty`; Qwen serves `high` and `max` effort as `xhigh`, GLM serves `medium` as `high` and `xhigh` as `max`, each with a notice in the log and the response.
 
 ## v1.2.4 — Faster Qwen3.8-Flash-Next, more context admission, image cache
 

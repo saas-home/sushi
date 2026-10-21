@@ -858,6 +858,8 @@ fn validateRequired(
 
 fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig, layer_prefix: []const u8) !@import("sushi_exl3").GroupLayout {
     var plan = @import("sushi_exl3").GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+    plan.rates = config.expert_quant_rates;
+    plan.streams_groups = std.mem.eql(u8, config.model_type, "qwen4_exp");
     const prefix = try std.fmt.allocPrint(allocator, "{s}.mlp.switch_mlp.", .{layer_prefix});
     const router = source.tensors.get(try std.fmt.allocPrint(allocator, "{s}.mlp.gate.weight", .{layer_prefix})) orelse return error.MissingMimoRequiredTensor;
     if (router.shape.len != 2 or router.shape[0] > std.math.maxInt(u32)) return error.Exl3RouterWidthMismatch;
@@ -874,6 +876,7 @@ fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *
     }
     try plan.finish(@intCast(router.shape[0]), config.num_experts_per_tok, config.expert_streaming, config.num_experts);
     if (config.moe_n_group > 1 and (plan.grouped.? or router.shape[0] != config.num_experts)) return error.Exl3RouterGroupsUnsupported;
+    if (plan.grouped.? and config.isGlm5()) return error.Exl3RateGroupsUnsupported;
     return plan;
 }
 
@@ -917,6 +920,7 @@ fn countResidentBytes(
             .resident, .routed_expert => |kind| {
                 if (kind == .routed_expert and config.expert_streaming) continue;
                 var bytes = try payloadBytes(meta, null);
+                if (kind == .routed_expert) bytes += expert_quant.rateGroupMetaBytes(key, meta.shape[0]);
                 // The transformer loader keeps an f32 copy of each router for f32 routing.
                 if (layerKey(key)) |ref| if (std.mem.eql(u8, ref.rest, "mlp.gate.weight")) {
                     bytes += try shapeProduct(meta.shape) * 4;
@@ -2016,7 +2020,9 @@ test "sushi coder MiMo ragged bill equals all stored tensors" {
     try validatePlan(&source, alloc, &config);
     const old_experts = 2 * 3 * (8 * 8 * 40 * 2 + 256 * 2);
     const new_experts = 3 * (8 * 8 * (32 + 48 + 64) * 2 + 3 * 256 * 2);
-    try t.expectEqual(before - old_experts + new_experts + 128 * 6 + 4, try countResidentBytes(&source, alloc, &config));
+    // Plus the grouped layer's per-expert rate and offset table.
+    const table = 3 * @import("sushi_exl3").rate_groups.META_WORDS * 4;
+    try t.expectEqual(before - old_experts + new_experts + 128 * 6 + 4 + table, try countResidentBytes(&source, alloc, &config));
     config.num_experts_per_tok = 4;
     try t.expectError(error.Exl3TopKExceedsExperts, validatePlan(&source, alloc, &config));
     config.num_experts_per_tok = 1;
@@ -2106,17 +2112,12 @@ test "sushi coder incomplete grouped EXL3 index refuses instead of guessing a la
     try expectError(error.ExpertLayoutUnsupported, model.parseConfig(t.io, alloc, buf[0..len]));
 }
 
-test "sushi coder qwen trunk and MTP preflight use each router width" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
+/// A two-group Flash-Next pack: trunk layers 0 and 1, then the MTP head, with a router `layer_experts[i]` wide each.
+fn writeRaggedQwenFixture(io: std.Io, alloc: Allocator, dir: std.Io.Dir, layer_experts: [3]u64) !void {
     var tensors: std.ArrayList(TestTensor) = .empty;
     var entries: std.ArrayList(TestIndexEntry) = .empty;
     for ([_][]const u8{ "language_model.model.layers.0", "language_model.model.layers.1", "language_model.mtp.layers.0" }, 0..) |base, layer| {
-        const e: u64 = if (layer == 1) 2 else 3;
+        const e = layer_experts[layer];
         try tensors.append(alloc, .{
             .key = try std.fmt.allocPrint(alloc, "{s}.mlp.gate.weight", .{base}),
             .dtype = "BF16",
@@ -2139,8 +2140,18 @@ test "sushi coder qwen trunk and MTP preflight use each router width" {
         }
     }
     for (tensors.items) |tensor| try entries.append(alloc, .{ .key = tensor.key, .file = "ragged.safetensors" });
-    try writeTestShard(t.io, alloc, tmp.dir, "ragged.safetensors", tensors.items);
-    try writeTestIndex(t.io, alloc, tmp.dir, entries.items);
+    try writeTestShard(io, alloc, dir, "ragged.safetensors", tensors.items);
+    try writeTestIndex(io, alloc, dir, entries.items);
+}
+
+test "sushi coder qwen trunk and MTP preflight use each router width" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 2, 3 });
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(t.io, &buf);
     var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 512, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128 };
@@ -2149,6 +2160,22 @@ test "sushi coder qwen trunk and MTP preflight use each router width" {
     try t.expectError(error.Exl3TopKExceedsExperts, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
     cfg.num_experts_per_tok = 2;
     cfg.expert_streaming = true;
+    try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
+}
+
+test "sushi coder a rate-grouped Flash-Next pack passes the streaming preflight, a pruned one does not" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeRaggedQwenFixture(t.io, alloc, tmp.dir, .{ 3, 3, 3 });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(t.io, &buf);
+    var cfg = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .num_hidden_layers = 2, .num_experts = 3, .num_experts_per_tok = 2, .hidden_size = 128, .moe_intermediate_size = 128, .expert_streaming = true };
+    try validateExl3Pack(t.io, alloc, buf[0..len], &cfg);
+    cfg.num_experts = 512;
     try t.expectError(error.Exl3RaggedStreamingUnsupported, validateExl3Pack(t.io, alloc, buf[0..len], &cfg));
 }
 
@@ -2263,4 +2290,22 @@ test "GLM EXL3 preflight refuses orphan MTP and out of range packed tensors" {
         defer _ = source.tensors.remove(key);
         if (validateExl3Source(&source, a, &cfg)) |_| return error.ExpectedGlmPackRejection else |_| {}
     }
+}
+
+test "GLM EXL3 preflight refuses a rate-grouped layer by name" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source = SourceIndex{ .weight_map = std.StringHashMap([]const u8).init(a), .files = std.StringHashMap(void).init(a), .tensors = std.StringHashMap(TensorMeta).init(a), .stamps = std.StringHashMap(ShardStamp).init(a) };
+    const cfg = model.ModelConfig{ .model_type = "glm5_next", .expert_layout = .exl3_k4, .expert_quant_rate = .{ .n = 36 }, .num_hidden_layers = 2, .first_k_dense_replace = 1, .num_experts = 2, .num_experts_per_tok = 1, .hidden_size = 128, .moe_intermediate_size = 128 };
+    for ([_]u64{ 32, 36 }, 0..) |n, group| {
+        const code = TensorMeta{ .dtype = .u16, .shape = try a.dupe(u64, &.{ 1, 8, 8, n }), .data_start = 0, .data_end = 8 * 8 * n * 2, .data_base = 0, .file = "test.safetensors" };
+        const scale = TensorMeta{ .dtype = .f16, .shape = &.{ 1, 128 }, .data_start = 0, .data_end = 128 * 2, .data_base = 0, .file = "test.safetensors" };
+        for ([_][]const u8{ "gate", "up", "down" }) |p| for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, i| {
+            try source.tensors.put(try std.fmt.allocPrint(a, "model.language_model.layers.1.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{ p, group, part }), if (i == 0) code else scale);
+        };
+    }
+    try source.tensors.put("model.language_model.layers.1.mlp.gate.weight", .{ .dtype = .bf16, .shape = &.{ 2, 128 }, .data_start = 0, .data_end = 512, .data_base = 0, .file = "test.safetensors" });
+    try t.expectError(error.Exl3RateGroupsUnsupported, validateExl3Source(&source, a, &cfg));
 }
