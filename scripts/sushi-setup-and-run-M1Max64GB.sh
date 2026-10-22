@@ -90,7 +90,14 @@ MTP_MIN_DEPTH="${MTP_MIN_DEPTH:-1}"
 MTP_MAX_DEPTH="${MTP_MAX_DEPTH:-${MTP_DEPTH}}"
 MTP_TYPICAL="${MTP_TYPICAL:-0.2}"
 MTP_GREEDY_TAIL="${MTP_GREEDY_TAIL:-true}"  # Optimizes draft acceptance beside typical MTP
-PRESERVE_THINKING="${PRESERVE_THINKING:-off}"
+PRESERVE_THINKING="${PRESERVE_THINKING:-on}"
+
+# DFlash2 Speculative Decoding configuration
+# When enabled and drafter is found, DFlash2 replaces MTP for speculative decoding
+ENABLE_DFLASH="${ENABLE_DFLASH:-true}"
+DFLASH_DIR="${DFLASH_DIR:-${SUSHI_DIR}/dflash2}"
+DRAFTER_MIN_DEPTH="${DRAFTER_MIN_DEPTH:-2}"
+DRAFTER_MAX_DEPTH="${DRAFTER_MAX_DEPTH:-8}"
 
 # Production & Reliability settings
 TIMEOUT="${TIMEOUT:-300}"                  # Stall timeout in seconds
@@ -1160,16 +1167,21 @@ run_service() {
         fi
     fi
 
+    local spec_args=()
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        print_info "Speculative decoding: DFlash2 enabled (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+        spec_args+=(--drafter "${DFLASH_DIR}" --drafter-min-depth "${DRAFTER_MIN_DEPTH}" --drafter-max-depth "${DRAFTER_MAX_DEPTH}")
+    else
+        spec_args+=(--mtp --mtp-min-depth "${MTP_MIN_DEPTH}" --mtp-max-depth "${MTP_MAX_DEPTH}" --mtp-head-kv-quant)
+    fi
+
     print_info "Executing Sushi in foreground under launchd supervision (PID: $$)..."
     exec "${launcher[@]}" "${SUSHI_BIN}" serve \
         --model "${MODEL_PATH}" \
         --host "${HOST}" \
         --port "${PORT}" \
-        --mtp \
-        --mtp-min-depth "${MTP_MIN_DEPTH}" \
-        --mtp-max-depth "${MTP_MAX_DEPTH}" \
+        "${spec_args[@]}" \
         --kv-quant "${KV_QUANT}" \
-        --mtp-head-kv-quant \
         --skip-mem-preflight \
         --ctx-size "${CTX_SIZE}" \
         --max-tokens "${MAX_TOKENS}" \
@@ -1242,6 +1254,11 @@ start_server() {
     echo "  Prefill decode share: ${PREFILL_DECODE_SHARE}"
     echo "  Reasoning effort: ${REASONING_EFFORT}"
     echo "  Preserve thinking: ${PRESERVE_THINKING}"
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        echo "  Speculative decoding: DFlash2 (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+    else
+        echo "  Speculative decoding: MTP (depth: ${MTP_MIN_DEPTH}..${MTP_MAX_DEPTH})"
+    fi
     echo "  Prefill chunk: ${PREFILL_CHUNK} tokens"
     echo "  MTP typical: ${MTP_TYPICAL}"
     echo "  GPU warm: ${GPU_WARM_SECS} s"
@@ -1294,16 +1311,21 @@ start_server() {
         fi
     fi
     
+    local spec_args=()
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        print_info "Speculative decoding: DFlash2 enabled (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+        spec_args+=(--drafter "${DFLASH_DIR}" --drafter-min-depth "${DRAFTER_MIN_DEPTH}" --drafter-max-depth "${DRAFTER_MAX_DEPTH}")
+    else
+        spec_args+=(--mtp --mtp-min-depth "${MTP_MIN_DEPTH}" --mtp-max-depth "${MTP_MAX_DEPTH}" --mtp-head-kv-quant)
+    fi
+
     # Start the server in background, preserving startup logs in LOG_FILE
     nohup "${launcher[@]}" "${SUSHI_BIN}" serve \
         --model "${MODEL_PATH}" \
         --host "${HOST}" \
         --port "${PORT}" \
-        --mtp \
-        --mtp-min-depth "${MTP_MIN_DEPTH}" \
-        --mtp-max-depth "${MTP_MAX_DEPTH}" \
+        "${spec_args[@]}" \
         --kv-quant "${KV_QUANT}" \
-        --mtp-head-kv-quant \
         --skip-mem-preflight \
         --ctx-size "${CTX_SIZE}" \
         --max-tokens "${MAX_TOKENS}" \
