@@ -11,7 +11,7 @@ set -e  # Exit on error
 # ============================================================================
 
 # Model rate & directories (switchable between 2.6bpw and 3.0bpw)
-MODEL_BPW="${MODEL_BPW:-3.0bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
+MODEL_BPW="${MODEL_BPW:-2.6bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
 MODELS_DIR="${SUSHI_DIR}/model-${MODEL_BPW}"
