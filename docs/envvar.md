@@ -6,12 +6,13 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Summary.** 163 vars. By kind: tradeoff levers 13, diagnostics 38, microbenches 61, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
-## Tradeoff levers (13)
+## Tradeoff levers (14)
 
 Two arms that trade speed, memory or exactness, or a policy a user may want to move.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
+| `MLX_MAX_OPS_PER_BUFFER`, `MLX_MAX_MB_PER_BUFFER` | read by MLX (`device.cpp`), not sushi; mirrored by `server.resolveMlxCadence` | MLX's arch default (50 / 50 on Max and Ultra, 40 / 40 on base and Pro). A larger MB per buffer keeps more prefill inputs alive and the bill adds (MB - 50) MiB x 9/8 for it; ops per buffer is not billed (measured no effect) | once, at the first Metal device | yes: engine-memory-admission |
 | `MLX_ENABLE_TF32` | `transformer.zig:3717, glm5_kld_capture.zig:196` | default on: the QSA score GEMM may use TF32 on NAX; `0` keeps f32. GLM teacher capture requires `0` | once | yes: glm5-kernels, glm5-kld, quality-kld, ... |
 | `QWEN4_PLE_PREFETCH_PREFILL` | `qwen4_exp.zig:949` | wide n-gram gather arm: unset = kv gate (pool from 256k keys, serial walk below), `0` serial, `1` pool; both arms measured, the best flips with table residency | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_DECODE_ASYNC_LADDER` | `transformer.zig:15036` | unset: batched Qwen4 decode ladders every 4th layer, other paths serial; `0\|off` off, `auto` every 8th, `<n>` every n-th | boot | yes: engine-kernels, qwen4-perf |
@@ -19,7 +20,6 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_LMHEAD_FULL` | `transformer.zig:24018` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
 | `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
-| `SUSHI_MTP_DENSE_ROWS` | `mtp_dense_rows.zig:10` | `1` runs the dense-row router GEMV for MTP verify rows (default off; one equivalence run failed, seven reruns passed) | once | yes: engine-mtp, qwen4-perf |
 | `SUSHI_MTP_DRAFT_HEAD_BITS` | `mtp.zig:822, mimo_mtp.zig:33` | draft-only lm_head requant width (default 3, MiMo coarse readout 2; `0\|off` disables); verification is untouched | load | yes: mimo2-mtp |
 | `SUSHI_MTP_HEAD_QUANT_BITS` | `mtp.zig:1780` | requant width of dense MTP head trunks at load (default 4, g64; `0` off) | load | yes: engine-mtp |
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:146` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |
@@ -88,7 +88,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_GLM_A6_SHAPES_UBENCH`, `SUSHI_GLM_ARMS_UBENCH`, `SUSHI_GLM_ATTN_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH_CTX`, `SUSHI_GLM_LONGCTX_UBENCH_REPS`, `SUSHI_GLM_QMM_UBENCH` | `glm5_a6_dense_once.zig`, `glm5_model.zig`, `glm5_attention.zig`, `glm5_dflash_qmm.zig` | GLM NAX-arm, sparse-attention, long-context and qmm meters (+ ctx/reps lists) | test | yes: glm5-perf, glm5-kernels |
 | `SUSHI_GLM_DECODE_UBENCH`, `SUSHI_GLM_DECODE_UBENCH_CTX`, `SUSHI_GLM_KDA_PREFILL_UBENCH` | `glm5_attention.zig`, `glm5_model.zig` | GLM serial-decode MLA attention stages per context list; KDA prefill layer components | test | yes: glm5-kernels |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
-| `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
+| `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
 | `SUSHI_KVQ_MPP_UBENCH`, `SUSHI_KVQ_MPP_UBENCH_KV4`, `SUSHI_KVQ_SPLITK_UBENCH`, `SUSHI_KVQ_UBENCH` | `transformer.zig`, `kv_quant.zig` | quantized-KV attention meters: MiMo matmul2d and split-K decode (`_KV4` switches the 8-bit meter to 4-bit), the composed-read meter | test | no |
 | `SUSHI_MIMO_ROWS_UBENCH`, `SUSHI_MIMO_VISION_UBENCH`, `SUSHI_QWEN_VISION_UBENCH` | `transformer.zig`, `mimo_vision.zig`, `qwen_vision.zig` | MiMo verify-rows attention meter, MiMo-ViT and Qwen vision encoder meters (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `scheduler.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |

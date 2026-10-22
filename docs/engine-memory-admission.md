@@ -16,6 +16,28 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- **A command buffer fails (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) once MLX's peak passes the wired limit less
+  the GPU memory MLX does not own** (#61). The limit counts AGX "In use system memory", which is system-wide: other
+  processes' Metal allocations (WindowServer, every app with a layer) count against it. Measured on an M1 Max 32 GB,
+  `iogpu.wired_limit_mb=30000` (31.46 GB), Qwen3.8-Flash-Next Ternary, kv8, `--no-mtp`, sushi 1.2.4, 8k-35k prompts,
+  30+ cold prefills: a 0.62 GB floor idle, MLX peaks of 30.57 GB and below passed, 30.85 GB and above failed.
+  - **Non-MLX GPU floor**: under a declared limit the ceiling is the limit less the larger of `--wired-margin-gib` and
+    floor + 512 MiB slack (`wiredUnplannedBytes`). The floor is read once, at startup, before MLX holds a model
+    (`measureGpuFloor`): right after a load it read 0 and 407 MB (weights still being wired), and after an unload it
+    lags high while freed pages unwire.
+  - Above the floor the counter is elastic: 1-op/1-MB command buffers drove it to the limit itself, with 1.85 GB of
+    non-MLX share, and the prefill passed.
+  - Other processes' memory is not the trigger here. A ballast of 1-4 GB touched incompressible RAM was swapped out
+    and the prefill passed at the same speed. With the model resident, `mlock` of even 0.5 GB was refused (EAGAIN).
+- **The bill counts MLX's command-buffer size** (`cadenceInflightBytes`, in `prefillNeededAtChunk` and
+  `prefillTransientReserveAtKv`). MLX keeps each op's inputs alive until its command buffer completes, up to 10 in
+  flight, and commits a buffer once its distinct inputs pass `MLX_MAX_MB_PER_BUFFER`. The prefill terms were fitted
+  at 50 MB, MLX's Max/Ultra default, so the term is (MB per buffer - 50) MiB x 9/8 and 0 at the default.
+  - Measured, same box: 1000 MB lifted MLX's prefill peak by 1.11 / 1.12 / 1.03 GB at 8k / 19k / 35k. 1000 ops at
+    50 MB moved nothing.
+  - At 1000/1000, 19k and the 35k edge failed inside admission, 3/3 and 2/2; the default passed at every length.
+  - Startup logs the cadence MLX resolved from its arch table or the env: `[mem] MLX command buffers: 50 ops / 50 MB
+    (default, applegpu_g13s); prefill bill +0 MB in flight`.
 - The box: M5 Max 128 GB; the default wired limit admits about 120 GB; a resident MiMo EXL3 pack is over 90 GB, so two
   heavy GPU jobs at once risk an OOM for both (and concurrent conversions have died together in a GPU reset).
 
@@ -46,6 +68,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
   plus 1.125 GiB while MTP is on, MiMo 0.25 GiB, GLM its fixed KDA state, pool rings and first 1024 latent rows plus
   0.375 GiB. A new arch or layout adds its own measured figure here, never a percentage of its weights.
+- **Flash-Next with a DFlash2 drafter bills the drafter as it is resident and as it loads**: `assistantLoadBytes` reads the
+  safetensors headers and bills what the 8-bit gs64 quantize step leaves (0.71 GiB for the shipped drafter, not its 1.12
+  GiB of BF16 file bytes: the codebooks and norms stay dense) plus a load transient, the dense linears the weight map keeps
+  until the load ends (0.89 GiB), which `loadWarmupBytes` adds through `dflash_load_transient_bytes` (stamped with the
+  other drafter terms). Measured on the real drafter: resident 760.8 MB, peak over before 1712.4 MB; the formula is
+  never under either, within 0.04%.
+- **A request bills the MTP head only when it runs MTP** (`requestBillsMtpHead`, the `requestSpecModes` verdict): a
+  DFlash2 request never builds the head's cache, state or QSA ring. `enable_drafter:false` hands the request back to MTP
+  and bills the head. The head weights and coarse lm_head stay billed at load for that hand-back. The load-time and
+  auto-context bills (`mtpHeadDefaultOn`, `sessionBytesPerToken`) drop the head terms when Qwen's default round is DFlash2.
+- **The cold-load gate stamps the drafter's request terms before reading the serving bill** (`coldServingBillBytes`), the
+  same config the load preflight reads after `stampDflashRequestTerms`; unstamped, the gate missed the DFlash2 per-request
+  term (0.48 GB at chunk 4096).
 - Qwen drops disabled native MTP tensors before the transformer binds them. An auto context bills no context term: it
   is pinned after the load from what the weights leave. Their default KV remains affine 8-bit.
 - An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.

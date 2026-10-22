@@ -570,6 +570,8 @@ fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
 /// (`sessionBytesPerToken`) price its KV whenever it does, the request-time bill per request.
 fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     if (config.isGlm5()) return false;
+    // A loaded DFlash2 drafter outranks the head: the default round never builds its cache.
+    if (config.dflash_loaded) return false;
     const choice = mtpChoiceFor(config);
     if (choice.forced()) return true;
     return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
@@ -2861,6 +2863,141 @@ pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
 /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
+/// GPU memory the wired limit counts that MLX does not own: other processes' Metal allocations
+/// (WindowServer, every app with a layer) and the driver's. `AGXAccelerator` "In use system
+/// memory" is system-wide, so this is that counter less MLX's active + cache, read once at
+/// startup before MLX holds a model (`measureGpuFloor`). A command buffer fails once MLX's peak
+/// passes the wired limit less this floor; above it the counter is elastic.
+pub var gpu_floor_bytes = std.atomic.Value(u64).init(0);
+
+/// What the bill may still be wrong by once the floor is planned, including sushi's own non-MLX
+/// Metal objects that arrive after the startup reading.
+pub const GPU_FLOOR_SLACK_BYTES: u64 = 512 << 20;
+
+/// PURE: what stays unplanned under a declared wired limit: the operator's margin, or the
+/// measured floor plus the bill's slack when that is larger.
+pub fn wiredUnplannedBytes(margin: u64, gpu_floor: u64) u64 {
+    if (gpu_floor == 0) return margin;
+    return @max(margin, gpu_floor +| GPU_FLOOR_SLACK_BYTES);
+}
+
+/// PURE: the floor from one idle reading; 0 when IOKit gave nothing.
+pub fn gpuFloorFrom(in_use_system: u64, mlx_active: u64, mlx_cache: u64) u64 {
+    if (in_use_system == 0) return 0;
+    return in_use_system -| (mlx_active +| mlx_cache);
+}
+
+/// Read the floor once, at startup, before MLX holds a model: the only moment the counter is
+/// clean both ways: right after a load it lags low while the weights are still being wired, and
+/// after an unload it lags high while freed pages unwire.
+pub fn measureGpuFloor() void {
+    var active: usize = 0;
+    var cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const in_use = metrics.getGpuInUseSystemMemBytes();
+    const floor = gpuFloorFrom(in_use, active, cache);
+    gpu_floor_bytes.store(floor, .monotonic);
+    log.info("[mem] GPU floor {d} MB (system GPU in use {d} MB, MLX active {d} MB + cache {d} MB)\n", .{
+        floor >> 20,
+        in_use >> 20,
+        active >> 20,
+        cache >> 20,
+    });
+}
+
+/// The MB-per-buffer the prefill terms were measured at (`prefillStreamBytesPerToken` on an
+/// M4 Max, MLX's Max/Ultra default). MLX commits a command buffer once its distinct inputs pass
+/// `MLX_MAX_MB_PER_BUFFER`, and every op's inputs live until its buffer completes, up to 10
+/// buffers in flight (`mlx/backend/metal/eval.cpp`, `MAX_ACTIVE_TASKS`).
+pub const BILL_FIT_MB_PER_BUFFER: u64 = 50;
+
+/// MLX's per-buffer defaults by architecture suffix (`mlx/backend/metal/device.cpp`).
+pub fn mlxDefaultMbPerBuffer(arch: []const u8) u64 {
+    if (arch.len == 0) return 40;
+    return switch (arch[arch.len - 1]) {
+        'p', 'g' => 40,
+        's', 'd' => 50,
+        else => 40,
+    };
+}
+
+pub fn mlxDefaultOpsPerBuffer(arch: []const u8) u64 {
+    if (arch.len == 0) return 40;
+    return switch (arch[arch.len - 1]) {
+        'p' => 20,
+        'g' => 40,
+        's', 'd' => 50,
+        else => 40,
+    };
+}
+
+/// PURE: MLX's reading of its env override (a positive integer replaces the default).
+pub fn mlxPerBufferFromEnv(raw: ?[]const u8, default: u64) u64 {
+    const s = raw orelse return default;
+    const n = std.fmt.parseInt(u64, std.mem.trim(u8, s, " \t"), 10) catch return default;
+    return if (n > 0) n else default;
+}
+
+/// PURE: prefill bytes the command-buffer cadence keeps alive beyond what the bill's fitted
+/// terms already hold; ops per buffer does not move the peak. A narrower cap is not credited.
+pub fn cadenceInflightBytes(mb_per_buffer: u64) u64 {
+    return (mb_per_buffer -| BILL_FIT_MB_PER_BUFFER) * (1 << 20) * 9 / 8;
+}
+
+test "the bill plans the non-MLX GPU floor and the command-buffer size" {
+    const t = std.testing;
+    const mb: u64 = 1 << 20;
+    // An idle reading: 28.96 GB in use, 28.28 active + 0.06 cache -> a 0.62 GB floor.
+    try t.expectEqual(@as(u64, 620 * mb), gpuFloorFrom(28_960 * mb, 28_280 * mb, 60 * mb));
+    try t.expectEqual(@as(u64, 0), gpuFloorFrom(0, 28_280 * mb, 0));
+    try t.expectEqual(@as(u64, 0), gpuFloorFrom(100 * mb, 200 * mb, 0));
+    // No reading keeps the operator's margin; a floor above margin - slack widens it.
+    try t.expectEqual(WIRED_LIMIT_MARGIN_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 0));
+    try t.expectEqual(WIRED_LIMIT_MARGIN_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 256 * mb));
+    try t.expectEqual(620 * mb + GPU_FLOOR_SLACK_BYTES, wiredUnplannedBytes(WIRED_LIMIT_MARGIN_BYTES, 620 * mb));
+    // The default cadence bills nothing extra; 1000 MB bills about 1.07 GB.
+    try t.expectEqual(@as(u64, 0), cadenceInflightBytes(BILL_FIT_MB_PER_BUFFER));
+    try t.expectEqual(@as(u64, 0), cadenceInflightBytes(40));
+    try t.expectEqual(@as(u64, 950 * mb * 9 / 8), cadenceInflightBytes(1000));
+    // MLX's table and env reading.
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13s"));
+    try t.expectEqual(@as(u64, 50), mlxDefaultMbPerBuffer("applegpu_g13d"));
+    try t.expectEqual(@as(u64, 40), mlxDefaultMbPerBuffer("applegpu_g13g"));
+    try t.expectEqual(@as(u64, 20), mlxDefaultOpsPerBuffer("applegpu_g14p"));
+    try t.expectEqual(@as(u64, 1000), mlxPerBufferFromEnv("1000", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("0", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv("lots", 50));
+    try t.expectEqual(@as(u64, 50), mlxPerBufferFromEnv(null, 50));
+}
+
+/// The effective `MLX_MAX_MB_PER_BUFFER`, resolved once at startup.
+pub var mlx_mb_per_buffer: u64 = BILL_FIT_MB_PER_BUFFER;
+
+/// Main thread, before other threads: resolve MLX's command-buffer cadence the way MLX does
+/// and say what it is, since MLX reads the env once and reports nothing.
+pub fn resolveMlxCadence() void {
+    var arch_z: [*:0]const u8 = "";
+    var dev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&dev);
+    var info = mlx.mlx_device_info_new();
+    defer _ = mlx.mlx_device_info_free(info);
+    if (mlx.mlx_device_info_get(&info, dev) == 0) _ = mlx.mlx_device_info_get_string(&arch_z, info, "architecture");
+    const arch = std.mem.span(arch_z);
+    const env_mb: ?[]const u8 = if (std.c.getenv("MLX_MAX_MB_PER_BUFFER")) |v| std.mem.span(v) else null;
+    const env_ops: ?[]const u8 = if (std.c.getenv("MLX_MAX_OPS_PER_BUFFER")) |v| std.mem.span(v) else null;
+    mlx_mb_per_buffer = mlxPerBufferFromEnv(env_mb, mlxDefaultMbPerBuffer(arch));
+    const ops = mlxPerBufferFromEnv(env_ops, mlxDefaultOpsPerBuffer(arch));
+    log.info("[mem] MLX command buffers: {d} ops / {d} MB ({s}, {s}); prefill bill +{d} MB in flight\n", .{
+        ops,
+        mlx_mb_per_buffer,
+        if (env_mb != null or env_ops != null) "env" else "default",
+        if (arch.len > 0) arch else "unknown arch",
+        cadenceInflightBytes(mlx_mb_per_buffer) >> 20,
+    });
+    measureGpuFloor();
+}
+
 /// PURE: the ceiling with the wired-limit floor applied. `wired_floor == 0` returns
 /// `physicalMemoryCeiling` byte for byte. A declared limit IS the ceiling, its margin included:
 /// the working-set term is the limit itself, so on a quiet box it would plan into the margin.
@@ -2923,13 +3060,16 @@ fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64
     const c = config orelse return 0;
     // Resident MiMo fills a 128 GB Mac, so its ceiling is the declared limit, not what other apps leave free.
     if (!c.longCtxGated() and !c.expert_streaming and !c.isMimo() and !c.isGlm5()) return 0;
-    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, wired_limit_margin_bytes);
+    const unplanned = wiredUnplannedBytes(wired_limit_margin_bytes, gpu_floor_bytes.load(.monotonic));
+    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, unplanned);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
-        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
+        log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB, GPU floor {d} MB, unplanned {d} MB)\n", .{
             floor >> 20,
             wiredLimitBytes() >> 20,
             getGpuWorkingSetLimit() >> 20,
             wired_limit_margin_bytes >> 20,
+            gpu_floor_bytes.load(.monotonic) >> 20,
+            unplanned >> 20,
         });
     }
     return floor;
@@ -3212,7 +3352,8 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
+        cadenceInflightBytes(mlx_mb_per_buffer);
 }
 
 /// The composed score sheet a ringed arch's SLIDING layers build where
@@ -6408,7 +6549,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    const mtp_on = warm.mtp_on or forceMtpFor(config);
+    const mtp_on = warm.mtp_on or (forceMtpFor(config) and !config.dflash_loaded);
     const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
     const head_qsa_ring: u64 = if (mtp_on) mtpHeadQsaRingBytes(config) else 0;
     const head_state_per_tok: u64 = if (mtp_on) mtpHeadStateBytesPerToken(config) else 0;
@@ -6678,7 +6819,8 @@ pub fn prefillNeededAtChunk(
             glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
             glmCommitStateBytes(config, seq, warm, kv_bits),
         )) *| 5 / 4 +|
-            (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+            (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +|
+            cadenceInflightBytes(mlx_mb_per_buffer);
     }
     const heads: u64 = config.num_attention_heads;
     const kv_heads: u64 = config.num_key_value_heads;
@@ -6689,7 +6831,8 @@ pub fn prefillNeededAtChunk(
         qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
+        cadenceInflightBytes(mlx_mb_per_buffer);
 }
 
 /// Headroom a rung must clear beyond its own bill when the long-context gate is what widened
@@ -9546,7 +9689,8 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, logprobs_n);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -9804,7 +9948,8 @@ fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c }, logprobs_n);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
     var sampling = generate_mod.SamplingParams{
@@ -11009,6 +11154,19 @@ pub fn requestSpecModes(
     };
 }
 
+/// Will this request build the MTP head's cache? The admission bill prices the head's KV, state and QSA ring
+/// only then: a request a DFlash2 drafter serves never allocates them.
+pub fn requestBillsMtpHead(
+    enable_drafter: bool,
+    enable_mtp: bool,
+    dflash_loaded: bool,
+    mtp_loaded: bool,
+    sampling: generate_mod.SamplingParams,
+    logprobs_n: u32,
+) bool {
+    return requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
+}
+
 /// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
 fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: generate_mod.SamplingParams, logprobs_n: u32) void {
     if (!enable_mtp or !mtp_loaded) return;
@@ -11052,6 +11210,31 @@ test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP he
     r = requestSpecModes(true, true, false, false, plain, 0);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain, 0));
+}
+
+test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
+    const t = std.testing;
+    const saved_force = server_config.default_force_mtp;
+    defer server_config.default_force_mtp = saved_force;
+    server_config.default_force_mtp = false;
+    const plain = generate_mod.SamplingParams{};
+    // A loaded drafter outranks the head; `enable_drafter:false` hands the request back to it.
+    try t.expect(!requestBillsMtpHead(true, true, true, true, plain, 0));
+    try t.expect(requestBillsMtpHead(false, true, true, true, plain, 0));
+    // A penalty keeps the drafter off, so the head runs.
+    try t.expect(requestBillsMtpHead(true, true, true, true, .{ .presence_penalty = 1.5 }, 0));
+    try t.expect(requestBillsMtpHead(true, true, false, true, plain, 0));
+    try t.expect(!requestBillsMtpHead(true, false, false, true, plain, 0));
+    var cfg = qwen4ExpOomConfig();
+    cfg.mtp_override = null;
+    cfg.dflash_loaded = true;
+    const seq: u64 = 100_000;
+    const dflash = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(true, true, true, true, plain, 0) });
+    const head = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(false, true, true, true, plain, 0) });
+    try t.expectEqual(@as(u64, 0), dflash.mtp_head_kv_bytes);
+    try t.expect(head.mtp_head_kv_bytes > 0);
+    try t.expect(head.state_bytes > dflash.state_bytes);
+    try t.expect(head.qsa_ring_bytes > dflash.qsa_ring_bytes);
 }
 
 test "requestSpecModes: a repeat or presence penalty keeps the sidecar off but MTP on" {
@@ -16172,7 +16355,8 @@ fn handleAnthropicMessages(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -17893,8 +18077,19 @@ fn handleResponsesInner(
     if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
+    // Drafter (Responses-side parsing). Same disable rules as the chat
+    // and Anthropic parse sites.
+    const lm_default_enable_drafter_resp: bool = lm.dflash != null;
+    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        lm_default_enable_drafter_resp;
+    if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
+    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
+
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), enable_mtp_resp)) return;
+    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty }, 0);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.embeddings != null), bill_head)) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -18046,16 +18241,6 @@ fn handleResponsesInner(
     defer if (streamed_message_id) |id| allocator.free(id);
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
-
-    // Drafter (Responses-side parsing). Same disable rules as the chat
-    // and Anthropic parse sites.
-    const lm_default_enable_drafter_resp: bool = lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
@@ -22960,6 +23145,31 @@ test "the load-time bill prices the MTP head a served pack runs by default" {
     streamed.stream_mtp_head = true;
     try t.expect(mtpHeadDefaultOn(&streamed));
     try t.expectEqual(sessionBytesPerToken(&off, 8) + head, sessionBytesPerToken(&streamed, 8));
+}
+
+test "the load-time bill drops the MTP head when Qwen's default round is DFlash2" {
+    const t = std.testing;
+    const saved_force = server_config.default_force_mtp;
+    defer server_config.default_force_mtp = saved_force;
+    server_config.default_force_mtp = false;
+    var cfg = qwen4ExpOomConfig();
+    cfg.mtp_override = null;
+    const head = mtpHeadKvBytesPerToken(&cfg) + mtpHeadStateBytesPerToken(&cfg);
+    const with_head = sessionBytesPerToken(&cfg, 8);
+    var dflash = cfg;
+    dflash.dflash_loaded = true;
+    try t.expect(!mtpHeadDefaultOn(&dflash));
+    try t.expectEqual(with_head - head, sessionBytesPerToken(&dflash, 8));
+    // The auto-context bill reads the same default: no head terms at the rung it prices.
+    const a = sushiContextBytesAt(&cfg, 100_000, 8).bytes;
+    const b = sushiContextBytesAt(&dflash, 100_000, 8).bytes;
+    try t.expect(b + 100_000 * head <= a + dflashRequestBytes(&dflash, 4096));
+    try t.expect(b < a + dflashRequestBytes(&dflash, 8192));
+    // A forced head still yields to the drafter by default, and `enable_drafter:false` bills it again.
+    server_config.default_force_mtp = true;
+    try t.expectEqual(@as(u64, 0), prefillRequestTerms(&dflash, 100_000, 4096, 8, 4096, .{}).mtp_head_kv_bytes);
+    try t.expect(prefillRequestTerms(&dflash, 100_000, 4096, 8, 4096, .{ .mtp_on = true }).mtp_head_kv_bytes > 0);
+    try t.expect(prefillRequestTerms(&cfg, 100_000, 4096, 8, 4096, .{}).mtp_head_kv_bytes > 0);
 }
 
 test "chat stream tool-call delta escapes the function name" {

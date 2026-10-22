@@ -16,6 +16,7 @@ const mimo_mtp = @import("mimo_mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const model_settings = @import("model_settings.zig");
 const round_cost = @import("round_cost.zig");
+const spec_cost_gate = @import("spec_cost_gate.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
@@ -1757,11 +1758,15 @@ pub const Generator = struct {
     glm_prefill_window: ?GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
+    /// Whether a DFlash2 round pays against a plain one-row tick for this request, and the plain ticks it ran.
+    glm_gate: spec_cost_gate.Gate = .{},
+    glm_plain: struct { ticks: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
     /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
     /// Wall ms of this request's DFlash rounds, for the cost gate.
     dflash_wall_ms: f64 = 0,
+    dflash_gate_window: DflashGateWindow = .{},
     /// Drafts the verifies of this request carried, and the selector-confidence calibration that picks rows.
     dflash_drafts_verified: u64 = 0,
     dflash_calib: dflash_policy.Calibration = .{},
@@ -2005,10 +2010,9 @@ pub const Generator = struct {
     pub const DFLASH_GATE_MARGIN: f32 = 0.05;
 
     /// Accepted drafts per round at which a round of `rows` verifier rows costs one serial step per
-    /// token, used until a serial sample exists. A round costs about 0.25 + 0.28 serial steps per
-    /// row (Sushi-2.6bpw, M5 Max: 24.1, 30.6 and 46.7 ms at 2, 4 and 8 rows against a 13.3 ms token).
+    /// token, used while the request's context bucket holds no serial sample. The policy's own cost ladder.
     pub fn dflashBreakEvenAccepted(rows: f32) f32 {
-        return 0.25 + 0.28 * rows;
+        return dflash_policy.breakEvenDrafts(rows);
     }
 
     /// Does the request's DFlash yield lose to serial decoding? With a measured serial price (the
@@ -2025,6 +2029,24 @@ pub const Generator = struct {
         const avg = @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(attempted));
         return avg < dflashBreakEvenAccepted(rows);
     }
+
+    /// The rounds the gate judges: those after the warmup. The warmup's own wall carries one-time costs (graph builds,
+    /// first touches of a long context) that would decide a request the steady rounds win.
+    pub const DflashGateWindow = struct {
+        open: bool = false,
+        attempted: u64 = 0,
+        accepted: u64 = 0,
+        wall_ms: f64 = 0,
+
+        pub fn shouldDisable(self: *DflashGateWindow, attempted: u64, accepted: u64, wall_ms: f64, rows: f32, serial_ms_tok: ?f32) bool {
+            if (attempted < DFLASH_GATE_WARMUP) return false;
+            if (!self.open) {
+                self.* = .{ .open = true, .attempted = attempted, .accepted = accepted, .wall_ms = wall_ms };
+                return false;
+            }
+            return dflashGateShouldDisable(attempted - self.attempted, accepted - self.accepted, wall_ms - self.wall_ms, rows, serial_ms_tok);
+        }
+    };
 
     /// Verifier rows a round of this request carried on average: the block's until a round has run.
     fn dflashMeanRows(self: *const Generator) f32 {
@@ -2175,13 +2197,19 @@ pub const Generator = struct {
             if (self.glm_dflash_native) {
                 const rounds: f64 = @floatFromInt(self.dflash_attempted);
                 const r = self.glm_round;
-                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d}\n", .{
+                const plain_ticks: f64 = @floatFromInt(@max(self.glm_plain.ticks, 1));
+                log.info("  [spec-stats] glm_round_ms draft={d:.2} verify={d:.2} replay={d:.2} commit={d:.2} lookup={d}/{d} plain={d} serial_ms={d:.2} plain_ms verify={d:.2} replay={d:.2} commit={d:.2}\n", .{
                     @as(f64, @floatFromInt(r.draft_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.verify_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.replay_ns)) / rounds / 1e6,
                     @as(f64, @floatFromInt(r.commit_ns)) / rounds / 1e6,
                     self.glm_lookup.rounds,
                     self.glm_lookup.landed,
+                    self.glm_plain.ticks,
+                    self.glm_gate.serial_ms orelse 0.0,
+                    @as(f64, @floatFromInt(self.glm_plain.verify_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.glm_plain.replay_ns)) / plain_ticks / 1e6,
+                    @as(f64, @floatFromInt(self.glm_plain.commit_ns)) / plain_ticks / 1e6,
                 });
             }
             return;
@@ -4079,8 +4107,13 @@ pub const Generator = struct {
         const schedule = @import("glm5_dflash_model.zig").bindDefaultSchedule();
         defer schedule.restore();
         var timer = io_util.Stopwatch.init(self.timer.io);
-        const lookup = try self.glmLookupChain(allocator);
-        const proposal = lookup orelse try self.glmPropose(dflash_mod.glmMaxNodes(self.dflash_block_size, dflash_mod.drafterDepthExplicit()));
+        const tick = io_util.Stopwatch.init(self.timer.io);
+        const action = self.glm_gate.next();
+        const lookup = if (self.glm_gate.probing()) null else try self.glmLookupChain(allocator);
+        const proposal = lookup orelse switch (action) {
+            .round => try self.glmProposeRound(),
+            .plain => self.glmPlainProposal(),
+        };
         const draft_ns = timer.read();
         timer.reset();
         const request = self.ctx.glm5_request.?;
@@ -4092,11 +4125,25 @@ pub const Generator = struct {
         defer layerwise.deinit();
         const verify_ns = timer.read();
         const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
+        const wall_ms = @as(f64, @floatFromInt(tick.read())) / @as(f64, std.time.ns_per_ms);
+        const emitted: u32 = @intCast(result.tokens.len);
         if (lookup != null) {
             self.glm_lookup.rounds += 1;
             self.glm_lookup.landed += result.accepted_tokens;
-        }
+            self.glm_gate.observeLookup(emitted);
+        } else if (proposal.count == 1) {
+            self.glm_gate.observePlain(wall_ms);
+        } else self.glm_gate.observeRound(wall_ms, emitted);
         return result;
+    }
+
+    /// The pending token alone: a plain one-row tick that still commits the assistant's taps, so
+    /// DFlash2 rounds resume on the next tick.
+    fn glmPlainProposal(self: *const Generator) @import("glm5_dflash.zig").Proposal {
+        var one = @import("glm5_dflash.zig").Proposal{ .count = 1 };
+        one.tokens[0] = self.next_token_id;
+        one.parents[0] = -1;
+        return one;
     }
 
     /// Drafts a verbatim-copy round takes from the context instead of the assistant: four rows,
@@ -4135,6 +4182,13 @@ pub const Generator = struct {
         return true;
     }
 
+    /// This request's round draft: as many rows as the policy finds worth their verify, within the flags' bounds.
+    fn glmProposeRound(self: *Generator) !@import("glm5_dflash.zig").Proposal {
+        const costs = dflash_policy.glmLadder();
+        const min = dflash_mod.drafter_min_depth orelse dflash_mod.GLM_MIN_ROWS;
+        return @import("glm5_dflash.zig").proposeRoundAdaptive(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4, .{ .min = min, .max = std.math.clamp(dflash_policy.GLM_USEFUL_ROWS, min, self.dflash_block_size) }, &self.dflash_calib, &costs);
+    }
+
     /// This request's round draft of at most `max_nodes` nodes.
     pub fn glmPropose(self: *Generator, max_nodes: usize) !@import("glm5_dflash.zig").Proposal {
         return @import("glm5_dflash.zig").proposeRound(self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, self.ctx.glm5_request.?, self.next_token_id, max_nodes, self.max_tokens - self.completion_tokens, self.eos_token_ids, 4);
@@ -4150,6 +4204,7 @@ pub const Generator = struct {
         var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, budget, self.eos_token_ids);
         round.draft_ns = draft_ns;
         round.verify_ns = verify_ns;
+        if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
         // Accepted share of the tree's depth: a fork can land one draft, a chain two.
         var depth: [16]u32 = @splat(0);
         var deepest: u32 = 0;
@@ -4176,14 +4231,21 @@ pub const Generator = struct {
         self.advanceStep(@intCast(tokens.len));
         self.ctx.cache.step = request.offset;
         self.next_token_id = round.pending orelse tokens[tokens.len - 1];
-        self.dflash_attempted += 1;
-        self.dflash_accepted_tokens += round.accepted_drafts;
-        self.dflash_round_width = @intCast(round.verified_rows - 1);
-        self.glm_round.drafted += round.verified_rows - 1;
-        self.glm_round.draft_ns += round.draft_ns;
-        self.glm_round.verify_ns += round.verify_ns;
-        self.glm_round.replay_ns += round.replay_ns;
-        self.glm_round.commit_ns += round.commit_ns;
+        if (round.verified_rows > 1) {
+            self.dflash_attempted += 1;
+            self.dflash_accepted_tokens += round.accepted_drafts;
+            self.dflash_round_width = @intCast(round.verified_rows - 1);
+            self.glm_round.drafted += round.verified_rows - 1;
+            self.glm_round.draft_ns += round.draft_ns;
+            self.glm_round.verify_ns += round.verify_ns;
+            self.glm_round.replay_ns += round.replay_ns;
+            self.glm_round.commit_ns += round.commit_ns;
+        } else if (!lookup) {
+            self.glm_plain.ticks += 1;
+            self.glm_plain.verify_ns += round.verify_ns;
+            self.glm_plain.replay_ns += round.replay_ns;
+            self.glm_plain.commit_ns += round.commit_ns;
+        }
         if (round.stopped) {
             self.done = true;
             self.finish_reason = "stop";
@@ -4213,7 +4275,7 @@ pub const Generator = struct {
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
-        std.debug.assert(self.dflash_ctx != null);
+        std.debug.assert(self.dflash_ctx != null or self.spec_disabled_runtime);
         if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         if (self.completion_tokens >= self.max_tokens) {
@@ -4618,7 +4680,7 @@ pub const Generator = struct {
             // re-point moe_seq_offset at the committed length.
             self.ctx.cache.step = kv_step_snap;
             if (self.ctx.ssm_entries) |entries| {
-                const gdn_captured = entries.len > 0 and entries[0].spec_state_seq.ctx != null;
+                const gdn_captured = entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0]);
                 if (!gdn_captured) return error.SpecRollbackUnavailable;
                 try self.rollbackSsmFromCapture(entries, accepted, 1 + m, s);
             }
@@ -4700,14 +4762,24 @@ pub const Generator = struct {
     fn checkDflashRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
         const serial = dflashSerialPrice(&self.xfm.round_cost, self.xfm.round_cost.bucketOf(self.mtpKvLen()));
-        if (!dflashGateShouldDisable(self.dflash_attempted, self.dflash_accepted_tokens, self.dflash_wall_ms, self.dflashMeanRows(), serial)) return;
-        const avg = @as(f32, @floatFromInt(self.dflash_accepted_tokens)) /
-            @as(f32, @floatFromInt(self.dflash_attempted));
+        if (!self.dflash_gate_window.shouldDisable(self.dflash_attempted, self.dflash_accepted_tokens, self.dflash_wall_ms, self.dflashMeanRows(), serial)) return;
+        const w = self.dflash_gate_window;
+        const rounds = self.dflash_attempted - w.attempted;
+        const accepted = self.dflash_accepted_tokens - w.accepted;
         log.info(
-            "  dflash=disabled (runtime yield {d:.2} accepted/round, {d:.2} ms/token against {d:.2} serial, after {d} attempts)\n",
-            .{ avg, self.dflash_wall_ms / @as(f64, @floatFromInt(self.dflash_attempted + self.dflash_accepted_tokens)), serial orelse 0.0, self.dflash_attempted },
+            "  dflash=disabled (runtime yield {d:.2} accepted/round, {d:.2} ms/token against {d:.2} serial, over {d} rounds after the warmup)\n",
+            .{ @as(f32, @floatFromInt(accepted)) / @as(f32, @floatFromInt(rounds)), (self.dflash_wall_ms - w.wall_ms) / @as(f64, @floatFromInt(rounds + accepted)), serial orelse 0.0, rounds },
         );
+        self.stopDflash();
+    }
+
+    /// Serial decoding for the rest of the request: nothing resumes the drafter, so its window goes now.
+    fn stopDflash(self: *Generator) void {
         self.spec_disabled_runtime = true;
+        if (self.dflash_ctx) |*dc| {
+            dc.deinit();
+            self.dflash_ctx = null;
+        }
     }
 
     /// Qwen native-MTP speculative round. Structure mirrors `nextDrafter`
@@ -7143,7 +7215,7 @@ pub const Generator = struct {
         new_hidden = .{ .ctx = null };
 
         const gdn_captured = if (self.ctx.ssm_entries) |entries|
-            entries.len > 0 and entries[0].spec_state_seq.ctx != null
+            entries.len > 0 and transformer_mod.ssmHasSpecCapture(&entries[0])
         else
             false;
 
@@ -13026,18 +13098,76 @@ test "Generator.dflashGateShouldDisable: a serial price decides by ms per token,
     try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, round_ms * @as(f64, @floatFromInt(w)), 4.0, 13.3));
     // A slower serial token (a larger pack) keeps rounds the 13.3 ms one would drop.
     try testing.expect(!G.dflashGateShouldDisable(w, w, round_ms * @as(f64, @floatFromInt(w)), 4.0, 20.0));
-    // No serial sample: the ladder's break-even yield, 1.37 accepted drafts at 4 rows.
-    try testing.expectApproxEqAbs(@as(f32, 1.37), G.dflashBreakEvenAccepted(4.0), 0.001);
-    try testing.expect(G.dflashGateShouldDisable(w, w + w / 5, 0, 4.0, null));
-    try testing.expect(!G.dflashGateShouldDisable(w, w + w / 2, 0, 4.0, null));
+    // No serial sample: the ladder's break-even yield, 0.69 accepted drafts at 4 rows.
+    try testing.expectApproxEqAbs(@as(f32, 0.69), G.dflashBreakEvenAccepted(4.0), 0.01);
+    try testing.expect(G.dflashGateShouldDisable(w, w / 2, 0, 4.0, null));
+    try testing.expect(!G.dflashGateShouldDisable(w, w * 9 / 10, 0, 4.0, null));
     // A round never offers fewer accepted drafts than its break-even asks for, up to eight rows.
     for ([_]f32{ 3, 4, 5, 6, 8 }) |rows| try testing.expect(G.dflashBreakEvenAccepted(rows) < rows - 1);
-    // Rows the policy left out of a round are not a cost: 2.5 accepted per round at five rows on average
-    // clears the bar the eight-row block would set at 2.49.
+    // Rows the policy left out of a round are not a cost: 1.3 accepted per round at five rows on average
+    // clears the bar, and the same yield at the eight-row block does not.
     const rounds = 3 * w;
-    const acc = rounds * 5 / 2;
-    try testing.expect(!G.dflashGateShouldDisable(rounds, acc, 0, 5.0, null));
-    try testing.expect(G.dflashGateShouldDisable(rounds, acc - rounds / 20, 0, 8.0, null));
+    try testing.expect(!G.dflashGateShouldDisable(rounds, rounds * 13 / 10, 0, 5.0, null));
+    try testing.expect(G.dflashGateShouldDisable(rounds, rounds * 13 / 10, 0, 8.0, null));
+    // Normandy, 15k context: 1.18 accepted per round over 3.3 rows at 15.26 ms per token, against 17.74 ms serial,
+    // is a request DFlash wins, whether or not the bucket held a serial price when the gate looked.
+    const emitted: f64 = 1370 + 1617;
+    try testing.expect(!G.dflashGateShouldDisable(1370, 1617, 15.26 * emitted, 3.33, 17.74));
+    try testing.expect(!G.dflashGateShouldDisable(1370, 1617, 15.26 * emitted, 3.33, null));
+}
+
+test "Generator.DflashGateWindow: one-time costs in the warmup rounds do not decide the request, a steady loser is still dropped" {
+    const G = Generator;
+    const w: u64 = G.DFLASH_GATE_WARMUP;
+    const serial: f32 = 14.5;
+    // Warmup rounds of 80 ms (graph builds), then 30 ms rounds that emit 3.4 tokens: 8.8 ms per token.
+    var win = G.DflashGateWindow{};
+    var wall: f64 = 80.0 * @as(f64, @floatFromInt(w));
+    try testing.expect(!win.shouldDisable(w, 2 * w, wall, 5.0, serial));
+    var n: u64 = w;
+    while (n < 4 * w) : (n += 1) {
+        wall += 30.0;
+        try testing.expect(!win.shouldDisable(n + 1, 2 * w + (n + 1 - w) * 5 / 2, wall, 5.0, serial));
+    }
+    // The cumulative price over the same rounds is above the serial token, so the unwindowed test dropped it.
+    try testing.expect(G.dflashGateShouldDisable(w, 2 * w, 80.0 * @as(f64, @floatFromInt(w)), 5.0, serial));
+    // Rounds of 60 ms emitting 2 tokens (30 ms per token) lose once a warmup's worth of them has run.
+    var loser = G.DflashGateWindow{};
+    var lw: f64 = 30.0 * @as(f64, @floatFromInt(w));
+    try testing.expect(!loser.shouldDisable(w, w, lw, 5.0, serial));
+    var dropped_at: u64 = 0;
+    n = w;
+    while (n < 4 * w) : (n += 1) {
+        lw += 60.0;
+        if (loser.shouldDisable(n + 1, w + (n + 1 - w), lw, 5.0, serial)) {
+            dropped_at = n + 1;
+            break;
+        }
+    }
+    try testing.expectEqual(2 * w, dropped_at);
+}
+
+test "Generator.stopDflash: the drafter's window is released and no later tick can reach it" {
+    var g: Generator = undefined;
+    g.spec_disabled_runtime = false;
+    g.dflash_ctx = .{ .cache = try KVCache.init(testing.allocator, 5), .base_pos = 128 };
+    g.stopDflash();
+    try testing.expect(g.spec_disabled_runtime);
+    try testing.expect(g.dflash_ctx == null);
+    g.stopDflash();
+    try testing.expect(g.dflash_ctx == null);
+}
+
+test "Generator.dflashSerialPrice prices a context bucket by its own cell, never a shorter bucket's" {
+    var t = round_cost.Table{ .layout = .long };
+    const short_kv: u32 = 24000;
+    const long_kv: u32 = 90000;
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(0, short_kv, 17.74, 1, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 17.74), Generator.dflashSerialPrice(&t, t.bucketOf(short_kv)).?, 1e-3);
+    try testing.expect(Generator.dflashSerialPrice(&t, t.bucketOf(long_kv)) == null);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(0, long_kv, 30.2, 1, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 30.2), Generator.dflashSerialPrice(&t, t.bucketOf(long_kv)).?, 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 17.74), Generator.dflashSerialPrice(&t, t.bucketOf(short_kv)).?, 1e-3);
 }
 
 test "Generator.dflashSerialPrice reads the width-0 cell the DFlash fallback feeds, then the serial row" {

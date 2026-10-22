@@ -414,9 +414,9 @@ pub const DRAFTER_DEPTH_MAX: u32 = 16;
 pub const QWEN_MIN_ROWS: u32 = 2;
 /// The widest verify whose rows are decode-tick identical on qwen4 (`mtp.MAX_DEPTH` drafts + t1).
 pub const QWEN_MAX_ROWS: u32 = 9;
-pub const GLM_DEFAULT_ROWS: u32 = 3;
-/// The widest tree the GLM planner carries.
-pub const GLM_MAX_ROWS: u32 = 4;
+pub const GLM_MIN_ROWS: u32 = 2;
+/// The widest tree a GLM round verifies (`glm5_attention_decode_batch.max_tail`).
+pub const GLM_MAX_ROWS: u32 = 8;
 
 pub fn qwenMinRows() u32 {
     return drafter_min_depth orelse QWEN_MIN_ROWS;
@@ -443,19 +443,12 @@ pub fn qwenRowBounds(min: ?u32, max: ?u32, config_block: u32) error{DrafterDepth
     return .{ .min = lo, .max = hi };
 }
 
-/// GLM-5.3-Flash serves one tree shape: null keeps the engine's own default (two nodes, three rows), an
-/// explicit max sets the rows, and a min is only checked against them.
-pub fn glmRows(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!?u32 {
-    if (min == null and max == null) return null;
-    const rows = max orelse GLM_DEFAULT_ROWS;
-    if (rows > GLM_MAX_ROWS or (min orelse 0) > rows) return error.DrafterDepthUnsupported;
-    return rows;
-}
-
-/// Draft nodes a GLM round proposes: the block bound, then the two-node default or the flags' rows - 1.
-pub fn glmMaxNodes(block_size: u32, explicit: bool) usize {
-    const cap: u32 = if (explicit) GLM_MAX_ROWS - 1 else GLM_DEFAULT_ROWS - 1;
-    return @min(@max(block_size, 2) - 1, cap);
+/// GLM-5.3-Flash: the rows a round may verify, from the flags or the defaults; the verify path bounds them.
+pub fn glmRowBounds(min: ?u32, max: ?u32) error{DrafterDepthUnsupported}!RowBounds {
+    const hi = max orelse GLM_MAX_ROWS;
+    const lo = min orelse GLM_MIN_ROWS;
+    if (hi > GLM_MAX_ROWS or lo < GLM_MIN_ROWS or lo > hi) return error.DrafterDepthUnsupported;
+    return .{ .min = lo, .max = hi };
 }
 
 test "dflash: a drafter depth parses an integer in 2..16 and names everything else" {
@@ -479,17 +472,14 @@ test "dflash: Qwen rows default to 2..block and are bounded by the drafter block
     try testing.expectError(error.DrafterDepthUnsupported, qwenRowBounds(9, null, 8));
 }
 
-test "dflash: GLM keeps its own default unless asked, and an explicit 3 is that default" {
-    try testing.expectEqual(@as(?u32, null), try glmRows(null, null));
-    try testing.expectEqual(@as(?u32, 4), try glmRows(null, 4));
-    try testing.expectEqual(@as(?u32, 3), try glmRows(2, null));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRows(null, 5));
-    try testing.expectError(error.DrafterDepthUnsupported, glmRows(4, 3));
-    // unset: the loader's block (8 on the released drafter); explicit 3: block 3.
-    try testing.expectEqual(glmMaxNodes(8, false), glmMaxNodes(3, true));
-    try testing.expectEqual(@as(usize, 2), glmMaxNodes(8, false));
-    try testing.expectEqual(@as(usize, 3), glmMaxNodes(4, true));
-    try testing.expectEqual(@as(usize, 1), glmMaxNodes(2, true));
+test "dflash: GLM rows default to 2..8 and the flags move either end inside them" {
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 8 }, try glmRowBounds(null, null));
+    try testing.expectEqual(RowBounds{ .min = 2, .max = 4 }, try glmRowBounds(null, 4));
+    try testing.expectEqual(RowBounds{ .min = 3, .max = 8 }, try glmRowBounds(3, null));
+    try testing.expectEqual(RowBounds{ .min = 5, .max = 5 }, try glmRowBounds(5, 5));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(null, 9));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(4, 3));
+    try testing.expectError(error.DrafterDepthUnsupported, glmRowBounds(1, null));
 }
 
 /// Resolve the effective block size: the config's value, capped by what the
@@ -537,6 +527,86 @@ pub fn quantGroupFor(in_features: u32) ?u32 {
     if (in_features % QUANT_GROUP == 0) return QUANT_GROUP;
     if (in_features % 32 == 0) return 32;
     return null;
+}
+
+/// Bytes an assistant holds, and what its load holds above them while it runs.
+pub const AssistantBytes = struct {
+    /// Resident once loaded: the linears at `bits`, every other tensor as stored.
+    resident: u64,
+    /// The stored-precision copies of the quantized linears, which the weight map keeps until the load ends.
+    transient: u64,
+};
+
+/// The linears `loadLinear` quantizes (and, for the codebooks, the tensors it leaves dense).
+fn isAssistantLinear(key: []const u8) bool {
+    const suffixes = [_][]const u8{ ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight", ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight", ".kernel_projection.weight", ".hidden_projection.weight", ".markov_w2.weight" };
+    if (std.mem.eql(u8, key, "fc.weight") or std.mem.eql(u8, key, "encoder.fc.weight")) return true;
+    for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
+    return false;
+}
+
+fn allocationBytes(n: u64) u64 {
+    return (n + 16383) / 16384 * 16384;
+}
+
+/// What loading the assistant in `dir` at `bits` (0 = dense) holds, from the safetensors headers alone.
+/// Each array is billed at its allocation granule so the bill is never under what the allocator holds.
+pub fn assistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, bits: u32) !AssistantBytes {
+    const discovery = @import("model_discovery.zig");
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| discovery.freeShardSet(r);
+    var out = AssistantBytes{ .resident = 0, .transient = 0 };
+    var files = dir.iterate();
+    while (try files.next(io)) |entry| {
+        if ((entry.kind != .file and entry.kind != .sym_link) or !std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const file = try dir.openFile(io, entry.name, .{});
+        defer file.close(io);
+        const stat = try file.stat(io);
+        var buffer: [8192]u8 = undefined;
+        var reader = file.reader(io, &buffer);
+        const header_len = try reader.interface.takeInt(u64, .little);
+        if (header_len == 0 or header_len > 128 * 1024 * 1024 or header_len > stat.size -| 8) return error.InvalidSafetensorsHeader;
+        const header = try allocator.alloc(u8, @intCast(header_len));
+        defer allocator.free(header);
+        try reader.interface.readSliceAll(header);
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{}) catch return error.InvalidSafetensorsHeader;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |tensor| {
+            const key = tensor.key_ptr.*;
+            if (std.mem.eql(u8, key, "__metadata__")) continue;
+            if (tensor.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            const offsets = tensor.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+            if (offsets != .array or offsets.array.items.len != 2 or offsets.array.items[0] != .integer or offsets.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
+            const start = offsets.array.items[0].integer;
+            const end = offsets.array.items[1].integer;
+            if (start < 0 or end < start or @as(u64, @intCast(end)) > stat.size -| header_len -| 8) return error.InvalidSafetensorsHeader;
+            const stored: u64 = @intCast(end - start);
+            const shape = tensor.value_ptr.object.get("shape");
+            // A weight that ships packed (`.scales` beside it) is served as stored.
+            var packed_buf: [512]u8 = undefined;
+            const shipped_packed = key.len > ".weight".len and std.mem.endsWith(u8, key, ".weight") and
+                parsed.value.object.contains(std.fmt.bufPrint(&packed_buf, "{s}.scales", .{key[0 .. key.len - ".weight".len]}) catch "");
+            if (bits != 0 and !shipped_packed and isAssistantLinear(key) and shape != null and shape.? == .array and shape.?.array.items.len == 2 and
+                shape.?.array.items[0] == .integer and shape.?.array.items[1] == .integer)
+            {
+                const rows: u64 = @intCast(shape.?.array.items[0].integer);
+                const cols: u64 = @intCast(shape.?.array.items[1].integer);
+                if (quantGroupFor(@intCast(cols))) |group| {
+                    out.resident += allocationBytes(rows * cols * bits / 8) + 2 * allocationBytes(rows * (cols / group) * 2);
+                    out.transient += stored;
+                    continue;
+                }
+            }
+            out.resident += allocationBytes(stored);
+        }
+    }
+    if (out.resident == 0) return error.MissingAssistantWeights;
+    return out;
 }
 
 /// One assistant linear. Dense weights are pre-transposed to `[in, out]` and
@@ -3727,4 +3797,58 @@ test "dflash2: prefix outputs preserve full block attention and causal convoluti
         try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, 0));
         try testing.expectError(error.InvalidDflashPrefix, forwardBlockPrefix(&m, &ctx, noise, 10, TinyFix.BLOCK + 1));
     }
+}
+
+test "assistantLoadBytes: a quantizing load bills the packed linears, the dense rest, and the stored copies as its transient" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // fc [1024, 2048] bf16 quantizes (gs 64); a codebook and a norm stay dense; a [8, 30] linear has no group.
+    const header =
+        \\{"fc.weight":{"dtype":"BF16","shape":[1024,2048],"data_offsets":[0,4194304]},
+        \\"candidate_selector.predecessor_codebook":{"dtype":"BF16","shape":[256,128],"data_offsets":[4194304,4259840]},
+        \\"layers.0.self_attn.q_proj.weight":{"dtype":"BF16","shape":[8,30],"data_offsets":[4259840,4260320]},
+        \\"norm.weight":{"dtype":"BF16","shape":[2048],"data_offsets":[4260320,4264416]}}
+    ;
+    const body = try testing.allocator.alloc(u8, 8 + header.len + 4264416);
+    defer testing.allocator.free(body);
+    @memset(body, 0);
+    std.mem.writeInt(u64, body[0..8], header.len, .little);
+    @memcpy(body[8 .. 8 + header.len], header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    const g: u64 = 16384;
+    const q = try assistantLoadBytes(io, testing.allocator, dir_path, 8);
+    const packed_fc: u64 = 1024 * 2048 + 2 * 65536; // codes, then scales and biases of [1024, 32] bf16
+    try testing.expectEqual(packed_fc + 65536 + g + g, q.resident);
+    try testing.expectEqual(@as(u64, 4194304), q.transient);
+    const dense = try assistantLoadBytes(io, testing.allocator, dir_path, 0);
+    try testing.expectEqual(@as(u64, 4194304 + 65536 + g + g), dense.resident);
+    try testing.expectEqual(@as(u64, 0), dense.transient);
+}
+
+test "assistantLoadBytes: a tiny assistant's bill is never under what its load keeps or peaks at" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s);
+    const bill = try assistantLoadBytes(io, allocator, dir_path, 8);
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    _ = mlx.mlx_reset_peak_memory();
+    var m = try loadDflashQuant(io, allocator, s, dir_path, 8);
+    var after: usize = 0;
+    var peak: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    _ = mlx.mlx_get_peak_memory(&peak);
+    m.deinit();
+    try testing.expect(bill.resident >= after - before);
+    try testing.expect(bill.resident + bill.transient >= peak - before);
 }
