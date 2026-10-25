@@ -38,7 +38,7 @@ pub const ImageData = struct {
 pub const VisionPreproc = struct {
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
-    mode: enum { gemma, qwen, mimo, glm5 } = .gemma,
+    mode: enum { gemma, qwen, mimo, glm5, dsv41 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -48,6 +48,8 @@ pub const VisionPreproc = struct {
     max_tokens: u32 = 0,
     max_video_tokens: u32 = 0,
     min_tokens: u32 = 0,
+    /// dsv41: an image wider than this many heights is stretched into the capped canvas (0 = no cap).
+    max_wh_ratio: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -152,6 +154,9 @@ pub const ChatConfig = struct {
     /// The template's `preserve_thinking`, resolved per request; null leaves it
     /// undefined, which Qwen3.8 reads as keeping every turn's thinking.
     preserve_thinking: ?bool = null,
+    /// A template that reads `content` as a STRING (DeepSeek-V4.1): each image becomes this atom where it sits,
+    /// joined to the text around it by blank lines, as the release's encoder renders image blocks.
+    image_placeholder: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -312,7 +317,11 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 
     const root = parsed.value.object;
 
-    const chat_template: []const u8 = if (chatTemplateFromValue(root.get("chat_template"))) |t|
+    // DeepSeek's V4.1 template merges dicts with `**`, which jinja.cpp cannot parse; ours is pinned to the encoder.
+    const dsv41 = dirModelTypeIs(io, allocator, model_dir, "deepseek_v41");
+    const chat_template: []const u8 = if (dsv41)
+        try allocator.dupe(u8, @embedFile("fixtures/dsv41_chat_template.jinja"))
+    else if (chatTemplateFromValue(root.get("chat_template"))) |t|
         try allocator.dupe(u8, t)
     else blk: {
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
@@ -360,8 +369,12 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .eos_token = eos_token,
         .add_bos_token = add_bos_token,
         .allocator = allocator,
+        .image_placeholder = if (dsv41) dsv41_image_atom else null,
     };
 }
+
+/// V4.1's image placeholder token, which the processor expands into the image's span.
+const dsv41_image_atom = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>";
 
 /// Format chat messages into token IDs using the model's Jinja chat template.
 /// `effort` is the client's raw `reasoning_effort` string (see
@@ -1063,7 +1076,7 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1074,7 +1087,7 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template));
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.image_placeholder);
 }
 
 /// `content` as the typed part list vision templates render, each media part
@@ -1109,7 +1122,29 @@ fn appendContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), con
     try buf.append(allocator, ']');
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool) ![]const u8 {
+/// `content` as one string for a template that has no part list: an `atom` for each image at its offset, the
+/// text around them, all joined by blank lines. Video has no atom there and is dropped.
+fn appendContentText(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), content: []const u8, parts: []const MediaPart, atom: []const u8) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    var from: usize = 0;
+    for (parts) |p| {
+        const at = @max(from, @min(p.at, content.len));
+        if (p.kind != .image) continue;
+        if (at > from) try appendJoined(allocator, &text, content[from..at]);
+        try appendJoined(allocator, &text, atom);
+        from = at;
+    }
+    if (from < content.len) try appendJoined(allocator, &text, content[from..]);
+    try appendJsonString(allocator, buf, text.items);
+}
+
+fn appendJoined(allocator: std.mem.Allocator, text: *std.ArrayList(u8), piece: []const u8) !void {
+    if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
+    try text.appendSlice(allocator, piece);
+}
+
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, image_atom: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1121,7 +1156,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 
         try buf.appendSlice(allocator, ",\"content\":");
         if (msg.media_parts != null and msg.media_parts.?.len > 0) {
-            try appendContentParts(allocator, &buf, msg.content, msg.media_parts.?);
+            if (image_atom) |atom| try appendContentText(allocator, &buf, msg.content, msg.media_parts.?, atom) else try appendContentParts(allocator, &buf, msg.content, msg.media_parts.?);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {
@@ -1262,6 +1297,14 @@ pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
     return "low";
 }
 
+/// OpenAI's effort vocabulary -> DeepSeek-V4.1's low|high|max (the encoder's default is high).
+fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "high";
+    if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) return "low";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max") or std.mem.eql(u8, e, "ultra")) return "max";
+    return "high";
+}
+
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
 /// absent or unrecognized effort keeps the checkpoint default. Thinking-off
@@ -1373,8 +1416,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         try buf.appendSlice(allocator, effort orelse "high");
         try buf.append(allocator, '"');
     } else if (dsv4_style) {
+        // V4.1 renders a numeric budget for every thinking turn, on its own ladder.
+        const v41 = std.mem.indexOf(u8, chat_config.chat_template, "(range 1-100") != null;
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
-        try buf.appendSlice(allocator, dsv4EffortFor(effort));
+        try buf.appendSlice(allocator, if (v41) dsv41EffortFor(effort) else dsv4EffortFor(effort));
         try buf.append(allocator, '"');
     } else if (qwen38_style) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
@@ -1897,6 +1942,40 @@ const tool_markup_openers = [_][]const u8{
     INKLING_INVOKE_TAG,
 };
 
+/// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
+/// the opener alone is prose ("wrap it in <invoke name=…>"): a `<parameter ` or `</invoke>` must be there too.
+fn bareInvokeMarkupCut(text: []const u8) ?usize {
+    if (std.mem.indexOf(u8, text, "<parameter ") == null and
+        std.mem.indexOf(u8, text, BARE_INVOKE.invoke_close) == null) return null;
+    var cut = std.mem.indexOf(u8, text, FUNCTION_CALLS_TAG);
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, text, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= text.len or std.ascii.isWhitespace(text[after])) {
+            if (cut == null or p < cut.?) cut = p;
+            break;
+        }
+        scan = after;
+    }
+    return cut;
+}
+
+/// True while `buf` holds, or ends in a growing prefix of, a `<function_calls>` / `<invoke …` opener.
+fn invokeOpenerHoldsForTools(buf: []const u8) bool {
+    if (std.mem.indexOf(u8, buf, FUNCTION_CALLS_TAG) != null) return true;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= buf.len or std.ascii.isWhitespace(buf[after])) return true;
+        scan = after;
+    }
+    inline for (.{ FUNCTION_CALLS_TAG, BARE_INVOKE.invoke }) |marker| {
+        var k: usize = 2;
+        while (k < marker.len) : (k += 1) if (std.mem.endsWith(u8, buf, marker[0..k])) return true;
+    }
+    return false;
+}
+
 /// Earliest index of MiniCPM5 attribute-form tool markup, or null.
 /// Discriminated exactly as the streaming gate does it — `<function` followed
 /// by WHITESPACE, with a `name=` inside the opener region — so `<functional`,
@@ -1946,6 +2025,12 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     // dialect is `<function` + whitespace + a `name=` attribute, so prose words
     // beginning `<function…` are left alone.
     if (miniCpm5MarkupCut(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
+    if (bareInvokeMarkupCut(text)) |p| {
         if (p < cut) {
             cut = p;
             is_inkling = false;
@@ -3052,6 +3137,8 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // `<function…` family: MiniCPM5's `<function name="…">`.
     if (functionOpenerHoldsForTools(buf)) return true;
+    // Claude-style `<function_calls>` / `<invoke name="…">`.
+    if (invokeOpenerHoldsForTools(buf)) return true;
 
     // Trailing partial prefixes — the next streamed token could complete any
     // of these into a real tool open. Order doesn't matter; first endsWith
@@ -3506,7 +3593,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
     // tool segments arrive wrapped in channel headers the think-strip above
     // would misjudge.
-    try parseAtemToolCalls(allocator, text, &calls);
+    try parseInvokeToolCalls(allocator, text, &calls, ATEM_INVOKE);
     // gpt_oss / harmony (`to=functions.NAME<|channel|>commentary…<|message|>`):
     // the name lives in the header, not the payload, so no generic scan can
     // recover it. Runs on the FULL text for the same reason ATEM does — the
@@ -3526,6 +3613,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
     try parseHy3ToolCalls(allocator, effective_text, &calls);
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -5130,10 +5218,25 @@ fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
 /// argument values.
 // DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
 // (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
-const DSML_INVOKE_TAG = "<｜DSML｜invoke";
-const DSML_INVOKE_CLOSE = "</｜DSML｜invoke>";
-const DSML_PARAM_TAG = "<｜DSML｜parameter";
-const DSML_PARAM_CLOSE = "</｜DSML｜parameter>";
+// V4.1 puts a space before every tag name (`<｜DSML｜ invoke`); both spellings parse.
+const DsmlTag = struct { open: []const u8, name: []const u8 };
+const DSML_INVOKE_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "invoke" };
+const DSML_INVOKE_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "invoke>" };
+const DSML_PARAM_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "parameter" };
+const DSML_PARAM_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "parameter>" };
+
+const DsmlHit = struct { at: usize, end: usize };
+
+fn dsmlFind(text: []const u8, from: usize, comptime tag: DsmlTag) ?DsmlHit {
+    var p = from;
+    while (std.mem.indexOfPos(u8, text, p, tag.open)) |at| {
+        var q = at + tag.open.len;
+        if (q < text.len and text[q] == ' ') q += 1;
+        if (std.mem.startsWith(u8, text[q..], tag.name)) return .{ .at = at, .end = q + tag.name.len };
+        p = at + 1;
+    }
+    return null;
+}
 
 /// Tolerant quoted-attribute extraction from a tag-attribute segment:
 /// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
@@ -5173,8 +5276,8 @@ fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
 fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     const Param = struct { key: []const u8, value: []const u8, is_string: bool };
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, DSML_INVOKE_TAG)) |inv| {
-        var p = inv + DSML_INVOKE_TAG.len;
+    while (dsmlFind(text, pos, DSML_INVOKE_TAG)) |inv| {
+        var p = inv.end;
         const tag_end = std.mem.indexOfScalarPos(u8, text, p, '>') orelse break;
         const name = dsmlAttr(text[p..tag_end], "name") orelse {
             pos = tag_end + 1;
@@ -5185,19 +5288,19 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         var params = std.ArrayList(Param).empty;
         defer params.deinit(allocator);
         while (true) {
-            const next_param = std.mem.indexOfPos(u8, text, p, DSML_PARAM_TAG);
-            const next_close = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_CLOSE);
-            const next_invoke = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_TAG);
-            const np = next_param orelse std.math.maxInt(usize);
-            const nc = next_close orelse std.math.maxInt(usize);
-            const ni = next_invoke orelse std.math.maxInt(usize);
+            const next_param = dsmlFind(text, p, DSML_PARAM_TAG);
+            const next_close = dsmlFind(text, p, DSML_INVOKE_CLOSE);
+            const next_invoke = dsmlFind(text, p, DSML_INVOKE_TAG);
+            const np = if (next_param) |h| h.at else std.math.maxInt(usize);
+            const nc = if (next_close) |h| h.at else std.math.maxInt(usize);
+            const ni = if (next_invoke) |h| h.at else std.math.maxInt(usize);
             if (np == std.math.maxInt(usize) and nc == std.math.maxInt(usize) and ni == std.math.maxInt(usize)) {
                 // truncated invoke: ship NAME + completed pairs
                 p = text.len;
                 break;
             }
             if (nc <= np and nc <= ni) {
-                p = nc + DSML_INVOKE_CLOSE.len;
+                p = next_close.?.end;
                 break;
             }
             if (ni < np) {
@@ -5207,7 +5310,7 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
                 break;
             }
             // parameter
-            var q = np + DSML_PARAM_TAG.len;
+            var q = next_param.?.end;
             const ptag_end = std.mem.indexOfScalarPos(u8, text, q, '>') orelse {
                 p = text.len;
                 break;
@@ -5216,14 +5319,14 @@ fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
             const pkey = dsmlAttr(attrs, "name");
             const pstring = dsmlAttr(attrs, "string");
             const vstart = ptag_end + 1;
-            const vclose = std.mem.indexOfPos(u8, text, vstart, DSML_PARAM_CLOSE) orelse {
+            const vclose = dsmlFind(text, vstart, DSML_PARAM_CLOSE) orelse {
                 // unterminated value = server-cut fragment; drop it, end scan
                 p = text.len;
                 break;
             };
-            q = vclose + DSML_PARAM_CLOSE.len;
+            q = vclose.end;
             if (pkey) |k| {
-                const value = text[vstart..vclose];
+                const value = text[vstart..vclose.at];
                 // string attr absent (mangled opener): treat JSON-parseable
                 // values as JSON, everything else as a string.
                 const is_string = if (pstring) |sf|
@@ -5366,10 +5469,19 @@ fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
 // coercion chokepoint still gets the final word). The parser keys on the
 // INVOKE tag so a dropped wrapper still parses (delimiter-drop class), and
 // truncation salvages NAME + completed parameters — never fragment values.
-const ATEM_INVOKE_TAG = "<atem:invoke";
-const ATEM_PARAM_TAG = "<atem:parameter";
-const ATEM_PARAM_CLOSE = "</atem:parameter>";
-const ATEM_INVOKE_CLOSE = "</atem:invoke>";
+const InvokeDialect = struct {
+    invoke: []const u8,
+    param: []const u8,
+    param_close: []const u8,
+    invoke_close: []const u8,
+    /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
+    inferred: bool,
+};
+const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
+/// Claude's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
+/// which models trained on Claude transcripts emit in place of their own (qwen4_exp).
+const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
+const FUNCTION_CALLS_TAG = "<function_calls>";
 
 /// gpt_oss / harmony tool calls. Structurally unlike every other family here:
 /// the function NAME is not in the payload at all, it is the segment header's
@@ -5428,11 +5540,19 @@ fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
     }
 }
 
-fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
+    // An inferred dialect's opener alone is prose ("wrap it in <invoke name=\"bash\">", even naming a declared
+    // tool): a call also carries a parameter or its close, as `bareInvokeMarkupCut` demands.
+    if (d.inferred and std.mem.indexOf(u8, text, d.param ++ " ") == null and std.mem.indexOf(u8, text, d.invoke_close) == null) return;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, ATEM_INVOKE_TAG)) |inv| {
-        const after_tag = inv + ATEM_INVOKE_TAG.len;
+    while (std.mem.indexOfPos(u8, text, pos, d.invoke)) |inv| {
+        const after_tag = inv + d.invoke.len;
         const seg = text[after_tag..];
+        // `<invoked>` is a word, not the tag.
+        if (seg.len > 0 and !std.ascii.isWhitespace(seg[0])) {
+            pos = after_tag;
+            continue;
+        }
         // Attribute scan bounded so a runaway unclosed quote can't eat the
         // rest of the output.
         const raw_name = dsmlAttr(seg[0..@min(seg.len, 512)], "name") orelse {
@@ -5453,10 +5573,10 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         var args_json: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
-            const body_end = std.mem.indexOf(u8, body_all, ATEM_INVOKE_CLOSE) orelse body_all.len;
-            args_json = try atemParamsToJson(allocator, body_all[0..body_end]);
+            const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
+            args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
-                after_tag + te + 1 + body_end + ATEM_INVOKE_CLOSE.len
+                after_tag + te + 1 + body_end + d.invoke_close.len
             else
                 text.len; // truncated body — completed params already salvaged
         } else {
@@ -5466,24 +5586,24 @@ fn parseAtemToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *st
         const name = try allocator.dupe(u8, name_slice);
         errdefer allocator.free(name);
         const arguments = args_json orelse try allocator.dupe(u8, "{}");
-        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = d.inferred });
     }
 }
 
-/// Assemble `<atem:parameter name="k">v</atem:parameter>` runs into a JSON
+/// Assemble `<parameter name="k">v</parameter>` runs (ATEM's namespaced or Claude's bare) into a JSON
 /// object string. A value that parses as COMPLETE JSON keeps its spelled type;
 /// everything else is a raw string, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
 /// JSON. Returns null when no complete parameter was found.
-fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8 {
+fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
     var map: std.json.ObjectMap = .empty;
     var pos: usize = 0;
     var found = false;
-    while (std.mem.indexOfPos(u8, body, pos, ATEM_PARAM_TAG)) |p| {
-        const after = p + ATEM_PARAM_TAG.len;
+    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
+        const after = p + d.param.len;
         const seg = body[after..];
         const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
         const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
@@ -5494,13 +5614,13 @@ fn atemParamsToJson(allocator: std.mem.Allocator, body: []const u8) !?[]const u8
         // The value runs to the CONFIRMED closing tag — rich values with
         // newlines/quotes/`<` survive; no close by end of text = fragment,
         // dropped.
-        const vend_rel = std.mem.indexOf(u8, body[vstart..], ATEM_PARAM_CLOSE) orelse break;
+        const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
         const raw = body[vstart .. vstart + vend_rel];
         const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
             std.json.Value{ .string = raw };
         try map.put(aa, pname, v);
         found = true;
-        pos = vstart + vend_rel + ATEM_PARAM_CLOSE.len;
+        pos = vstart + vend_rel + d.param_close.len;
     }
     if (!found) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
@@ -14103,6 +14223,40 @@ test "parseAtemToolCalls: parallel invokes each parse; dropped wrapper still par
     try testing.expectEqualStrings("a.two", calls[1].name);
 }
 
+test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
+    const allocator = testing.allocator;
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && ls -la</parameter>\n<parameter name=\"timeout\">30</parameter>\n</invoke>\n</function_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    // Not the model's own dialect: it must name a declared tool to survive.
+    try testing.expect(calls[0].inferred);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && ls -la", parsed.value.object.get("command").?.string);
+    try testing.expectEqual(@as(i64, 30), parsed.value.object.get("timeout").?.integer);
+    try testing.expect((try parseToolCalls(allocator, "I <invoked> it with <parameters> set.")) == null);
+    // An unparsed block never reaches content; prose naming the tag stays.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));
+    const prose = "Claude's format wraps each call in <invoke name=\"x\"> tags.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+}
+
+test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</function_calls>";
+    for ([_]usize{ 0, std.mem.indexOf(u8, text, "<invoke").? }) |start| {
+        var end = start + 2;
+        while (end <= text.len) : (end += 1) {
+            testing.expect(streamShouldBufferForTools(text[start..end])) catch |e| {
+                std.debug.print("gate flushed a prefix of an accepted call: '{s}'\n", .{text[start..end]});
+                return e;
+            };
+        }
+    }
+    try testing.expect(!streamShouldBufferForTools("I <invoked> the <function_callback> helper"));
+}
+
 test "muse streaming gate: headers hold, self holds then splits, user splits" {
     // Growing bare header — never flush the ` to=…` text. The sub-"to="
     // prefixes are the live 2026-08-10 leak (" to" shipped as a text delta
@@ -15343,6 +15497,29 @@ test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-of
     try testing.expectEqualStrings("</think>", contentChannelTail("", "x<think>\n", true));
 }
 
+test "serializeMessagesJson: a string-content template gets each image as its atom where it sits, blank-line joined" {
+    const a = testing.allocator;
+    const parts = [_]MediaPart{ .{ .at = 0, .kind = .image }, .{ .at = 5, .kind = .image }, .{ .at = 5, .kind = .video } };
+    const msgs = [_]Message{
+        .{ .role = "user", .content = "AAAAABBB", .media_parts = &parts },
+        .{ .role = "tool", .content = "result", .media_parts = parts[0..1] },
+        .{ .role = "user", .content = "plain" },
+    };
+    var cfg = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = "<IMG>" };
+    const json = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    defer a.free(json);
+    try testing.expectEqualStrings(
+        "[{\"role\":\"user\",\"content\":\"<IMG>\\n\\nAAAAA\\n\\n<IMG>\\n\\nBBB\"}," ++
+            "{\"role\":\"tool\",\"content\":\"<IMG>\\n\\nresult\"},{\"role\":\"user\",\"content\":\"plain\"}]",
+        json,
+    );
+    // Without the atom the same message renders as typed parts.
+    cfg.image_placeholder = null;
+    const typed = try serializeMessagesJsonFor(a, msgs[0..1], .null_literal, &cfg);
+    defer a.free(typed);
+    try testing.expect(std.mem.indexOf(u8, typed, "{\"type\":\"image\"}") != null);
+}
+
 test "K2-Horizon: assistant history always carries a thinking field, and the effort word is high|medium|low" {
     const k2_tpl = "{%- set think_tag = 'ifm|think' -%}{%- set effort = reasoning_effort | default('high') -%}";
     const cfg = ChatConfig{ .chat_template = k2_tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
@@ -15627,4 +15804,90 @@ test "history tool arguments nested past the limit embed an empty object" {
     const json = try serializeMessagesJson(a, &msgs);
     defer a.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "\"arguments\":{}") != null);
+}
+
+test "chat: V4.1 renders images as the release's encoder does, an atom for each where it sat" {
+    // Expected strings are `encoding.encode_messages` on the same blocks (image_url parts, thinking_mode chat/thinking).
+    const a = testing.allocator;
+    const img1 = [_]ImageData{.{ .pixels = &.{}, .width = 1, .height = 1 }};
+    const lead = [_]MediaPart{.{ .at = 0, .kind = .image }};
+    const tail = [_]MediaPart{.{ .at = 2, .kind = .image }};
+    const cases = [_]struct { msgs: []const Message, chat: []const u8, thinking: []const u8 }{
+        .{
+            .msgs = &.{.{ .role = "user", .content = "What is this?", .images = &img1, .media_parts = &lead }},
+            .chat = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}><\u{ff5c}deepseek_image\u{ff5c}>\n\nWhat is this?<\u{ff5c}Assistant\u{ff5c}></think>",
+            .thinking = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{ff5c}User\u{ff5c}><\u{ff5c}deepseek_image\u{ff5c}>\n\nWhat is this?<\u{ff5c}Assistant\u{ff5c}><think>",
+        },
+        .{
+            .msgs = &.{.{ .role = "user", .content = "Look:Describe.", .images = &img1, .media_parts = &.{.{ .at = 5, .kind = .image }} }},
+            .chat = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>Look:\n\n<\u{ff5c}deepseek_image\u{ff5c}>\n\nDescribe.<\u{ff5c}Assistant\u{ff5c}></think>",
+            .thinking = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{ff5c}User\u{ff5c}>Look:\n\n<\u{ff5c}deepseek_image\u{ff5c}>\n\nDescribe.<\u{ff5c}Assistant\u{ff5c}><think>",
+        },
+        .{
+            .msgs = &.{
+                .{ .role = "system", .content = "S" },
+                .{ .role = "user", .content = "q1", .images = &img1, .media_parts = &lead },
+                .{ .role = "assistant", .content = "a1" },
+                .{ .role = "user", .content = "q2", .images = &img1, .media_parts = &tail },
+            },
+            .chat = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}System\u{ff5c}>S<\u{ff5c}User\u{ff5c}><\u{ff5c}deepseek_image\u{ff5c}>\n\nq1<\u{ff5c}Assistant\u{ff5c}></think>a1<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>q2\n\n<\u{ff5c}deepseek_image\u{ff5c}><\u{ff5c}Assistant\u{ff5c}></think>",
+            .thinking = "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}System\u{ff5c}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nS<\u{ff5c}User\u{ff5c}><\u{ff5c}deepseek_image\u{ff5c}>\n\nq1<\u{ff5c}Assistant\u{ff5c}></think>a1<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}><\u{ff5c}User\u{ff5c}>q2\n\n<\u{ff5c}deepseek_image\u{ff5c}><\u{ff5c}Assistant\u{ff5c}><think>",
+        },
+    };
+    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = dsv41_image_atom };
+    const tpl_z = try a.dupeSentinel(u8, cfg.chat_template, 0);
+    defer a.free(tpl_z);
+    for (cases) |c| for ([_]struct { mode: []const u8, want: []const u8 }{ .{ .mode = "chat", .want = c.chat }, .{ .mode = "thinking", .want = c.thinking } }) |arm| {
+        const json = try serializeMessagesJsonFor(a, c.msgs, .null_literal, &cfg);
+        defer a.free(json);
+        const json_z = try a.dupeSentinel(u8, json, 0);
+        defer a.free(json_z);
+        const extra = try std.fmt.allocPrintSentinel(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"high\"}}", .{arm.mode}, 0);
+        defer a.free(extra);
+        var len: usize = 0;
+        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, json_z.ptr, null, extra.ptr, 1, &len) orelse return error.RenderFailed;
+        defer jinja_c.jinja_str_free(ptr);
+        try testing.expectEqualStrings(arm.want, ptr[0..len]);
+    };
+}
+
+test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with DeepSeek's encoder" {
+    const a = testing.allocator;
+    const tpl = @embedFile("fixtures/dsv41_chat_template.jinja");
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("fixtures/dsv41_template_cases.json"), .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |case| {
+        const o = case.object;
+        const msgs = try std.json.Stringify.valueAlloc(a, o.get("messages").?, .{});
+        defer a.free(msgs);
+        const tools: ?[]u8 = if (o.get("tools").? == .null) null else try std.json.Stringify.valueAlloc(a, o.get("tools").?, .{});
+        defer if (tools) |t| a.free(t);
+        const extra = try std.fmt.allocPrint(a, "{{\"thinking_mode\":\"{s}\",\"reasoning_effort\":\"{s}\"}}", .{ o.get("thinking_mode").?.string, o.get("reasoning_effort").?.string });
+        defer a.free(extra);
+        const tpl_z = try a.dupeSentinel(u8, tpl, 0);
+        defer a.free(tpl_z);
+        const msgs_z = try a.dupeSentinel(u8, msgs, 0);
+        defer a.free(msgs_z);
+        const extra_z = try a.dupeSentinel(u8, extra, 0);
+        defer a.free(extra_z);
+        const tools_z = if (tools) |t| try a.dupeSentinel(u8, t, 0) else null;
+        defer if (tools_z) |t| a.free(t);
+        var len: usize = 0;
+        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, if (tools_z) |t| t.ptr else null, extra_z.ptr, 1, &len) orelse {
+            std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
+            return error.RenderFailed;
+        };
+        defer jinja_c.jinja_str_free(ptr);
+        testing.expectEqualStrings(o.get("expected").?.string, ptr[0..len]) catch |e| {
+            std.debug.print("case: {s}\n", .{o.get("label").?.string});
+            return e;
+        };
+    }
+}
+
+test "chat: the V4.1 effort words stay on the encoder's low|high|max ladder" {
+    try testing.expectEqualStrings("high", dsv41EffortFor(null));
+    try testing.expectEqualStrings("low", dsv41EffortFor("minimal"));
+    try testing.expectEqualStrings("high", dsv41EffortFor("medium"));
+    try testing.expectEqualStrings("max", dsv41EffortFor("xhigh"));
 }
