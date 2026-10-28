@@ -69,7 +69,7 @@ FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0.0}"
 # 228k tokens is the safe single-request ceiling for 64 GB Mac with Qwen resident; override with 262144 if needed
 CTX_SIZE="${CTX_SIZE:-228000}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
-REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
+REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-2}"
 WIRED_MARGIN_GIB="${WIRED_MARGIN_GIB:-2}"
 PREFILL_DECODE_SHARE="${PREFILL_DECODE_SHARE:-0.2}"
@@ -94,7 +94,7 @@ PRESERVE_THINKING="${PRESERVE_THINKING:-on}"
 
 # DFlash2 Speculative Decoding configuration
 # When enabled and drafter is found, DFlash2 replaces MTP for speculative decoding
-ENABLE_DFLASH="${ENABLE_DFLASH:-true}"
+ENABLE_DFLASH="${ENABLE_DFLASH:-false}"
 DFLASH_DIR="${DFLASH_DIR:-${SUSHI_DIR}/dflash2}"
 DRAFTER_MIN_DEPTH="${DRAFTER_MIN_DEPTH:-2}"
 DRAFTER_MAX_DEPTH="${DRAFTER_MAX_DEPTH:-8}"
