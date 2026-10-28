@@ -10,8 +10,8 @@ set -e  # Exit on error
 # CONFIGURATION
 # ============================================================================
 
-# Model rate & directories (switchable between 2.6bpw and 3.0bpw)
-MODEL_BPW="${MODEL_BPW:-2.6bpw}"  # Options: 2.6bpw (43.9 GB) or 3.0bpw (49.3 GB)
+# Model rate & directories (options: STQ-2.75bpw, 2.6bpw, 3.0bpw)
+MODEL_BPW="${MODEL_BPW:-STQ-2.75bpw}"  # Default: STQ-2.75bpw (recommended for 64 GB Mac)
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
 MODELS_DIR="${SUSHI_DIR}/model-${MODEL_BPW}"
