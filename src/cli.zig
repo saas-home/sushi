@@ -2,7 +2,7 @@
 //! ergonomics for the terminal.
 //!
 //!   sushi run qwen3.8-flash-next          # download if missing, serve, drop into a REPL
-//!   sushi pull qwen3.8-flash-next:2.6bpw  # download only
+//!   sushi pull qwen3.8-flash-next:2.75bpw  # download only
 //!   sushi run mimo-v2.6-flash             # MiMo-V2.6-Flash (128 GB)
 //!   sushi list                            # the Sushi packs for this Mac, and what's on disk
 //!
@@ -119,17 +119,17 @@ pub const Alias = struct {
 pub const HF_ORG = "beamster";
 
 /// The published Sushi packs, with the memory tiers the README and docs/usage.md state. The bare Qwen
-/// name picks 3bpw: 2.6bpw needs the same 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's pack and
+/// name picks 2.75bpw (64 GB); 4bpw needs 96 GB. MiMo's pack and
 /// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
 /// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
 pub const aliases = [_]Alias{
     .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32 },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", .tier_gb = 64, .recommend_gb = 64 },
-    .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true, .tier_gb = 64 },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64 },
     .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
     .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96 },
 };
 
 pub const Resolved = struct {
@@ -198,7 +198,7 @@ fn stripTag(name: []const u8) []const u8 {
 }
 
 /// Short name / repo ref → HF repo id. Accepts:
-///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.6bpw"  (alias table)
+///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.75bpw"  (alias table)
 ///   "org/repo" / "org/repo:tag"       (direct, tag stripped; `checkPullable` refuses any org but beamster)
 ///   "hf.co/org/repo", "huggingface.co/org/repo"
 /// Returns null for unknown alias-shaped names (no '/').
@@ -400,16 +400,85 @@ pub const Reporter = struct {
     }
 };
 
-/// Appends the shared curl argv prefix; returns the owned Authorization
-/// header string when HF_TOKEN is set (caller frees).
-fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !?[]u8 {
-    try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
-    if (std.c.getenv("HF_TOKEN")) |tok| {
-        const header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
-        try list.appendSlice(allocator, &.{ "-H", header });
-        return header;
+/// The process environment a Hugging Face token is resolved from; a test passes its own.
+const HfEnv = struct {
+    token: ?[]const u8 = null,
+    token_path: ?[]const u8 = null,
+    hf_home: ?[]const u8 = null,
+    home: []const u8,
+
+    fn fromProcess() HfEnv {
+        const get = struct {
+            fn f(name: [:0]const u8) ?[]const u8 {
+                return if (std.c.getenv(name.ptr)) |v| std.mem.span(v) else null;
+            }
+        }.f;
+        return .{ .token = get("HF_TOKEN"), .token_path = get("HF_TOKEN_PATH"), .hf_home = get("HF_HOME"), .home = homeDir() };
     }
-    return null;
+};
+
+/// The token `sushi pull` and `sushi list` send: `HF_TOKEN`, else the file `hf auth login` wrote (`HF_TOKEN_PATH`,
+/// else `$HF_HOME/token`, else `~/.cache/huggingface/token`; the first one set is the only one read). Blank is none.
+fn resolveHfToken(allocator: std.mem.Allocator, io: std.Io, env: HfEnv) !?[]u8 {
+    if (env.token) |t| {
+        const v = std.mem.trim(u8, t, " \t\r\n");
+        if (v.len > 0) return try allocator.dupe(u8, v);
+    }
+    const path = try hfTokenPath(allocator, env);
+    defer allocator.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(4096)) catch return null;
+    defer allocator.free(raw);
+    const v = std.mem.trim(u8, raw, " \t\r\n");
+    return if (v.len == 0) null else try allocator.dupe(u8, v);
+}
+
+fn hfTokenPath(allocator: std.mem.Allocator, env: HfEnv) ![]u8 {
+    if (env.token_path) |p| if (p.len > 0) return allocator.dupe(u8, p);
+    if (env.hf_home) |h| if (h.len > 0) return std.fmt.allocPrint(allocator, "{s}/token", .{h});
+    return std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/token", .{env.home});
+}
+
+var hf_header_seq = std.atomic.Value(u32).init(0);
+
+/// The Authorization header for one curl call, kept in a 0600 file passed as `-H @file`: a token in argv shows in `ps`.
+const HfAuth = struct {
+    arg: ?[]u8 = null,
+
+    fn initProcess(allocator: std.mem.Allocator, io: std.Io) !HfAuth {
+        const tmp_dir = if (std.c.getenv("TMPDIR")) |t| std.mem.trimEnd(u8, std.mem.span(t), "/") else "/tmp";
+        return init(allocator, io, HfEnv.fromProcess(), tmp_dir);
+    }
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, env: HfEnv, tmp_dir: []const u8) !HfAuth {
+        const token = try resolveHfToken(allocator, io, env) orelse return .{};
+        defer allocator.free(token);
+        const line = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\n", .{token});
+        defer allocator.free(line);
+        const arg = try std.fmt.allocPrint(allocator, "@{s}/sushi-hf-{d}-{d}.hdr", .{ tmp_dir, std.c.getpid(), hf_header_seq.fetchAdd(1, .monotonic) });
+        errdefer allocator.free(arg);
+        const file = try std.Io.Dir.cwd().createFile(io, arg[1..], .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        errdefer std.Io.Dir.cwd().deleteFile(io, arg[1..]) catch {};
+        try file.writeStreamingAll(io, line);
+        return .{ .arg = arg };
+    }
+
+    fn deinit(self: *HfAuth, allocator: std.mem.Allocator, io: std.Io) void {
+        const arg = self.arg orelse return;
+        std.Io.Dir.cwd().deleteFile(io, arg[1..]) catch {};
+        allocator.free(arg);
+        self.arg = null;
+    }
+
+    fn appendArgs(self: HfAuth, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+        if (self.arg) |arg| try list.appendSlice(allocator, &.{ "-H", arg });
+    }
+};
+
+/// Appends the shared curl argv prefix and the Hugging Face credentials.
+fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator, auth: HfAuth) !void {
+    try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
+    try auth.appendArgs(list, allocator);
 }
 
 /// How an HTTP status reads for a Hugging Face lookup: a document, "no such repo" (HF answers 401 for a repo
@@ -432,12 +501,9 @@ fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8, quick: boo
         &.{ "--connect-timeout", "3", "--max-time", "6" }
     else
         &.{ "--retry", "3", "--retry-delay", "2" });
-    var header: ?[]u8 = null;
-    defer if (header) |h| allocator.free(h);
-    if (std.c.getenv("HF_TOKEN")) |tok| {
-        header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
-        try argv.appendSlice(allocator, &.{ "-H", header.? });
-    }
+    var auth = HfAuth.initProcess(allocator, io) catch return error.FetchFailed;
+    defer auth.deinit(allocator, io);
+    try auth.appendArgs(&argv, allocator);
     try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
     const result = std.process.run(allocator, io, .{
         .argv = argv.items,
@@ -475,8 +541,9 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
 
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
-    const header_storage = try curlBaseArgs(&argv, allocator);
-    defer if (header_storage) |h| allocator.free(h);
+    var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
+    defer auth.deinit(allocator, io);
+    try curlBaseArgs(&argv, allocator, auth);
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");
@@ -573,9 +640,9 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
         if (err == error.NotFound) {
-            reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is gated: set HF_TOKEN)", .{resolved.repo});
+            reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is private or gated: set HF_TOKEN or run `hf auth login`)", .{resolved.repo});
         } else {
-            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
+            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN / `hf auth login` for gated repos)", .{resolved.repo});
         }
         return error.PullFailed;
     };
@@ -646,12 +713,24 @@ fn stderrReport(impl: *anyopaque, line: []const u8) void {
 var stderr_reporter_dummy: u8 = 0;
 const stderr_reporter = Reporter{ .impl = &stderr_reporter_dummy, .reportFn = &stderrReport };
 
+/// The absolute real path of `path` when it is a relative path naming an existing directory (resolved against the
+/// cwd), else null. Everything downstream of launch takes absolute model paths only.
+pub fn resolveRelativeDir(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return null;
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return null;
+    defer dir.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = dir.realPath(io, &buf) catch return null;
+    return allocator.dupe(u8, buf[0..n]) catch null;
+}
+
 /// Resolve + download-if-missing; returns the local model dir (owned).
 /// Exits the process with a friendly message on unknown names, and on a repo of another org that is not
 /// already on disk (downloads come from the `beamster` org only).
 pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
     // A path that exists locally is used as-is.
     if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
+    if (resolveRelativeDir(allocator, io, name)) |abs| return abs;
     const resolved = resolveShortName(name) orelse {
         log.err("unknown model '{s}'\n", .{name});
         printKnownAliases(io);
@@ -1949,12 +2028,15 @@ test "cli: --no-mtp-lookup is its own flag, not --no-mtp" {
 
 test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Bare alias picks the family default.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next").?.repo);
     // Tagged alias, case-insensitive.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next:2.75bpw").?.repo);
+    // The packs the 2.75bpw one replaced are no longer short names.
+    try testing.expect(resolveShortName("qwen3.8-flash-next:2.6bpw") == null);
+    try testing.expect(resolveShortName("qwen3.8-flash-next:3bpw") == null);
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-4bpw", resolveShortName("QWEN3.8-FLASH-NEXT:4BPW").?.repo);
     // :latest behaves like bare.
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-3bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next:latest").?.repo);
     // MiMo's one published pack, bare or tagged.
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("mimo-v2.6-flash").?.repo);
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("MiMo-V2.6-Flash:2.3bpw").?.repo);
@@ -1962,6 +2044,8 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("glm-5.3-flash").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2bpw", resolveShortName("glm-5.3-flash:2bpw").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("GLM-5.3-Flash:2.4bpw").?.repo);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", resolveShortName("deepseek-v4.1-flash").?.repo);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", resolveShortName("DeepSeek-V4.1-Flash:1.75bpw").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
@@ -1974,7 +2058,7 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
-    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", (try checkPullable("qwen3.8-flash-next:2.6bpw")).repo);
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", (try checkPullable("qwen3.8-flash-next:2.75bpw")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("beamster/Some-Pack")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("hf.co/beamster/Some-Pack:latest")).repo);
     try testing.expectEqualStrings("Beamster/Some-Pack", (try checkPullable("Beamster/Some-Pack")).repo);
@@ -2006,12 +2090,10 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
     try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 32));
     try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 47));
     try testing.expectEqual(Verdict.fits, verdictFor(a2, 48));
-    const a26 = aliasForRepo(resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo).?;
-    const a3 = aliasForRepo(resolveShortName("qwen3.8-flash-next:3bpw").?.repo).?;
+    const a275 = aliasForRepo(resolveShortName("qwen3.8-flash-next:2.75bpw").?.repo).?;
     const a4 = aliasForRepo(resolveShortName("qwen3.8-flash-next:4bpw").?.repo).?;
-    try testing.expectEqual(Verdict.may_stream, verdictFor(a26, 63));
-    try testing.expectEqual(Verdict.fits, verdictFor(a26, 64));
-    try testing.expectEqual(Verdict.fits, verdictFor(a3, 64));
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a275, 63));
+    try testing.expectEqual(Verdict.fits, verdictFor(a275, 64));
     try testing.expectEqual(Verdict.may_stream, verdictFor(a4, 95));
     try testing.expectEqual(Verdict.fits, verdictFor(a4, 96));
     for ([_][]const u8{ "mimo-v2.6-flash", "glm-5.3-flash" }) |name| {
@@ -2019,6 +2101,10 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
         try testing.expectEqual(Verdict.may_stream, verdictFor(a, 96));
         try testing.expectEqual(Verdict.fits, verdictFor(a, 128));
     }
+    // The 80 GiB expert-cache launch fits a 96 GB Mac at a 93,000 MB GPU limit; below it the pack may stream.
+    const dsv41 = aliasForRepo(resolveShortName("deepseek-v4.1-flash").?.repo).?;
+    try testing.expectEqual(Verdict.may_stream, verdictFor(dsv41, 95));
+    try testing.expectEqual(Verdict.fits, verdictFor(dsv41, 96));
     const glm2 = aliasForRepo(resolveShortName("glm-5.3-flash:2bpw").?.repo).?;
     try testing.expectEqual(Verdict.may_stream, verdictFor(glm2, 95));
     try testing.expectEqual(Verdict.fits, verdictFor(glm2, 96));
@@ -2029,8 +2115,8 @@ test "list recommends one pack per family from the tier table" {
     try testing.expect(recommendedAlias(q, 16) == null);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 32).?.tag);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 48).?.tag);
-    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 64).?.tag);
-    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 95).?.tag);
+    try testing.expectEqualStrings("2.75bpw", recommendedAlias(q, 64).?.tag);
+    try testing.expectEqualStrings("2.75bpw", recommendedAlias(q, 95).?.tag);
     try testing.expectEqualStrings("4bpw", recommendedAlias(q, 96).?.tag);
     try testing.expectEqualStrings("4bpw", recommendedAlias(q, 128).?.tag);
     try testing.expect(recommendedAlias("mimo-v2.6-flash", 96) == null);
@@ -2039,15 +2125,19 @@ test "list recommends one pack per family from the tier table" {
     try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 96).?.tag);
     try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 127).?.tag);
     try testing.expectEqualStrings("2.4bpw", recommendedAlias("glm-5.3-flash", 128).?.tag);
+    try testing.expect(recommendedAlias("deepseek-v4.1-flash", 95) == null);
+    try testing.expectEqualStrings("1.75bpw", recommendedAlias("deepseek-v4.1-flash", 96).?.tag);
 }
 
 test "pull warns only below the documented tier, naming --ssd-budget-gb" {
     var buf: [256]u8 = undefined;
-    try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 64) == null);
+    try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 64) == null);
     try testing.expect(tierWarning(&buf, "beamster/unlisted-pack", 8) == null);
-    const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 48).?;
+    const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 48).?;
     try testing.expect(std.mem.indexOf(u8, warn, "documented 64 GB") != null);
     try testing.expect(std.mem.indexOf(u8, warn, "--ssd-budget-gb") != null);
+    const dsv41_warn = tierWarning(&buf, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", 64).?;
+    try testing.expect(std.mem.indexOf(u8, dsv41_warn, "documented 96 GB") != null);
 }
 
 const FakeFetch = struct {
@@ -2103,7 +2193,7 @@ test "pull: Hugging Face's 401/403/404 mean a missing repo, other failures mean 
     try testing.expect(statusKind(503) == .failed);
 }
 
-test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.6bpw recommended" {
+test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended" {
     var rows: [aliases.len]CatalogRow = undefined;
     for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = (@as(u64, i) + 1) << 30, .downloaded = i == 1 };
     var buf: [2048]u8 = undefined;
@@ -2116,7 +2206,7 @@ test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.6bpw recommen
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, "<- recommended") == null) continue;
         recommended += 1;
-        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.6bpw"));
+        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.75bpw"));
         try testing.expect(std.mem.indexOf(u8, line, "yes") != null);
         try testing.expect(std.mem.indexOf(u8, line, "fits") != null);
     }
@@ -2136,7 +2226,8 @@ test "cli: every short name is a published Sushi pack" {
     for (aliases) |a| try testing.expect(isBeamsterRepo(a.repo));
     for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-") or
-        std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-"));
+        std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-") or
+        std.mem.startsWith(u8, a.repo, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-"));
 }
 
 test "cli: modelDestPath layout" {
@@ -3042,4 +3133,129 @@ test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM o
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
     try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+}
+
+test "hf token: env var, then HF_TOKEN_PATH, then HF_HOME/token, then the default file, then none" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.createDirPath(io, "home/.cache/huggingface");
+    try tmp.dir.createDirPath(io, "hfhome");
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.cache/huggingface/token", .data = "default-tok\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "hfhome/token", .data = "  home-tok \r\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "explicit", .data = "path-tok" });
+    const home = try std.fmt.allocPrint(a, "{s}/home", .{root});
+    defer a.free(home);
+    const hf_home = try std.fmt.allocPrint(a, "{s}/hfhome", .{root});
+    defer a.free(hf_home);
+    const explicit = try std.fmt.allocPrint(a, "{s}/explicit", .{root});
+    defer a.free(explicit);
+
+    const Case = struct { env: HfEnv, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .env = .{ .token = " env-tok\n", .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "env-tok" },
+        .{ .env = .{ .token = "", .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "path-tok" },
+        .{ .env = .{ .token_path = explicit, .hf_home = hf_home, .home = home }, .want = "path-tok" },
+        .{ .env = .{ .hf_home = hf_home, .home = home }, .want = "home-tok" },
+        .{ .env = .{ .home = home }, .want = "default-tok" },
+    };
+    for (cases) |c| {
+        const got = try resolveHfToken(a, io, c.env);
+        defer if (got) |g| a.free(g);
+        try testing.expectEqualStrings(c.want.?, got.?);
+    }
+    // The first path set is the only one read: a missing file there is no token, not a fall-through.
+    const missing = try std.fmt.allocPrint(a, "{s}/nope", .{root});
+    defer a.free(missing);
+    try testing.expect(try resolveHfToken(a, io, .{ .token_path = missing, .hf_home = hf_home, .home = home }) == null);
+    try testing.expect(try resolveHfToken(a, io, .{ .home = root }) == null);
+}
+
+test "hf token: an empty or blank token file is no token" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blank", .data = " \n\t\n" });
+    for ([_][]const u8{ "empty", "blank" }) |name| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, name });
+        defer a.free(path);
+        try testing.expect(try resolveHfToken(a, io, .{ .token_path = path, .home = root }) == null);
+    }
+}
+
+test "hf auth: a token becomes a private header file for curl, never an argument, and goes away with it" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "secret-tok\n" });
+    const token_path = try std.fmt.allocPrint(a, "{s}/token", .{root});
+    defer a.free(token_path);
+
+    var auth = try HfAuth.init(a, io, .{ .token_path = token_path, .home = root }, root);
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(a);
+    try auth.appendArgs(&argv, a);
+    try testing.expectEqual(@as(usize, 2), argv.items.len);
+    try testing.expectEqualStrings("-H", argv.items[0]);
+    try testing.expect(argv.items[1][0] == '@');
+    try testing.expect(std.mem.indexOf(u8, argv.items[1], "secret-tok") == null);
+    const header_path = argv.items[1][1..];
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, header_path, a, .limited(4096));
+    defer a.free(body);
+    try testing.expectEqualStrings("Authorization: Bearer secret-tok\n", body);
+    const st = try std.Io.Dir.cwd().statFile(io, header_path, .{});
+    try testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    auth.deinit(a, io);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, header_path, .{}));
+
+    var anon = try HfAuth.init(a, io, .{ .home = root }, root);
+    defer anon.deinit(a, io);
+    var none = std.ArrayList([]const u8).empty;
+    defer none.deinit(a);
+    try anon.appendArgs(&none, a);
+    try testing.expectEqual(@as(usize, 0), none.items.len);
+}
+
+test "resolveRelativeDir: a relative directory becomes its absolute real path, anything else is left alone" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "pack", .default_dir);
+    var pack = try tmp.dir.openDir(io, "pack", .{});
+    defer pack.close(io);
+    try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_len = try tmp.dir.realPath(io, &tmp_buf);
+    const rel = try std.fs.path.relative(a, cwd_buf[0..cwd_len], null, cwd_buf[0..cwd_len], tmp_buf[0..tmp_len]);
+    defer a.free(rel);
+    const rel_pack = try std.fs.path.join(a, &.{ rel, "pack" });
+    defer a.free(rel_pack);
+    try std.testing.expect(!std.fs.path.isAbsolute(rel_pack));
+
+    const abs = resolveRelativeDir(a, io, rel_pack) orelse return error.TestUnexpectedResult;
+    defer a.free(abs);
+    const want = try std.fs.path.join(a, &.{ tmp_buf[0..tmp_len], "pack" });
+    defer a.free(want);
+    try std.testing.expectEqualStrings(want, abs);
+    const expert_quant = @import("expert_quant.zig");
+    try std.testing.expect(expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", rel_pack, 4, 3) == null);
+    try std.testing.expectEqual(expert_quant.Layout.fp8_individual, expert_quant.layoutOfDirWithFirstMoe(a, io, "glm5_next", abs, 4, 3).?);
+
+    try std.testing.expect(resolveRelativeDir(a, io, want) == null);
+    try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
+    try std.testing.expect(resolveRelativeDir(a, io, "") == null);
 }

@@ -56,7 +56,7 @@ existing struct literals keep working), `format.Codebook` gains `std1`, `spec1` 
 A `Decode` that names std1 or spec1 without its table is refused by name (`Exl3CodebookTableUnknown`) at the dispatch, never
 decoded. A host that only ever sees MCG and MUL1 packs needs no change.
 
-The module's tests run as their own artifact (`exl3-test`) on `zig build test`; a change that
+The module's tests run as their own artifacts (`exl3-test-N`) on `zig build test`; a change that
 passes them and keeps the names above is safe to hand over.
 
 ## What the host owes the module
@@ -80,13 +80,11 @@ passes them and keeps the names above is safe to hand over.
 ## MLX pins
 
 Each repo builds its own MLX and mlx-c; the module adds no pin of its own. Both repos pin the
-same commits: MLX d73eb752 (v0.32.2 plus the sorted `gather_qmm` NAX 32K-row fix,
-ml-explore/mlx#3922) and mlx-c 56b2d39. Move both pins together. MLX v0.32.3 needs a newer
-mlx-c: its `gather_qmm` gained a `global_scale` argument that mlx-c 56b2d39 does not pass.
+same commits: MLX 64ea011 (v0.32.3) and mlx-c 56b2d39. Move both pins together.
 
 ## Recommended pin
 
-sushi v1.3.0 (8e4c0af1), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
+sushi v1.4.0 (90bee8d9), proposed in ddalcu/mlx-serve#933; mlx-serve main pins v1.2.4 (0bc61aa6) until it merges.
 mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#768. Reasons it matters, oldest first:
 - Before 4ca5ece4 (in v1.1.1), a pack whose gate and up trellises differ in rate passes `trellisAdmitted` and then
   fails at dispatch with `BadExl3Shape`; from 4ca5ece4 `moe` serves it.
@@ -98,10 +96,12 @@ mlx-serve has served the GLM and MiMo packs in-process since ddalcu/mlx-serve#76
   row, and a decode lane that reads its third word through two 32-bit funnels; both bit-identical and additive.
 - v1.3.0 adds `moeRagged` over a `Ragged` bank, the STQ format's experts split into rate groups with their own
   bit rates, and `shardStampAgrees` for the named codebook table; additive, mlx-serve calls none of them yet.
+- v1.4.0 adds `linear` (trellis-coded dense linears, the STQ trunk) and `parseQuantBlock` for any `expert_quant`-shaped
+  block; additive, mlx-serve calls neither yet.
 
 ## Handing a new engine to mlx-serve
 
-1. Land the change on Sushi `main` with `zig build test` green, `exl3-test` included.
+1. Land the change on Sushi `main` with `zig build test` green, the `exl3-test-N` artifacts included.
 2. Make the commit reachable from the submodule's url (`ddalcu/sushi`): the fork must fetch it
    from this repo, or the change must go through it.
 3. Give mlx-serve the full commit hash. mlx-serve bumps the gitlink

@@ -147,6 +147,9 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const isExpertStreamingArch = expert_quant.isExpertStreamingArch;
 
+/// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
+pub const dsv41_pool_bytes: u64 = 1 << 30;
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -244,14 +247,13 @@ pub const ModelConfig = struct {
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
-    // DeepSeek-V3-style sigmoid routing (hy_v3): scores = sigmoid(logits) in
+    // DeepSeek-V3-style sigmoid routing: scores = sigmoid(logits) in
     // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
     // scores; optional renorm (/(sum+1e-20)) then × router_scaling_factor.
     moe_sigmoid_router: bool = false,
     moe_route_norm: bool = true,
     router_scaling_factor: f32 = 1.0,
-    // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
-    // (hy_v3: layer 0 dense at intermediate_size, the rest MoE).
+    // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE.
     first_k_dense_replace: u32 = 0,
 
     // Grouped ("noaux_tc") expert routing: split the biased scores into
@@ -341,15 +343,12 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
 
-    // Laguna: per-layer Q-head count (full-attention layers 48, sliding 72;
-    // KV heads uniform at num_key_value_heads). 0 = uniform num_attention_heads.
+    // Per-layer Q-head count (MiMo: sliding layers differ from global ones).
+    // 0 = uniform num_attention_heads.
     num_attention_heads_per_layer: [128]u32 = @splat(0),
     has_per_layer_heads: bool = false,
 
-
-    // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
-    // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
-    // precompute at model load; the sliding/full split is by isGlobalLayer.
+    // YaRN RoPE: rope_yarn gates the freqs + mscale precompute at model load.
     rope_yarn: bool = false,
     yarn_factor: f32 = 1.0,
     yarn_orig_max_pos: u32 = 0,
@@ -550,9 +549,9 @@ pub const ModelConfig = struct {
             (if (self.isGlobalLayer(layer_idx)) self.attn_sinks_global else self.attn_sinks_sliding);
     }
 
-    /// Per-layer Q-head count (Laguna: 48 on full-attention layers, 72 on
-    /// sliding). Every other arch has uniform heads, so this falls back to
-    /// num_attention_heads. KV heads stay uniform (layerKVHeads).
+    /// Per-layer Q-head count (MiMo: sliding layers differ from global ones).
+    /// Every other arch has uniform heads, so this falls back to
+    /// num_attention_heads. KV heads follow layerKVHeads.
     pub fn layerNumHeads(self: ModelConfig, layer_idx: u32) u32 {
         if (self.has_per_layer_heads and layer_idx < 128 and self.num_attention_heads_per_layer[layer_idx] > 0) {
             return self.num_attention_heads_per_layer[layer_idx];
@@ -889,6 +888,11 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "glm5_next");
     }
 
+    /// The MLX buffer pool a streamed load is allowed to hold, billed in its ssd-budget ledger; 0 keeps the RAM-wide cap.
+    pub fn expertPoolBytes(self: *const ModelConfig) u64 {
+        return if (self.isDsv41()) dsv41_pool_bytes else 0;
+    }
+
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
@@ -1022,8 +1026,7 @@ pub const ModelConfig = struct {
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
-    /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
-    /// convolutions. Shared by Transformer.init and the scheduler's per-slot
+    /// recurrence (LFM2/Nemotron/GDN). Shared by Transformer.init and the scheduler's per-slot
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
@@ -1669,7 +1672,7 @@ fn parseQwenVisionFields(config: *ModelConfig, root: std.json.ObjectMap, cfg_obj
 /// `yarnMscale(factor)`. Neither is present in a vendor config, and per HF's
 /// default the mscale is then COMPUTED as 0.1·ln(factor)+1 — the value the
 /// scaling was calibrated with. Nested per-layer-type `rope_parameters`
-/// (laguna/gemma4) never reach here: they have no top-level `rope_type`.
+/// never reach here: they have no top-level `rope_type`.
 fn parseYarnRopeParameters(config: *ModelConfig, cfg_obj: std.json.ObjectMap) !void {
     const rp_val = cfg_obj.get("rope_parameters") orelse return;
     if (rp_val != .object) return;
@@ -2943,14 +2946,10 @@ pub fn loadWeightsForConfig(
     }
     if (config.expert_streaming) return loadWeightsStreaming(io, allocator, model_dir, config.expert_layout, load_vision, config.stream_mtp_head);
     if (config.usesMimoSourceTrunk()) return loadWeightsMimoSource(io, allocator, model_dir, load_vision and config.mimo_vision);
-    var weights = if (load_vision)
-        try loadWeightsWithVision(io, allocator, model_dir)
-    else
-        try loadWeights(io, allocator, model_dir);
-    errdefer weights.deinit();
-    if (std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false)
-        try weights.dropPrefix("language_model.mtp.");
-    return weights;
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    const mtp_off = std.mem.eql(u8, config.model_type, "qwen4_exp") and config.mtp_override == false;
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, mtp_off);
 }
 
 /// deepseek_v41's resident trunk from the release's shards, and its vision tower when asked for; its routed experts stream.
@@ -2967,7 +2966,7 @@ pub fn loadWeightsStreaming(io: std.Io, allocator: std.mem.Allocator, model_dir:
     if (layout == .mxfp4_individual) return loadWeightsMimoSource(io, allocator, model_dir, vision);
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, .{ .layout = layout, .keep_mtp = keep_mtp });
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, vision, .{ .layout = layout, .keep_mtp = keep_mtp }, false);
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3007,10 +3006,11 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
 fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
-    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null);
+    return loadWeightsFromOpenDirMode(io, allocator, dir, model_dir, load_vision, null, false);
 }
 
-fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?StreamingLoad) !Weights {
+/// `drop_mtp` skips the MTP head's tensors before they are read; a streamed load drops them unless `keep_mtp`.
+fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool, streaming: ?StreamingLoad, drop_mtp: bool) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -3057,9 +3057,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         const path = try allocator.dupeSentinel(u8, path_slice, 0);
         defer allocator.free(path);
 
-        log.info("Loading {s}...\n", .{entry.name});
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, shard);
+        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, drop_mtp, shard, entry.name);
         file_count += 1;
     }
 
@@ -3089,12 +3088,12 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 ///
 ///   - Quant SIDE tensors (scales/biases), which can be 2-D so they are keyed
 ///     on the suffix. f16 side tensors force gather_qmm/qmatmul onto a ~4x
-///     slower mixed-dtype path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms
-///     per 8-expert gather — 1.2 tok/s on the 295B instead of ~15+).
+///     slower mixed-dtype path (2-bit MoE live, 2026-07-14: 0.70 vs 0.18 ms
+///     per 8-expert gather).
 ///   - ANY 1-D f16 tensor: a per-channel table (norm weight, bias, A_log,
 ///     dt_bias) that is multiplied or added straight into the residual. Leave
 ///     one f16 and the residual turns f32 at the first layer and STAYS f32,
-///     so every later weight read is upcast — the Laguna YaRN-mscale class,
+///     so every later weight read is upcast — the YaRN-mscale class,
 ///     one level up. Measured on prism-ml/Ternary-Bonsai-27B-mlx-2bit (the
 ///     only f16 checkpoint on hand, qwen3_5 GDN hybrid): 27.99 -> 23.88
 ///     ms/forward, 14.7%, three paired boots with cooldown.
@@ -3134,7 +3133,7 @@ pub fn loadSafetensorsFile(
 ) !void {
     var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
     defer reader.deinit();
-    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, null);
+    return loadSafetensorsFileMode(allocator, &reader, weights, path, s, load_vision, null, false, null, null);
 }
 
 fn qwen4NormFold(key: []const u8) bool {
@@ -3263,7 +3262,7 @@ pub const TensorArray = struct {
 
 /// From this size a tensor is read into its own mapping that MLX imports without a copy;
 /// below it, the scratch copy into a fresh MLX buffer costs less than a page per tensor.
-const import_min_bytes: usize = 1 << 20;
+pub var import_min_bytes: usize = 1 << 20;
 
 /// `len` bytes at `offset` as a `shape`/`dtype` array, read around the file cache with the read
 /// and copy of its chunks spread over several threads (`expert_io.ParallelReader`). A large tensor
@@ -3280,7 +3279,61 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         try mlx.check(mlx.mlx_array_eval(array));
         return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };
     }
-    const size: usize = @intCast(expert_io.pageRoundUp(len));
+    const region = try ownedRegion(len);
+    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
+        destroyRegion(region);
+        return err;
+    };
+    const ptr = region.ptr;
+    const wrapped = try wrapRegion(region, shape, dtype);
+    return .{ .array = wrapped.array, .bytes = mlx.mlx_array_data_uint8(wrapped.array).?[0..len], .mapped = if (wrapped.aliased) ptr else null };
+}
+
+pub const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+
+/// Bytes of the live regions MLX holds as array buffers (`wrapOwned`), the weights sushi owns.
+pub var owned_bytes: std.atomic.Value(u64) = .init(0);
+/// No-copy wraps MLX refused (it copied the region instead).
+pub var refused_imports: std.atomic.Value(u64) = .init(0);
+
+const Span = struct { ptr: usize, len: usize };
+var span_lock: std.atomic.Value(bool) = .init(false);
+var spans: std.ArrayList(Span) = .empty;
+
+fn lockSpans() void {
+    while (span_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+}
+
+fn trackRegion(region: *const MappedRegion) void {
+    _ = owned_bytes.fetchAdd(region.len, .monotonic);
+    lockSpans();
+    defer span_lock.store(false, .release);
+    spans.append(std.heap.c_allocator, .{ .ptr = @intFromPtr(region.ptr), .len = region.len }) catch {};
+}
+
+/// Does `ptr` lie inside a live owned region? A test helper and the load log's audit.
+/// Every byte sushi maps and MLX sees without a copy: weight regions plus the expert slab pools.
+pub fn ownedBytesTotal() u64 {
+    return owned_bytes.load(.monotonic) + expert_io.slab_bytes.load(.monotonic);
+}
+
+pub fn ownsPointer(ptr: ?*const anyopaque) bool {
+    const at = @intFromPtr(ptr orelse return false);
+    lockSpans();
+    defer span_lock.store(false, .release);
+    for (spans.items) |sp| if (at >= sp.ptr and at < sp.ptr + sp.len) return true;
+    return false;
+}
+
+pub fn ownedRegionCount() usize {
+    lockSpans();
+    defer span_lock.store(false, .release);
+    return spans.items.len;
+}
+
+/// A zeroed, page-rounded anonymous mapping of at least `len` bytes (a mapping cannot be empty).
+pub fn ownedRegion(len: usize) !*MappedRegion {
+    const size: usize = @intCast(expert_io.pageRoundUp(@max(len, 1)));
     const mapped = std.c.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     if (mapped == std.c.MAP_FAILED) return error.OutOfMemory;
     const region = std.heap.c_allocator.create(MappedRegion) catch {
@@ -3288,13 +3341,20 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
         return error.OutOfMemory;
     };
     region.* = .{ .ptr = @ptrCast(@alignCast(mapped)), .len = size };
-    reader.fill(fd, region.ptr[0..len], offset) catch |err| {
-        unmapRegion(region);
-        return err;
-    };
-    // When Metal refuses the mapping MLX copies it and runs `unmapRegion` before returning:
-    // `region` is not touched after this call.
+    return region;
+}
+
+/// Releases a region that was never wrapped.
+pub fn destroyRegion(region: *MappedRegion) void {
+    _ = std.c.munmap(region.ptr, region.len);
+    std.heap.c_allocator.destroy(region);
+}
+
+/// `region` as an evaluated array; `aliased` is false when MLX copied the mapping instead of importing it, which
+/// releases the region.
+fn wrapRegion(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !struct { array: mlx.mlx_array, aliased: bool } {
     const ptr = region.ptr;
+    trackRegion(region);
     const array = mlx.mlx_array_new_data_managed_payload(ptr, shape.ptr, @intCast(shape.len), dtype, region, unmapRegion);
     if (array.ctx == null) {
         // MLX throws from this constructor only before adopting the mapping (its copy
@@ -3304,20 +3364,40 @@ pub fn readTensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, offset
     }
     errdefer _ = mlx.mlx_array_free(array);
     try mlx.check(mlx.mlx_array_eval(array));
-    const data = mlx.mlx_array_data_uint8(array).?;
-    return .{ .array = array, .bytes = data[0..len], .mapped = if (data == ptr) ptr else null };
+    return .{ .array = array, .aliased = mlx.mlx_array_data_uint8(array) == ptr };
 }
 
-const MappedRegion = struct { ptr: [*]align(std.heap.page_size_min) u8, len: usize };
+/// `region` as an evaluated `shape`/`dtype` array whose buffer is the region itself; the region goes with the array.
+/// A mapping Metal refuses is copied by MLX into its own allocator, which is `error.OwnedImportCopied`.
+pub fn wrapOwned(region: *MappedRegion, shape: []const c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const wrapped = try wrapRegion(region, shape, dtype);
+    if (wrapped.aliased) return wrapped.array;
+    _ = refused_imports.fetchAdd(1, .monotonic);
+    _ = mlx.mlx_array_free(wrapped.array);
+    return error.OwnedImportCopied;
+}
 
-fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
+pub fn unmapRegion(payload: ?*anyopaque) callconv(.c) void {
     const region: *MappedRegion = @ptrCast(@alignCast(payload.?));
-    _ = std.c.munmap(region.ptr, region.len);
-    std.heap.c_allocator.destroy(region);
+    _ = owned_bytes.fetchSub(region.len, .monotonic);
+    {
+        lockSpans();
+        defer span_lock.store(false, .release);
+        for (spans.items, 0..) |sp, i| if (sp.ptr == @intFromPtr(region.ptr)) {
+            _ = spans.swapRemove(i);
+            break;
+        };
+    }
+    destroyRegion(region);
 }
 
 /// One header entry's payload as an MLX array. Caller frees.
 pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !mlx.mlx_array {
+    return (try readSafetensorArray(reader, fd, header, meta)).array;
+}
+
+/// `readSafetensor` with the import's outcome: `mapped` is null for a tensor MLX copied.
+pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !TensorArray {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -3334,9 +3414,28 @@ pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header:
     const lo = offsets.array.items[0];
     const hi = offsets.array.items[1];
     if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
-    return (try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype)).array;
+    return readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype);
 }
 
+/// The resident key a shard tensor loads under, or null when it is skipped.
+fn loadedKey(
+    key_raw: []const u8,
+    key_buf: []u8,
+    load_vision: bool,
+    streaming: ?StreamingLoad,
+    drops_mtp: bool,
+    shard: ?ShardOwners,
+) ?[]const u8 {
+    if (std.mem.eql(u8, key_raw, "__metadata__")) return null;
+    if (shard) |sh| if (sh.map.get(key_raw)) |owner| {
+        if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) return null;
+    };
+    const key = if (streaming) |load| streamedResidentKey(load, key_buf, key_raw) orelse return null else key_raw;
+    if (!shouldKeepWeightKey(key, load_vision) or (drops_mtp and streamingDropsWeightKey(key))) return null;
+    return key;
+}
+
+/// `announce` names the shard in the log once its first tensor loads; a shard that loads nothing stays silent.
 fn loadSafetensorsFileMode(
     allocator: std.mem.Allocator,
     reader: *expert_io.ParallelReader,
@@ -3345,12 +3444,15 @@ fn loadSafetensorsFileMode(
     s: mlx.mlx_stream,
     load_vision: bool,
     streaming: ?StreamingLoad,
+    drop_mtp: bool,
     shard: ?ShardOwners,
+    announce: ?[]const u8,
 ) !void {
     // Only the dense HF layout needs the converter's work at load time: the
     // fused bank split, the delta norms and the conv transpose. An MLX pack
     // ships every resident tensor in its serving layout already.
     const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
+    const drops_mtp = drop_mtp or (streaming != null and !streaming.?.keep_mtp);
     // Read here rather than through MLX's loader, whose descriptor cannot take F_NOCACHE:
     // filtered tensors are never read, kept ones bypass the file cache (`readTensorArray`).
     const fd = try expert_io.openHinted(std.mem.span(path), .{ .readahead_off = false });
@@ -3358,19 +3460,14 @@ fn loadSafetensorsFileMode(
     var header = try expert_io.SafetensorsHeader.read(allocator, fd);
     defer header.deinit();
     var tensors = header.parsed.value.object.iterator();
+    var pending_announce = announce;
     while (tensors.next()) |entry| {
-        const key_str_raw = entry.key_ptr.*;
-        if (std.mem.eql(u8, key_str_raw, "__metadata__")) continue;
-        if (shard) |sh| if (sh.map.get(key_str_raw)) |owner| {
-            if (owner == .string and !std.mem.eql(u8, owner.string, sh.file) and sh.present.contains(owner.string)) continue;
-        };
         var key_buf: [512]u8 = undefined;
-        const key_str = if (streaming) |load|
-            streamedResidentKey(load, &key_buf, key_str_raw) orelse continue
-        else
-            key_str_raw;
-
-        if (!shouldKeepWeightKey(key_str, load_vision) or (streaming != null and !streaming.?.keep_mtp and streamingDropsWeightKey(key_str))) continue;
+        const key_str = loadedKey(entry.key_ptr.*, &key_buf, load_vision, streaming, drops_mtp, shard) orelse continue;
+        if (pending_announce) |name| {
+            log.info("Loading {s}...\n", .{name});
+            pending_announce = null;
+        }
         const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
@@ -3489,10 +3586,10 @@ test "ModelConfig defaults" {
 }
 
 test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-path class)" {
-    // hy_v3 2-bit (ox-ox) ships F16 scales/biases beside bf16 activations —
+    // A 2-bit pack can ship F16 scales/biases beside bf16 activations —
     // MLX's gather_qmm/qmatmul take a ~4x slower mixed-dtype path (measured
-    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather; 1.2 tok/s on the 295B
-    // instead of ~15+). The loader must cast quant SIDE tensors to bf16 once;
+    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather).
+    // The loader must cast quant SIDE tensors to bf16 once;
     // weights and non-quant tensors keep their dtype. Dequant delta from the
     // 3 dropped mantissa bits: cos 0.99999994 — under the 2-bit noise floor.
     const allocator = testing.allocator;
@@ -4084,8 +4181,7 @@ test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048
     // default applies): 0.1·ln 4 + 1 — the value the extension is calibrated to.
     try testing.expectApproxEqAbs(@as(f32, 1.138629436111989), c.yarn_attention_factor, 1e-6);
     // qwen4_exp has ONE rope for the trunk, so the YaRN table spans exactly the
-    // 64 dims attention rotates: `partial_rotary_factor`, NOT laguna's
-    // dims and rotate the pass-through slice).
+    // 64 dims attention rotates: `partial_rotary_factor`, not the full head dim.
     try testing.expectApproxEqAbs(@as(f32, 0.25), c.yarnPartial(), 1e-9);
     try testing.expectEqual(@as(u32, 64), c.yarnRotaryDim());
     try testing.expectApproxEqAbs(@as(f32, 10_000_000.0), c.rope_theta, 1.0);
@@ -4746,6 +4842,35 @@ test "the streamed load drops the MTP head the ledger bills at zero" {
     }
 }
 
+test "a resident load with MTP off never reads the head's bytes; with MTP on it keeps them" {
+    const t = std.testing;
+    const io = t.io;
+    const allocator = t.allocator;
+    const header = "{\"language_model.model.layers.0.mlp.gate.weight\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]},\"language_model.mtp.fc_hidden.weight\":{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[2,4]}}";
+    const padded_header_len = std.mem.alignForward(usize, header.len, 8);
+    const tensor_data = [_]u16{ 0x3f80, 0x4000 };
+    // The MTP-off file ends inside the head's range, so reading the head fails.
+    for ([_]struct { mtp: bool, payload: usize }{ .{ .mtp = false, .payload = 2 }, .{ .mtp = true, .payload = 4 } }) |c| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try tmp.dir.realPath(io, &path_buf);
+        const file_bytes = try allocator.alloc(u8, 8 + padded_header_len + c.payload);
+        defer allocator.free(file_bytes);
+        std.mem.writeInt(u64, file_bytes[0..8], padded_header_len, .little);
+        @memset(file_bytes[8 .. 8 + padded_header_len], ' ');
+        @memcpy(file_bytes[8 .. 8 + header.len], header);
+        @memcpy(file_bytes[8 + padded_header_len ..], std.mem.sliceAsBytes(&tensor_data)[0..c.payload]);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = file_bytes });
+
+        var config = ModelConfig{ .model_type = "qwen4_exp", .mtp_override = c.mtp };
+        var weights = try loadWeightsForConfig(io, allocator, path_buf[0..path_len], &config, false);
+        defer weights.deinit();
+        try t.expect(weights.get("language_model.model.layers.0.mlp.gate.weight") != null);
+        try t.expectEqual(c.mtp, weights.get("language_model.mtp.fc_hidden.weight") != null);
+    }
+}
+
 test "qwen4 streaming resident byte estimate excludes experts PLE and vision" {
     const t = std.testing;
     const io = t.io;
@@ -5075,7 +5200,6 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
         "mistral",
         "gemma3",
         "gemma4",
-        "deepseek_v4",
         "muse_glimmer",
     }) |mt| {
         var cfg = ModelConfig{ .model_type = mt };
@@ -5222,7 +5346,7 @@ test "isExpertStreamingArch admits only implemented streaming families" {
     const t = std.testing;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
-    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "hy_v3", "laguna", "llama", "deepseek_v4", "gguf", "" }) |mt| {
+    for ([_][]const u8{ "qwen4_exp_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "llama", "gguf", "" }) |mt| {
         try t.expect(!isExpertStreamingArch(mt));
         var c = ModelConfig{
             .model_type = mt,
@@ -6435,4 +6559,45 @@ test "deepseek_v41 thinks by default, at its native high effort" {
     // A checkpoint that declares thinking off still outranks the arch default.
     const declared_off = ModelConfig{ .model_type = "deepseek_v41", .gen_enable_thinking = false };
     try testing.expect(!declared_off.defaultEnableThinking());
+}
+
+test "a shard loads only when one of its tensors survives the filter" {
+    const mtp_only = [_][]const u8{ "__metadata__", "language_model.mtp.fc.weight", "language_model.mtp.layers.0.mlp.gate.weight" };
+    const mixed = [_][]const u8{ "language_model.mtp.fc.weight", "language_model.model.norm.weight" };
+    var buf: [512]u8 = undefined;
+    const Case = struct { keys: []const []const u8, drop_mtp: bool, loads: bool };
+    const cases = [_]Case{
+        .{ .keys = &mtp_only, .drop_mtp = true, .loads = false },
+        .{ .keys = &mtp_only, .drop_mtp = false, .loads = true },
+        .{ .keys = &mixed, .drop_mtp = true, .loads = true },
+    };
+    for (cases) |c| {
+        var any = false;
+        for (c.keys) |k| {
+            if (loadedKey(k, &buf, true, null, c.drop_mtp, null) != null) any = true;
+        }
+        try testing.expectEqual(c.loads, any);
+    }
+}
+
+test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned bytes return" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const start = owned_bytes.load(.monotonic);
+    const refused = refused_imports.load(.monotonic);
+    const spans_start = ownedRegionCount();
+
+    // The control: a page-aligned region is imported as it is.
+    const good = try ownedRegion(100);
+    const kept = try wrapOwned(good, &.{100}, .uint8);
+    try testing.expect(ownsPointer(mlx.mlx_array_data_uint8(kept)));
+    try testing.expectEqual(start + expert_io.pageRoundUp(100), owned_bytes.load(.monotonic));
+    _ = mlx.mlx_array_free(kept);
+    try testing.expectEqual(start, owned_bytes.load(.monotonic));
+    try testing.expectEqual(spans_start, ownedRegionCount());
+
+    // Empty.
+    const empty = try ownedRegion(1);
+    try testing.expectError(error.OwnedImportCopied, wrapOwned(empty, &.{0}, .uint8));
+    try testing.expectEqual(start, owned_bytes.load(.monotonic));
+    try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
 }

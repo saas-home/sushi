@@ -59,9 +59,9 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/flags.md](docs/flags.md) | every launch flag: default, who it is for, keep/cut recommendation, cut list, owner calls |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, metadata stamp, window, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders |
-| [docs/bench/v1.3.0/summary.md](docs/bench/v1.3.0/summary.md) | release context ladder and per-model benchmark reports |
+| [docs/bench/v1.4.0/summary.md](docs/bench/v1.4.0/summary.md) | release context ladder and per-model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
-| [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
+| [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number, the release bench |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
 **Private, local-only** (`docs/private/`, gitignored, main checkout only: a worktree reads them from there). Never
@@ -117,6 +117,7 @@ Box: M5 Max 128 GB, macOS 27.
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
 | `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
+| `bench.zig` | `sushi bench`: the release bench's HTTP client (corpus, ladder, report) | process-measurement |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
 
@@ -161,11 +162,13 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = the `docs/bench/v<ver>/` run on the FINAL tree (Qwen 2.6bpw,
-Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw) vs the previous report; ONE new `benchmarks.md` column per release. `/bench` for
-methodology: same-methodology cells only, spec cells are variance (sample across boots), an A/B arm is proven by
-ENGAGEMENT lines in its log. Interleave A/B kernels in ONE process (separate runs drift 15%); same-boot medians per
-cell; sub-2% calls need an IDLE box.
+`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` (`sushi bench`: code and prose arms, ONE cold prefill each,
+8k restore windows, 3 decode samples a rung) on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM 2.4bpw, DeepSeek STQ 1.75bpw),
+report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per release. Protocol:
+[process-measurement](docs/process-measurement.md#release-bench). `/bench` for methodology: same-methodology cells only, spec
+cells are variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in
+ONE process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for
+cross-engine comparisons only.
 
 Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
 merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.
@@ -249,8 +252,8 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
   starts a build or test while that file exists. The GPU lock does not stop compiles.
 - Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
-- Bench thermal: fans to max; 3 min idle first if the die is over 90 °C after heavy GPU work, else 10 s; fans back to
-  auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
+- Bench thermal: fans to max; before each server, and between the code and prose arms too, idle until the hottest die
+  sensor (`fanctl status`) is under 50 °C, at most 3 min; fans back to auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never slot a GPU job into a bench's cooldown idle: the next server starts throttled.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
 - **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`

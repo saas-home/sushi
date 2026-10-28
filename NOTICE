@@ -386,9 +386,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     Modifications: scoped to the common prelude, the qwen4_exp branch and
     discovery; qwen4_exp adds a geometry refusal, and the fixtures are the
     served packs' configs.
-  * The DeepSeek-V4.1-Flash arm (`src/dsv41_*.zig`, `src/fixtures/dsv41_chat_template.jinja`,
+  * The DeepSeek-V4.1-Flash arm (`src/dsv41_{borrow,config,engram,kernels,model,prefix,qat,scope,source,stream,vision}.zig`,
+    `src/fixtures/dsv41_chat_template.jinja`,
     `src/fixtures/dsv41_engram_token_map.bin`, the spaced DSML tags in `src/chat.zig`), from
-    mlx-serve's `src/deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
+    mlx-serve's `deepseek_v41.zig`, `src/dsv41_engram.zig` and `src/chat.zig` at f1c3276f
     by David Dalcu. Modifications: the MLX-native path only (no embedded ds4 engine); the
     op scope, Engram lookup, attention and indexer formulation were rewritten against the
     release's `inference/model.py` and pinned to it by a tiny-model oracle, the expert
@@ -400,7 +401,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
     DeepSeek.
   * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
-    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `src/deepseek_v41.zig`
+    in `src/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
     at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
     verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
     `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output
@@ -635,11 +636,6 @@ No code from the following was copied into sushi. They were read as
 specifications while writing our own implementations of the same architectures,
 and they are listed because they made that work possible.
 
-  * poolside `modeling_laguna.py` (Apache-2.0), the reference for the `laguna`
-    architecture.
-  * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
-    checkpoints (Apache-2.0), the reference and parity oracle for
-    `inkling_mm_model`.
   * turboderp/exllamav3 (MIT), the EXL3 format. `src/exl3/` re-implements the
     16x16 trellis packing, the MCG and MUL1 decodes, the tensor-core permutation
     and the suh/svh Hadamard from that reference. `src/encoder/` re-implements
@@ -652,6 +648,10 @@ and they are listed because they made that work possible.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. sushi does not redistribute them.
+
+`src/fixtures/prose_pride_and_prejudice.txt` is Jane Austen's Pride and Prejudice (1813), in the public domain,
+as Project Gutenberg eBook #1342 with the Project Gutenberg header and footer removed (its license allows that for a
+public-domain work once every reference to Project Gutenberg is gone). `sushi bench` embeds it as its prose corpus.
 
 WikiText-103 (Merity et al., CC BY-SA 3.0) is downloaded at runtime by
 `sushi convert exl3` as calibration text. sushi does not redistribute it.

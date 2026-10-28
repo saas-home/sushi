@@ -14,9 +14,11 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const engram = @import("dsv41_engram.zig");
 const source = @import("dsv41_source.zig");
+const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("expert_usage.zig");
+const transient_peak = @import("transient_peak.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -26,6 +28,7 @@ const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 const evalAll = sc_mod.evalAll;
 const Config = cfg_mod.Config;
+const prefetch_cand_max = @import("expert_stream.zig").Prefetcher.cand_max;
 
 /// Rows one attention span handles: the compressed rows each query gathers are its largest
 /// transient (`[span, index_topk, head_dim]` in f32).
@@ -173,6 +176,28 @@ pub const Experts = union(enum) {
         release: *const fn (ctx: *anyopaque) void,
         /// Profiling: the stream's cumulative host time (SSD reads and cache copies), in ns.
         host_ns: ?*const fn (ctx: *anyopaque) u64 = null,
+        /// Experts layer `layer` is expected to pick, read into its pool before its chain is queued: for each of `rows` rows,
+        /// `n` ranked candidates, of which the first `m` the pool lacks are read.
+        prefetch: ?*const fn (ctx: *anyopaque, layer: usize, cand: []const u16, rows: usize, n: usize, m: usize) void = null,
+        /// Decode widths: the routed chain queued before the host knows the picks, checked one layer late.
+        spec: ?Spec = null,
+    };
+
+    pub const Spec = struct {
+        /// Whether layer `layer` can queue its chain from the stream's cache map.
+        can: *const fn (ctx: *anyopaque, layer: usize) bool,
+        /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
+        /// read; `map` is the host copy of that map, kept until the layer is settled.
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) anyerror!Queued,
+        /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
+        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A, map: []const i32) anyerror!?A,
+    };
+
+    pub const Queued = struct {
+        out: A,
+        /// The picks as int32, already submitted: the settle reads this array, never a node built after the layer.
+        idx: A,
+        map: []const i32,
     };
 
     pub const Lease = struct { banks: BankSet, local: A };
@@ -416,6 +441,8 @@ pub const State = struct {
     hist: std.ArrayList(u32) = .empty,
     /// Per DSpark stage: the window of the main stream's keys for the committed positions.
     ds: []Ring = &.{},
+    /// The stage rings hold a commit no pass has submitted yet (`commitMain` lazy); `flushMain` submits it.
+    main_lazy: bool = false,
     verify: ?Verify = null,
 
     pub fn deinit(self: *State) void {
@@ -444,7 +471,7 @@ pub const State = struct {
     }
 };
 
-fn arrayBytes(a: A) u64 {
+pub fn arrayBytes(a: A) u64 {
     if (a.ctx == null) return 0;
     return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
 }
@@ -586,7 +613,12 @@ pub const Model = struct {
     drop: ?*const expert_usage.Drop = null,
     /// Arrays made at load (casts, views, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
+    /// Bytes this load built in owned regions rather than read from the shards: widened f32 tensors, shared stacks,
+    /// the DSpark ragged storage.
+    built: struct { widened: u64 = 0, stacks: u64 = 0, ragged: u64 = 0 } = .{},
     dec_state: ?State = null,
+    /// Counts the states dropped: a record of the live state (`dsv41_prefix.Live`) holds only while it is unchanged.
+    state_epoch: u64 = 0,
     /// Tests: named intermediates of a chunk.
     trace: ?*Trace = null,
     /// The fused Metal kernels of `dsv41_kernels.zig` serve where they apply; off, the op chains they replace
@@ -597,6 +629,12 @@ pub const Model = struct {
     attn_f16: bool = false,
     /// TEMPORARY A/B: a decode-width pass reads its Engram rows ahead (`prefetchEngram`).
     decode_engram_ahead: bool = true,
+    /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
+    /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
+    dspark_exact: bool = true,
+    /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
+    engram_ahead: ?*engram.Prefetch = null,
+    engram_ahead_used: u64 = 0,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -606,6 +644,18 @@ pub const Model = struct {
     pack_kv: bool = true,
     /// Tests: each layer completes on the GPU before the next is built, the decode schedule's reference.
     sync_layers: bool = false,
+    /// TEMPORARY A/B: a decode-width STQ layer queues its routed chain from the stream's cache map before the host
+    /// reads its picks (`Experts.Spec`); off, it waits for them.
+    route_spec: bool = true,
+    /// Layers ahead whose picks a layer's router input predicts for the expert prefetch (`Experts.Hook.prefetch`), for a
+    /// forward of 2 or more rows (a one-row step pays more for the prediction than it saves); 0 turns it off. Each row
+    /// asks for its `prefetch_m` best uncached of its `prefetch_n` ranked.
+    prefetch_lead_rows: u8 = 0,
+    prefetch_n: u8 = 12,
+    prefetch_m: u8 = 1,
+    /// Layers a pass may rebuild, plus a third of the layers built so far, before it stops queueing: a cold pool misses
+    /// on most layers, and each miss costs the successor's work twice.
+    route_spec_rebuilds: u32 = 3,
     /// CED: the decoder's first layer (`Config.cedSplit`); null where the layout has none (and in tests, the full
     /// forward a CED prefill's encoder state is checked against).
     ced_split: ?usize = null,
@@ -615,6 +665,7 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
+        self.dropAhead();
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -633,6 +684,11 @@ pub const Model = struct {
         self.gpa.destroy(self);
     }
 
+    fn dropAhead(self: *Model) void {
+        if (self.engram_ahead) |pf| pf.finish();
+        self.engram_ahead = null;
+    }
+
     fn own(self: *Model, x: A) !A {
         self.owned.append(self.gpa, x) catch |e| {
             _ = mlx.mlx_array_free(x);
@@ -641,8 +697,12 @@ pub const Model = struct {
         return x;
     }
 
-    /// `x` cast to `dt` and evaluated, owned by the model.
+    /// `x` cast to `dt` and evaluated, owned by the model. A bf16 tensor widened to f32 is built in an owned region.
     fn ownCast(self: *Model, x: A, dt: mlx.mlx_dtype) !A {
+        if (dt == .float32) if (try owned_mod.widenF32(x)) |wide| {
+            self.built.widened += mlx.mlx_array_size(wide) * 4;
+            return self.own(wide);
+        };
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&o, x, dt, self.s));
         _ = try self.own(o);
@@ -1000,6 +1060,11 @@ fn fuseShared(m: *Model, lins: []const *Lin) !?exl3.linear.Shared {
     }
     var cat: [3]A = undefined;
     for (0..3) |k| {
+        if (try owned_mod.stack(parts[k][0..lins.len], @enumFromInt(k))) |stacked| {
+            m.built.stacks += mlx.mlx_array_size(stacked) * mlx.mlx_array_itemsize(stacked);
+            cat[k] = try m.own(stacked);
+            continue;
+        }
         const v = mlx.mlx_vector_array_new_data(&parts[k], lins.len);
         defer _ = mlx.mlx_vector_array_free(v);
         var o = mlx.mlx_array_new();
@@ -1079,6 +1144,28 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
     m.ced_split = c.cedSplit();
     return m;
+}
+
+/// Where the load's weight arrays live: sushi's owned regions or MLX's allocator. Evaluates them.
+pub fn memoryAudit(m: *const Model) !owned_mod.Audit {
+    var arrays: std.ArrayList(A) = .empty;
+    defer arrays.deinit(m.gpa);
+    try arrays.appendSlice(m.gpa, m.owned.items);
+    if (m.dspark) |ds| for (ds.stq) |rb| try arrays.appendSlice(m.gpa, rb.storage()[0..9]);
+    return owned_mod.audit(m.gpa, arrays.items);
+}
+
+pub fn logMemory(m: *const Model) void {
+    const gb = struct {
+        fn of(b: u64) f64 {
+            return @as(f64, @floatFromInt(b)) / 1e9;
+        }
+    }.of;
+    const a = memoryAudit(m) catch |e| return log.warn("[dsv41-mem] audit failed: {s}\n", .{@errorName(e)});
+    log.info("[dsv41-mem] owned {d:.2} GB in {d} regions (built here: DSpark storage {d:.2}, f32 widenings {d:.2}, shared stacks {d:.2}), MLX-owned weights {d:.2} GB in {d} arrays ({d} of 1 MiB or more), refused {d}\n", .{
+        gb(model_mod.owned_bytes.load(.monotonic)), model_mod.ownedRegionCount(), gb(m.built.ragged), gb(m.built.widened), gb(m.built.stacks),
+        gb(a.mlx_bytes),                            a.mlx_arrays,                 a.mlx_large,         model_mod.refused_imports.load(.monotonic),
+    });
 }
 
 fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
@@ -1300,9 +1387,26 @@ fn blockMax(sc: *Scope, scores: A, bs: usize) !A {
     return sc.max(try sc.reshape(padded, &.{ ci(L), ci(n_blocks), ci(bs) }), -1, false);
 }
 
+/// `candidateBlocks` as the picked block ids `[L, kb]` int32 (ascending, -1 = a block no query reaches), or none when
+/// every block is kept.
+fn candidateBlockIds(sc: *Scope, m: *const Model, li: usize, scores: A, lens: A, bs: usize, kb: usize) !A {
+    if ((dim(scores, 1) + bs - 1) / bs <= kb) return none;
+    const p = try candidatePicks(sc, m, li, try blockMax(sc, scores, bs), lens, bs, kb);
+    return sc.where(p.reach, p.chosen, try sc.i(-1));
+}
+
 /// `candidateBlocks` from the block maxima `blocks_in` `[L, n_blocks]`, more than `kb` of them.
 fn candidateMask(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, bs: usize, kb: usize) !A {
-    const L = dim(blocks_in, 0);
+    const p = try candidatePicks(sc, m, li, blocks_in, lens, bs, kb);
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(dim(blocks_in, 0)), ci(dim(blocks_in, 1)) }, .bool_), p.chosen, p.reach, -1, sc.s), &o);
+}
+
+const CandPicks = struct { chosen: A, reach: A };
+
+/// The `kb` blocks of the maxima `blocks_in` `[L, n_blocks]` a query keeps (the one holding its newest group pinned), and
+/// which of them it reaches.
+fn candidatePicks(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, bs: usize, kb: usize) !CandPicks {
     const n_blocks = dim(blocks_in, 1);
     const ninf = try sc.f(-std.math.inf(f32));
     var blocks = blocks_in;
@@ -1314,9 +1418,7 @@ fn candidateMask(sc: *Scope, m: *const Model, li: usize, blocks_in: A, lens: A, 
         try t.put("cand_scores_{d}", .{li}, blocks);
         try t.put("cand_idx_{d}", .{li}, chosen);
     }
-    const reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf);
-    var o = mlx.mlx_array_new();
-    return sc.res(mlx.mlx_put_along_axis(&o, try sc.zeros(&.{ ci(L), ci(n_blocks) }, .bool_), chosen, reach, -1, sc.s), &o);
+    return .{ .chosen = chosen, .reach = try sc.op2(mlx.mlx_greater, try sc.takeAlong(blocks, chosen, -1), ninf) };
 }
 
 /// The indexer's scores `[Ls, nb]` of `q` (f32 `[Ls, ih, ihd]`) against `keys`: sum over heads of the weight (the
@@ -1473,15 +1575,25 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
             cand.* = if (kb > 0) sc.out(got.cand) else none;
         }
         idx = got.idx;
+    } else if (masked and mlx.mlx_array_dtype(cand.*) == .int32) {
+        const pk = rows.pack.?;
+        const scores = try kernels.indexScoresGather(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs);
+        idx = try kernels.candidateKeys(sc, try topkRows(sc, m, scores, kk), cand.*, bs);
     } else {
-        var scores = if (rows.pack != null and narrowIndex(sc, m, Ls, nb)) // [Ls, nb]
+        const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
+        var scores = if (packed_scan) // [Ls, nb]
             try kernels.indexScoresPacked(sc, q, try sc.slice(rows.buf, 0, 0, nb), try sc.slice(rows.sbuf, 0, 0, nb), wts, wscale, p0, r, rows.pack.?.mode, rows.pack.?.group)
         else
             try indexScores(sc, m, q, try rows.rows(sc, nb), wts, wscale, p0, r);
         if (is_source) {
-            const mask = try candidateBlocks(sc, m, li, scores, lens, bs, c.cand_blocks);
+            // A decode block's later layers score only the picked blocks' keys, so they get the ids; the picks are the
+            // masked whole scan's while the blocks hold more reachable keys than a query keeps.
+            const picks = if (packed_scan and m.trace == null and (c.cand_blocks -| 1) * bs >= c.index_topk)
+                try candidateBlockIds(sc, m, li, scores, lens, bs, c.cand_blocks)
+            else
+                try candidateBlocks(sc, m, li, scores, lens, bs, c.cand_blocks);
             if (cand.ctx != null) _ = mlx.mlx_array_free(cand.*);
-            cand.* = if (mask.ctx != null) sc.out(mask) else none;
+            cand.* = if (picks.ctx != null) sc.out(picks) else none;
         } else if (masked) {
             var o = mlx.mlx_array_new();
             const rep = try sc.res(mlx.mlx_repeat_axis(&o, cand.*, ci(bs), -1, sc.s), &o);
@@ -1540,6 +1652,9 @@ const Shared = struct {
     floor: ?usize = null,
     /// `[L]` bool, the chunk's rows inside an image span (none for text): borrowed from the pass.
     img: A = none,
+    /// The layer being built queues its routed chain from the cache map, and the record it leaves for `settleRecord`.
+    spec_on: bool = false,
+    spec: ?Unresolved = null,
 
     fn init(gpa: std.mem.Allocator, spans: usize) !Shared {
         const t = try gpa.alloc(A, spans);
@@ -1551,6 +1666,7 @@ const Shared = struct {
     }
 
     fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
+        if (self.spec) |*u| u.deinit();
         for (self.topk) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -1646,10 +1762,11 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             .scale = scale,
             .freqs = rope,
             .rd = rd,
+            .qat_fp8 = m.qat_on,
             .out_dt = m.act,
         });
         if (pf) |p| try p.mark(.core, &.{o});
-        return attnOut(sc, m, ly, o);
+        return attnOut(sc, m, ly, o, m.qat_on);
     }
     const n_spans = (L + span - 1) / span;
     const heads = try sc.a.alloc(A, n_spans);
@@ -1700,7 +1817,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     }
     try ls.win.write(kv, p0, sc.s);
 
-    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null));
+    const out = try attnOut(sc, m, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false);
     if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
     return out;
 }
@@ -1738,16 +1855,18 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const band = if (ds.band.ctx != null) ds.band else try sc.ge(try sc.zeros(&.{ ci(B), ci(dim(keys, 0)) }, .float32), try sc.f(0));
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const heads = try attnCore(sc, ly.sink, q, keys, band, none, none, scale, m.act);
-    return attnOut(sc, m, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null));
+    return attnOut(sc, m, ly, try ropeQ(sc, m, heads, rope, pos, true, .none, null), false);
 }
 
-/// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections.
-fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A) !A {
+/// The heads `o` `[L, H, hd]` (already inverse-rotated) through the output projections; `rounded`: they already left
+/// the fp8 round trip (the decode kernels fold it in).
+fn attnOut(sc: *Scope, m: *const Model, ly: *const Layer, o: A, rounded: bool) !A {
     const c = &m.cfg;
     const L = dim(o, 0);
     const og = c.o_groups;
     const gin = c.heads * c.head_dim / og;
-    const ob = try qatIf(sc, m, try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) }), .fp8_ue8m0, 32);
+    const grouped = try sc.reshape(o, &.{ ci(L), ci(og), ci(gin) });
+    const ob = if (rounded) grouped else try qatIf(sc, m, grouped, .fp8_ue8m0, 32);
     const obg = try sc.transpose(ob, &.{ 1, 0, 2 }); // [og, L, in]
     const oa = if (ly.wo_a.stq) |q|
         try q.applyGrouped(sc, obg)
@@ -1937,7 +2056,8 @@ fn sharedExpert(sc: *Scope, m: *const Model, ly: *const Layer, h: A) !A {
     return ly.shared[2].apply(sc, act);
 }
 
-fn moe(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !A {
+fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
+    const img = sh.img;
     const c = &m.cfg;
     const ly = &m.layers[li];
     const r = try router(sc, m, li, h, img);
@@ -1952,6 +2072,22 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !A {
             .resident => return error.Dsv41StqExpertsStream,
             .hook => |hk| hk,
         };
+        if (sh.spec_on) {
+            const sy = try sharedExpert(sc, m, ly, h);
+            const target = prefetchTarget(m, li, dim(h, 0));
+            // Submitted ahead of the chain, so the host's read of it waits for nothing but the router.
+            const pred = if (target) |j| try predictLogits(sc, m, h, j) else none;
+            if (pred.ctx != null) try submit(pred);
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, sy);
+            const out = try sc.astype(q.out, m.act);
+            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .sy = sc.out(sy) };
+            if (pred.ctx != null) {
+                sh.spec.?.pred = sc.out(pred);
+                sh.spec.?.pred_layer = target.?;
+            }
+            try submit(out);
+            return out;
+        }
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
@@ -2013,27 +2149,46 @@ pub fn engramGateOps(sc: *Scope, c: *const Config, qk: A, x: A, kv: A) !A {
 
 const Pair = struct { x: A, pre: A };
 
-const HcPre = struct { sp: qat_mod.Split, h: A, x1: A };
+/// A stage's coefficients: the split, or the mixes `z` of a narrow stage, which splits them in the next stage's kernel
+/// and in `split` only for a reader of the arrays.
+const HcMix = struct {
+    sp: ?qat_mod.Split = null,
+    z: A = none,
 
-/// The coefficients of the stream `x` (of `hcExpand(x, ex.y, ex.post, ex.comb)` with `ex`, returned as `x1`) and its
-/// collapse by the previous mix `cpre`, rms-normed by `norm_w`: one stage and one split kernel at a few rows, the
-/// mix and norm kernels on a wide block, else the op chains.
-fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?kernels.HcExpand, cpre: A, hc: *const Hc, norm_w: A) !HcPre {
+    fn split(self: HcMix, sc: *Scope, m: *const Model) !qat_mod.Split {
+        if (self.sp) |s| return s;
+        const c = &m.cfg;
+        const s = try kernels.hcSplitZ(sc, self.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps));
+        return .{ .pre = s.pre, .post = s.post, .comb = s.comb };
+    }
+};
+
+const HcPre = struct { mix: HcMix, h: A, x1: A };
+
+/// The stream `hcExpand(x, y, prev.post, prev.comb)`, collapsed by `prev.pre`.
+const HcPrev = struct { y: A, prev: HcMix };
+
+/// The coefficients of the stream `x` (of `hcExpand(x, ex.y, previous post, previous comb)` with `ex`, returned as
+/// `x1`) and its collapse by the previous pre (`cpre` without `ex`), rms-normed by `norm_w`: one stage kernel at a few
+/// rows, the mix and norm kernels on a wide block, else the op chains.
+fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?HcPrev, cpre: A, hc: *const Hc, norm_w: A) !HcPre {
     const c = &m.cfg;
     if (fusedOn(sc, m) and dim(hc.fn_w, 0) == (2 + c.hc_mult) * c.hc_mult and dim(x, 2) % 32 == 0) {
         const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
         const hw = kernels.HcWeights{ .fn_w = hc.fn_w, .scale = hc.scale, .base = hc.base };
         if (dim(x, 0) <= NARROW_ROWS) {
-            const st = try kernels.hcStage(sc, x, ex, cpre, norm_w, hw, eps);
-            const sp = try kernels.hcSplitZ(sc, st.z, c.hc_mult, c.hc_iters, eps);
-            return .{ .sp = .{ .pre = sp.pre, .post = sp.post, .comb = sp.comb }, .h = st.h, .x1 = st.x1 };
+            const kex: ?kernels.HcExpand = if (ex) |e| .{ .y = e.y, .prev = if (e.prev.sp) |s| .{ .split = .{ .pre = s.pre, .post = s.post, .comb = s.comb } } else .{ .z = .{ .z = e.prev.z, .iters = c.hc_iters } } } else null;
+            const st = try kernels.hcStage(sc, x, kex, cpre, norm_w, hw, eps);
+            return .{ .mix = .{ .z = st.z }, .h = st.h, .x1 = st.x1 };
         }
-        const x1 = if (ex) |e| try hcExpand(sc, x, e.y, e.post, e.comb) else x;
-        const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, cpre, norm_w, c.hc_iters, eps);
-        return .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb }, .h = n.h, .x1 = x1 };
+        const sp = if (ex) |e| try e.prev.split(sc, m) else null;
+        const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+        const n = try kernels.hcNorm(sc, try kernels.hcMix(sc, x1, hw, eps), x1, if (sp) |s| s.pre else cpre, norm_w, c.hc_iters, eps);
+        return .{ .mix = .{ .sp = .{ .pre = n.sp.pre, .post = n.sp.post, .comb = n.sp.comb } }, .h = n.h, .x1 = x1 };
     }
-    const x1 = if (ex) |e| try hcExpand(sc, x, e.y, e.post, e.comb) else x;
-    return .{ .sp = try hcMixes(sc, m, x1, hc), .h = try sc.rms(try hcCollapse(sc, x1, cpre), norm_w, c.eps), .x1 = x1 };
+    const sp = if (ex) |e| try e.prev.split(sc, m) else null;
+    const x1 = if (ex) |e| try hcExpand(sc, x, e.y, sp.?.post, sp.?.comb) else x;
+    return .{ .mix = .{ .sp = try hcMixes(sc, m, x1, hc) }, .h = try sc.rms(try hcCollapse(sc, x1, if (sp) |s| s.pre else cpre), norm_w, c.eps), .x1 = x1 };
 }
 
 /// A block: attention, then the FFN, each between a collapse of the stream and an expand back. The
@@ -2042,10 +2197,13 @@ fn hcPre(sc: *Scope, m: *const Model, x: A, ex: ?kernels.HcExpand, cpre: A, hc: 
 fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: usize, sh: *Shared, span: usize, ds: ?DsKeys) !Pair {
     const ly = &m.layers[li];
     const pa = try hcPre(sc, m, x, null, cpre, &ly.hc_attn, ly.attn_norm);
-    const sa = pa.sp;
     const h = pa.h;
-    if (prof(m, dim(x, 0))) |p| try p.mark(.hc_attn, &.{ h, sa.pre, sa.post, sa.comb });
+    if (prof(m, dim(x, 0))) |p| {
+        const s = pa.mix.sp orelse qat_mod.Split{ .pre = pa.mix.z, .post = pa.mix.z, .comb = pa.mix.z };
+        try p.mark(.hc_attn, &.{ h, s.pre, s.post, s.comb });
+    }
     if (m.trace) |t| {
+        const sa = try pa.mix.split(sc, m);
         try t.put("hc_pre_{d}", .{li}, sa.pre);
         try t.put("hc_post_{d}", .{li}, sa.post);
         try t.put("hc_comb_{d}", .{li}, sa.comb);
@@ -2059,9 +2217,9 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
         break :blk try sc.keep(asc.out(o));
     };
     if (m.trace) |t| try t.put("attn_{d}", .{li}, a);
-    const pf = try hcPre(sc, m, x, .{ .y = a, .post = sa.post, .comb = sa.comb }, sa.pre, &ly.hc_ffn, ly.ffn_norm);
+    const pf = try hcPre(sc, m, x, .{ .y = a, .prev = pa.mix }, none, &ly.hc_ffn, ly.ffn_norm);
     const x1 = pf.x1;
-    const sf = pf.sp;
+    const sf = try pf.mix.split(sc, m);
     const h2 = pf.h;
     if (prof(m, dim(x, 0))) |p| try p.mark(.hc_ffn, &.{ h2, x1, sf.pre, sf.post, sf.comb });
     if (m.trace) |t| try t.put("ffn_in_{d}", .{li}, h2);
@@ -2069,8 +2227,14 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
     const y = blk: {
         var fsc = Scope.init(sc.a, sc.s);
         defer fsc.deinit();
-        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh.img)));
+        break :blk try sc.keep(fsc.out(try moe(&fsc, m, li, h2, sh)));
     };
+    if (sh.spec) |*u| {
+        u.x1 = sc.out(x1);
+        u.post = sc.out(sf.post);
+        u.comb = sc.out(sf.comb);
+        u.pre = sc.out(sf.pre);
+    }
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     return .{ .x = sc.out(try hcExpand(sc, x1, y, sf.post, sf.comb)), .pre = sc.out(sf.pre) };
 }
@@ -2099,8 +2263,10 @@ pub fn ensureState(m: *Model) !*State {
 }
 
 pub fn resetState(m: *Model) void {
+    m.dropAhead();
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
+    m.state_epoch +%= 1;
 }
 
 /// Every decode width a request can take (1..16 rows, after a short prefill so compressed rows exist), with DSpark a
@@ -2153,7 +2319,19 @@ pub const nil_slot: Slot = @splat(none);
 /// Slots a restore point holds: per layer the window ring with the open pooling group, then the compressed and
 /// index rows; then one per DSpark stage window.
 pub fn slotCount(m: *const Model) usize {
-    return 2 * m.cfg.layers + (if (m.dspark != null) m.cfg.n_mtp else 0);
+    return slotCountFor(&m.cfg, m.dspark != null);
+}
+
+/// Tokens per row of layer `li`'s compressed rows and of its index keys; 0 where the layer keeps none. A restore
+/// point at position `n` holds `n / ratio` rows of each.
+pub fn rowRatios(c: *const cfg_mod.Config, li: usize) [2]u32 {
+    const r: u32 = c.ratios[li];
+    return .{ if (c.isKvSource(li)) r else 0, if (c.isOwner(li)) r else 0 };
+}
+
+/// `slotCount` for a config.
+pub fn slotCountFor(c: *const cfg_mod.Config, dspark: bool) usize {
+    return 2 * c.layers + (if (dspark) c.n_mtp else 0);
 }
 
 /// An owned copy of rows [0, n) that keeps every bit (a float add of zero would turn -0.0 into +0.0).
@@ -2193,7 +2371,7 @@ fn ownedRows(x: A, n: usize, s: S) !A {
 }
 
 /// A slot array the checkpoint holds; every real one is 2-D, and an absent one is stored as a one-byte placeholder.
-fn present(a: A) bool {
+pub fn present(a: A) bool {
     return a.ctx != null and mlx.mlx_array_ndim(a) == 2 and mlx.mlx_array_size(a) > 0;
 }
 
@@ -2290,10 +2468,58 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
     }
 }
 
+/// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
+/// quarter its bill adds (`server.prefillNeededAtChunk`): the live buffers are kept whole by `rollbackState`, so only then are they paid for.
+pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
+    const st = m.dec_state orelse return false;
+    for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
+        const own = (prompt_len / m.ratio(li) + 1) * 5 / 4;
+        if (r.cap > @max(own, 64)) return false;
+    };
+    return true;
+}
+
+/// Makes the live state its own earlier self at `n`: `slots` are the fixed arrays a restore point of the same
+/// request held there (`captureState`'s rows are not needed), and the compressed and index rows keep their first
+/// `n / ratio`, because rows are append-only. The arrays are shared, never written. Checked whole before anything
+/// changes; the caller guarantees the first `n` of `ids` are the tokens the state was built from.
+pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
+    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    if (st.verify != null or slots.len != slotCount(m) or ids.len < n or st.n < n) return error.Dsv41CheckpointMismatch;
+    if (m.hash != null and st.hist.items.len < n) return error.Dsv41CheckpointMismatch;
+    for (st.layers, 0..) |*ls, li| {
+        const a = slots[2 * li];
+        if (!present(a[0]) or dim(a[0], 0) != ls.win.cap) return error.Dsv41CheckpointMismatch;
+        for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
+    }
+    for (st.ds, 0..) |*ring, si| {
+        const a = slots[2 * st.layers.len + si][0];
+        if (!present(a) or dim(a, 0) != ring.cap) return error.Dsv41CheckpointMismatch;
+    }
+    errdefer resetState(m);
+    for (st.layers, 0..) |*ls, li| {
+        const a = slots[2 * li];
+        try shareInto(&ls.win.buf, a[0]);
+        try shareInto(&ls.pend_kv, a[1]);
+        try shareInto(&ls.pend_gate, a[2]);
+        if (ls.comp) |*rows| rows.used = n / m.ratio(li);
+        if (ls.idx_k) |*rows| rows.used = n / m.ratio(li);
+    }
+    for (st.ds, 0..) |*ring, si| try shareInto(&ring.buf, slots[2 * st.layers.len + si][0]);
+    st.n = n;
+    st.main_lazy = false;
+    if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
+}
+
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;
     log.info("[dsv41] fused kernels {s}{s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "" });
+}
+
+pub fn setDsparkExact(m: *Model, on: bool) void {
+    m.dspark_exact = on;
+    if (m.dspark != null and !on) log.info("[dsv41] DSpark rounds sum by width (SUSHI_DSV41_DSPARK_EXACT=0): greedy text may differ with the round mix\n", .{});
 }
 
 /// One chunk of a request in flight: the residual streams between layers, the Engram rows and what layers hand
@@ -2313,10 +2539,23 @@ pub const Pass = struct {
     tail: ?usize = null,
     /// The chunk's Engram rows read on a thread while the layers before each Engram layer run.
     engram_pf: ?*engram.Prefetch = null,
+    /// The prompt tokens after this chunk, whose Engram rows are read while the chunk runs (`aheadEngram`).
+    ahead: []const u32 = &.{},
+    ahead_started: bool = false,
     /// `[L]` bool, the rows inside an image span (none for text): they route by the image bias and take no Engram write.
     img: A = none,
+    /// The last layer built, when its routed chain was queued from the cache map and the host has not checked it yet.
+    unresolved: ?Unresolved = null,
+    /// Each Engram layer's rows, read once per pass: a rebuilt layer reuses them.
+    engram_rows: [cfg_mod.max_engram]A = @splat(none),
+    /// Layers this pass rebuilt after a pick missed the map: past `Model.route_spec_rebuilds` it waits for every layer's picks.
+    rollbacks: u32 = 0,
 
     pub fn deinit(self: *Pass, gpa: std.mem.Allocator) void {
+        if (self.unresolved) |*u| u.deinit();
+        for (self.engram_rows) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
         if (self.engram_pf) |pf| pf.finish();
         if (self.img.ctx != null) _ = mlx.mlx_array_free(self.img);
         gpa.free(self.rows);
@@ -2347,6 +2586,7 @@ pub fn imageRows(m: *const Model, ids: []const u32) usize {
 
 /// `beginPass` with the images of the request: the span positions of `ids` take `vision`'s rows.
 pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: usize, vision: ?VisionRows) !Pass {
+    try flushMain(st);
     const gpa = m.gpa;
     const c = &m.cfg;
     const L = ids.len;
@@ -2397,12 +2637,269 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     const first = try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0));
     const cpre = sc.out(try sc.broadcast(try sc.astype(first, .float32), &.{ ci(L), ci(hc) }));
     errdefer _ = mlx.mlx_array_free(cpre);
-    try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
+    // A decode-width pass builds layer 0 on these lazily: the embedding is a few microseconds of GPU work.
+    if (L > exl3.kernels.DECODE_ROWS_MAX) try evalAll(if (img.ctx != null) &.{ x, cpre, img } else &.{ x, cpre });
     return .{ .st = st, .ids = ids, .p0 = p0, .span = span, .rows = rows, .x = x, .cpre = cpre, .sh = try Shared.init(gpa, (L + span - 1) / span), .img = img };
 }
 
-/// Layer `li` over the pass's rows, evaluated, with the new state arrays.
+/// Diagnostic (`SUSHI_DSV41_READ_DIAG`): the blocking host reads of decode-width forwards by site, printed at debug
+/// level as the mean of 64 forwards. `settle_last` is a layer settled before its successor was built.
+pub const ReadSite = enum { settle, settle_last, picks_sync, engram, state, head };
+const read_sites = std.meta.tags(ReadSite).len;
+var read_diag = false;
+var read_n: [read_sites]u64 = @splat(0);
+var read_ns: [read_sites]u64 = @splat(0);
+var read_forwards: u64 = 0;
+/// The site the next settle read is booked to.
+pub var settle_site: ReadSite = .settle;
+
+pub fn setReadDiag(on: bool) void {
+    read_diag = on;
+}
+
+/// A timestamp for `readDone`, 0 while the diagnostic is off.
+pub fn readStart() u64 {
+    if (!read_diag) return 0;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(std.Io.Timestamp.now(io, .boot).nanoseconds);
+}
+
+pub fn readDone(site: ReadSite, t0: u64) void {
+    if (!read_diag) return;
+    read_n[@intFromEnum(site)] += 1;
+    read_ns[@intFromEnum(site)] += readStart() -| t0;
+}
+
+fn reportReads(L: usize) void {
+    if (!read_diag or L > exl3.kernels.DECODE_ROWS_MAX) return;
+    read_forwards += 1;
+    if (read_forwards < 64) return;
+    if (log.isDebug()) {
+        const f: f64 = @floatFromInt(read_forwards);
+        inline for (std.meta.tags(ReadSite), 0..) |site, i| {
+            log.debug("[dsv41] reads/forward {s}: {d:.2} blocking, {d:.3} ms (mean of 64)\n", .{ @tagName(site), @as(f64, @floatFromInt(read_n[i])) / f, @as(f64, @floatFromInt(read_ns[i])) / 1e6 / f });
+        }
+    }
+    read_n = @splat(0);
+    read_ns = @splat(0);
+    read_forwards = 0;
+}
+
+/// A decode-width layer whose routed chain was queued from the stream's cache map before the host read its picks. The
+/// host checks it once the next layer is submitted (`Experts.Spec.settle`); a miss rebuilds the layer from its exact sum
+/// and the successor from there. The arrays are what that rebuild reads.
+const Unresolved = struct {
+    li: usize,
+    map: []const i32,
+    h: A,
+    idx: A,
+    wts: A,
+    sy: A,
+    x1: A = none,
+    post: A = none,
+    comb: A = none,
+    pre: A = none,
+    /// The router logits of layer `pred_layer` over this layer's router input, for the expert prefetch.
+    pred: A = none,
+    pred_layer: usize = 0,
+
+    fn deinit(self: *Unresolved) void {
+        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+};
+
+pub var spec_kept: u64 = 0;
+pub var spec_rebuilt: u64 = 0;
+
+fn handle(x: A) A {
+    if (x.ctx == null) return none;
+    var o = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&o, x);
+    return o;
+}
+
+/// What a successor of an unresolved layer changes that its rebuild does not overwrite: the open pooling group (replaced,
+/// not written in place), the row counts and, for a chunk of several rows, the window ring (a row's write can land on a
+/// slot an earlier row of the chunk still reads). A one-row pass writes only the slot of a position that left the window,
+/// and the rows it appends are written again at the same places.
+const Undo = struct {
+    st: *State,
+    li: usize,
+    ring: A,
+    comp_used: usize,
+    idx_used: usize,
+    pend_kv: A,
+    pend_gate: A,
+    verify_kv: A,
+    verify_gate: A,
+
+    fn take(st: *State, li: usize, rows: usize) Undo {
+        const ls = &st.layers[li];
+        const v = if (st.verify) |*vv| vv else null;
+        return .{
+            .st = st,
+            .li = li,
+            .ring = if (rows > 1) handle(ls.win.buf) else none,
+            .comp_used = if (ls.comp) |r| r.used else 0,
+            .idx_used = if (ls.idx_k) |r| r.used else 0,
+            .pend_kv = handle(ls.pend_kv),
+            .pend_gate = handle(ls.pend_gate),
+            .verify_kv = if (v) |vv| handle(vv.pend_kv[li]) else none,
+            .verify_gate = if (v) |vv| handle(vv.pend_gate[li]) else none,
+        };
+    }
+
+    fn give(slot: *A, saved: *A) void {
+        if (slot.ctx != null) _ = mlx.mlx_array_free(slot.*);
+        slot.* = saved.*;
+        saved.* = none;
+    }
+
+    fn restore(self: *Undo) void {
+        const ls = &self.st.layers[self.li];
+        if (self.ring.ctx != null) give(&ls.win.buf, &self.ring);
+        if (ls.comp) |*r| r.used = self.comp_used;
+        if (ls.idx_k) |*r| r.used = self.idx_used;
+        give(&ls.pend_kv, &self.pend_kv);
+        give(&ls.pend_gate, &self.pend_gate);
+        if (self.st.verify) |*v| {
+            give(&v.pend_kv[self.li], &self.verify_kv);
+            give(&v.pend_gate[self.li], &self.verify_gate);
+        }
+    }
+
+    fn deinit(self: *Undo) void {
+        for ([_]A{ self.ring, self.pend_kv, self.pend_gate, self.verify_kv, self.verify_gate }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+};
+
+/// Whether layer `li` of the pass queues its routed chain from the stream's cache map.
+fn specOn(m: *const Model, p: *const Pass, li: usize) bool {
+    if (!m.route_spec or m.sync_layers or p.ids.len > exl3.kernels.DECODE_ROWS_MAX or p.rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (m.trace != null or m.profile != null or p.tail != null or p.img.ctx != null) return false;
+    const hk = switch (m.experts) {
+        .resident => return false,
+        .hook => |hk| hk,
+    };
+    const sp = hk.spec orelse return false;
+    return sp.can(hk.ctx, li);
+}
+
+/// The layer whose picks layer `li`'s router input is used to predict, or null where nothing is prefetched.
+fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
+    const hk = switch (m.experts) {
+        .resident => return null,
+        .hook => |hk| hk,
+    };
+    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS) return null;
+    const lead: usize = m.prefetch_lead_rows;
+    if (lead == 0 or li + lead >= m.cfg.layers) return null;
+    return li + lead;
+}
+
+/// Layer `j`'s router logits over `h`, the input of an earlier layer's router: the stream drifts slowly enough that
+/// its top picks are mostly the ones `j` will make.
+fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
+    const w = m.layers[j].gate_w;
+    if (fusedOn(sc, m) and m.cfg.dim % 8 == 0) return kernels.gateLogits(sc, h, w);
+    return sc.matmul(try sc.astype(h, .float32), try sc.t2(w));
+}
+
+/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first.
+fn rankPicks(logits: []const f32, bias: []const f32, out: []u16) void {
+    var best: [prefetch_cand_max]f32 = undefined;
+    var filled: usize = 0;
+    for (logits, bias, 0..) |x, b, e| {
+        const soft = if (x > 20) x else std.math.log1p(std.math.exp(x));
+        const score = @sqrt(soft) + b;
+        if (filled == out.len and score <= best[filled - 1]) continue;
+        var at = if (filled < out.len) filled else filled - 1;
+        while (at > 0 and best[at - 1] < score) : (at -= 1) {
+            best[at] = best[at - 1];
+            out[at] = out[at - 1];
+        }
+        best[at] = score;
+        out[at] = @intCast(e);
+        if (filled < out.len) filled += 1;
+    }
+}
+
+/// Hands the stream the experts the prefetch layer's router is expected to pick, ranked from `u.pred`.
+fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
+    const hk = m.experts.hook;
+    const prefetch = hk.prefetch orelse return;
+    const logits = try sc_mod.hostF32(u.pred);
+    const bias = try sc_mod.hostF32(m.layers[u.pred_layer].gate_bias);
+    const rows = dim(u.pred, 0);
+    const E = bias.len;
+    const n: usize = @min(m.prefetch_n, prefetch_cand_max, E);
+    var cand: [16 * prefetch_cand_max]u16 = undefined;
+    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, cand[r * n ..][0..n]);
+    prefetch(hk.ctx, u.pred_layer, cand[0 .. rows * n], rows, n, m.prefetch_m);
+}
+
+/// The host's check of an unresolved layer: null when its queued chain stands, else the layer's exact output stream.
+fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
+    const hk = m.experts.hook;
+    if (u.pred.ctx != null) issuePrefetch(m, u) catch {};
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const t0 = readStart();
+    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, u.sy, u.map);
+    readDone(settle_site, t0);
+    if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
+    if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
+    if (sum == null) return null;
+    return sc.out(try hcExpand(&sc, u.x1, try sc.astype(sum.?, m.act), u.post, u.comb));
+}
+
+/// Checks the pass's unresolved layer, if any, and takes its exact output where the queued chain missed.
+fn settleLast(m: *const Model, p: *Pass) !bool {
+    var u = p.unresolved orelse return false;
+    p.unresolved = null;
+    defer u.deinit();
+    settle_site = .settle_last;
+    defer settle_site = .settle;
+    const exact = try settleRecord(m, &u) orelse return false;
+    _ = mlx.mlx_array_free(p.x);
+    p.x = exact;
+    return true;
+}
+
+/// Layer `li` over the pass's rows, evaluated, with the new state arrays. At decode widths the layer's routed chain is
+/// queued from the stream's cache map and the previous layer's is checked after this one is submitted, so the host
+/// never waits on a layer's own picks; a miss in the previous layer rebuilds this one from its exact output.
 pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
+    const on = specOn(m, p, li);
+    // A layer that cannot queue from the map starts from its predecessor's exact output.
+    if (p.unresolved != null and !on) _ = try settleLast(m, p);
+    var prior = p.unresolved;
+    p.unresolved = null;
+    defer if (prior) |*u| u.deinit();
+    var undo: ?Undo = if (prior != null) Undo.take(p.st, li, p.ids.len) else null;
+    defer if (undo) |*u| u.deinit();
+    p.sh.spec_on = on;
+    try buildLayer(m, p, li);
+    if (prior == null) return;
+    const u = &prior.?;
+    const exact = try settleRecord(m, u) orelse return;
+    if (p.unresolved) |*next| next.deinit();
+    p.unresolved = null;
+    undo.?.restore();
+    _ = mlx.mlx_array_free(p.x);
+    _ = mlx.mlx_array_free(p.cpre);
+    p.x = exact;
+    p.cpre = handle(u.pre);
+    p.rollbacks += 1;
+    try submit(p.x);
+    return passLayer(m, p, li);
+}
+
+fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const gpa = m.gpa;
     if (p.tail) |t| if (li == m.ced_split.?) {
         try cedReplay(m, p, li, t);
@@ -2425,20 +2922,27 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(io, .boot);
         defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-        const table_rows = if (p.engram_pf) |pf| blk: {
-            const raw = try pf.take(p.p0, ei, 0);
-            defer raw.deinit(gpa);
-            break :blk try sc.keep(try e.table.dequant(raw, mine.len, m.s));
-        } else try sc.keep(try e.table.gather(gpa, mine, m.s)); // [L * cols, head_dim]
+        if (p.engram_rows[ei].ctx == null) {
+            const rt = readStart();
+            defer readDone(.engram, rt);
+            p.engram_rows[ei] = if (p.engram_pf) |pf| blk: {
+                const raw = try pf.take(p.p0, ei, 0);
+                defer raw.deinit(gpa);
+                break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
+            } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
+        }
+        const table_rows = p.engram_rows[ei];
         const nx = sc.out(try engramWrite(&sc, m, e, p.x, table_rows, p.img));
         _ = mlx.mlx_array_free(p.x);
         p.x = nx;
         if (prof(m, L)) |pf| try pf.mark(.engram, &.{nx});
     }
+    if (m.cfg.engram.layerAt(li)) |ei| if (ei + 1 == m.engrams.len) aheadEngram(m, p) catch {};
     const c = &m.cfg;
     // At decode widths a layer is submitted, not waited on: the next layer's router picks are the one host read.
     const wait = m.sync_layers or L > exl3.kernels.DECODE_ROWS_MAX;
     if (p.st.ds.len > 0) for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| if (tl == li) {
+        if (p.targets[t].ctx != null) _ = mlx.mlx_array_free(p.targets[t]);
         p.targets[t] = sc.out(try sc.astype(try sc.mean(try sc.astype(p.x, .float32), 1, false), m.act));
         try if (wait) mlx.check(mlx.mlx_array_eval(p.targets[t])) else submit(p.targets[t]);
     };
@@ -2448,6 +2952,8 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
     _ = mlx.mlx_array_free(p.cpre);
     p.x = out.x;
     p.cpre = out.pre;
+    p.unresolved = p.sh.spec;
+    p.sh.spec = null;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, p.x);
@@ -2467,6 +2973,17 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
 pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
     const c = &m.cfg;
     const L = p.ids.len;
+    // The head is queued before the host checks the last layer, so the GPU goes from that layer to the logits; a miss
+    // there builds the head again from the exact stream.
+    const queued = p.unresolved != null and prof(m, L) == null;
+    var res = if (queued) try queuedHead(m, p, want) else none;
+    errdefer if (res.ctx != null) {
+        _ = mlx.mlx_array_free(res);
+    };
+    if (try settleLast(m, p) and queued) {
+        _ = mlx.mlx_array_free(res);
+        res = none;
+    }
     reportEngramWait(m, L);
     p.st.n = p.p0 + L;
     if (p.st.ds.len > 0) {
@@ -2475,23 +2992,39 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         const main_rows = try msc.concat(p.targets[0..c.dspark.n_targets], -1); // [L, targets * dim]
         if (p.st.verify) |*v| {
             v.mh = msc.out(main_rows);
+            const t0 = readStart();
+            defer readDone(.state, t0);
             try mlx.check(mlx.mlx_array_eval(v.mh));
-        } else try commitMain(&msc, m, p.st, main_rows, p.p0);
+        } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
-    var sc = Scope.init(m.gpa, m.s);
-    defer sc.deinit();
-    const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
-    const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
-    const hn = try sc.rms(try hcCollapse(&sc, xs, ps), m.norm, c.eps);
-    const logits = try m.head.apply(&sc, try sc.astype(hn, .float32));
-    const res = sc.out(logits);
-    errdefer _ = mlx.mlx_array_free(res);
+    if (res.ctx == null) res = try headLogits(m, p, want);
     if (prof(m, L)) |pf| {
         pf.restart();
         try pf.mark(.head, &.{res});
         pf.report(L, p.p0);
     }
+    const t0 = readStart();
+    defer readDone(.head, t0);
     try mlx.check(mlx.mlx_array_eval(res));
+    reportReads(L);
+    return res;
+}
+
+fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
+    const L = p.ids.len;
+    var sc = Scope.init(m.gpa, m.s);
+    defer sc.deinit();
+    const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
+    const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
+    const hn = try sc.rms(try hcCollapse(&sc, xs, ps), m.norm, m.cfg.eps);
+    return sc.out(try m.head.apply(&sc, try sc.astype(hn, .float32)));
+}
+
+/// `headLogits`, submitted.
+fn queuedHead(m: *Model, p: *const Pass, want: Want) !A {
+    const res = try headLogits(m, p, want);
+    errdefer _ = mlx.mlx_array_free(res);
+    try submit(res);
     return res;
 }
 
@@ -2503,13 +3036,24 @@ pub fn extendSpan(m: *Model, ids: []const u32, want: Want, span: usize) !A {
 
 /// `extendSpan` over a chunk that may hold image spans, whose rows `vision` carries.
 pub fn extendVision(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows) !A {
+    return extendAhead(m, ids, want, span, vision, &.{});
+}
+
+/// `extendVision` of a prefill chunk whose request goes on with the tokens `ahead`: their Engram rows are read while
+/// this chunk runs, and the next pass starts with them when it is that chunk. Any other pass reads its own.
+pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows, ahead: []const u32) !A {
+    errdefer m.dropAhead();
     const st = try ensureState(m);
+    transient_peak.begin();
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
+    pass.ahead = ahead;
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
-    return finishPass(m, &pass, want);
+    const logits = try finishPass(m, &pass, want);
+    transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
+    return logits;
 }
 
 /// At debug level: the Engram wait of each wide chunk, and the mean of every 64 decode forwards.
@@ -2529,11 +3073,45 @@ fn reportEngramWait(m: *Model, L: usize) void {
 /// A chunk's Engram rows start reading now, one grid of one span per table, so each table's reads hide behind the
 /// layers before it (a decode token's: layer 0 for layer 1, layers 0-13 for layer 14).
 fn prefetchEngram(m: *Model, p: *Pass) !void {
+    const carried = m.engram_ahead;
+    m.engram_ahead = null;
+    var adopted = false;
+    defer if (carried) |pf| if (!adopted) pf.finish();
     const hs = &(m.hash orelse return);
     if (m.engrams.len == 0 or (!m.decode_engram_ahead and p.ids.len <= NARROW_ROWS)) return;
+    if (carried) |pf| if (pf.matches(p.p0, p.rows)) {
+        adopted = true;
+        p.engram_pf = pf;
+        m.engram_ahead_used += 1;
+        log.debug("[dsv41] engram rows of the chunk at {d} were read ahead ({d} rows)\n", .{ p.p0, p.ids.len });
+    };
+    if (p.engram_pf == null) {
+        var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
+        for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+        p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+    }
+    if (p.engram_pf.?.finished()) aheadEngram(m, p) catch {};
+}
+
+/// Starts reading the rows of `p.ahead` (a chunk of the request after this one) once this pass's own are in RAM, so they
+/// arrive while its layers run and the SSD is not shared. Host memory: one chunk's rows, 264 B for each of the
+/// 24 row ids of 2 tables a token. A failure leaves the next pass to read its own.
+fn aheadEngram(m: *Model, p: *Pass) !void {
+    if (p.ahead_started or p.ahead.len == 0) return;
+    p.ahead_started = true;
+    const hs = &(m.hash orelse return);
+    if (m.engrams.len == 0) return;
+    const gpa = m.gpa;
+    const comp = try gpa.alloc(u32, p.ahead.len);
+    defer gpa.free(comp);
+    for (p.ahead, comp) |t, *o| o.* = m.compressedId(t);
+    const rows = try gpa.alloc(u32, comp.len * hs.n_layers * hs.cols());
+    defer gpa.free(rows);
+    hs.rows(p.st.hist.items, comp, rows);
     var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
-    p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+    m.dropAhead();
+    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and
@@ -2594,9 +3172,13 @@ pub fn extend(m: *Model, ids: []const u32, want: Want) !A {
 
 // ── DSpark ───────────────────────────────────────────────────────────────
 
+/// How `commitMain` leaves the stage rings: evaluated before it returns, or as a graph the next pass submits (a draft
+/// or a capture reading a ring evaluates it on its own).
+const Commit = enum { wait, lazy };
+
 /// The stages' window rows for the committed positions [p0, p0 + n): the target layers' main stream
 /// `main_norm(main_proj(rows))`, `rows` `[n, targets * dim]`, through each stage's own key path.
-fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize) !void {
+fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, how: Commit) !void {
     const ds = &m.dspark.?;
     const n = dim(rows, 0);
     const main_x = try sc.rms(try ds.main_proj.apply(sc, rows), ds.main_norm, m.cfg.eps);
@@ -2606,10 +3188,26 @@ fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize) !void {
         const ly = &m.layers[m.cfg.layers + si];
         try ring.write(try windowRow(sc, m, ly, try ly.wkv.apply(sc, main_x), m.rope_plain.freqs, pos), p0, sc.s);
     }
+    st.main_lazy = how == .lazy;
+    if (how == .lazy) return;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(sc.a);
     for (st.ds) |r| try ev.append(sc.a, r.buf);
+    const t0 = readStart();
+    defer readDone(.state, t0);
     try evalAll(ev.items);
+}
+
+/// Submits the commit a step left lazy, so the GPU runs it while the host builds the next pass.
+fn flushMain(st: *State) !void {
+    if (!st.main_lazy) return;
+    st.main_lazy = false;
+    var bufs: [cfg_mod.max_targets]A = undefined;
+    if (st.ds.len > bufs.len) return error.Dsv41NoDspark;
+    for (st.ds, bufs[0..st.ds.len]) |r, *b| b.* = r.buf;
+    const vec = mlx.mlx_vector_array_new_data(&bufs, st.ds.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
 }
 
 /// A drafted block: `ids[0]` the token the draft started from and `ids[1..]` its `block` picks; with the heads' rows
@@ -2639,6 +3237,13 @@ pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
 /// the windows of committed main rows, the trunk head over the last stage's norm, then the Markov bigram bias chained
 /// token to token.
 pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+    transient_peak.begin();
+    const out = try draftPass(m, t1, heads_wanted);
+    transient_peak.end(.dspark_draft, m.cfg.dspark.block);
+    return out;
+}
+
+fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const gpa = m.gpa;
     const saved_profile = m.profile;
     m.profile = null;
@@ -2703,6 +3308,9 @@ pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
 pub fn verify(m: *Model, ids: []const u32) !A {
     const st = try ensureState(m);
     if (st.verify != null) return error.Dsv41VerifyOpen;
+    exl3.kernels.rows_exact = m.dspark_exact;
+    defer exl3.kernels.rows_exact = false;
+    if (ids.len == 1) return extend(m, ids, .all);
     const nl = m.cfg.layers;
     var v: Verify = .{
         .n0 = st.n,
@@ -2729,7 +3337,8 @@ pub fn verify(m: *Model, ids: []const u32) !A {
 pub fn finishVerify(m: *Model, accepted: usize) !void {
     const st = try ensureState(m);
     defer st.dropVerify();
-    const v = &(st.verify orelse return error.Dsv41NoVerify);
+    // A one-row chunk opens no verify: it keeps its row and had nothing to give back.
+    const v = &(st.verify orelse return if (accepted == 0) {} else error.Dsv41NoVerify);
     const keep = accepted + 1;
     if (keep > v.rows) return error.Dsv41VerifyTooWide;
     var sc = Scope.init(m.gpa, m.s);
@@ -2755,7 +3364,7 @@ pub fn finishVerify(m: *Model, accepted: usize) !void {
         st.n = end;
         if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);
     }
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0);
+    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep), v.n0, .lazy);
 }
 
 /// DSpark stage `si`'s routed experts as trellis banks, `mtp.<si>.mlp.switch_mlp.<P>[.g<N>].{trellis,suh,svh}`, held as one
@@ -2786,14 +3395,23 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
             @field(banks[count], pn) = .{ .trellis = parts[0], .suh = parts[1], .svh = parts[2] };
         }
     }
-    var rb = try exl3.Ragged.init(m.s, banks[0..count]);
+    // A group's source is dropped once copied, so a stage's load peak is its storage plus one group.
+    const drop_group = struct {
+        const Ctx = struct { w: *model_mod.Weights, names: []const NameBuf, lens: []const usize };
+        fn run(raw: ?*anyopaque, g: usize) void {
+            const ctx: *const Ctx = @ptrCast(@alignCast(raw.?));
+            for (ctx.names[g * 9 ..][0..9], ctx.lens[g * 9 ..][0..9]) |*b, n| source.drop(ctx.w, b[0..n]);
+        }
+    };
+    var drop_ctx: drop_group.Ctx = .{ .w = w, .names = names[0 .. count * 9], .lens = lens[0 .. count * 9] };
+    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], .{ .ctx = &drop_ctx, .run = drop_group.run });
     errdefer rb.deinit();
     if (rb.experts != c.dspark.experts or rb.hidden != c.dim or rb.inter != c.moe_inter) {
         log.err("deepseek_v41: DSpark stage {d}'s trellis experts are {d} of {d}x{d}, config says {d} of {d}x{d}\n", .{ si, rb.experts, rb.hidden, rb.inter, c.dspark.experts, c.dim, c.moe_inter });
         return error.Dsv41WeightLayout;
     }
-    // The ragged storage is a copy: evaluated, it outlives the weight map's arrays.
     try evalAll(&rb.storage());
+    for (rb.storage()[0..9]) |a| m.built.ragged += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
     return rb;
 }
 
@@ -3282,11 +3900,11 @@ test "dsv41 DSpark: with the QAT round trips on, the stages draft the reference'
     // The trunk's own rounding flips would move the main rows, so the reference's rows feed the stages directly.
     const st = try ensureState(m);
     const prefill_rows = fx.get("ds_mh_prefill").?;
-    try commitMain(&sc, m, st, prefill_rows, 0);
+    try commitMain(&sc, m, st, prefill_rows, 0, .wait);
     st.n = dim(prefill_rows, 0);
     const step_rows = fx.get("ds_mh").?;
     for (0..dim(step_rows, 0)) |k| {
-        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n);
+        try commitMain(&sc, m, st, try sc.slice(step_rows, 0, k, k + 1), st.n, .wait);
         st.n += 1;
         var d = try draft(m, t1[k], true);
         defer d.deinit();
@@ -3434,6 +4052,120 @@ test "dsv41 DSpark: after a rollback the next draft is the serial model's draft 
         try compare("draft after rollback", got.logits, want.logits, 2e-3);
         t1 = next;
     }
+}
+
+fn expectDraftsEqual(want: Draft, got: Draft) !void {
+    try testing.expectEqualSlices(u32, want.ids, got.ids);
+    try testing.expectEqualSlices(f32, want.logits, got.logits);
+    try testing.expectEqualSlices(f32, want.conf, got.conf);
+}
+
+/// Forces the stage rings now, as a commit that is not left to the next pass does.
+fn settleRings(m: *Model) !void {
+    const st = try ensureState(m);
+    for (st.ds) |r| try mlx.check(mlx.mlx_array_eval(r.buf));
+    st.main_lazy = false;
+}
+
+test "dsv41 DSpark: a one-row verify round is the serial step, opens no verify and leaves the rings for the next pass (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const P = TINY_S - 5;
+    var l0: []f32 = undefined;
+    const serial = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l0);
+    defer serial.deinit();
+    defer testing.allocator.free(l0);
+    var l1: []f32 = undefined;
+    const one = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l1);
+    defer one.deinit();
+    defer testing.allocator.free(l1);
+    var t = argmaxRow(l0);
+    for (0..6) |_| {
+        const want = try extend(serial, &.{t}, .last);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try verify(one, &.{t});
+        defer _ = mlx.mlx_array_free(got);
+        const st = try ensureState(one);
+        try testing.expect(st.verify == null);
+        try testing.expect(st.main_lazy);
+        const row = try sc_mod.hostF32(want);
+        try testing.expectEqualSlices(f32, row, try sc_mod.hostF32(got));
+        try finishVerify(one, 0);
+        try testing.expectEqual((try ensureState(serial)).n, st.n);
+        t = argmaxRow(row);
+    }
+    var want = try draft(serial, t, true);
+    defer want.deinit();
+    var got = try draft(one, t, true);
+    defer got.deinit();
+    try expectDraftsEqual(want, got);
+    try testing.expectError(error.Dsv41NoVerify, finishVerify(one, 1));
+}
+
+test "dsv41 DSpark: plain rounds whose commit is left lazy give the drafts and verify rows of the eager commit, where the drafter re-engages (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const P = TINY_S - 7;
+    var l0: []f32 = undefined;
+    const lazy = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l0);
+    defer lazy.deinit();
+    defer testing.allocator.free(l0);
+    var l1: []f32 = undefined;
+    const eager = try prefilledTiny(dir, ids, P, mlx.gpuStream(), &l1);
+    defer eager.deinit();
+    defer testing.allocator.free(l1);
+    const B = lazy.cfg.dspark.block;
+    const V = lazy.cfg.vocab;
+    var t1 = argmaxRow(l0);
+    // a wide round, then a plain run of 5, 1 and 3 rounds; the eager model forces its rings after every pass
+    for ([_]usize{ 5, 1, 3 }) |plain| {
+        var want = try draft(eager, t1, true);
+        defer want.deinit();
+        var got = try draft(lazy, t1, true);
+        defer got.deinit();
+        try expectDraftsEqual(want, got);
+        const vl = try verify(lazy, got.ids[0 .. B + 1]);
+        defer _ = mlx.mlx_array_free(vl);
+        const ve = try verify(eager, got.ids[0 .. B + 1]);
+        defer _ = mlx.mlx_array_free(ve);
+        const rows = try sc_mod.hostF32(vl);
+        try testing.expectEqualSlices(f32, try sc_mod.hostF32(ve), rows);
+        var accepted: usize = 0;
+        while (accepted < B and argmaxRow(rows[accepted * V ..][0..V]) == got.ids[1 + accepted]) accepted += 1;
+        try finishVerify(lazy, accepted);
+        try finishVerify(eager, accepted);
+        try settleRings(eager);
+        t1 = argmaxRow(rows[accepted * V ..][0..V]);
+        for (0..plain) |_| {
+            const a = try verify(lazy, &.{t1});
+            defer _ = mlx.mlx_array_free(a);
+            const b = try verify(eager, &.{t1});
+            defer _ = mlx.mlx_array_free(b);
+            try settleRings(eager);
+            const row = try sc_mod.hostF32(a);
+            try testing.expectEqualSlices(f32, try sc_mod.hostF32(b), row);
+            try finishVerify(lazy, 0);
+            try finishVerify(eager, 0);
+            t1 = argmaxRow(row);
+        }
+    }
+    var want = try draft(eager, t1, true);
+    defer want.deinit();
+    var got = try draft(lazy, t1, true);
+    defer got.deinit();
+    try expectDraftsEqual(want, got);
 }
 
 /// Bytes of every array a DSpark load holds beyond the trunk.
@@ -3692,7 +4424,6 @@ test "dsv41 restore point: a checkpoint of another position or shape is refused 
     try testing.expectError(error.Dsv41CheckpointMismatch, restoreState(m, cp[1..], 9, ids));
     try testing.expectError(error.Dsv41CheckpointMismatch, restoreState(m, cp, 9, ids[0..4]));
 }
-
 /// Cosine and the largest absolute difference over the peak of two rows.
 fn rowDiff(a: []const f32, b: []const f32) struct { cos: f64, err: f64, same_max: bool } {
     var dot: f64 = 0;
@@ -3738,6 +4469,8 @@ fn cedArm(m: *Model, sc: *Scope, ids: []const u32, chunks: []const usize, steps:
 
 test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are the full forward's bits, and the same prompt in other chunks gives the same state and logits (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+
+
     const dir = try fixtureDir();
     var fx = try loadFixture(dir, "fixture_noqat.safetensors");
     defer fx.deinit();
@@ -3783,7 +4516,6 @@ test "dsv41 CED: a prefill's encoder state and the decoder's compressed rows are
         }
     }
 }
-
 
 test "dsv41 Engram: each table keeps a row cache of exactly the bytes the load bills (DSV41_TINY)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
@@ -3831,6 +4563,153 @@ test "dsv41 Engram: a chunk's rows read ahead on a thread give the bytes of the 
     }
     defer for (rows) |pair| for (pair) |r| testing.allocator.free(r);
     for (rows[0], rows[1]) |a, b| try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(b), std.mem.sliceAsBytes(a));
+}
+
+const Told = enum { off, next, long, short, wrong };
+
+/// A prefill of `ids[from..]` cut as `chunks`; each chunk is told the tokens that follow it as `told` says (the next
+/// chunk's, five more than it, half of it, or others). Every chunk's last-row logits and the state it ends in.
+fn aheadArm(m: *Model, sc: *Scope, ids: []const u32, from: usize, chunks: []const usize, told: Told, rows: ?A) !Run {
+    var run: Run = .{};
+    errdefer run.deinit();
+    var other: [64]u32 = undefined;
+    var at = from;
+    var consumed: usize = 0;
+    for (chunks, 0..) |n, c| {
+        var ahead: []const u32 = &.{};
+        if (told != .off and c + 1 < chunks.len) {
+            const next = chunks[c + 1];
+            ahead = ids[at + n ..][0..switch (told) {
+                .long => @min(next + 5, ids.len - at - n),
+                .short => next / 2,
+                else => next,
+            }];
+            if (told == .wrong) {
+                for (other[0..ahead.len], ahead) |*o, t| o.* = (t + 1) % m.cfg.vocab;
+                ahead = other[0..ahead.len];
+            }
+        }
+        const vision: ?VisionRows = if (rows) |r| .{ .rows = r, .offset = consumed } else null;
+        try run.take(sc, try extendAhead(m, ids[at..][0..n], .last, 5, vision, ahead));
+        consumed += imageRows(m, ids[at..][0..n]);
+        at += n;
+    }
+    run.slots = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(run.slots, nil_slot);
+    try captureState(m, run.slots);
+    return run;
+}
+
+fn beginAheadArm(m: *Model, restore: ?[]const Slot, ids: []const u32, from: usize) !void {
+    if (restore) |slots| try restoreState(m, slots, from, ids) else resetState(m);
+}
+
+fn expectAheadArms(m: *Model, sc: *Scope, ids: []const u32, from: usize, chunks: []const usize, rows: ?A, restore: ?[]const Slot) !void {
+    try beginAheadArm(m, restore, ids, from);
+    const used0 = m.engram_ahead_used;
+    var plain = try aheadArm(m, sc, ids, from, chunks, .off, rows);
+    defer plain.deinit();
+    try testing.expectEqual(used0, m.engram_ahead_used);
+    const hist = try testing.allocator.dupe(u32, (try ensureState(m)).hist.items);
+    defer testing.allocator.free(hist);
+    for ([_]Told{ .next, .long, .short, .wrong }) |told| {
+        try beginAheadArm(m, restore, ids, from);
+        const used = m.engram_ahead_used;
+        var run = try aheadArm(m, sc, ids, from, chunks, told, rows);
+        defer run.deinit();
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(plain.rows.items), std.mem.sliceAsBytes(run.rows.items));
+        try expectSlotsBits(sc, plain.slots, run.slots);
+        try testing.expectEqualSlices(u32, hist, (try ensureState(m)).hist.items);
+        // The rows told are taken when they are the next chunk's ids, or more: the cut falls inside n-grams, after a
+        // restored prefix and inside an image span.
+        const taken: u64 = switch (told) {
+            .next, .long => chunks.len - 1,
+            else => 0,
+        };
+        try testing.expectEqual(taken, m.engram_ahead_used - used);
+    }
+}
+
+test "dsv41 Engram: a prefill that reads each chunk's successor ahead gives the logits and state of one that does not (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try fixtureDir();
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .qat = true }, s);
+    defer m.deinit();
+    try testing.expect(m.engrams.len > 0 and ids.len >= TINY_S);
+    try expectAheadArms(m, &sc, ids[0..TINY_S], 0, &.{ 13, 9, 10, 8 }, null, null);
+
+    // From a restored prefix, whose history the first look-ahead continues.
+    resetState(m);
+    _ = mlx.mlx_array_free(try extend(m, ids[0..9], .last));
+    const cp = try testing.allocator.alloc(Slot, slotCount(m));
+    @memset(cp, nil_slot);
+    defer {
+        for (cp) |*sl| freeSlot(sl);
+        testing.allocator.free(cp);
+    }
+    try captureState(m, cp);
+    try expectAheadArms(m, &sc, ids[0..TINY_S], 9, &.{ 12, 11, 8 }, null, cp);
+}
+
+test "dsv41 Engram: the look-ahead holds across an image span cut by a chunk (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    for (ids[5..15]) |*id| id.* = t.image_id;
+    const rows = try routerRows(&sc, t.m.cfg.dim, 10, 0x1a6e);
+    try expectAheadArms(t.m, &sc, ids, 0, &.{ 8, 8, 12, 12 }, rows, null);
+    try testing.expectEqual(@as(usize, 10), std.mem.count(u32, (try ensureState(t.m)).hist.items, &.{engram.Hash.DEAD}));
+}
+
+test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass and by the model's unload (DSV41_TINY)" {
+    const dir = try fixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var fx = try loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    var sc = Scope.init(testing.allocator, cpu);
+    defer sc.deinit();
+    const base = try tokens(&sc, &fx);
+    defer testing.allocator.free(base);
+    const t = try visionTinyModel(dir, cpu);
+    defer t.m.deinit();
+    const m = t.m;
+    const ids = try testing.allocator.dupe(u32, base[0..TINY_S]);
+    defer testing.allocator.free(ids);
+    try testing.expectEqual(@as(usize, 0), imageRows(m, ids));
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
+    resetState(m);
+    try testing.expect(m.engram_ahead == null);
+
+    // The next chunk holds an image span no rows were given for: the pass fails, and the rows read for it go.
+    for (ids[22..26]) |*id| id.* = t.image_id;
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
+    try testing.expectError(error.Dsv41VisionRowsMissing, extendAhead(m, ids[20..], .last, 5, null, &.{}));
+    try testing.expect(m.engram_ahead == null);
+
+    // A request that ends here leaves its look-ahead to the unload.
+    resetState(m);
+    _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
+    try testing.expect(m.engram_ahead != null);
 }
 
 const AttnCase = struct { L: usize, wp: usize, K: usize, nc: usize, holes: bool = true, H: usize = 64, hd: usize = 512, window: usize = 128 };
@@ -3916,7 +4795,8 @@ test "dsv41 fused attention: the one-pass kernel is no further from the f32 trut
         const err_core = maxRelErr(core, truth);
         const err_fused = maxRelErr(fused, truth);
         if (@import("transformer.zig").diagEnvOn("SUSHI_DSV41_ATTN_UBENCH")) std.debug.print("case {d}: core {e}, fused {e}\n", .{ ci_, err_core, err_fused });
-        try testing.expect(err_fused <= err_core);
+        // Without NAX the composed core's GEMMs are true f32 and sit near the kernel's own accumulation noise.
+        try testing.expect(err_fused <= @max(err_core, 1.5e-5));
         try testing.expect(err_fused < 3e-5);
     }
 }
@@ -4110,6 +4990,111 @@ test "dsv41 index stream peak bytes by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
         const plain = try peakOf(&sc, indexNarrowArm, .{ a, none });
         const masked = try peakOf(&sc, indexNarrowArm, .{ a, mask });
         std.debug.print("dsv41-index narrow L {d} ctx {d}: packed keys {d} MB, with the mask {d} MB\n", .{ L, ctx, plain >> 20, masked >> 20 });
+    }
+}
+
+fn msSince(io: std.Io, t0: std.Io.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+}
+
+// A decode block's indexer stages per context (release shapes, packed keys), each evaluated alone, best of 15 ms.
+// Prints only under SUSHI_DSV41_INDEX_UBENCH.
+test "dsv41 decode index stage timing by context (SUSHI_DSV41_INDEX_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_DSV41_INDEX_UBENCH")) return error.SkipZigTest;
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    var fake: Model = undefined;
+    fake.fused = true;
+    fake.trace = null;
+    for ([_]usize{ 32768, 65536, 131072, 262144 }) |nb| {
+        var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
+        defer rows.deinit();
+        const pk = rows.pack.?;
+        for ([_]usize{ 1, 2, 4 }) |L| {
+            const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0), .float32);
+            const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
+            const lens_h = try testing.allocator.alloc(i32, L);
+            defer testing.allocator.free(lens_h);
+            for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
+            const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
+            const codes = try sc.slice(rows.buf, 0, 0, nb);
+            const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+            const full = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+            const mask = try candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
+            try evalAll(&.{ q, w, lens, codes, scl, full, mask });
+            var best: [5]f64 = @splat(std.math.inf(f64));
+            for (0..16) |rep| {
+                var t = Scope.init(testing.allocator, gpu);
+                defer t.deinit();
+                var t0 = std.Io.Timestamp.now(io, .boot);
+                const scores = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+                try evalAll(&.{scores});
+                const a = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                var o = mlx.mlx_array_new();
+                const rep_m = try t.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, t.s), &o);
+                const masked = try t.where(try t.slice(rep_m, -1, 0, nb), scores, try t.f(-std.math.inf(f32)));
+                try evalAll(&.{masked});
+                const b = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const idx = try topkRows(&t, &fake, masked, 512);
+                try evalAll(&.{idx});
+                const c = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const cand = try candidateBlocks(&t, &fake, 0, scores, lens, 8, 2048);
+                try evalAll(&.{cand});
+                const d = msSince(io, t0);
+                t0 = std.Io.Timestamp.now(io, .boot);
+                const s2 = try kernels.indexScoresPacked(&t, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+                const ix2 = try topkRows(&t, &fake, s2, 512);
+                try evalAll(&.{ix2});
+                const e = msSince(io, t0);
+                if (rep > 0) for ([_]f64{ a, b, c, d, e }, 0..) |v, i| {
+                    best[i] = @min(best[i], v);
+                };
+            }
+            std.debug.print("dsv41-index-decode nb {d} L {d}: scores {d:.3} ms, mask {d:.3}, topk {d:.3}, cand-source blocks {d:.3}, scores+topk {d:.3}\n", .{ nb, L, best[0], best[1], best[2], best[3], best[4] });
+        }
+    }
+}
+
+// A later index source's picks over the candidate blocks' keys alone are the masked whole scan's, ties included (the
+// keys repeat every 4096, so scores tie across blocks).
+test "dsv41 index decode: scoring the candidate blocks' keys picks what the masked whole scan picks" {
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    var fake: Model = undefined;
+    fake.fused = true;
+    fake.trace = null;
+    const nb: usize = 65536;
+    var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
+    defer rows.deinit();
+    const pk = rows.pack.?;
+    const codes = try sc.slice(rows.buf, 0, 0, nb);
+    const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+    for ([_]usize{ 1, 2, 4, 16 }) |L| {
+        const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0 + L), .float32);
+        const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
+        const lens_h = try testing.allocator.alloc(i32, L);
+        defer testing.allocator.free(lens_h);
+        for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
+        const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
+        const scores = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
+        const mask = try candidateBlocks(&sc, &fake, 0, scores, lens, 8, 2048);
+        const ids = try candidateBlockIds(&sc, &fake, 0, scores, lens, 8, 2048);
+        var o = mlx.mlx_array_new();
+        const rep = try sc.res(mlx.mlx_repeat_axis(&o, mask, 8, -1, sc.s), &o);
+        const masked = try sc.where(try sc.slice(rep, -1, 0, nb), scores, try sc.f(-std.math.inf(f32)));
+        const want = try sc.where(try sc.lt(try topkRows(&sc, &fake, masked, 512), lens), try topkRows(&sc, &fake, masked, 512), try sc.i(-1));
+        const gathered = try kernels.indexScoresGather(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group, ids, 8);
+        const keys = try kernels.candidateKeys(&sc, try topkRows(&sc, &fake, gathered, 512), ids, 8);
+        const got = try sc.where(try sc.lt(keys, lens), keys, try sc.i(-1));
+        try expectSameInts(want, got);
     }
 }
 
@@ -4503,4 +5488,37 @@ test "dsv41 vision: the CED replay keeps the image mask of the rows it replays (
     const got = try sc_mod.hostI32(try sc.astype(pass.img, .int32));
     for (got, ids[ids.len - w ..]) |g, id| try testing.expectEqual(@as(i32, @intFromBool(id == t.image_id)), g);
     try testing.expect(std.mem.indexOfScalar(i32, got, 1) != null and std.mem.indexOfScalar(i32, got, 0) != null);
+}
+
+fn stqFixtureDir() ![]const u8 {
+    return std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+}
+
+test "dsv41 owned: every weight array of an STQ load with DSpark lies in a sushi-owned region (DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const dir = try stqFixtureDir();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const min = model_mod.import_min_bytes;
+    model_mod.import_min_bytes = 1;
+    defer model_mod.import_min_bytes = min;
+    const m = try tinyModel(dir, .{ .act = .bfloat16, .experts = false, .dspark = true }, cpu);
+    defer m.deinit();
+    // The rope tables and Engram's q.k product are built by MLX ops from a few KiB.
+    var mlx_made: std.ArrayList(?*anyopaque) = .empty;
+    defer mlx_made.deinit(testing.allocator);
+    try mlx_made.appendSlice(testing.allocator, &.{ m.rope_plain.freqs.ctx, m.rope_yarn.freqs.ctx });
+    for (m.engrams) |e| try mlx_made.append(testing.allocator, e.qk.ctx);
+    var outside: usize = 0;
+    for (m.owned.items) |a| {
+        try mlx.check(mlx.mlx_array_eval(a));
+        if (model_mod.ownsPointer(mlx.mlx_array_data_uint8(a))) continue;
+        outside += 1;
+        try testing.expect(std.mem.indexOfScalar(?*anyopaque, mlx_made.items, a.ctx) != null);
+    }
+    try testing.expectEqual(mlx_made.items.len, outside);
+    for (m.dspark.?.stq) |rb| for (rb.storage()[0..9]) |a| try testing.expect(model_mod.ownsPointer(mlx.mlx_array_data_uint8(a)));
+    try testing.expect(m.built.ragged > 0 and m.built.widened > 0 and m.built.stacks > 0);
+    const audit = try memoryAudit(m);
+    try testing.expectEqual(outside, audit.mlx_arrays);
 }

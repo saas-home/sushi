@@ -4,11 +4,11 @@ A flag exists for a setting a user picks: a real tradeoff (`--kv-quant 4` for co
 
 Precedence: an explicit flag outranks `model-settings.json`, which outranks the default ([server-lifecycle](server-lifecycle.md#settings)). A flag that mirrors a settings key adds the precedence and nothing else; that is not bloat by itself.
 
-The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update`, `kld` and `convert` parse their own. `pull` and `list` take no flags and reject extra arguments.
+The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update`, `kld`, `bench` and `convert` parse their own. `pull` and `list` take no flags and reject extra arguments.
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 106 rows: 58 shared by `run`, `serve` and the bare form, 48 in `run`, `launch`, `update`, `kld` and `convert`. By who: user 33, operator 28, machine 17, dev 27, dead 1. By recommendation: keep 98, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
+**Summary.** 114 rows: 58 shared by `run`, `serve` and the bare form, 56 in `run`, `launch`, `update`, `kld`, `bench` and `convert`. By who: user 33, operator 28, machine 17, dev 35, dead 1. By recommendation: keep 106, cut 4, owner call 4. Among the 58 shared rows: keep 52, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -40,11 +40,11 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
 | `--ctx-size` | model max → context length; also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
 | `--config-overrides` | none → JSON deep-merged into every model's `config.json`, e.g. YaRN extension (main.zig:666) | user | help; 0 tests | keep: the context-extension lever; add a test |
-| `--vision` / `--no-vision` | tower loads on a resident model, not on a streamed one → force it on or save its memory; also `vision` in settings (main.zig:693) | machine | help, README, topic docs; 17 tests | keep |
+| `--vision` / `--no-vision` | tower loads on a resident model and on DeepSeek-V4.1, not on any other streamed one → force it on or save its memory; also `vision` in settings (main.zig:693) | machine | help, README, topic docs; 17 tests | keep |
 | `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |
 | `--ssd-budget-gb` | none → stream experts from SSD within a TOTAL resident target; also `ssd_budget_gb` in settings (main.zig:985) | machine | help, README, engine-expert-streaming; 9 tests | keep |
-| `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool) | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
+| `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool); does nothing on streamed GLM | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
 | `--drop-expert` | `0` off → never load, bill, cache or pick the n least-used routed experts of every layer, ranked by the pack's `expert_usage.json`; a multiple of 8; DeepSeek-V4.1 only, every other arch refuses it at load (main.zig:886, `archFlagRefusal`); `sushi kld compare` takes it, `capture` refuses it ([dsv41-arch](dsv41-arch.md#drop-expert)) | user | help, dsv41-arch, engine-expert-streaming, pack-format; 18 tests | keep: frees expert bytes for re-routed picks; answers change, so score it with `sushi kld compare` |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
 | `--prefill-decode-share` | `0` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
@@ -61,12 +61,12 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
-| `--mtp` / `--no-mtp` | on for Qwen and MiMo, off for GLM → force the head on (required for a streamed pack) or off; also `mtp` in settings (main.zig:754) | user | help, usage, engine-mtp; 22 tests | keep |
-| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load, its DSpark block is fixed (main.zig:771) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
-| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8; DeepSeek-V4.1 refuses it at load (main.zig:771) | machine | help, engine-mtp; 5 tests | keep |
-| `--mtp-typical` | off, exact → typical acceptance, d > 0, lossy for sampled requests; also `mtp_acceptance` in settings (main.zig:780) | user | help, engine-mtp; 1 test | keep: measured 15-20% on sampled decode; docs warn it has looped |
-| `--mtp-tokenv3` | off → TokenV3 cascade acceptance, 0..1, lossy (main.zig:783) | user | help; 2 tests | owner call |
-| `--mtp-greedy-tail` | off → sampled requests draft only the first token by sampling; also in settings (main.zig:786) | user | help, engine-mtp, mimo2-perf; 1 test | keep: measured to pay only beside `--mtp-typical` |
+| `--mtp` / `--no-mtp` | on for Qwen and MiMo, and for DeepSeek-V4.1's DSpark, off for GLM → force the head on (required for a streamed pack) or off; also `mtp` in settings (main.zig:754) | user | help, usage, engine-mtp; 22 tests | keep |
+| `--mtp-min-depth` | `1` → fewest tokens a round drafts, 1..8; DeepSeek-V4.1: DSpark verifies at least min + 1 rows (above 1 it takes no plain step or back-off; past the 5-draft block it clamps) | machine | help, engine-mtp; 5 tests | keep: depth range is a property of the chip; launch-only by design |
+| `--mtp-max-depth` | adaptive, up to 8 on eligible M5 → most tokens a round drafts, 1..8; DeepSeek-V4.1: caps DSpark at max + 1 verified rows (the block is 5 drafts, a larger value clamps with one log line) | machine | help, engine-mtp; 5 tests | keep |
+| `--mtp-typical` | off, exact → typical acceptance, d > 0, lossy for sampled requests; also `mtp_acceptance` in settings (main.zig:780) | user | help, engine-mtp; 1 test | keep: measured 15-20% on sampled decode; docs warn it has looped; DeepSeek-V4.1 refuses it at load (DSpark is exact only) and ignores a settings `mtp_acceptance` with one log line |
+| `--mtp-tokenv3` | off → TokenV3 cascade acceptance, 0..1, lossy; DeepSeek-V4.1 refuses it at load (main.zig:783) and ignores a settings `mtp_acceptance` with one log line | user | help; 2 tests | owner call |
+| `--mtp-greedy-tail` | off → sampled requests draft only the first token by sampling; also in settings (main.zig:786) | user | help, engine-mtp, mimo2-perf; 1 test | keep: measured to pay only beside `--mtp-typical`; DeepSeek-V4.1 refuses it at load and ignores a settings `mtp_greedy_tail` with one log line |
 | `--max-mtp-ctx` | `0` no ceiling → MTP off past n context tokens (main.zig:790) | machine | help, `/props`; 0 tests | owner call |
 | `--no-mtp-lookup` | off → drop prompt-lookup drafts inside MTP rounds and GLM DFlash2 chains (cli.zig:708) | dev | help, engine-mtp; 2 tests | cut: kill switch of an adopted default; one arm per boot is why a bench wants it |
 | `--drafter` | none → path of a DFlash2 assistant stored elsewhere (GLM, Qwen3.8-Flash-Next); on Qwen3.8-Flash-Next it is the only way to run DFlash2, a drafter beside the pack is ignored and MTP stays the default (main.zig:719) | operator | help, usage, glm5-arch, qwen4-arch; 7 tests | keep |
@@ -138,6 +138,14 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--ctx-size` | model max → context override (kld.zig:108) | dev | help | keep |
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `32` → `16` scores a bf16-state student against the f32 teacher; a GLM capture refuses it (kld.zig:107) | dev | help, quality-kld; 2 tests | keep |
+| `bench`: `--url` | `127.0.0.1:8080` → `host:port` of the running server to drive (bench.zig `parseArgs`) | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--model` | first id of `/v1/models` → model id sent in each request | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--out` | required → directory for `bench.json`, the raw samples | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--log` | required → the server's log, read for `[spec-stats] mode=` and the restore line | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--report` | none → write the `docs/bench/v<ver>/<model>.md` report here | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--version` | none → release version in the report title | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--stamp` | none → header lines for the report (`\n` separates), which `tests/bench.sh` fills | dev | help, process-measurement; 1 test | keep |
+| `bench`: `--decode-tokens` | `512` → tokens decoded per sample, at least 2 | dev | help, process-measurement; 1 test | keep |
 | `kld`: `--drop-expert` | `0` → compare only, the student drops n experts a layer by the pack's usage list; a capture refuses it (the teacher is exact) (kld.zig:112) | dev | help, dsv41-arch; 1 test | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
@@ -150,7 +158,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `convert exl3`: `--model` | required → source checkpoint directory (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--out` | required → new pack directory, refused when non-empty unless `--resume` (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--experts-k` | `2.5` → routed-expert rate, 1.5 to 8 in steps of 0.125 (encoder/cli.zig) | user | help, encoder | keep |
-| `convert exl3`: `--codebook` | `mcg` → `mcg` or `mul1` (encoder/cli.zig) | user | help, encoder | keep |
+| `convert exl3`: `--expert-codebook` | `exl3-mcg` → `exl3-mcg` or `exl3-mul1` (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--window` | `15` → trellis search window, 12 to 16 (encoder/cli.zig) | dev | help, encoder | keep: the window is part of the pack's stamp |
 | `convert exl3`: `--calib` | built-in 64k mix → calibration text file (encoder/cli.zig) | user | help, encoder | keep |
 | `convert exl3`: `--calib-tokens` | `65536` → calibration tokens, at least 2048 (encoder/cli.zig) | user | help, encoder | keep |

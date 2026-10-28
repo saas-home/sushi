@@ -23,7 +23,7 @@ hidden 2560, expert intermediate 640.
 | `src/transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3` |
 | `src/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
-| `src/mtp.zig` | The native MTP head (`Qwen4Mtp`), see [engine-mtp](engine-mtp.md) |
+| `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
 ## Trunk rules
 
@@ -142,7 +142,9 @@ native tree.
 
 | pack | directory under the models root | notes |
 |---|---|---|
-| MCG K3 w15 (served target) | `Qwen3.8-Flash-Next-Sushi-3bpw` | our MCG experts (window 15) |
+| Sushi 2bpw | `Qwen3.8-Flash-Next-Sushi-2bpw` | served, 48 GB tier (32 GB streamed) |
+| Sushi STQ 2.75bpw | `Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw` | served, 64 GB tier, the default `qwen3.8-flash-next` |
+| Sushi 4bpw | `Qwen3.8-Flash-Next-Sushi-4bpw` | served, 96 GB tier |
 | affine 4/8 control | `Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit` | the control column in every table |
 | bf16 source | `Qwen/Qwen3.8-Flash-Next` | the KLD teacher; streams (335 GB) |
 

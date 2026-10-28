@@ -83,6 +83,57 @@ Set the fans back to auto when the bench ends. The fan control and temperature r
 box, the fan-control MCP: `max_fans`, `set_fan_auto`, `get_thermal_status`). A bench script waits on a marker file that
 the driver touches once the fans are at max. Nothing else may compute during the idle and the bench (quiet box).
 
+<a id="release-bench"></a>
+## 4c. The release bench
+
+`tests/bench.sh --version <ver> <pack> [-- <serve flags>]` is the perf gate: one model, one server boot, one run. It
+takes the box rules itself (clean tree, fresh ReleaseFast build, QUIET marker, AC power, GPU lock, fans max and an idle
+under 50 °C for at most 3 min, `taskpolicy -a`, a private `SUSHI_PREFIX_CACHE_DIR` under `~/.sushi/runs/bench-<tag>/`,
+refusal while any `sushi`, `sushi-repack` or `sushi-grid` runs), boots the server by PID, runs `sushi bench` against it
+and stops it. The raw `bench.json` (every request), the server log and `bench.log` stay in the run directory; the report
+`docs/bench/v<ver>/<pack>.md` carries the commit, binary SHA-256 and mtime, flags and hardware.
+
+The protocol, fixed for every model and release:
+- **Two corpora, two arms.** The code arm is a seeded synthetic TypeScript codebase (`bench.Corpus`, seed fixed). The prose
+  arm is Pride and Prejudice (`src/fixtures/prose_pride_and_prejudice.txt`, Project Gutenberg #1342, public domain, header
+  and footer removed): speculative decoding accepts fewer tokens on prose than on code (1.95 against 2.9 a round on a 209k
+  DSpark trace), so code decode alone flatters it. Each is tokenized through the server's `/tokenize`, sent as token ids
+  on `/v1/completions`: greedy, `ignore_eos`, 256 decoded tokens on the code arm and 128 on the prose arm, the server's default speculative mode (the
+  `[spec-stats] mode=` lines of each request name it in the report). One `sushi bench` run does the code arm, then the
+  prose arm, each with the whole schedule below, on one server and one private prefix-cache directory: the two prompts
+  share no prefix, so the prose arm's 4k request is cold. It is not expert-cache cold: the code arm has run before it.
+- **One cold prefill.** A cold 4k request, then `corpus[:8192k]` for k = 1..16. Each request restores the previous
+  prompt-end point and prefills only the new tokens: the report's window table is the continuous prefill curve, 0 to 128k.
+  Windows hold about 8,223 new tokens, not 8,192: the prompt-end checkpoint trails the prompt end by 30 tokens (GLM 31 to
+  34, a pool boundary), so every window re-forwards that tail. The tables name the actual restored and new counts.
+- **Prefill rate** = new tokens over the server's `prompt_ms` minus the restore time. `prompt_ms` includes the SSD
+  restore (it covers the whole prefix lookup), and each request logs `[prefix] reused N of M ... lookup and restore X ms`
+  (`[dsv41-prefix]` on DeepSeek), which the bench subtracts. TTFT = request wall time minus `predicted_ms`.
+- **Decode rungs 4k, 8k, 16k, 32k, 64k, 128k.** The ladder request decodes (sample 1, the first request, never
+  discarded); samples 2 and 3 are the same prompt sent right after it, restoring at the prompt end (about 31 tokens to
+  forward). Order rule, the one for every rung and release: ladder step, its two repeats, next ladder step, ascending.
+  Repeating a rung straight away keeps its restore point from being thinned by the per-entry checkpoint cap (Qwen,
+  GLM) that a 128k entry would apply to it later. Expert-cache warmth is whatever the preceding requests left.
+- **The report** puts code and prose decode side by side per rung (with the prose/code ratio), one window table per
+  arm, and a summary row set: the code rows keep the old shape and stay comparable across releases, and the prose rows
+  are added beneath them as `<pack> (prose)`.
+- **The GPU clock is read, and a throttled run stops.** `sushi bench` runs `sudo -n powermetrics --samplers gpu_power,thermal`
+  (500 ms) beside the run and keeps, for each request, the median active MHz of the samples with at least 50% GPU
+  residency and the worst thermal pressure level; both are columns beside the tok/s and the header gives the run's
+  minimum and median. A request whose busy clock is at 1100 MHz or under aborts the bench with an error naming it
+  (the top clock is 1620 MHz; a throttled run sat at 1025 to 1120). The pressure level is recorded only: a DeepSeek run
+  reached `Heavy` 25 minutes in with the GPU still at 1539 MHz. The partial report is `bench-aborted.md` in the run
+  directory, never `docs/bench`. `bench.sh` logs the pressure level after the cooldown. Without a passwordless `sudo -n powermetrics` both say the clock is not monitored and
+  go on; a decode number from a run that was not monitored needs a `powermetrics` look beside it before it is recorded.
+- **The prose arm starts cool.** Between the arms `sushi bench` sets the fans to max and idles until the hottest
+  `fanctl status` die is under 50 C, at most 180 s (a fixed 180 s without `fanctl`); the wait is logged and named in the report's protocol line.
+- **A request that did not restore** within 64 tokens of the point it should, one without a restore log line, or a
+  short decode is listed under Warnings and makes the run exit non-zero: it is not a measurement. A decode the
+  server's loop stop ended (`finish_details.type` = `repetition_loop`) is valid: it counts and is listed under Notes.
+
+Cross-engine comparison is not this bench: start the other engine, run llmprobe by hand
+(`npx -y llmprobe@latest <host:port> -m <id> --bench-only`) and name the engine beside every number.
+
 ## 5. Wait without hanging
 
 Never wait on `pgrep -f "<string>"`: every agent shell's own `zsh -c "<command>"` contains the string and matches

@@ -7,6 +7,7 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
+pub const bench = bench_mod;
 pub const imatrix = @import("imatrix.zig");
 pub const transformer = transformer_mod;
 const transformer_mod = @import("transformer.zig");
@@ -26,6 +27,7 @@ const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
 pub const log = @import("log.zig");
@@ -124,6 +126,9 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
+        \\  bench               Drive a running server through the release bench
+        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
@@ -176,7 +181,8 @@ fn printUsage(io: std.Io) void {
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --vision            Load the vision tower on an SSD-streamed load too (off by
-        \\                      default there: its weights come out of the expert cache)
+        \\                      default there, except for DeepSeek-V4.1: its weights
+        \\                      come out of the expert cache)
         \\  --no-prevent-sleep  Allow Mac idle sleep during inference and model
         \\                      loads. Display sleep is always allowed.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
@@ -189,7 +195,8 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
         \\                        rounds and GLM DFlash2 (default: ON).
         \\  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
-        \\                        and run it by default; GLM's stays off.
+        \\                        and run it by default; GLM's stays off. On
+        \\                        DeepSeek-V4.1 it turns DSpark off.
         \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
         \\                        default, GLM does not; an SSD-streamed pack
         \\                        that cannot stream its head refuses --mtp.
@@ -215,7 +222,10 @@ fn printUsage(io: std.Io) void {
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
-        \\                        equal values pin one depth.
+        \\                        equal values pin one depth. DeepSeek-V4.1:
+        \\                        DSpark verifies depth + 1 rows (its block
+        \\                        is 5 drafts); a min above 1 never takes a
+        \\                        plain step.
         \\  --mtp-max-depth <n> Most tokens an MTP round drafts, 1..8 (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
@@ -259,7 +269,9 @@ fn printUsage(io: std.Io) void {
         \\                      change, so score it with `sushi kld compare`.
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        8, 6 or 4 — affine group quant; default 8 on
-        \\                          every model (GLM refuses 4). 16 (or `off`)
+        \\                          every model but DeepSeek-V4.1, which has no
+        \\                          KV cache and refuses the flag (GLM refuses
+        \\                          4). 16 (or `off`)
         \\                          keeps dense bf16 KV. It outranks a
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
@@ -472,6 +484,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "kld")) {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
+        } else if (std.mem.eql(u8, cmd, "bench")) {
+            try bench_mod.cmdBench(allocator, io, args[2..]);
+            return;
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
             return;
@@ -479,7 +494,7 @@ pub fn main(init: std.process.Init) !void {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -581,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         } else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
             i += 1;
-            model_dir = args[i];
+            model_dir = cli_mod.resolveRelativeDir(allocator, io, args[i]) orelse args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
             port_flag = flagInt(u16, "--port", args[i], 0);
@@ -1466,25 +1481,6 @@ pub fn main(init: std.process.Init) !void {
         }
         log.info("Model ready.\n", .{});
 
-        // Qwen native MTP head — auto-load when the model ships one (sidecar
-        // file or in-checkpoint tensors in the trunk shards).
-        var mtp_head: ?mtp_mod.MtpModel = null;
-        defer if (mtp_head) |*h| h.deinit();
-        if (mtp_choice.on and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
-            // A failed load (e.g. a sidecar layout we can't bind yet) only
-            // disables the head — mirrors the serve path's graceful degrade.
-            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
-                mtp_head = loaded;
-                mtp_head.?.bind(&xfm) catch |err| {
-                    log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
-                    mtp_head.?.deinit();
-                    mtp_head = null;
-                };
-            } else |err| {
-                log.warn("[mtp] failed to load sidecar ({any}) — disabled\n", .{err});
-            }
-        }
-
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
@@ -1540,10 +1536,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
-            else
-                try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 

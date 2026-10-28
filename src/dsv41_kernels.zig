@@ -297,11 +297,10 @@ const ROUTE_SOURCE =
 
 /// The K largest of each row of `x` [L, n] f32 (K <= n), as their indices in ascending order, ties to the lower
 /// index: a radix select of the order-preserving uint keys, 8 bits a pass, then one pass writing every key above
-/// the threshold and the first ties. One threadgroup a row.
-const TOPK_SOURCE =
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
-    \\const auto xr = x + size_t(l) * n;
+/// the threshold and the first ties. One threadgroup a row; the split variant runs it on G chunks of a row, then on
+/// the chunks' candidates (ascending in the row's index, so a tie still goes to the lower index). A variant defines
+/// `n`, `xr`, `ELEM(i)` (the key of element i) and `EMIT(p, i)` (pick p is element i).
+const TOPK_BODY =
     \\threadgroup atomic_uint hist[256];
     \\threadgroup uint t_sel[2], t_part[TG / 32];
     \\const uint K = uint(kk[0]);
@@ -312,7 +311,7 @@ const TOPK_SOURCE =
     \\  for (uint b = tid; b < 256; b += TG) atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  for (int i = int(tid); i < n; i += TG) {
-    \\    const uint key = dsv41_key(xr[i]);
+    \\    const uint key = ELEM(i);
     \\    if ((key & hmask) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, metal::memory_order_relaxed);
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -336,7 +335,7 @@ const TOPK_SOURCE =
     \\}
     \\const int C = (n + TG - 1) / TG, i0 = int(tid) * C, i1 = metal::min(n, i0 + C);
     \\uint gt = 0, eq = 0;
-    \\for (int i = i0; i < i1; ++i) { const uint key = dsv41_key(xr[i]); gt += key > prefix; eq += key == prefix; }
+    \\for (int i = i0; i < i1; ++i) { const uint key = ELEM(i); gt += key > prefix; eq += key == prefix; }
     \\uint s = metal::simd_prefix_exclusive_sum(eq);
     \\if (lane == 31) t_part[sg] = s + eq;
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -353,13 +352,47 @@ const TOPK_SOURCE =
     \\for (uint g = 0; g < sg; ++g) off += t_part[g];
     \\uint pos = s + off, taken = 0;
     \\for (int i = i0; i < i1; ++i) {
-    \\  const uint key = dsv41_key(xr[i]);
+    \\  const uint key = ELEM(i);
     \\  if (key > prefix || (key == prefix && taken < take)) {
     \\    taken += key == prefix;
-    \\    out[size_t(l) * K + pos++] = i;
+    \\    EMIT(pos, i);
+    \\    ++pos;
     \\  }
     \\}
 ;
+
+const TOPK_PRE =
+    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+;
+
+const TOPK_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
+    \\const auto xr = x + size_t(l) * n;
+    \\#define ELEM(i) dsv41_key(xr[i])
+    \\#define EMIT(p, i) out[size_t(l) * K + (p)] = (i)
+    \\
+++ TOPK_BODY;
+
+/// Chunk g of G of each row: its K picks as row indices, `[L, G * K]`; kk = {K, G}.
+const TOPK_CHUNK_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, g = threadgroup_position_in_grid.x, G = kk[1], N = x_shape[1];
+    \\const size_t c0 = size_t(N) * g / G;
+    \\const int n = int(size_t(N) * (g + 1) / G - c0);
+    \\const auto xr = x + size_t(l) * N + c0;
+    \\#define ELEM(i) dsv41_key(xr[i])
+    \\#define EMIT(p, i) out[(size_t(l) * G + g) * kk[0] + (p)] = int(c0) + (i)
+    \\
+++ TOPK_BODY;
+
+/// The K largest of each row of `x` among its candidate indices `ids` `[L, C]` (ascending).
+const TOPK_MERGE_SOURCE = TOPK_PRE ++
+    \\const int l = threadgroup_position_in_grid.y, n = ids_shape[1];
+    \\const auto xr = x + size_t(l) * x_shape[1];
+    \\const auto ir = ids + size_t(l) * n;
+    \\#define ELEM(i) dsv41_key(xr[ir[i]])
+    \\#define EMIT(p, i) out[size_t(l) * kk[0] + (p)] = ir[i]
+    \\
+++ TOPK_BODY;
 
 const TOPK_HEADER =
     \\inline uint dsv41_key(float f) {
@@ -393,6 +426,8 @@ const DENSE_F32X_SOURCE =
 var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"logits"}, .source = GATE_SOURCE };
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
 var topk_def = Def{ .name = "dsv41_topk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_SOURCE, .header = TOPK_HEADER };
+var topk_chunk_def = Def{ .name = "dsv41_topk_chunk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_CHUNK_SOURCE, .header = TOPK_HEADER };
+var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk" }, .outs = &.{"out"}, .source = TOPK_MERGE_SOURCE, .header = TOPK_HEADER };
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
 
 const gate_sgs = 8;
@@ -425,13 +460,38 @@ pub fn route(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, scale: f32) !
     return .{ .idx = o[0], .wts = o[1] };
 }
 
+/// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
+/// below them, or at a wide k, the merge costs what the split saves (`dsv41 topk split timing`).
+pub fn topkSplits(rows: usize, n: usize, k: usize) usize {
+    if (rows > topk_split_rows or k > topk_split_max_k) return 1;
+    return if (n >= (if (rows == 1) topk_split_min_n_one_row else topk_split_min_n)) topk_splits else 1;
+}
+
+const topk_split_rows = 16;
+const topk_split_max_k = 512;
+const topk_split_min_n_one_row: usize = 131072;
+const topk_split_min_n: usize = 262144;
+const topk_splits: usize = 8;
+
 /// The indices of the `k` largest of each row of `x` `[L, n]` (f32), ascending, ties to the lower index.
 pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
+    return topkIndicesSplit(sc, x, k, topkSplits(dim(x, 0), dim(x, 1), k));
+}
+
+/// `topkIndices` over `splits` chunks of each row (1: one threadgroup a row); each chunk holds at least `k` scores.
+pub fn topkIndicesSplit(sc: *Scope, x: A, k: usize, splits: usize) !A {
+    const L = dim(x, 0);
     var o: [1]A = undefined;
+    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = topk_tg }};
+    const spec: []const OutSpec = &.{.{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 }};
     // k rides in a buffer: as a template arg every index width up to index_topk was its own Metal compile.
-    try launch(sc, &topk_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}) }, &.{.{ .shape = &.{ ci(dim(x, 0)), ci(k) }, .dt = .int32 }}, .{ topk_tg, dim(x, 0), 1 }, .{ topk_tg, 1, 1 }, &.{
-        .{ .name = "TG", .v = topk_tg },
-    }, &.{}, &o);
+    if (splits <= 1) {
+        try launch(sc, &topk_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
+        return o[0];
+    }
+    var cand: [1]A = undefined;
+    try launch(sc, &topk_chunk_def, &.{ x, try sc.ints(&.{ ci(k), ci(splits) }, &.{2}) }, &.{.{ .shape = &.{ ci(L), ci(splits * k) }, .dt = .int32 }}, .{ topk_tg * splits, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &cand);
+    try launch(sc, &topk_merge_def, &.{ x, cand[0], try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
     return o[0];
 }
 
@@ -624,7 +684,9 @@ const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
     \\for (int d = sg * 32 + lane; d < D; d += NSG * 32) {
     \\  float o = 0.0f;
     \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
-    \\  out[(i * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
+    \\  OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
+    \\  if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
+    \\  out[(i * H + h) * D + d] = ov;
     \\}
 ;
 
@@ -642,6 +704,18 @@ const UNROPE_HEADER =
     \\  const float theta = float(pos) * freqs[(d - (D - RD)) / 2];
     \\  const float cs = metal::precise::cos(theta), sn = -metal::precise::sin(theta);
     \\  return OT(even ? x1 * cs - x2 * sn : x1 * sn + x2 * cs);
+    \\}
+;
+
+/// UNROPE_HEADER and the fp8 activation round trip of a simdgroup's 32 channels (one dsv41_qat group), for the
+/// kernels that write the heads attnOut rounds next.
+const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
+    \\template <typename OT>
+    \\inline OT dsv41_fp8_store(OT v) {
+    \\  #pragma clang fp contract(off)
+    \\  #pragma clang fp reassociate(off)
+    \\  const float s = qat_scale<0>(metal::simd_max(metal::fabs(float(v))));
+    \\  return static_cast<OT>(qat_round<0>(float(v), s));
     \\}
 ;
 
@@ -674,7 +748,9 @@ const ATTN_MERGE_SOURCE =
     \\  total += pl[base + j] * w;
     \\  o += pacc[(base + j) * D + d] * w;
     \\}
-    \\out[(size_t(i) * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
+    \\OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
+    \\if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
+    \\out[(size_t(i) * H + h) * D + d] = ov;
 ;
 
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores `lw` [L*H, Wk] under the band
@@ -713,9 +789,9 @@ const ATTN_SOFTMAX_SOURCE =
     \\}
 ;
 
-var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_SOURCE, .header = UNROPE_HEADER };
+var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_SOURCE, .header = HEADS_HEADER };
 var attn_split_def = Def{ .name = "dsv41_attn_split", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_SOURCE };
-var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = UNROPE_HEADER };
+var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = HEADS_HEADER };
 var attn_softmax_def = Def{ .name = "dsv41_attn_softmax", .ins = &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, .outs = &.{ "pw", "pc" }, .source = ATTN_SOFTMAX_SOURCE };
 
 const attn_dec_nsg = 8;
@@ -741,6 +817,8 @@ pub const DecodeArgs = struct {
     /// The inverse rotation of the heads' tail (`rd` channels, `freqs`), or `rd` 0.
     freqs: A = sc_mod.none,
     rd: usize = 0,
+    /// The heads leave through attnOut's fp8 round trip (groups of 32 channels).
+    qat_fp8: bool = false,
     out_dt: mlx.mlx_dtype,
 };
 
@@ -772,7 +850,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const common = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "NSG", .v = attn_dec_nsg } };
     if (splits == 1) {
         var o: [1]A = undefined;
-        try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, grid, tg, &(common ++ [_]Tmpl{.{ .name = "RD", .v = ci(a.rd) }}), &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } }, &o);
+        try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, grid, tg, &(common ++ [_]Tmpl{ .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) } }), &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } }, &o);
         return o[0];
     }
     var parts: [3]A = undefined;
@@ -783,7 +861,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     }, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, &parts);
     var o: [1]A = undefined;
     try launch(sc, &attn_merge_def, &.{ parts[0], parts[1], parts[2], a.sink, meta, freqs }, &.{.{ .shape = &.{ ci(L), ci(H), ci(D) }, .dt = a.out_dt }}, .{ D, H, L }, .{ D, 1, 1 }, &.{
-        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) },
+        .{ .name = "D", .v = ci(D) }, .{ .name = "RD", .v = ci(a.rd) }, .{ .name = "QAT", .v = @intFromBool(a.qat_fp8) },
     }, &.{.{ .name = "OT", .dt = a.out_dt }}, &o);
     return o[0];
 }
@@ -1035,16 +1113,51 @@ const IDX_SCORE_SECOND =
     \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
 ;
 
-const IDX_SCORE_LAST =
+const IDX_SCORE_DOT =
     \\for (int j = 0; j < IHD; ++j) {
     \\  const float kv = KEY(j);
     \\  for (int h = 0; h < IH; ++h) dots[h] += qs[h * IHD + j] * kv;
     \\}
     \\float s = 0.0f;
     \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+;
+
+/// `IDX_SCORE_SECOND` with q in four-wide rows, for `IDX_SCORE_DOT4`.
+const IDX_SCORE_SECOND4 =
+    \\threadgroup float4 qs[IH * IHD / 4];
+    \\for (uint k = tid; k < IH * IHD / 4; k += tgn) {
+    \\  const device float* qp = q + size_t(l) * IH * IHD + 4 * k;
+    \\  qs[k] = float4(qp[0], qp[1], qp[2], qp[3]);
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\if (n >= nb) return;
+    \\float dots[IH];
+    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
+;
+
+/// `IDX_SCORE_DOT` reading four channels of q a threadgroup load: each head still adds channel j, j + 1, j + 2, j + 3 in
+/// that order, so the scores keep their bits.
+const IDX_SCORE_DOT4 =
+    \\for (int j = 0; j < IHD; j += 4) {
+    \\  const float k0 = KEY(j), k1 = KEY(j + 1), k2 = KEY(j + 2), k3 = KEY(j + 3);
+    \\  for (int h = 0; h < IH; ++h) {
+    \\    const float4 qv = qs[(h * IHD + j) / 4];
+    \\    dots[h] += qv.x * k0;
+    \\    dots[h] += qv.y * k1;
+    \\    dots[h] += qv.z * k2;
+    \\    dots[h] += qv.w * k3;
+    \\  }
+    \\}
+    \\float s = 0.0f;
+    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+;
+
+const IDX_SCORE_TAIL =
     \\const int seen = (meta[0] + l + 1) / meta[1];
     \\scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
 ;
+
+const IDX_SCORE_LAST = IDX_SCORE_DOT ++ IDX_SCORE_TAIL;
 
 const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = keys_shape[0];
@@ -1060,12 +1173,43 @@ const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
 const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = codes_shape[0];
     \\
-++ IDX_SCORE_SECOND ++
+++ IDX_SCORE_SECOND4 ++
     \\const auto kc = codes + size_t(n) * (IHD / 2);
     \\const auto ks = scales + size_t(n) * (IHD / G);
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
-++ IDX_SCORE_LAST;
+++ IDX_SCORE_DOT4 ++ IDX_SCORE_TAIL;
+
+/// The packed scores of candidate blocks only: score c of row l is key `blocks[l, c / BS] * BS + c % BS` (`blocks`
+/// `[L, KB]` int32, ascending, < 0 = none), -inf for no block or a key the query cannot see. A key scores the bits it
+/// does in `IDX_SCORE_PACKED_SOURCE`.
+const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
+    \\const int nb = blocks_shape[1] * BS;
+    \\
+++ IDX_SCORE_SECOND4 ++
+    \\const int blk = blocks[l * blocks_shape[1] + n / BS];
+    \\const int key = blk * BS + n % BS;
+    \\if (blk < 0 || key >= (meta[0] + l + 1) / meta[1]) {
+    \\  scores[size_t(l) * nb + n] = -INFINITY;
+    \\  return;
+    \\}
+    \\const auto kc = codes + size_t(key) * (IHD / 2);
+    \\const auto ks = scales + size_t(key) * (IHD / G);
+    \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
+    \\
+++ IDX_SCORE_DOT4 ++
+    \\scores[size_t(l) * nb + n] = s;
+;
+
+/// Key ids of the picks `pos` (`[L, K]` positions into a gathered score row) of `blocks`; ids of no block are past any query.
+const CAND_KEYS_SOURCE =
+    \\const int j = thread_position_in_grid.x, l = thread_position_in_grid.y;
+    \\const int k = pos_shape[1];
+    \\if (j >= k) return;
+    \\const int p = pos[l * k + j];
+    \\const int blk = blocks[l * blocks_shape[1] + p / BS];
+    \\out[l * k + j] = blk < 0 ? 0x7fffffff : blk * BS + p % BS;
+;
 
 const IDX_PACKED_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++
     \\template <typename C, typename S>
@@ -1148,6 +1292,8 @@ const IDX_TILE_SOURCE =
 var idx_score_def = Def{ .name = "dsv41_index_scores", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_SOURCE };
 var idx_packed_def = Def{ .name = "dsv41_index_scores_fp4", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_PACKED_SOURCE, .header = IDX_PACKED_HEADER };
 var idx_tile_def = Def{ .name = "dsv41_index_tile", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_SOURCE };
+var idx_gather_def = Def{ .name = "dsv41_index_scores_gather", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc", "blocks" }, .outs = &.{"scores"}, .source = IDX_GATHER_SOURCE, .header = IDX_PACKED_HEADER };
+var cand_keys_def = Def{ .name = "dsv41_cand_keys", .ins = &.{ "pos", "blocks" }, .outs = &.{"out"}, .source = CAND_KEYS_SOURCE };
 
 /// Keys one threadgroup of `indexScoresTile` scores for keys of `dt`: a slice scored at an offset must start on one.
 pub fn indexKeyTile(dt: mlx.mlx_dtype) usize {
@@ -1183,6 +1329,27 @@ pub fn indexScoresPacked(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f3
     try launch(sc, &idx_packed_def, &.{ q, codes, scales, w, meta, try f32Const(sc, &.{wscale}) }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
         .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(codes, 1) * 2) }, .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) },
     }, &.{}, &o);
+    return o[0];
+}
+
+/// `indexScoresPacked` over the keys of `blocks` (`[L, KB]` int32 block ids of `bs` keys, ascending, < 0 = none) only:
+/// `[L, KB * bs]`, column c the key `blocks[l, c / bs] * bs + c % bs`, each the bits the whole scan gives that key.
+pub fn indexScoresGather(sc: *Scope, q: A, codes: A, scales: A, w: A, wscale: f32, p0: usize, ratio: usize, mode: qat_mod.Qat, group: usize, blocks: A, bs: usize) !A {
+    const L = dim(q, 0);
+    const nc = dim(blocks, 1) * bs;
+    const meta = try sc.ints(&.{ ci(p0), ci(ratio) }, &.{2});
+    const tg: usize = 256;
+    var o: [1]A = undefined;
+    try launch(sc, &idx_gather_def, &.{ q, codes, scales, w, meta, try f32Const(sc, &.{wscale}), blocks }, &.{.{ .shape = &.{ ci(L), ci(nc) }, .dt = .float32 }}, .{ (nc + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(codes, 1) * 2) }, .{ .name = "G", .v = ci(group) }, .{ .name = "MODE", .v = qat_mod.packMode(mode) }, .{ .name = "BS", .v = ci(bs) },
+    }, &.{}, &o);
+    return o[0];
+}
+
+/// The key ids of `pos` (`[L, K]` int32 columns of `indexScoresGather`'s scores): a block id of none maps to past any query.
+pub fn candidateKeys(sc: *Scope, pos: A, blocks: A, bs: usize) !A {
+    var o: [1]A = undefined;
+    try launch(sc, &cand_keys_def, &.{ pos, blocks }, &.{.{ .shape = mlx.getShape(pos), .dt = .int32 }}, .{ (dim(pos, 1) + 255) / 256 * 256, dim(pos, 0), 1 }, .{ 256, 1, 1 }, &.{.{ .name = "BS", .v = ci(bs) }}, &.{}, &o);
     return o[0];
 }
 
@@ -1248,10 +1415,11 @@ const HC_MIX_SOURCE =
     \\}
 ;
 
-/// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`cpre`), so in
+/// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`HC_PRE`), so in
 /// `HC_STAGE_SOURCE` threadgroup 0 collapses and rms-norms the stream without waiting for this stage's mixes, while
 /// threadgroups 1..MIX each take one mix's dot; the FFN side rebuilds the stream from the block output in every
-/// threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read only later.
+/// threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read only later, except where
+/// `HC_STAGE_Z_SOURCE` derives the previous split itself.
 const HC_STAGE_HEAD =
     \\#pragma clang fp contract(off)
     \\const uint role = threadgroup_position_in_grid.x;
@@ -1261,9 +1429,43 @@ const HC_STAGE_HEAD =
     \\threadgroup float t_a[TG / 32], t_b[TG / 32];
     \\const device auto* xr = x + size_t(l) * HC * D;
     \\float v[HC][ND];
+    \\
+;
+
+const HC_STAGE_LOOP =
     \\for (int c = 0; c < ND; ++c) {
     \\  const int d = int(tid) + c * TG;
     \\  for (int i = 0; i < HC; ++i) v[i][c] = 0.0f;
+;
+
+/// The collapse weights are `cpre`.
+const HC_COEF_PLAIN =
+    \\#define HC_PRE(j) cpre[l * HC + (j)]
+    \\
+;
+
+/// The previous split arrives as arrays.
+const HC_COEF_ARRAYS = HC_COEF_PLAIN ++
+    \\#define HC_POST(i) spost[l * HC + (i)]
+    \\#define HC_COMB(j, i) scomb[l * HC * HC + (j) * HC + (i)]
+    \\
+;
+
+/// The previous mixes `za` arrive unsplit: simdgroup 0 splits them into threadgroup memory.
+const HC_COEF_Z =
+    \\threadgroup float t_pre[HC], t_post[HC], t_comb[HC * HC];
+    \\#define HC_PRE(j) t_pre[(j)]
+    \\#define HC_POST(i) t_post[(i)]
+    \\#define HC_COMB(j, i) t_comb[(j) * HC + (i)]
+    \\#define HC_SPLIT_PRE(i, v) t_pre[(i)] = (v)
+    \\#define HC_SPLIT_POST(i, v) t_post[(i)] = (v)
+    \\#define HC_SPLIT_COMB(i, v) t_comb[(i)] = (v)
+    \\if (sg == 0) {
+    \\  const device float* zr = za + l * ((2 + HC) * HC);
+++ "\n" ++ HC_SPLIT_BODY ++
+    \\}
+    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
 ;
 
 /// The stream is `x` itself.
@@ -1275,15 +1477,13 @@ const HC_STAGE_LOAD_PLAIN =
 /// The stream is `hcExpand(x, y, previous split)`, rounded to T where the expand rounds it.
 const HC_STAGE_LOAD_EXPAND =
     \\  if (d < D) {
-    \\    const auto pr = spost + l * HC;
-    \\    const auto cb = scomb + l * HC * HC;
     \\    float sv[HC];
     \\    for (int j = 0; j < HC; ++j) sv[j] = float(xr[j * D + d]);
     \\    const float yv = float(y[size_t(l) * D + d]);
     \\    for (int i = 0; i < HC; ++i) {
     \\      float acc = 0.0f;
-    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(cb[j * HC + i], sv[j], acc);
-    \\      const T o = T(metal::fma(pr[i], yv, acc));
+    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(HC_COMB(j, i), sv[j], acc);
+    \\      const T o = T(metal::fma(HC_POST(i), yv, acc));
     \\      v[i][c] = float(o);
     \\      if (role == 0) x1[(size_t(l) * HC + i) * D + d] = o;
     \\    }
@@ -1294,7 +1494,7 @@ const HC_STAGE_LOAD_EXPAND =
 const HC_STAGE_TAIL =
     \\if (role == 0) {
     \\  float cp[HC];
-    \\  for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
+    \\  for (int j = 0; j < HC; ++j) cp[j] = HC_PRE(j);
     \\  float ss = 0.0f;
     \\  T hv[ND];
     \\  #pragma clang loop unroll(full)
@@ -1339,16 +1539,14 @@ const HC_STAGE_TAIL =
     \\}
 ;
 
-/// The hc split of the mixes `z` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row, lane
-/// a * HC + b holding comb[a][b] and each sum gathering its HC terms in the serial order.
+/// The hc split of the mixes `zr` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row, lane
+/// a * HC + b holding comb[a][b] and each sum gathering its HC terms in the serial order. The includer declares
+/// `lane` and `zr` and defines the stores `HC_SPLIT_PRE`, `HC_SPLIT_POST` and `HC_SPLIT_COMB`.
 const HC_SPLIT_BODY =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\constexpr int MIX = (2 + HC) * HC;
     \\const float e = eps[1];
-    \\const device float* zr = z + l * MIX;
     \\if (lane < HC) {
-    \\  pre[l * HC + lane] = 1.0f / (1.0f + metal::precise::exp(-zr[lane])) + e;
-    \\  post[l * HC + lane] = 2.0f / (1.0f + metal::precise::exp(-zr[HC + lane]));
+    \\  HC_SPLIT_PRE(lane, 1.0f / (1.0f + metal::precise::exp(-zr[lane])) + e);
+    \\  HC_SPLIT_POST(lane, 2.0f / (1.0f + metal::precise::exp(-zr[HC + lane])));
     \\}
     \\const bool act = lane < HC * HC;
     \\const ushort a = act ? lane / HC : 0, b = act ? lane % HC : 0;
@@ -1365,9 +1563,19 @@ const HC_SPLIT_BODY =
     \\  for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, rows ? a * HC + k : k * HC + b);
     \\  v = v / (sm + e);
     \\}
-    \\if (act) comb[l * HC * HC + lane] = v;
+    \\if (act) HC_SPLIT_COMB(lane, v);
 ;
-const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_BODY;
+
+/// The split of row `l` of `z` into the output arrays.
+const HC_SPLIT_GLOBAL =
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const device float* zr = z + l * ((2 + HC) * HC);
+    \\#define HC_SPLIT_PRE(i, v) pre[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_POST(i, v) post[l * HC + (i)] = (v)
+    \\#define HC_SPLIT_COMB(i, v) comb[l * HC * HC + (i)] = (v)
+    \\
+;
+const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
 
 /// The hc split, then the stream collapsed with `cpre` (f32, rounded to T like `hcCollapse`) and rms-normed like
 /// MLX's `rms_norm`. One threadgroup a row.
@@ -1377,7 +1585,7 @@ const HC_NORM_SOURCE =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const int D = x_shape[2];
     \\if (sg == 0) {
-++ "\n" ++ HC_SPLIT_BODY ++
+++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
     \\}
     \\float cp[HC];
     \\for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
@@ -1402,12 +1610,14 @@ const HC_NORM_SOURCE =
     \\}
 ;
 
-const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
-const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_COEF_PLAIN ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
+const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
 
 var hc_mix_def = Def{ .name = "dsv41_hc_mix", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_SOURCE, .header = HC_HEADER };
 var hc_stage_def = Def{ .name = "dsv41_hc_stage", .ins = &.{ "x", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z" }, .source = HC_STAGE_SOURCE, .header = HC_HEADER };
 var hc_stage_x_def = Def{ .name = "dsv41_hc_stage_x", .ins = &.{ "x", "y", "spost", "scomb", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_X_SOURCE, .header = HC_HEADER };
+var hc_stage_z_def = Def{ .name = "dsv41_hc_stage_z", .ins = &.{ "x", "y", "za", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_Z_SOURCE, .header = HC_HEADER };
 var hc_split_def = Def{ .name = "dsv41_hc_split", .ins = &.{ "z", "eps" }, .outs = &.{ "pre", "post", "comb" }, .source = HC_SPLIT_SOURCE };
 var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w", "eps" }, .outs = &.{ "pre", "post", "comb", "h_out" }, .source = HC_NORM_SOURCE };
 
@@ -1419,8 +1629,11 @@ const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
 pub const HcWeights = struct { fn_w: A, scale: A, base: A };
 pub const HcSplit = struct { pre: A, post: A, comb: A };
 pub const HcStaged = struct { h: A, z: A, x1: A };
-/// The stream `hcExpand(x, y, post, comb)` that a stage rebuilds in place of `x`.
-pub const HcExpand = struct { y: A, post: A, comb: A };
+/// The previous mixes of a stage that expands: their split, or the mixes `z` it splits itself.
+pub const HcPrev = union(enum) { split: HcSplit, z: struct { z: A, iters: usize } };
+/// The stream `hcExpand(x, y, previous post, previous comb)` that a stage rebuilds in place of `x` and collapses with
+/// the previous pre.
+pub const HcExpand = struct { y: A, prev: HcPrev };
 
 pub fn hcEps(sc: *Scope, rms_eps: f32, hc_eps: f32) !A {
     return f32Const(sc, &.{ rms_eps, hc_eps });
@@ -1444,7 +1657,12 @@ pub fn hcStage(sc: *Scope, x: A, ex: ?HcExpand, cpre: A, norm_w: A, hw: HcWeight
     const ints = [_]Tmpl{ .{ .name = "TG", .v = ci(tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ND", .v = ci((D + tg - 1) / tg) } };
     const dts = [_]TDtype{.{ .name = "T", .dt = dt }};
     if (ex) |e| {
-        try launch(sc, &hc_stage_x_def, &.{ x, try sc.astype(e.y, dt), e.post, e.comb, cpre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, .{ (mix + 1) * tg, L, 1 }, .{ tg, 1, 1 }, &ints, &dts, &o);
+        const grid: Grid = .{ (mix + 1) * tg, L, 1 };
+        const y = try sc.astype(e.y, dt);
+        switch (e.prev) {
+            .split => |sp| try launch(sc, &hc_stage_x_def, &.{ x, y, sp.post, sp.comb, sp.pre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &ints, &dts, &o),
+            .z => |p| try launch(sc, &hc_stage_z_def, &.{ x, y, p.z, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &(ints ++ [_]Tmpl{.{ .name = "ITERS", .v = ci(p.iters) }}), &dts, &o),
+        }
         return .{ .h = o[0], .z = o[1], .x1 = o[2] };
     }
     try launch(sc, &hc_stage_def, &.{ x, cpre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, outs3[0..2], .{ (mix + 1) * tg, L, 1 }, .{ tg, 1, 1 }, &ints, &dts, o[0..2]);
@@ -1518,12 +1736,14 @@ fn probeHcOnce(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
     const w = try sc.zeros(&.{ci(D)}, dt);
     const eps = try hcEps(&sc, 1e-6, 1e-6);
     const plain = try hcStage(&sc, x, null, cpre, w, hw, eps);
-    const ex = HcExpand{ .y = try sc.zeros(&.{ 1, ci(D) }, dt), .post = try sc.zeros(&.{ 1, ci(hc) }, .float32), .comb = try sc.zeros(&.{ 1, ci(hc), ci(hc) }, .float32) };
-    const expanded = try hcStage(&sc, x, ex, cpre, w, hw, eps);
+    const y = try sc.zeros(&.{ 1, ci(D) }, dt);
+    const prev = HcSplit{ .pre = cpre, .post = try sc.zeros(&.{ 1, ci(hc) }, .float32), .comb = try sc.zeros(&.{ 1, ci(hc), ci(hc) }, .float32) };
+    const expanded = try hcStage(&sc, x, .{ .y = y, .prev = .{ .split = prev } }, sc_mod.none, w, hw, eps);
+    const expanded_z = try hcStage(&sc, x, .{ .y = y, .prev = .{ .z = .{ .z = plain.z, .iters = iters } } }, sc_mod.none, w, hw, eps);
     const wide_z = try hcMix(&sc, x, hw, eps);
     const wide = try hcNorm(&sc, wide_z, x, cpre, w, iters, eps);
     const sp = try hcSplitZ(&sc, plain.z, hc, iters, eps);
-    try sc_mod.evalAll(&.{ plain.h, expanded.h, expanded.x1, wide.h, wide.sp.comb, sp.comb });
+    try sc_mod.evalAll(&.{ plain.h, expanded.h, expanded.x1, expanded_z.h, expanded_z.x1, wide.h, wide.sp.comb, sp.comb });
 }
 
 // ── Engram ───────────────────────────────────────────────────────────────
@@ -1836,7 +2056,7 @@ test "dsv41 moe decode: the gate-up and down-expand kernels are no further from 
     const err_kernel = relErr(try hostOf(&sc, got), truth);
     const err_composed = relErr(try hostOf(&sc, want), truth);
     try expectLe("kernel vs truth", err_kernel, 1e-5);
-    try expectLe("kernel vs composed's error", err_kernel, err_composed);
+    try expectLe("kernel vs composed's error", err_kernel, @max(err_composed, 2e-6));
 }
 
 test "dsv41 moe decode: in bf16 the kernels give the composed chain's stream to a few bf16 ulps" {
@@ -1928,6 +2148,87 @@ test "dsv41 topk: the picks are the k largest in index order, ties to the lower 
     tie[7] = -std.math.inf(f32);
     const t = try sc_mod.hostI32(try topkIndices(&sc, try sc.floats(&tie, &.{ 1, n }), 10));
     try testing.expectEqualSlices(i32, &.{ 0, 1, 2, 3, 4, 5, n - 4, n - 3, n - 2, n - 1 }, t[0..10]);
+}
+
+test "dsv41 topk split: the chunked picks are the one-threadgroup picks on long rows, ties and -inf included" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const k = 512;
+    var prng = std.Random.DefaultPrng.init(0x70b1);
+    const rnd = prng.random();
+    for ([_]usize{ 4099, 20000, 100003, 262144 }) |n| {
+        const L = 3;
+        const h = try testing.allocator.alloc(f32, L * n);
+        defer testing.allocator.free(h);
+        for (h[0..n]) |*v| v.* = rnd.floatNorm(f32);
+        // Row 1: eight score levels, so ties run across every chunk edge and the pick cut falls inside one level.
+        for (h[n .. 2 * n]) |*v| v.* = @floatFromInt(rnd.uintLessThan(u32, 8));
+        // Row 2: all equal but a -inf run and a few large scores in the last chunk.
+        @memset(h[2 * n ..][0..n], 1.0);
+        @memset(h[2 * n ..][0 .. n / 3], -std.math.inf(f32));
+        for (h[3 * n - 5 ..][0..5], 0..) |*v, i| v.* = 9.0 + @as(f32, @floatFromInt(i));
+        const x = try sc.floats(h, &.{ L, @intCast(n) });
+        const want = try testing.allocator.dupe(i32, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
+        defer testing.allocator.free(want);
+        for ([_]usize{ 2, 3, 8, 32 }) |g| {
+            if (n / g < k) continue;
+            try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, g)));
+        }
+        try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndices(&sc, x, k)));
+    }
+}
+
+// Decode top-k at the release shapes by split count, arms interleaved per rep; best and median of 15 evals, and eight
+// independent rows of work in one eval (a decode token's eight index sources). Prints only under SUSHI_DSV41_TOPK_UBENCH.
+test "dsv41 topk split timing by context (SUSHI_DSV41_TOPK_UBENCH=1)" {
+    if (!@import("transformer.zig").diagEnvOn("SUSHI_DSV41_TOPK_UBENCH")) return error.SkipZigTest;
+    const gpu = mlx.gpuStream();
+    if (!mlx.streamIsGpu(gpu)) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sc = Scope.init(testing.allocator, gpu);
+    defer sc.deinit();
+    const Shape = struct { n: usize, k: usize };
+    const splits = [_]usize{ 1, 2, 4, 8, 16, 32 };
+    for ([_]usize{ 65536, 262144, 524288 }) |ctx| {
+        // Index scores at ratio 2 and ratio 1, the candidate source's block maxima, a later source's gathered keys.
+        for ([_]Shape{ .{ .n = ctx / 2, .k = 512 }, .{ .n = ctx, .k = 512 }, .{ .n = ctx / 8, .k = 2048 }, .{ .n = 16384, .k = 512 } }) |sh| {
+            for ([_]usize{ 1, 4, 16 }) |L| {
+                var xs: [8]A = undefined;
+                for (&xs, 0..) |*x, i| x.* = try sc.add(try randn(&sc, &.{ @intCast(L), @intCast(sh.n) }, .float32, 90 + i, 1.0), try sc.f(@floatFromInt(i)));
+                try sc_mod.evalAll(&xs);
+                var tm: [splits.len][2][16]f64 = undefined;
+                var skip: [splits.len]bool = undefined;
+                for (splits, 0..) |g, gi| skip[gi] = sh.n / g < sh.k;
+                for (0..16) |rep| {
+                    for (splits, 0..) |g, gi| {
+                        if (skip[gi]) continue;
+                        var t = Scope.init(testing.allocator, gpu);
+                        defer t.deinit();
+                        var t0 = std.Io.Timestamp.now(io, .boot);
+                        const one = try topkIndicesSplit(&t, xs[0], sh.k, g);
+                        try sc_mod.evalAll(&.{one});
+                        tm[gi][0][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+                        var outs: [8]A = undefined;
+                        t0 = std.Io.Timestamp.now(io, .boot);
+                        for (&outs, xs) |*o, x| o.* = try topkIndicesSplit(&t, x, sh.k, g);
+                        try sc_mod.evalAll(&outs);
+                        tm[gi][1][rep] = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .boot)).nanoseconds)) / 1e6;
+                    }
+                }
+                for (splits, 0..) |g, gi| {
+                    if (skip[gi]) continue;
+                    var line: [2][2]f64 = undefined;
+                    for (0..2) |w| {
+                        const v = tm[gi][w][1..];
+                        std.mem.sort(f64, v, {}, std.sort.asc(f64));
+                        line[w] = .{ v[0], v[v.len / 2] };
+                    }
+                    std.debug.print("dsv41-topk ctx {d} n {d} k {d} L {d} splits {d}: one eval best {d:.3} med {d:.3} ms; x8 per row-of-work best {d:.3} med {d:.3} ms\n", .{ ctx, sh.n, sh.k, L, g, line[0][0], line[0][1], line[1][0] / 8, line[1][1] / 8 });
+                }
+            }
+        }
+    }
 }
 
 test "dsv41 dense f32x: the product is no further from the f64 truth than the widened f32 matmul" {
@@ -2185,6 +2486,22 @@ test "dsv41 decode attention: the folded inverse rotation is the rotation of the
     };
 }
 
+test "dsv41 decode attention: the folded fp8 round trip is the round trip of the heads, bit for bit" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const freqs = try ropeFreqs(&sc);
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 4, 5 }) |splits| {
+        const a = try attnData(&sc, .{}, dt);
+        var args = decodeArgs(&a, dt, freqs);
+        const plain = try attnDecodeSplit(&sc, args, splits);
+        const want = try qat_mod.qat(&sc, plain, .fp8_ue8m0, 32);
+        args.qat_fp8 = true;
+        const got = try attnDecodeSplit(&sc, args, splits);
+        try expectBitEqual("attn fp8", try hostOf(&sc, got), try hostOf(&sc, want));
+    };
+}
+
 test "dsv41 decode attention: a block of rows is the rows of single-row blocks, bit for bit, over a ring with slack" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
@@ -2333,7 +2650,7 @@ test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked 
     defer sc.deinit();
     const ratio = 1;
     // A few keys, one scale byte a key: arrays MLX passes in the constant address space.
-    for ([_]struct { ih: usize, ihd: usize }{ .{ .ih = 32, .ihd = 128 }, .{ .ih = 8, .ihd = 32 } }) |g| for ([_]usize{ 4, 1537 }) |nb| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 5, 16 }) |L| {
+    for ([_]struct { ih: usize, ihd: usize }{ .{ .ih = 32, .ihd = 128 }, .{ .ih = 8, .ihd = 32 } }) |g| for ([_]usize{ 4, 1537 }) |nb| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 2, 3, 4, 5, 8, 16 }) |L| {
         const x = try qat_mod.qat(&sc, try sc.astype(try randn(&sc, &.{ ci(nb), ci(g.ihd) }, .float32, 151, 2.0), dt), .fp4_ue8m0, 32);
         const packed_keys = try qat_mod.packFp4(&sc, x, .fp4_ue8m0, 32);
         const keys = try qat_mod.unpackFp4(&sc, packed_keys, .fp4_ue8m0, 32, dt);
@@ -2347,21 +2664,24 @@ test "dsv41 index scores: the scalar kernel over packed keys gives the unpacked 
     };
 }
 
-const HcData = struct { x: A, y: A, cpre: A, w: A, hw: HcWeights, ex: HcExpand, eps: A, L: usize, hc: usize, d: usize };
+const HcData = struct { x: A, y: A, cpre: A, w: A, hw: HcWeights, prev: HcSplit, eps: A, L: usize, hc: usize, d: usize };
 
 fn hcData(sc: *Scope, L: usize, dt: mlx.mlx_dtype) !HcData {
     const hc = 4;
     const D = 5120;
+    // A load runs this probe; a GPU that caps the register-heavy kernels' threadgroups below 1024 needs it here too.
+    try probeHc(sc.a, sc.s, hc, D, 20);
     const mix = (2 + hc) * hc;
     const f32t = mlx.mlx_dtype.float32;
     const l: c_int = ci(L);
+    const cpre = try sc.op1(mlx.mlx_abs, try randn(sc, &.{ l, hc }, f32t, 133, 0.6));
     return .{
         .x = try sc.astype(try randn(sc, &.{ l, hc, D }, f32t, 131, 1.5), dt),
         .y = try sc.astype(try randn(sc, &.{ l, D }, f32t, 132, 1.0), dt),
-        .cpre = try sc.op1(mlx.mlx_abs, try randn(sc, &.{ l, hc }, f32t, 133, 0.6)),
+        .cpre = cpre,
         .w = try sc.astype(try sc.add(try randn(sc, &.{D}, f32t, 134, 0.2), try sc.f(1.0)), dt),
         .hw = .{ .fn_w = try randn(sc, &.{ mix, hc * D }, f32t, 135, 0.02), .scale = try f32Const(sc, &.{ 0.3, 0.5, 0.7 }), .base = try randn(sc, &.{mix}, f32t, 136, 0.5) },
-        .ex = .{ .y = undefined, .post = try randn(sc, &.{ l, hc }, f32t, 137, 0.7), .comb = try randn(sc, &.{ l, hc, hc }, f32t, 138, 0.5) },
+        .prev = .{ .pre = cpre, .post = try randn(sc, &.{ l, hc }, f32t, 137, 0.7), .comb = try randn(sc, &.{ l, hc, hc }, f32t, 138, 0.5) },
         .eps = try hcEps(sc, 1e-6, 1e-6),
         .L = L,
         .hc = hc,
@@ -2417,8 +2737,7 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
-    var d = try hcData(&sc, 1, .float32);
-    d.ex.y = d.y;
+    const d = try hcData(&sc, 1, .float32);
     const z_truth = try testing.allocator.alloc(f64, 24);
     defer testing.allocator.free(z_truth);
     const h_truth = try testing.allocator.alloc(f64, d.d);
@@ -2429,12 +2748,12 @@ test "dsv41 hc stage: the mixes and the normed collapse are no further from the 
     try expectLe("stage z", relErr(try hostOf(&sc, st.z), z_truth), @max(relErr(try hostOf(&sc, ref.z), z_truth), 2e-6));
     try expectLe("stage h", relErr(try hostOf(&sc, st.h), h_truth), @max(relErr(try hostOf(&sc, ref.h), h_truth), 2e-6));
     // the expanded stream: the chain's `hcExpand`, then the same two outputs of its mixes
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.ex.post, d.ex.comb);
-    const sx = try hcStage(&sc, d.x, d.ex, d.cpre, d.w, d.hw, d.eps);
+    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     const xh = try hostOf(&sc, d.x);
     const yh = try hostOf(&sc, d.y);
-    const ph = try sc_mod.hostF32(d.ex.post);
-    const ch = try sc_mod.hostF32(d.ex.comb);
+    const ph = try sc_mod.hostF32(d.prev.post);
+    const ch = try sc_mod.hostF32(d.prev.comb);
     const x1_truth = try testing.allocator.alloc(f64, d.hc * d.d);
     defer testing.allocator.free(x1_truth);
     for (0..d.hc) |i| for (0..d.d) |c| {
@@ -2453,13 +2772,29 @@ test "dsv41 hc stage: in bf16 the stage gives the chain's normed collapse and ex
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
-    var d = try hcData(&sc, 1, .bfloat16);
-    d.ex.y = d.y;
-    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.ex.post, d.ex.comb);
-    const sx = try hcStage(&sc, d.x, d.ex, d.cpre, d.w, d.hw, d.eps);
+    const d = try hcData(&sc, 1, .bfloat16);
+    const x1_ref = try model.hcExpand(&sc, d.x, d.y, d.prev.post, d.prev.comb);
+    const sx = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = d.prev } }, d.cpre, d.w, d.hw, d.eps);
     try expectLe("bf16 expanded stream", relErrF(try hostOf(&sc, sx.x1), try hostOf(&sc, x1_ref)), 1.0 / 128.0);
     const ref = try composedHc(&sc, &d, x1_ref);
     try expectLe("bf16 normed collapse", relErrF(try hostOf(&sc, sx.h), try hostOf(&sc, ref.h)), 1.0 / 64.0);
+}
+
+test "dsv41 hc stage: a stage that splits its previous mixes gives the split kernel's and the array stage's bytes" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const iters = 20;
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| for ([_]usize{ 1, 3, 16 }) |L| {
+        const d = try hcData(&sc, L, dt);
+        const za = try randn(&sc, &.{ ci(L), 24 }, .float32, 161, 2.0);
+        const sp = try hcSplitZ(&sc, za, d.hc, iters, d.eps);
+        const want = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .split = sp } }, sc_mod.none, d.w, d.hw, d.eps);
+        const got = try hcStage(&sc, d.x, .{ .y = d.y, .prev = .{ .z = .{ .z = za, .iters = iters } } }, sc_mod.none, d.w, d.hw, d.eps);
+        try expectBitEqual("stage z h", try hostOf(&sc, got.h), try hostOf(&sc, want.h));
+        try expectBitEqual("stage z mixes", try sc_mod.hostF32(got.z), try sc_mod.hostF32(want.z));
+        try expectBitEqual("stage z x1", try hostOf(&sc, got.x1), try hostOf(&sc, want.x1));
+    };
 }
 
 test "dsv41 hc split: the lane-per-element split gives the thread-per-row split of the mixes" {

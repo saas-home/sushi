@@ -52,6 +52,7 @@ test {
     _ = @import("model_settings.zig");
     _ = @import("spec_cost_gate.zig");
     _ = @import("dspark_rows.zig");
+    _ = @import("row_grammar.zig");
     _ = @import("dflash.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("dflash_conv.zig");
@@ -83,9 +84,11 @@ test {
     _ = @import("dsv41_qat.zig");
     _ = @import("dsv41_engram.zig");
     _ = @import("dsv41_source.zig");
+    _ = @import("dsv41_owned.zig");
     _ = @import("dsv41_model.zig");
     _ = @import("dsv41_stream.zig");
     _ = @import("dsv41_borrow.zig");
+    _ = @import("dsv41_prefix.zig");
     _ = @import("dsv41_kernels.zig");
     _ = @import("glm5_next.zig");
     _ = @import("glm5_model.zig");
@@ -127,6 +130,8 @@ test {
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("kld.zig");
+    _ = @import("bench.zig");
+    _ = @import("gpu_clock.zig");
     _ = @import("cli.zig");
     _ = @import("repl_tools.zig");
     _ = @import("repl_input.zig");

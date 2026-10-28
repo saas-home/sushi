@@ -2,21 +2,23 @@
 
 # SUSHI
 
-A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ is required.
+A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
 
 ## Model support list
 
 Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
-* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming-on-a-32-gb-mac))
-* [Qwen3.8-Flash-Next-Sushi-2.6bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw) (requires 64 GB+)
-* [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
+* [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (requires 96 GB+ and sushi 1.4.0 or later, experts [streamed](#streaming), text and image input)
+* [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
+* [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (requires 64 GB+ and sushi 1.3.0 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
 * [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
 * [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
 ## Quality
+
+<p align="center"><img src="docs/assets/dsv41-1.75bpw-kld.png" alt="DeepSeek-V4.1-Flash KLD by category" width="100%"></p>
 
 <p align="center"><img src="docs/assets/kld-chart.png" alt="KLD vs size" width="100%"></p>
 
@@ -40,86 +42,75 @@ Update with `brew upgrade sushi`.
 
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
-The Qwen columns are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
+The Qwen rows are at the default f32 GatedDeltaNet state; `--qwen-gdn 16` (bf16) takes about 0.2 GiB off each Qwen cell.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
-|---|---:|---:|---:|---:|---:|---:|
-| weights only | 35.2 | 44.2 | 63.9 | 89.7 | 78.3 | 89.8 |
-| 128k | 40.3 | 49.3 | 69.0 | 93.7 | 82.6 | 94.1 |
-| 256k | 43.2 | 52.1 | 71.9 | 95.8 | 83.8 | 95.2 |
-| 512k | 48.2 | 57.2 | 76.9 | 99.9 | 86.0 | 97.5 |
-| 1M | 58.4 | 67.4 | 87.1 | 108.2 | 90.5 | 102.0 |
+| pack | weights only | 128k | 256k | 512k | 1M |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next-Sushi-2bpw | 35.2 | 40.3 | 43.2 | 48.2 | 58.4 |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | 46.4 | 51.4 | 54.3 | 59.4 | 69.5 |
+| Qwen3.8-Flash-Next-Sushi-4bpw | 63.9 | 69.0 | 71.9 | 76.9 | 87.1 |
+| GLM-5.3-Flash-Sushi-2bpw | 78.3 | 82.6 | 83.8 | 86.0 | 90.5 |
+| GLM-5.3-Flash-Sushi-2.4bpw | 89.8 | 94.1 | 95.2 | 97.5 | 102.0 |
+| MiMo-V2.6-Flash-Sushi-2.3bpw | 89.7 | 93.7 | 95.8 | 99.9 | 108.2 |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | 108.0 | 110.0 | 110.3 | 111.0 | 112.5 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no
 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
-|---|---|---|---|---|---|---|---|
-| 48 GB † | 43,000 MB (42.0 GiB) | 200k / 304k | — | — | — | — | — |
-| 64 GB † | 59,000 MB (57.6 GiB) | 976k / 1M | 528k / 840k | — | — | — | — |
-| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | — | 696k / — | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
+| pack | 48 GB † (43,000 MB) | 64 GB † (59,000 MB) | 96 GB (90,000 MB) | 128 GB (120,000 MB) |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-2bpw | 200k / 304k | 976k / 1M | 1M / 1M | 1M / 1M |
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | — | 416k / 664k | 1M / 1M | 1M / 1M |
+| Qwen3.8-Flash-Next-Sushi-4bpw | — | — | 1M / 1M | 1M / 1M |
+| GLM-5.3-Flash-Sushi-2bpw | — | — | 696k / — | 1M / — |
+| GLM-5.3-Flash-Sushi-2.4bpw | — | — | — | 1M / — |
+| MiMo-V2.6-Flash-Sushi-2.3bpw | — | — | — | 1M / 1M |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | — | — | 1M / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
-less: 192k / 288k at 48 GB, and 968k / 1M and 520k / 824k at 64 GB.
+less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 408k / 648k (Sushi-STQ-2.75bpw) at 64 GB.
 
-A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
-the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load
-serves text unless `--vision` loads the vision tower, whose weights then come out of the N GiB.
+‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on every under 128GB Mac. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `iogpu.wired_limit_mb=125000` and at `80` on a 96 GB Mac with `iogpu.wired_limit_mb=93000` ([usage](docs/usage.md#deepseek-launch)).
 
-## Streaming on a 32 GB Mac
+## Streaming
 
-Sushi-2bpw streams on a 32 GB Mac with MTP on, at about 20 tok/s decode:
+Any Sushi pack runs on a Mac with less memory than its weights. `--ssd-budget-gb N` keeps N GiB resident (the trunk,
+the speculative head and a cache of routed experts) and reads the other experts from the SSD, with the same replies as
+a resident load. A larger N caches more experts and reads the SSD less. The context's KV or state is billed on top, so
+N plus the context must fit under the GPU limit.
 
-```bash
-sudo sysctl iogpu.wired_limit_mb=27000
-sushi serve --model ~/.sushi/models/Qwen3.8-Flash-Next-Sushi-2bpw --ssd-budget-gb 18 --ctx-size 66000 \
-  --qwen-gdn 16 --expert-pick-tolerance 0.3
-```
-
-`--qwen-gdn 16` stores Qwen's recurrent state in bf16 instead of the f32 default, which halves the state in every cache
-checkpoint (about 54 MB each) and is what the 32, 48 and 64 GB recipes run.
-
-`--ssd-budget-gb 18` keeps 18 GiB resident (trunk, KV cache and an expert cache) and reads the remaining experts from
-the SSD. `--expert-pick-tolerance 0.3` is lossy: when a routed expert is not cached, it uses the best cached expert
-whose router probability is at least 0.7 of the missed one's, which saves an SSD read; leave it out for replies
-identical to a resident load. The plan may come within 1 GiB of the GPU limit
-(`--wired-margin-gib N`, 1 to 32). The GPU limit resets at reboot.
+| Mac | pack | `--ssd-budget-gb` | GPU limit (MB) | context | decode at 4k |
+|---|---|---:|---:|---|---|
+| 32 GB | Qwen3.8-Flash-Next-Sushi-2bpw | 18 | 27,000 | 66k | ~20 tok/s |
+| 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
+| 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
 
 ## Benchmarks
 
-| Sushi 🍣 1.2.2 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| **GLM 5.3 Flash-2bpw** | Prefill | 883 | 780 | 739 | 724 | 713 | 649 | 570 |
-| | Decode | 47.5 | 48.8 | 47.7 | 47.1 | 43.8 | 44.8 | 44.5 |
-| | TTFT (s) | 2.35 | 5.24 | 11.2 | 22.5 | 46.0 | 101.1 | 229.9 |
-| **GLM 5.3 Flash-2.4bpw** | Prefill | 859 | 833 | 821 | 816 | 805 | 737 | 645 |
-| | Decode | 50.1 | 51.8 | 48.7 | 46.4 | 47.4 | 46.6 | 44.2 |
-| | TTFT (s) | 2.42 | 4.91 | 10.1 | 20.0 | 40.7 | 89.1 | 203.3 |
-| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,308 | 1,227 | 1,225 | 1,144 | 994 | 891 | 679 |
-| | Decode | 56.7 | 55.4 | 56.2 | 65.5 | 54.9 | 57.2 | 50.2 |
-| | TTFT (s) | 1.61 | 3.33 | 6.75 | 14.3 | 33.0 | 73.7 | 193.0 |
-| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 2,144 | 2,355 | 2,413 | 2,414 | 2,399 | 2,348 | 2,255 |
-| | Decode | 92.3 | 86.1 | 88.8 | 89.2 | 90.9 | 83.1 | 79.6 |
-| | TTFT (s) | 0.98 | 1.73 | 3.43 | 6.74 | 13.7 | 27.9 | 58.2 |
-| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,871 | 2,113 | 2,192 | 2,187 | 2,262 | 2,225 | 2,178 |
-| | Decode | 77.9 | 72.8 | 85.2 | 90.3 | 82.6 | 78.3 | 71.3 |
-| | TTFT (s) | 1.13 | 1.93 | 3.77 | 7.44 | 14.5 | 29.4 | 60.2 |
+### Sushi bench (Speed)
 
-Community reports, using llmprobe `--bench-only`:
+| Sushi 🍣 1.4.0 | M5 Max 128 GB | 4k | 8k | 16k | 32k | 64k | 128k |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Qwen 3.8 Flash-Next-STQ-2.75bpw** | Prefill | 1,122 | 1,993 | 2,049 | 1,976 | 1,906 | 1,877 |
+| | Decode | 168.6 | 151.1 | 146.1 | 146.8 | 151.0 | 138.2 |
+| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 2,079 | 2,379 | 2,326 | 2,231 | 2,147 | 2,120 |
+| | Decode | 146.2 | 150.1 | 136.2 | 149.8 | 153.5 | 122.0 |
+| **GLM 5.3 Flash-2.4bpw** | Prefill | 928 | 775 | 814 | 805 | 688 | 573 |
+| | Decode | 71.5 | 69.4 | 67.3 | 65.8 | 71.8 | 63.8 |
+| **DeepSeek 4.1 Flash-STQ-1.75bpw** (`--ssd-budget-gb 108`) | Prefill | 707 | 1,024 | 998 | 993 | 950 | 829 |
+| | Decode | 76.6 | 84.2 | 76.2 | 85.3 | 78.1 | 63.7 |
 
-| Class | Typical RAM | Pack | Prefill tok/s | Gen tok/s |
-|---|---|---|---:|---:|
-| M1 Max | 64 GB | 3bpw | ~350 | ~32 |
-| M2 Max | 64 GB | 3bpw | ~400 | ~38-40 |
-| M3 Ultra 60c | 256 GB | 4bpw | ~420 | ~60 |
-| M4 Max | 64 GB | 3bpw | ~690 | ~60-65 |
-| M5 Pro | 64 GB | 2.6bpw | ~900 | ~50-55 |
-| M5 Max | 128 GB | 3bpw | ~1,900 | ~95 |
-| M5 Max | 128 GB | 4bpw | ~1,750 | ~90 |
-| M5 Max | 128 GB | MiMo 2.3bpw | ~1,130 | ~70 |
-| M5 Max | 128 GB | GLM 2.4bpw | ~860 | ~55 |
+### Tool-eval-bench 3.0 (Agentic)
+
+| Pack                 | Thinking | Score  | Points  | Rating | Max weights in RAM |
+| -------------------- | -------- | ------ | ------- | ------ | ------------------ |
+| DeepSeek STQ 1.75bpw | high     | **92** | 178/194 | 5★     | 129 GB (108 stream)|
+| Qwen STQ 2.75bpw     | medium   | **91** | 176/194 | 5★     | 50 GB              |
+| Qwen 4bpw            | medium   | **90** | 174/194 | 5★     | 68 GB              |
+| GLM 2.4bpw           | high     | **90** | 175/194 | 5★     | 98 GB              |
+| MiMo 2.3bpw          | on       | **89** | 172/194 | 4★     | 103 GB             |
+| Qwen 2bpw            | medium   | **88** | 170/194 | 3★     | 38 GB              |
 
 ## License
 

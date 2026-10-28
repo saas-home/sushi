@@ -169,6 +169,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   the stores ([engine-exl3-experts](engine-exl3-experts.md#kernels), 2.6x on the non-NAX GEMM).
 - Cooperative-only matmul2d takes M, N, K in {16, 32}, with at least one of them 32. Larger tiles are the 16x16
   fragments concatenated. A K=32 op runs no faster than two K=16 ops.
+- **A per-row FMA loop over more than four rows compiles 2 to 3x slower** (the accumulators leave registers; M5, the
+  SIMD multi-row projection): split the rows into loops of at most four over the same decoded weights.
 - **Metal caps each compiled kernel's threads per threadgroup by its register use**; MLX throws at a dispatch above it.
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
@@ -189,6 +191,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 - GPU parity = no-worse-than fp32 ground truth, never kernel-vs-kernel; a parity loop asserts FINITENESS before it
   diffs; every shape an eligibility predicate adopts gets its own A/B.
+- A "no further from truth than the composed chain" bar needs an f32 floor: without NAX the composed GEMMs are true f32
+  and the kernel's own accumulation noise exceeds them (CI's GPU and an M1; an M5's TF32 core hides it). A kernel test
+  whose launch geometry a load probes (`probeHc`) runs that probe too.
 - Drive a parity case at the model's REAL activation magnitudes, not synthetic unit-scale inputs, and score it
   against a TRUE f32 oracle (an oracle that mirrors the kernel's own f16 stores cannot see a saturation).
 - A `metal_kernel` config is cached by FULL SHAPE (`ShapeKey`); a per-token-varying TEMPLATE value is a fresh JIT

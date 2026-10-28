@@ -52,6 +52,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (Claude Code's hook output, Codex's mid-input `developer` turn on Responses) renders where it was sent, folded only
   for a template that cannot place it ([server-tool-calling](server-tool-calling.md#templates)); `developer` reads as
   `system` (`canonicalRole`).
+- **`/v1/messages/count_tokens`** takes a `/v1/messages` body (`max_tokens` optional, ignored) and answers
+  `{"input_tokens": N}`: the prompt `/v1/messages` prefills for it, through the same `renderAnthropicPrompt`.
+  Image and video rows count as `placeMedia` expands them, without the tower (`placeRequestMedia`); a body
+  `/v1/messages` refuses for its shape is refused with the same Anthropic error, and the model routes as there.
+  Nothing generates or queues, the prefix cache and the tokenize LRU are untouched, and a prompt past the context
+  is still counted (only `/v1/messages` 400s it). The effort word counts as the word it is served at (the template
+  renders it), and a rerouted one carries the effort notice, header and field, as on `/v1/messages`. The count equals
+  `usage.input_tokens + cache_read_input_tokens`.
 - **`preserve_thinking`** (templates that read it: Qwen3.8), resolved per request as `chat_template_kwargs.preserve_thinking`
   (bool, all three surfaces) > `--preserve-thinking on|off` > `preserve_thinking` in model-settings.json > the template
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
@@ -73,7 +81,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
   a message or a `function_call_output` array. Only base64 data URLs decode (remote URLs are refused, not fetched);
   a failure is a 400 naming the message index and the reason, an `input_audio` part a 400 on a model without an
-  audio encoder, more than 64 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
+  audio encoder, more than 1024 images a 400 with both counts, an encode failure a 500 (Anthropic: `api_error`).
   Stored Responses history keeps text only.
 
 ## Streaming
@@ -101,6 +109,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
   byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  While a stream waits in the queue behind another request, the comment reads `: queued behind N
+  request(s); running G of M tokens (~S s at R tok/s)` (G/M: the running request's generated tokens and max); an
+  Anthropic stream gets it before each `ping`.
   `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
@@ -134,6 +145,7 @@ before reading a completed stream and requires clean EOF.
   constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
   `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
 - A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
   (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
@@ -211,6 +223,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).
 - A root number ends only at EOS, so it is complete once terminable; the empty-mask disable in `nextConstrainedToken`
   is the logged last resort (a new dead end gets a schema in the `no reachable grammar state is a dead end` test).
+- DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; logprobs and forced calls still disable spec.
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
@@ -241,7 +254,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `phase`, `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
   effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
   output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
-  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row).
+  slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row; a DeepSeek
+  slot's is the model-held state, rows and rings, plus the live restore points).
 - A live row's `state_bytes` is at capacity: a ringed layer's ring, each QSA bank by its capacity buffer (never also
   its view), and the ring restore points the slot holds.
 - After the live rows come `cached` rows, one per hot-cache entry of every ready model (cap 32, published under
@@ -314,6 +328,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
+- opencode runs the newest version among every `opencode` on PATH, not the first (an old npm or `~/.opencode` copy
+  would otherwise shadow Homebrew's 2.x); `--standalone` is probed on that binary.
 - Claude Code's stream watchdogs and 10-min request timeout are raised and its non-stream fallback is off: a long
   prefill plus a long think tripped them, and each fallback re-sent the whole prompt, then timed out and retried.
 - Agent budgets (`launch.budgetForContext` + `compactionReserve`): output share ctx/2, compaction reserve ctx/4

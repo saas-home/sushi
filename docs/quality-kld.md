@@ -90,9 +90,16 @@ would silently do nothing is refused by name at load (`refuseForDsv41`): `--kv-q
 `--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
 (`Dsv41ImatrixCaptureUnsupported`). The teacher is exact routing: `capture` refuses `--drop-expert` and
 `--expert-pick-tolerance`; `compare --drop-expert n` scores a pruned student against it
-([dsv41-arch](dsv41-arch.md#drop-expert)). `SUSHI_DSV41_COMPOSED=1` runs the op chains in place of the fused kernels, the
+([dsv41-arch](dsv41-arch.md#drop-expert)). `compare --expert-pick-tolerance n` acts on the one-row steps that score the
+generated tokens (the prompt prefill is exact) and only where an expert can miss: a budget that holds every expert loads
+resident, logs that the flag has no effect, and scores the exact KLD; a real streamed load logs
+`[expert-swap] engaged` and counts the swaps ([engine-expert-streaming](engine-expert-streaming.md)).
+`SUSHI_DSV41_COMPOSED=1` runs the op chains in place of the fused kernels, the
 teacher arm of a fused-kernel A/B.
 A tiny-model test (`DSV41_TINY`) captures a teacher and compares it in both arms.
+`compare` scores prefill chunks on the GEMM and the generated tokens on one-row steps, so it never runs the NAX 2 to 8 row
+arm: a change to that arm's sum order leaves the KLD identical to the last digit (0.186614243 on the STQ 1.75bpw pack for
+main and for the reordered trunk rows) and is gated by the f32-truth bars and the width-invariance byte test instead.
 
 ## Bundled four-prompt screen
 

@@ -48,6 +48,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
   byte-stable greedy needs `--prefix-cache-entries 0`. A hybrid cache hit moves the top logprob ~0.2 nats, so any
   scorer boots with the cache off.
+- Every request logs one `[prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms` line (`[dsv41-prefix]` on DeepSeek); `prompt_ms` includes that time and `sushi bench` takes it out.
 - The always-on SSM snapshot sits 30 tokens BEFORE prompt end; a restored tail inside that window forwards as ONE
   span (`ssmSnapshotBackoff`). Guard: `tests/test_hybrid_reuse_equivalence.sh`.
 - **A ringed (sliding-window) entry restores at its end or at one of its ring checkpoints**
@@ -78,6 +79,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   global layers, `r{pos}.safetensors` each restore point's ringed rows (the RAM entry's checkpoints plus its end,
   `RING_DISK_MAX_PER_ENTRY` = 8 kept, thinned as in RAM, salvaged per file at scan; manifest v9, which an older reader
   drops; a media-bearing record stamps v10 for the same reason) ([mimo2-arch](mimo2-arch.md#sliding-layers-the-ring)).
+- **A tier can split a restore point's growing rows into one store per entry** (`DiskTier.setGrownSpec`, armed for
+  DeepSeek only; [dsv41-arch](dsv41-arch.md#prefix-cache)): every `span` tokens of rows go once into `g<n>.safetensors`
+  (append-only, never rewritten), and a point's `s<pos>.safetensors` holds its fixed arrays plus the rows past its last
+  whole span, naming the segments it leans on in its `grown` metadata. A point written whole (no spec, or no growing
+  array) keeps the layout every other arch reads. Retention and a thinned point never delete a segment; the store stays
+  as long as the longest point ever kept until the entry is evicted. An extending commit writes only the segments
+  past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
+  contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
+  (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
+- **DeepSeek rolls its live state back before any stored restore** (`HotPrefixCache.rollbackLiveDsv41`,
+  `dsv41_prefix.Live`; [dsv41-arch](dsv41-arch.md#prefix-cache)): the slot's last request keeps the fixed arrays of its
+  deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
+  unless a stored point reaches further. Valid only while `Model.state_epoch` is unchanged and a request finished over it.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
@@ -376,7 +390,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag
   (`ModelConfig.cacheLayoutNamespace`): `gdn-f32-state-v1` for the default f32 state, `gdn-gate-f32-v1` for
   `--qwen-gdn 16`, so the two widths never restore each other's checkpoints and entries written under the old bf16
-  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. KV width is not in the namespace: `bestMatch` skips an
+  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. DeepSeek's tag (`dsv41_prefix.layoutKey`) also names `--drop-expert`'s dropped list (count and a digest of the per-layer ids) and a non-zero `--expert-pick-tolerance` (decode-width picks read the cache, so the states built on them are not an exact boot's); a boot with neither keeps the plain tag. KV width is not in the namespace: `bestMatch` skips an
   entry whose manifest quant differs from the live one.
 
 - `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +
