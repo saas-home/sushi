@@ -125,9 +125,9 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 
   One `sushi bench` run each on an M5 Max 128 GB (DSpark on, one request); 108 is the
   [v1.4.0 bench](bench/v1.4.0/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw.md).
-- **Above 108 on a 128 GB Mac, raise the user wire limit too.** macOS caps the memory a process may wire at
+- **111 on a 128 GB Mac needs the user wire limit raised.** macOS caps the memory a process may wire at
   `vm.global_user_wire_limit`, 116.8 GB by default on 128 GB, separately from `iogpu.wired_limit_mb`. Past 108 the load
-  crosses it and prefill slows down (7% at 111, 15% at 114) with no error. Raising it restores full speed:
+  crosses it and prefill slows down (7% at 111) with no error. Raising it brings 111's prefill back to 108's speed:
   ```bash
   sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000   # resets at reboot
   ```
@@ -139,7 +139,7 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 - **DSpark** (the checkpoint's drafter) is on by default; `--no-mtp` turns it off. Greedy output is stable across round
   widths and identical between stream and non-stream.
 - **Thinking** is `high` by default; `reasoning_effort` `low`, `high` or `max`, or `off` / `enable_thinking: false`.
-- **Images** are on by default; `--no-vision` frees the 0.97 GB tower for the expert cache.
+- **Images** are on by default; `--no-vision` frees the 0.50 GB tower for the expert cache; `--vision-bf16` keeps the stored bf16 tower.
 - **`--drop-expert n`** (multiple of 8) skips the `n` least-used experts a layer, freeing 2.1–2.5 GB at 8 and 4.3–5.0 GB
   at 16. It is lossy: check it with `sushi kld compare` ([dsv41-arch](dsv41-arch.md#drop-expert)).
 - **Refused flags:** `--kv-quant`, `--qwen-gdn`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` and
@@ -149,6 +149,9 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 
 - `--prefix-cache-disk 20GB` sizes the SSD prefix cache (on by default, capped at 20 GB); `--prefix-cache-entries 1`
   keeps one conversation, raise it to 4-8 for several agents; `--prefix-cache-mem 1GB` also keeps prefixes in RAM.
+- A restore point sits every 8192 tokens and at each prompt's end, so a 1M-token conversation takes about 0.9 GB of
+  SSD (DeepSeek), 7-14 GB of points plus 16 GB of rows (Qwen) or 24 GB (GLM): raise `--prefix-cache-disk` for long
+  contexts. A conversation past the budget drops its oldest points first.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 

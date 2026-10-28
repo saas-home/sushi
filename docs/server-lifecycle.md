@@ -162,16 +162,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
-- `--prefill-decode-share S` (default 0) targets the fraction of wall time given
+- `--prefill-decode-share S` (default 0.25) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
-  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.
-- While decoders are live, the share caps the base prefill width at 1024 after explicit/environment chunk settings;
-  normal tail merging still applies. Admission bills the original width, and adaptive widening retains its memory
-  confirmation. An adaptive slot can lift the cap after the other decoders finish; a pinned slot keeps its cap.
-  Hosted decode time is excluded from prefill compute time but remains part of request latency.
-- **GLM prefill chunks never narrow for company** (`prefillShareCapFor`): its numerics depend on chunk boundaries, so a
-  request's output must not depend on what else decodes; it yields only between whole chunks.
+  decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables the share.
+- **The share never narrows a prefill chunk** (any arch): a request's chunk width, bill and numerics do not depend on
+  what else decodes; decoders get time only between whole chunks. Hosted decode time is excluded from prefill compute
+  time but remains part of request latency.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
@@ -250,7 +247,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   the encode and its bill (`visionEncodeBill`) cover the blocks after it, and a block the restore cuts through is
   encoded whole. The slot's splice offset is the placeholder rows in the prefix less the rows skipped.
 - **A patch-grid image is held as its file, never as f32 patches**: the connection thread base64-decodes the payload,
-  reads the size from the JPEG/PNG/WebP header and plans the grid with the processor's resize rule (`planImage`), so
+  reads the size from the JPEG/PNG/GIF/BMP/WebP header and plans the grid with the processor's resize rule (`planImage`), so
   the prompt places its rows and the request keeps the compressed bytes (`ImageData.undecoded`); a 1080p screenshot is
   19.8 MB of patches on DeepSeek-V4.1. The media key is unchanged, a hash of the decoded pixels: `keyMedia` decodes
   `decode_workers` (8) images at a time on that many threads (`ImageDecodeWindow`), feeds each to the chain and frees
@@ -267,7 +264,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
   `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
-  `stb_image` + libwebp decode image input.
+  `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.
 
 ## Config reading
 

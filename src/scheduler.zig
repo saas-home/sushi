@@ -50,6 +50,7 @@ const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const glm5_prefix = @import("glm5_prefix.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -262,6 +263,8 @@ pub const SubmitParams = struct {
 pub const CheckpointPlan = struct {
     keep: u32 = 0,
     released: bool = false,
+    /// The request will take a thought point mid-decode (`thoughtPointWanted`): one more state held to its commit.
+    thought: bool = false,
 };
 
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory
@@ -481,7 +484,7 @@ fn encodeMediaAfterRestore(sch: *Scheduler, model: *LoadedModel, d: *const Defer
     if (req.error_name) |name| {
         defer allocator.free(name);
         if (std.mem.eql(u8, name, image_undecodable_error)) {
-            refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG or WebP image", .{skip.images + req.failed_image + 1});
+            refusal.* = MediaRefusal.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{skip.images + req.failed_image + 1});
             return error.MediaRefused;
         }
         var text: [320]u8 = undefined;
@@ -1540,8 +1543,8 @@ pub const Scheduler = struct {
     /// Slots out of `pending` whose prefill pass is running: neither pending nor decoding, so
     /// a shutdown reaches them only here (queue_mu).
     prefilling: std.ArrayList(*Slot),
-    /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
-    /// Read once per REQUEST in `finishSlot` — never on the per-token path.
+    /// Metrics sink. Null while metrics are off. Populated from LoadParams, and adopted by the inference thread
+    /// (its only writer) once `POST /metrics/enable` publishes one. Read once per REQUEST in `finishSlot`.
     metrics: ?*metrics_mod.Metrics,
     /// In-flight generated-token aggregate: the sum of `completion_tokens`
     /// over the slots still decoding, republished by the inference thread once
@@ -2274,6 +2277,27 @@ pub const Scheduler = struct {
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
         req.done_mu.unlock(self.io);
+    }
+
+    pub const UnloadedIdle = struct { id: []const u8, bytes: u64 };
+
+    /// Unloads the least recently used resident model nobody holds, other than `keep`, on the
+    /// inference thread. Null when none was idle or a request took it before the commit.
+    pub fn unloadLruIdleModel(self: *Scheduler, keep: []const u8) ?UnloadedIdle {
+        self.registry.mutex.lockUncancelable(self.io);
+        const entry = self.registry.pickLruEvictable(keep) orelse {
+            self.registry.mutex.unlock(self.io);
+            return null;
+        };
+        const bytes = entry.bytes_resident;
+        self.registry.mutex.unlock(self.io);
+
+        self.unloadModelIfIdle(entry.id, 0) catch return null;
+
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        if (entry.state == .ready) return null;
+        return .{ .id = entry.id, .bytes = bytes };
     }
 
     /// Synchronously compute embeddings for `req.token_seqs` using the
@@ -4650,7 +4674,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[glm] native {s} MLA: {d} latent + {d} pooled-index bytes/token; serial decode\n", .{ if (!kv_quant_config.isQuant()) "BF16" else if (kv_quant_config.bits == 6) "kv6" else "kv8", @import("server.zig").kvBytesPerTokenAtBits(params.config.kvBytesPerToken(), latent_bits), params.config.qsaHistoryBytesPerToken() });
         log.info("[glm] NAX arms {s}\n", .{if (@import("glm5_model.zig").naxArms()) "on: packed sparse and B1/B3 attention, NAX index scores, KDA cluster, A6 dense-once, MLA head batches" else "off: FP32 composite sparse and B1/B3 attention, scalar index scores, staged KDA cluster, affine QMM trunk"});
         if (mtp.on) log.warn("[glm] MTP head is not integrated with serving; MTP off\n", .{});
-        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints at every prefill chunk and the prompt end (<= {d} per entry, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
+        if (params.prefix_cache_capacity > 0 and params.ssm_checkpoint_stride > 0) log.info("[glm] prefix cache: KDA checkpoints every 8192 tokens and at the prompt end (<= {d} held in memory, {d} MiB each)\n", .{ @import("glm5_prefix.zig").checkpointMax(params.ssm_checkpoint_max), params.config.ssmCheckpointBytes() >> 20 });
     }
     if (std.mem.indexOf(u8, params.chat_config.chat_template, "preserve_thinking") != null) {
         const keep = model_settings.pick(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, true);
@@ -5253,11 +5277,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =
                 if (params.config.longCtxGated() or !ram_prefix_cache or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isGlm5())
-                @import("glm5_prefix.zig").checkpoint_cap
-            else if (params.config.isDsv41())
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.isDsv41())
                 @import("dsv41_prefix.zig").disk_checkpoint_cap
-            else if (params.config.longCtxGated() or !ram_prefix_cache)
+            else if (params.config.isGlm5() or params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
@@ -5714,6 +5736,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
             }
             if (sch.shutdown.load(.acquire)) break;
+            // POST /metrics/enable publishes the sink from another thread; only this thread ever stores `sch.metrics`.
+            sch.metrics = metrics_mod.adoptPublished(sch.metrics, metrics_mod.current());
             // Hold until the loop parks again.
             sleep_inhibit.setActive(true);
 
@@ -6509,6 +6533,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
+    settleThoughtPoint(slot, gen_ptr);
     const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
@@ -6607,7 +6632,6 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// Ownership of `cps` passes to the cache.
 fn commitGlmSlot(hc: *prefix_cache_mod.HotPrefixCache, slot: *Slot, request: *const glm5_forward_mod.Request, tokens: []const u32, cps_opt: ?[]transformer_mod.SSMCheckpoint, dflash: ?prefix_cache_mod.DflashCommit, prompt_len: usize) void {
     const cps_all = cps_opt orelse return;
-    const glm5_prefix = @import("glm5_prefix.zig");
     const s = slot.model.transformer.?.s;
     // The rows are chosen before the copy: only what the RAM tier keeps, never a full copy followed by a trim.
     const window: u64 = if (dflash) |d| prefix_cache_mod.HotPrefixCache.liveCacheBytes(d.cache) else 0;
@@ -7184,20 +7208,10 @@ pub fn prefillInterleaveEnabled() bool {
     return on;
 }
 
-pub var prefill_decode_share: f32 = 0;
+pub var prefill_decode_share: f32 = 0.25;
 
 pub fn prefillDecodeShare() f32 {
     return if (prefillInterleaveEnabled()) prefill_decode_share else 0;
-}
-
-fn liveDecodingCount(sch: *Scheduler) usize {
-    sch.queue_mu.lockUncancelable(sch.io);
-    defer sch.queue_mu.unlock(sch.io);
-    var count: usize = 0;
-    for (sch.decoding.items) |slot| {
-        if (!slot.cancelled.load(.acquire) and !slot.finished and slot.error_code == null) count += 1;
-    }
-    return count;
 }
 
 const InterleaveCtx = struct {
@@ -7333,9 +7347,7 @@ fn chunkWidthCb(
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
-    if (!adaptiveChunkWidthFor(cfg)) return next;
-    const share_cap = prefillShareCapFor(cfg, liveDecodingCount(wc.sch), prefillDecodeShare());
-    return if (share_cap == 0) next else @min(next, share_cap);
+    return next;
 }
 
 /// Called with `mu` held; returns with it held. Drops `mu` while waiting so the
@@ -7746,6 +7758,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .checkpoints = .{
                     .keep = if (cfg.isGlm5() and cp_stride > 0) cp_max else 0,
                     .released = glmCheckpointsRelease(slot, slot.full_prompt.len - hot_matched),
+                    .thought = thoughtPointWanted(slot, cp_stride > 0),
                 },
                 .fits = fits_fn,
             };
@@ -7903,7 +7916,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .vision_rows_before = if (slot.vision_embeddings != null) vision_consumed - vision_skipped else 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = req_prefill_chunk,
-            .decode_share_width_cap = prefillShareCapFor(&xfm_ptr.config, liveDecodingCount(sch), prefillDecodeShare()),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -7945,6 +7957,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
 
     slot.legacy_gen = gen;
     armDsv41ThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
+    armThoughtPoint(slot, &slot.legacy_gen.?, cp_stride > 0);
     publishHandoverToken(slot, &slot.legacy_gen.?);
     // A long reply compacts the ring past the prompt end, where the next turn diverges.
     if (slot.model.prefix_cache != null and slot.ring_cps.prompt_end == null) {
@@ -8411,8 +8424,8 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick, and decode the answer regular from here on
-/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+/// through the model this tick; an MTP slot ramps back to speculating, any other spec mode
+/// decodes the answer regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
@@ -8443,8 +8456,10 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
         finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
-    gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = .think_bound;
+    if (!try gen.mtpResumeAfterForced(slot.allocator)) {
+        gen.spec_disabled_runtime = true;
+        gen.spec_disable_reason = .think_bound;
+    }
     return false;
 }
 
@@ -8459,6 +8474,51 @@ fn armDsv41ThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) v
     const close = tok.specialTokenId("</think>") orelse return;
     if (slot.full_prompt[slot.full_prompt.len - 1] != open) return;
     gen.dspark_round_ends_at = close;
+}
+
+/// The request shape that takes a thought point: admission bills the state from this answer, the arming acts on it.
+fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
+    const cfg = slot.model.config orelse return false;
+    if (!checkpoints_on or !slot.has_tools or !slot.enable_thinking) return false;
+    if (slot.full_prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return false;
+    return cfg.isGlm5() or (cfg.isQwen4() and slot.enable_mtp);
+}
+
+/// Qwen over MTP and GLM over DFlash2 keep a recurrent state that restores only at a saved point, and a thinking request
+/// with tools is re-rendered with its thought: the state right behind the generated `</think>` (on GLM the pool position
+/// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
+fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
+    if (!thoughtPointWanted(slot, checkpoints_on)) return;
+    const grid: u32 = if (gen.glm_dflash_native)
+        @intCast(glm5_prefix.pool_size)
+    else if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
+        1
+    else
+        return;
+    const tok = slot.model.tokenizer orelse return;
+    const open = tok.specialTokenId("<think>") orelse return;
+    const close = tok.specialTokenId("</think>") orelse return;
+    if (std.mem.indexOfScalar(u32, slot.full_prompt[slot.full_prompt.len - 2 ..], open) == null) return;
+    gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = generate_mod.thought_point_min_tokens, .base = slot.full_prompt.len };
+}
+
+/// A thought the next prompt would re-render differently is no restore point: its state is dropped before the commit.
+fn settleThoughtPoint(slot: *Slot, gen: *Generator) void {
+    const tp = gen.thought_point orelse return;
+    if (tp.state != .taken) return;
+    const tok = slot.model.tokenizer orelse return gen.dropThoughtPoint();
+    const generated = gen.generated_ids.items;
+    const end = std.mem.indexOfScalar(u32, generated, tp.closer) orelse return gen.dropThoughtPoint();
+    if (end < 2) return gen.dropThoughtPoint();
+    const first = tok.decode(slot.allocator, generated[0..1], false) catch return gen.dropThoughtPoint();
+    defer slot.allocator.free(first);
+    const tail = tok.decode(slot.allocator, generated[end - 2 .. end], false) catch return gen.dropThoughtPoint();
+    defer slot.allocator.free(tail);
+    const style: generate_mod.CloserStyle = if (gen.glm_dflash_native) .bare_closer else .newline_before_closer;
+    if (!generate_mod.thoughtEdgesSurvive(style, first, tail)) {
+        log.info("[prefix] no thought restore point: the template re-renders the thought's edges\n", .{});
+        gen.dropThoughtPoint();
+    }
 }
 
 /// The round that committed `</think>` ended right behind it: its state goes to the SSD tier as one restore point.
@@ -8504,6 +8564,27 @@ fn thinkBoundFired(gen: *const Generator) bool {
     return tb.fired;
 }
 
+/// A fired bound decodes plain unless an MTP head resumed behind it (DSpark and DFlash2 still do).
+fn thinkBoundForcesPlain(gen: *const Generator) bool {
+    return thinkBoundFired(gen) and (gen.mtp == null or gen.spec_disable_reason == .think_bound);
+}
+
+/// Drafts a thinking bound lets the slot's next MTP round carry, so it accepts no further than serial decode
+/// closes the thought: null = unbounded, 0 = the room's last token runs plain. `observe` first.
+fn thinkBoundDraftLimit(gen: *const Generator) ?u32 {
+    const room = (gen.sampling.think_bound orelse return null).room() orelse return null;
+    return generate_mod.mtpDraftCapForRoom(room) orelse 0;
+}
+
+/// A solo or grouped MTP round keeps the tighter of its own cap and the thought room, or runs the
+/// last room token serial.
+fn capMtpRoundToThinkBound(gen: *Generator) void {
+    const limit = thinkBoundDraftLimit(gen) orelse return;
+    if (limit == 0) {
+        gen.mtp_serial_left = 1;
+    } else gen.mtp_group_cap = if (gen.mtp_group_cap > 0) @min(gen.mtp_group_cap, limit) else limit;
+}
+
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
@@ -8537,7 +8618,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
     // generators handle the disabled fallback internally.
-    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null or gen.dspark,
         slot.enable_drafter,
@@ -8556,6 +8637,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     }
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
+        capMtpRoundToThinkBound(gen);
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -9196,6 +9278,14 @@ fn planProbe(
     return true;
 }
 
+/// Drafts the planner may give an MTP row: the depth range, the tokens `max_tokens` leaves and the
+/// thought room (0 = a plain row). A row with a think bound is `observe`d first.
+fn plannerRowCap(gen: *const Generator) u32 {
+    const depth = if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current);
+    const cap = @min(@min(depth, Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1);
+    return if (thinkBoundDraftLimit(gen)) |limit| @min(cap, limit) else cap;
+}
+
 fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
     const xfm = active[0].model.transformer orelse return false;
@@ -9220,7 +9310,8 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         const mtp_row = why == .spec_active and slotMtpGroupable(slot);
         if (why != .ok and !mtp_row) return false;
         has_mtp = has_mtp or mtp_row;
-        const cap = if (mtp_row) @min(@min(if (gen.mtp_depth > 0) gen.mtp_depth else @max(1, gen.mtp_depth_current), Planner.MAX_DEPTH), gen.max_tokens -| gen.completion_tokens -| 1) else 0;
+        if (gen.sampling.think_bound) |tb| tb.observe(gen.generated_ids.items);
+        const cap = if (mtp_row) plannerRowCap(gen) else 0;
         rows[i] = .{ .history = &gen.mtp_planner_history, .cap = @intCast(cap), .latency_ms = Planner.LATENCY_MS };
         lenses[i] = @intCast(slot.moe_seq_offset);
     }
@@ -9405,6 +9496,8 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        gen.mtp_group_cap = 0;
+        capMtpRoundToThinkBound(gen);
         gen.mtp_batch_head = true;
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             gen.mtp_batch_head = false;
@@ -9623,6 +9716,7 @@ fn runBatchedMtpTickInner(sch: *Scheduler, group: []*Slot) !void {
     for (group) |slot| {
         const gen = &slot.legacy_gen.?;
         if (try loopGuardTick(sch, slot, gen)) continue;
+        capMtpRoundToThinkBound(gen);
         const begun = gen.mtpRoundBegin(slot.allocator) catch |e| {
             slot.markError(@errorName(e));
             continue;
@@ -11656,6 +11750,118 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
 
+test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP ticks" {
+    var t: transformer_mod.Transformer = undefined;
+    var forced = [_]u32{7};
+    var tb = generate_mod.ThinkBound{ .budget = 4, .opener_id = null, .closer_id = 7, .forced = &forced, .in_think = true, .fired = true };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.think_closed_by_loop = false;
+    gen.mtp = .{ .qwen4 = &t };
+    // What commitThoughtClose leaves behind after a head resumed.
+    gen.spec_disabled_runtime = false;
+    gen.spec_disable_reason = .none;
+    try testing.expect(!thinkBoundForcesPlain(&gen));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, gen.mtp != null, false, false));
+    // A head that may not resume leaves `.think_bound`: plain, as before.
+    gen.spec_disable_reason = .think_bound;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+    // DSpark and DFlash2 carry no MTP head: a fired bound still decodes them plain.
+    gen.mtp = null;
+    gen.spec_disable_reason = .none;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+    gen.think_closed_by_loop = true;
+    tb.fired = false;
+    try testing.expect(thinkBoundForcesPlain(&gen));
+}
+
+test "an MTP round never accepts past the position serial decode closes the thought at" {
+    // Serial decode fires when the thought holds `budget` tokens; a round emits t1 plus its accepted drafts.
+    for ([_]u32{ 1, 2, 3, 9, 48 }) |budget| {
+        for ([_]u32{ 0, 1, 2, 3, 5, 8 }) |accept_every| {
+            var tb = generate_mod.ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
+            var emitted: u32 = 0;
+            var rounds: u32 = 0;
+            while (!tb.due()) : (rounds += 1) {
+                const room = tb.room().?;
+                const drafts: u32 = generate_mod.mtpDraftCapForRoom(room) orelse 0;
+                const accepted = @min(drafts, accept_every);
+                emitted += 1 + accepted;
+                tb.count = emitted;
+                try testing.expect(emitted <= budget);
+            }
+            try testing.expectEqual(budget, emitted);
+        }
+    }
+    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    try testing.expectEqual(@as(?u32, 1), tb.room());
+    try testing.expectEqual(@as(?u32, null), generate_mod.mtpDraftCapForRoom(1));
+    try testing.expectEqual(@as(?u32, 3), generate_mod.mtpDraftCapForRoom(4));
+    tb.fired = true;
+    try testing.expectEqual(@as(?u32, null), tb.room());
+    tb.fired = false;
+    tb.in_think = false;
+    try testing.expectEqual(@as(?u32, null), tb.room());
+}
+
+test "the last thought token before the bound runs serial, wider rooms cap the drafts" {
+    var tb = generate_mod.ThinkBound{ .budget = 5, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 4 };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    gen.mtp_group_cap = 0;
+    gen.mtp_serial_left = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 1), gen.mtp_serial_left);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_group_cap);
+    gen.mtp_serial_left = 0;
+    tb.count = 1;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_serial_left);
+    gen.sampling = .{};
+    gen.mtp_group_cap = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_group_cap);
+}
+
+test "a group's row cap and the thought room both bound a round's drafts" {
+    var tb = generate_mod.ThinkBound{ .budget = 12, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 1 };
+    var gen: Generator = undefined;
+    gen.sampling = .{ .think_bound = &tb };
+    // Room 11 leaves the group's row cap of 3 in force.
+    gen.mtp_group_cap = 3;
+    gen.mtp_serial_left = 0;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    // Room 4 caps below the row cap of 6.
+    gen.mtp_group_cap = 6;
+    tb.count = 8;
+    capMtpRoundToThinkBound(&gen);
+    try testing.expectEqual(@as(u32, 3), gen.mtp_group_cap);
+    try testing.expectEqual(@as(u32, 0), gen.mtp_serial_left);
+}
+
+test "a planner row never gets more drafts than its thought room" {
+    var tb = generate_mod.ThinkBound{ .budget = 20, .opener_id = null, .closer_id = 9, .forced = &.{9}, .in_think = true, .count = 0 };
+    var gen: Generator = undefined;
+    gen.mtp_depth = 4;
+    gen.mtp_depth_current = 4;
+    gen.max_tokens = 1000;
+    gen.completion_tokens = 10;
+    gen.sampling = .{};
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
+    gen.sampling = .{ .think_bound = &tb };
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
+    tb.count = 17;
+    try testing.expectEqual(@as(u32, 2), plannerRowCap(&gen));
+    // Room 1: the slot takes a plain row.
+    tb.count = 19;
+    try testing.expectEqual(@as(u32, 0), plannerRowCap(&gen));
+    // A bound that already fired no longer limits the answer.
+    tb.fired = true;
+    try testing.expectEqual(@as(u32, 4), plannerRowCap(&gen));
+}
+
 test "a plain batched tick checks the thinking budget before its rows forward" {
     // A thought past its budget with no room left to close it: the bound fires, the slot decodes on.
     const forced = [_]u32{ 9, 7 };
@@ -11927,9 +12133,9 @@ test "every real streamed pack and source on this box plans a streamed load" {
     const t = std.testing;
     const Case = struct { name: []const u8, layout: expert_stream_mod.quant.Layout, tower: u64 };
     for ([_]Case{
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 897_862_112 },
-        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4, .tower = 897_862_112 },
-        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused, .tower = 897_862_112 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-2.6bpw", .layout = .exl3_k4, .tower = 597_327_776 },
+        .{ .name = "Qwen3.8-Flash-Next-Sushi-4bpw", .layout = .exl3_k4, .tower = 597_327_776 },
+        .{ .name = "Qwen/Qwen3.8-Flash-Next", .layout = .bf16_fused, .tower = 597_327_776 },
         .{ .name = "MiMo-V2.6-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 1_457_188_864 },
         .{ .name = "GLM-5.3-Flash-Sushi-2.3bpw", .layout = .exl3_k4, .tower = 493_389_824 },
         .{ .name = "GLM-5.3-Flash-Sushi-2.5bpw", .layout = .exl3_k4, .tower = 493_389_824 },
@@ -11952,6 +12158,30 @@ test "every real streamed pack and source on this box plans a streamed load" {
         try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
         // Slots are whole per layer: a tower smaller than one slot across the layers, or a pack that fits in full, costs none.
         try t.expect(seen.cache.slots_per_layer <= plan.cache.slots_per_layer);
+    }
+}
+
+test "a DeepSeek STQ pack's ssd budget bills its tower as the requantized 8-bit codes" {
+    const t = std.testing;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try @import("test_models.zig").packPath(&path_buf, "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw");
+    var config = model_mod.parseConfig(t.io, t.allocator, path) catch return error.SkipZigTest;
+    defer config.deinit(t.allocator);
+    if (!config.has_vision) return error.SkipZigTest;
+    const stored_tower: u64 = 970_536_960 + 40 * 1536;
+    const report = std.c.getenv("SUSHI_VISION_Q8_REPORT") != null;
+    for ([_]u64{ 96, 108 }) |gb| {
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, gb << 30, true);
+        try t.expect(plan.vision.on);
+        // 483M of the tower's 485M parameters at a byte and 4/128 byte each: the codes, scales and biases.
+        try t.expect(plan.split.vision > 490_000_000 and plan.split.vision < 520_000_000);
+        const l = plan.resolved.ledger.?;
+        try t.expectEqual(plan.split.vision, l.vision_bytes);
+        const per_slot = l.cache_bytes / l.slots_per_layer;
+        const fixed = l.trunk_bytes + l.mtp_bytes + l.workspace_bytes + l.selected_bytes + l.bounce_bytes + l.pool_bytes;
+        const slots_stored: u64 = (l.budget_bytes - fixed - stored_tower) / per_slot;
+        try t.expect(plan.cache.slots_per_layer >= slots_stored);
+        if (report) std.debug.print("[vision-q8] ssd budget {d}: tower {d} B (stored {d} B), slots/layer without {d}, with {d} (stored tower: {d}), per slot {d} B\n", .{ gb, plan.split.vision, stored_tower, plan.vision.slots_without, plan.cache.slots_per_layer, slots_stored, per_slot });
     }
 }
 
@@ -12768,23 +12998,10 @@ test "the fwd-ubench QSA pooled-key arms interleave composed and fused A B B A i
 
 
 pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
-pub const DECODE_SHARE_PREFILL_CHUNK: u32 = 1024;
 pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
     if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
     return @min(v, PREFILL_DECODE_SHARE_MAX);
-}
-/// The decode share's prefill width cap for this model. GLM prefill numerics depend on the chunk
-/// boundaries, so its chunks stay whole whatever else decodes: it yields only between chunks.
-pub fn prefillShareCapFor(cfg: *const ModelConfig, decoding: usize, share: f32) u32 {
-    return if (cfg.isGlm5()) 0 else decodeShareAdmissionCap(decoding, share);
-}
-pub fn decodeShareAdmissionCap(decoding: usize, share: f32) u32 {
-    return if (decoding == 0 or share <= 0) 0 else DECODE_SHARE_PREFILL_CHUNK;
-}
-pub fn decodeShareWidthCap(width: u32, decoding: usize, share: f32) u32 {
-    const cap = decodeShareAdmissionCap(decoding, share);
-    return if (cap == 0) width else @min(width, cap);
 }
 pub fn decodeShareBudgetNs(chunk_ns: u64, share: f32) u64 {
     if (std.math.isNan(share) or share <= 0) return 0;
@@ -12807,23 +13024,12 @@ pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopa
     return result;
 }
 
-test "decode share never narrows a GLM prefill: its chunk boundaries are numerics" {
-    const glm = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("fixtures/glm5_config.json"));
-    const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&glm, 3, 0.5));
-    try testing.expectEqual(DECODE_SHARE_PREFILL_CHUNK, prefillShareCapFor(&qwen4, 3, 0.5));
-    try testing.expectEqual(@as(u32, 0), prefillShareCapFor(&qwen4, 0, 0.5));
-}
-
-test "decode share: a live share caps the width only while someone decodes" {
-    const w = DECODE_SHARE_PREFILL_CHUNK;
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(0, 0.5));
-    try testing.expectEqual(@as(u32, 0), decodeShareAdmissionCap(2, 0));
-    try testing.expectEqual(w, decodeShareAdmissionCap(1, 0.5));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 1, 0));
-    try testing.expectEqual(@as(u32, 8192), decodeShareWidthCap(8192, 0, 0.5));
-    try testing.expectEqual(w, decodeShareWidthCap(8192, 1, 0.5));
-    try testing.expectEqual(@as(u32, 512), decodeShareWidthCap(512, 1, 0.5));
+test "decode share: the default is 0.25 and reaches /props" {
+    const saved = prefill_interleave_cached;
+    defer prefill_interleave_cached = saved;
+    prefill_interleave_cached = true;
+    try testing.expectEqual(@as(f32, 0.25), prefill_decode_share);
+    try testing.expectEqual(@as(f32, 0.25), prefillDecodeShare());
 }
 
 test "decode share: parse clamps above 0.9 and rejects anything that is not a share" {
@@ -12885,7 +13091,15 @@ test "decode share: ticks to the budget, keeps one tick at zero, stops when deco
 
 
 
-test "decode share: the kill switch disables the effective share and only live slots count" {
+test "decode share: 0.25 owes a third of the chunk time in ticks" {
+    const ms = std.time.ns_per_ms;
+    var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
+    const r = runOwedDecodeTicks(0.25, 3000 * ms, 10 * ms, &f, FakeDecodeTicks.tick);
+    try testing.expectEqual(@as(u32, 100), r.ticks);
+    try testing.expectEqual(@as(u64, 1000 * ms), r.spent_ns);
+}
+
+test "decode share: the kill switch disables the effective share" {
     const saved_share = prefill_decode_share;
     const saved_interleave = prefill_interleave_cached;
     defer { prefill_decode_share = saved_share; prefill_interleave_cached = saved_interleave; }
@@ -12894,26 +13108,6 @@ test "decode share: the kill switch disables the effective share and only live s
     try testing.expectEqual(@as(f32, 0), prefillDecodeShare());
     prefill_interleave_cached = true;
     try testing.expectEqual(@as(f32, 0.5), prefillDecodeShare());
-    var sch: Scheduler = undefined;
-    sch.io = testing.io;
-    sch.queue_mu = .init;
-    var slots: [4]Slot = undefined;
-    var ptrs: [4]*Slot = undefined;
-    for (&slots, &ptrs) |*slot, *ptr| {
-        slot.cancelled = std.atomic.Value(bool).init(false);
-        slot.finished = false;
-        slot.error_code = null;
-        ptr.* = slot;
-    }
-    slots[1].cancelled.store(true, .release);
-    slots[2].finished = true;
-    slots[3].error_code = "test error";
-    sch.decoding = .empty;
-    sch.decoding.items = &ptrs;
-    sch.decoding.capacity = ptrs.len;
-    try testing.expectEqual(@as(usize, 1), liveDecodingCount(&sch));
-    slots[0].finished = true;
-    try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
 }
 
@@ -13101,7 +13295,6 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     slot.markError("MlxFailure");
     try testing.expect(slot.waitNextTimeout(0).? == .err);
     try testing.expect(slot.waitNext() == .err);
-    try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     cullDecoding(&sch);
     try testing.expectEqual(@as(usize, 0), sch.decoding.items.len);
 }

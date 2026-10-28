@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 183 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 72, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
+**Summary.** 187 vars. By kind: tradeoff levers 13, diagnostics 47, microbenches 76, test-only seams 43, paths and config 6, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -76,7 +76,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `transformer.zig:2992, transformer.zig:3079` | `0` runs the stock QSA arm instead of the NAX path; `tests/test_qsa_nax_prefill.py` compares them | once | no |
 | `SUSHI_VISION_CHUNKED` | `generate.zig:1533` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (72)
+## Microbenches (76)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -89,7 +89,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS`, `SUSHI_DECODE_FWD_UBENCH_PROFILE`, `SUSHI_DECODE_FWD_UBENCH_ROW_ARMS` | `scheduler.zig` | GDN chain vs fused step, one extra profiled pass per width, MiMo verify width run prefill-shaped then as rows | load | yes: engine-kernels |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
 | `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_LOWK_UBENCH`, `SUSHI_EXL3_CHAIN_UBENCH`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms, low-rate decode chain, every-rate decode chain (lane funnel vs 64-bit merge); `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
-| `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_DSV41_EXPERT_UBENCH`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/dsv41_ubench.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) and the 384-expert grouped chain at the plan's layers, as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
+| `SUSHI_DSV41_STQ_UBENCH`, `SUSHI_DSV41_EXPERT_UBENCH`, `SUSHI_DSV41_SHARED_UBENCH`, `SUSHI_DSV41_SHARED_LAYOUT`, `SUSHI_UBENCH_STEPS`, `SUSHI_UBENCH_ROUNDS` | `exl3/linear.zig`, `exl3/dsv41_ubench.zig`, `exl3/bench_util.zig` | DeepSeek-V4.1 STQ trunk linears (`=<shape filter>` or `1`) the 384-expert grouped chain at the plan's layers and the shared expert beside it (separate, fused, routed only; `_LAYOUT` picks the layer), as chains of dependent calls; steps per chain and rounds | test | yes: engine-exl3-experts, perf-baselines |
 | `SUSHI_EXL3_ROWS_SWEEP` | `exl3/expert_exl3_kernels.zig` | the multi-row kernel's launch geometries per trunk shape, chained and independent (`qwen4`, `glm5`, `dsv41`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_TRUNK_UBENCH`, `SUSHI_DSV41_TRUNK_UBENCH_ROWS` | `exl3/expert_exl3_kernels.zig` | DeepSeek trunk linears at the real shapes by width under the served geometry, with a streaming memory floor (`=<shape filter>` or `1`; `_ROWS=1,2,..`) | test | yes: engine-exl3-experts |
 | `SUSHI_DSV41_INDEX_UBENCH`, `SUSHI_DSV41_ATTN_UBENCH` | `dsv41_model.zig` | DeepSeek decode indexer stages (scores, mask, top-k, candidate gather) and index-stream peak bytes by context; decode attention core vs fused error by case | test | yes: dsv41-arch |
@@ -103,9 +103,11 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_GLM_A6_SHAPES_UBENCH`, `SUSHI_GLM_ARMS_UBENCH`, `SUSHI_GLM_ATTN_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH_CTX`, `SUSHI_GLM_LONGCTX_UBENCH_REPS`, `SUSHI_GLM_QMM_UBENCH` | `glm5_a6_dense_once.zig`, `glm5_model.zig`, `glm5_attention.zig`, `glm5_dflash_qmm.zig` | GLM NAX-arm, sparse-attention, long-context and qmm meters (+ ctx/reps lists) | test | yes: glm5-perf, glm5-kernels |
 | `SUSHI_GLM_DECODE_UBENCH`, `SUSHI_GLM_DECODE_UBENCH_CTX`, `SUSHI_GLM_KDA_PREFILL_UBENCH` | `glm5_attention.zig`, `glm5_model.zig` | GLM serial-decode MLA attention stages per context list; KDA prefill layer components | test | yes: glm5-kernels |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
+| `SUSHI_QWEN_FOLD_UBENCH` | `qwen4_shared.zig` (test) | `1` times a Flash-Next MoE layer with the shared expert separate, folded (either grid order) and absent, one-bank and rate-grouped, as a dependent chain | test | yes: qwen4-perf |
+| `SUSHI_GLM_FOLD_UBENCH` | `glm5_shared.zig` (test) | `1` times a routed GLM layer with the shared expert separate, folded (either grid order) and absent, as a dependent chain | test | yes: glm5-kernels |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
 | `SUSHI_KVQ_MPP_UBENCH`, `SUSHI_KVQ_MPP_UBENCH_KV4`, `SUSHI_KVQ_SPLITK_UBENCH`, `SUSHI_KVQ_UBENCH` | `transformer.zig`, `kv_quant.zig` | quantized-KV attention meters: MiMo matmul2d and split-K decode (`_KV4` switches the 8-bit meter to 4-bit), the composed-read meter | test | no |
-| `SUSHI_MIMO_ROWS_UBENCH`, `SUSHI_MIMO_VISION_UBENCH`, `SUSHI_QWEN_VISION_UBENCH` | `transformer.zig`, `mimo_vision.zig`, `qwen_vision.zig` | MiMo verify-rows attention meter, MiMo-ViT and Qwen vision encoder meters (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
+| `SUSHI_VISION_Q8_REPORT`, `SUSHI_MIMO_ROWS_UBENCH`, `SUSHI_MIMO_VISION_UBENCH`, `SUSHI_QWEN_VISION_UBENCH` | `dsv41_vision.zig`, `transformer.zig`, `mimo_vision.zig`, `qwen_vision.zig` | requantized-tower report (cosine, time) on a real tower, MiMo verify-rows attention meter, MiMo-ViT and Qwen vision encoder meters (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `scheduler.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_SWA_FUSED_UBENCH`, `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `transformer.zig` | sliding-window fused kernel and QSA prefill/wide meters | test | no |
 

@@ -56,10 +56,6 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
 var completion_id_counter = std.atomic.Value(i64).init(0);
-/// Set from main.zig before serve() is called when --metrics is on; null
-/// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503.
-pub var g_metrics: ?*instr.Metrics = null;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
 /// CORS preflight requires the key — the OpenAI/Anthropic APIs AND the
@@ -818,6 +814,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/health",
     "/metrics",
     "/metrics.json",
+    "/metrics/enable",
     "/props",
     "/tokenize",
     "/v1/chat/completions",
@@ -845,7 +842,7 @@ fn crossOriginRefused(method: []const u8, path: []const u8, headers: []const u8,
         std.mem.eql(u8, method, "GET") and ws_mod.isUpgrade(headers)
     else
         std.mem.eql(u8, path, "/v1/load-model") or std.mem.eql(u8, path, "/v1/unload-model") or
-            std.mem.eql(u8, path, "/v1/models/rescan");
+            std.mem.eql(u8, path, "/v1/models/rescan") or std.mem.eql(u8, path, "/metrics/enable");
     if (!guarded) return false;
     const origin = findHeaderValueCI(headers, "origin") orelse return false;
     return !update_mod.originMatches(origin, if (std.mem.eql(u8, host, "0.0.0.0")) "127.0.0.1" else host, port);
@@ -1893,29 +1890,12 @@ pub fn serve(
     scheduler_mod.vision_fit_fault = &towerFitFaultText;
     defer scheduler_mod.vision_encode_available = null;
 
-    // Gauge sampler: samples instantaneous system + queue state every 2 s and
-    // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
-    // (a few non-blocking syscalls + one brief queue_mu lock per 2 s); never on
-    // the per-token decode path.
-    // LIFO defer ordering: `stop` is registered AFTER `join` so it runs FIRST
-    // (setting the flag), letting the thread exit before join() blocks. Do NOT
-    // gate on scheduler.shutdown here — deinit() (which sets that flag) is the
-    // earliest defer and runs LAST, after the join, so the loop would never see
-    // it; the dedicated `sampler_stop` flag avoids that LIFO deadlock.
-    var sampler_thread: ?std.Thread = null;
-    var sampler_stop = std.atomic.Value(bool).init(false);
-    if (g_metrics) |m| {
-        const ctx = GaugeSamplerCtx{
-            .metrics = m,
-            .scheduler = scheduler,
-            .stop = &sampler_stop,
-        };
-        sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
+    if (instr.current() != null) {
+        startGaugeSampler() catch |err| log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
         log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics and /metrics.json\n", .{ host, port });
     }
-    // LIFO: join deferred first → runs second. stop deferred second → runs first.
-    defer if (sampler_thread) |t| t.join();
-    defer sampler_stop.store(true, .monotonic);
+    // Registered after the scheduler's deinit defer, so it runs first and the sampler never reads a freed scheduler.
+    defer stopGaugeSampler();
 
     // Idle eviction (--idle-evict-secs). Same lifetime shape as the sampler,
     // and never in `Scheduler.deinit` — see `IdleEvictCtx.stop`.
@@ -2011,6 +1991,7 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
+    warnUserWireLimit();
     if (manualContext(config) > 0) {
         const ctx = model_settings.contextPick(server_config.max_context_size, config.ctx_override);
         log.info("Context size: {d} tokens ({s})\n", .{ ctx.value, model_settings.sourceLabel(ctx.source, "--ctx-size") });
@@ -2362,21 +2343,21 @@ fn handleConnection(
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
     // API-key gate above when --api-key is set (auth already enforced here).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
-        if (g_metrics) |m| {
+        if (instr.current()) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             try instr.renderPrometheus(m, &out.writer);
             // Quiet: don't dump the ~3 KB scrape body every 2 s at debug level.
             try sendResponseQuiet(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics, or POST /metrics/enable)");
         }
         return;
     }
     // JSON feed of the same counters. Behind the global API-key gate above
     // when --api-key is set.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
-        if (g_metrics) |m| {
+        if (instr.current()) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
             var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
@@ -2384,7 +2365,7 @@ fn handleConnection(
             // Quiet: dashboards poll this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics\"}");
+            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics, or POST /metrics/enable\"}");
         }
         return;
     }
@@ -2396,6 +2377,14 @@ fn handleConnection(
     if (crossOriginRefused(method, path, request[0..header_end_pos], listen_host, listen_port)) {
         log.debug("{s} {s} -> 403 (foreign Origin)\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "This route accepts browser requests from this server's own page only", 403);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/metrics/enable")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "/metrics/enable answers POST only", 405);
+            return;
+        }
+        try handleMetricsEnable(stream);
         return;
     }
     if (std.mem.eql(u8, path, "/v1/update")) {
@@ -2611,6 +2600,7 @@ fn handleConnection(
     // what clients budget against, and each model has its own dims. Idempotent,
     // and a no-op under `--ctx-size`.
     if (lm.config) |c| _ = pinAutoContext(c);
+    warnUserWireLimit();
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
@@ -2805,6 +2795,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 fn getGpuWorkingSetLimit() u64 {
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) == 0) {
@@ -3001,6 +2992,7 @@ pub fn resolveMlxCadence() void {
     var arch_z: [*:0]const u8 = "";
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) == 0) _ = mlx.mlx_device_info_get_string(&arch_z, info, "architecture");
@@ -3051,6 +3043,51 @@ pub fn wiredLimitBytes() u64 {
         0;
     wired_limit_read = true;
     return wired_limit_bytes_cached;
+}
+
+/// Bytes MLX wires beside the owned weights and slabs: the decode buffer pool (`dsv41_pool_bytes`), the one
+/// ledger term the owned-bytes count lacks.
+pub const USER_WIRE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// RAM a suggested user-wire limit leaves to the rest of the system.
+const USER_WIRE_RAM_FLOOR_BYTES: u64 = 12_000_000_000;
+
+/// PURE: the one-line warning for a load whose wired bytes pass macOS's user-wire cap, else null.
+/// `limits` are `vm.global_user_wire_limit` and `vm.user_wire_limit` (0 = unreadable); the lower binds.
+/// Past it prefill slows down with no error. The suggested value is the need or the declared
+/// `iogpu.wired_limit_mb`, rounded up to a whole GB, never above `total_ram` less a floor.
+pub fn userWireWarning(buf: []u8, owned_bytes: u64, limits: [2]u64, wired_limit: u64, total_ram: u64) ?[]const u8 {
+    const names = [2][]const u8{ "vm.global_user_wire_limit", "vm.user_wire_limit" };
+    const bind: usize = if (limits[0] == 0 or (limits[1] != 0 and limits[1] < limits[0])) 1 else 0;
+    const limit = limits[bind];
+    if (limit == 0) return null;
+    const need = owned_bytes +| USER_WIRE_MARGIN_BYTES;
+    if (need <= limit) return null;
+    const GB: u64 = 1_000_000_000;
+    const cap = total_ram -| USER_WIRE_RAM_FLOOR_BYTES;
+    const suggested = @min((@max(need, wired_limit) +| (GB - 1)) / GB * GB, cap / GB * GB);
+    const head = "[mem] warning: this load wires ~{d:.1} GB but {s} is {d:.1} GB: prefill will run slower. ";
+    const args = .{ @as(f64, @floatFromInt(need)) / 1e9, names[bind], @as(f64, @floatFromInt(limit)) / 1e9 };
+    if (suggested < need)
+        return std.fmt.bufPrint(buf, head ++ "This Mac cannot wire that much: use a smaller pack or a lower --ssd-budget-gb", args) catch null;
+    return std.fmt.bufPrint(buf, head ++ "Raise it: sudo sysctl vm.global_user_wire_limit={d} vm.user_wire_limit={d} (resets at reboot)", args ++ .{ suggested, suggested }) catch null;
+}
+
+fn readSysctlU64(name: [*:0]const u8) u64 {
+    var v: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    return if (sysctlbyname(name, @ptrCast(&v), &len, null, 0) == 0 and len == @sizeOf(u64)) v else 0;
+}
+
+var user_wire_warned = std.atomic.Value(bool).init(false);
+
+/// Warns once per process, after the weights and expert slabs are mapped, when they pass the user-wire cap.
+pub fn warnUserWireLimit() void {
+    if (user_wire_warned.cmpxchgStrong(false, true, .monotonic, .monotonic) != null) return;
+    var buf: [384]u8 = undefined;
+    const limits = [2]u64{ readSysctlU64("vm.global_user_wire_limit"), readSysctlU64("vm.user_wire_limit") };
+    if (userWireWarning(&buf, model_mod.ownedBytesTotal(), limits, wiredLimitBytes(), metrics.getTotalMemBytes())) |line|
+        log.warn("{s}\n", .{line});
 }
 
 var wired_floor_logged = std.atomic.Value(bool).init(false);
@@ -3316,7 +3353,7 @@ fn safeContextForBudget(
 ) u32 {
     if (per_tok == 0) return 1024;
     const max_seq: u64 = contextForBudget(working_set_limit, active_mem, hot_cache_reserve, per_tok);
-    if (max_seq == 0) return 1024;
+    if (max_seq < 1024) return 1024;
 
     var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
     // Cap at model's max position embeddings.
@@ -4247,7 +4284,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
         config.pinned_context,
         ceiling,
         active_mem,
-        ctxSizingCacheReserve(config),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)),
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
@@ -4333,13 +4370,14 @@ fn billedAutoContext(config: *const model_mod.ModelConfig) bool {
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
 fn ramFirstContextForLoad(config: *const model_mod.ModelConfig, kv_bits: u64, active_mem: u64, chunk: u32) u32 {
-    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, chunk));
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    if (billedAutoContext(config)) return billedAdvertisedContext(config, memoryContextAtChunk(config, kv_bits, ceiling, active_mem, chunk));
     return resolvedContextForLoad(
         manualContext(config),
         config.pinned_context,
-        currentGpuMemoryCeiling(config, active_mem),
+        ceiling,
         active_mem,
-        ctxSizingCacheReserve(config),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)),
         prefillTransientReserve(config, kv_bits, chunk),
         sessionBytesPerToken(config, kv_bits),
         config.contextCap(),
@@ -4496,10 +4534,12 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
 /// The SSD bytes one cached token costs this model at these settings, from the serialized geometry:
 /// the KV rows at the served width, the one pooled QSA history the entry writes, and the MTP head's KV
 /// and history where the head is on. Execution state (the QSA score bank) is
-/// RAM-only and never enters it; GLM's KDA checkpoints, DFlash2 window and MiMo's rings are fixed per entry.
+/// RAM-only and never enters it. A recurrent state is kept on every `POINT_GRID` tokens, so its share per token
+/// is billed; DFlash2's window and MiMo's rings are fixed per entry.
 pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (config.dsv41) |c| return dsv41_prefix.diskBytesPerToken(&c, config.dsparkOn());
-    const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken();
+    const points = (config.ssmCheckpointBytes() +| kv_disk_cache.POINT_GRID - 1) / kv_disk_cache.POINT_GRID;
+    const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken() +| points;
     if (config.isGlm5() or !config.longCtxGated() or !mtpHeadDefaultOn(config)) return rows;
     const layers = config.attnCacheLayerCount();
     if (layers == 0) return rows;
@@ -4541,23 +4581,26 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
     var q = qwen4DeployedTestConfig();
     // kv8 rows plus the one pooled history; the head is off.
     configured_mtp = false;
-    try t.expectEqual(@as(u64, 13_824), diskBytesPerToken(&q, 8));
+    // Plus its share of the recurrent state kept on every grid point.
+    const points = (q.ssmCheckpointBytes() + kv_disk_cache.POINT_GRID - 1) / kv_disk_cache.POINT_GRID;
+    try t.expect(points > 0);
+    try t.expectEqual(@as(u64, 13_824) + points, diskBytesPerToken(&q, 8));
     const head = mtpHeadKvBytesPerToken(&q) + q.qsaHistoryBytesPerToken() / q.attnCacheLayerCount();
     try t.expect(head > 0);
     configured_mtp = true;
-    try t.expectEqual(@as(u64, 13_824) + head, diskBytesPerToken(&q, 8));
+    try t.expectEqual(@as(u64, 13_824) + points + head, diskBytesPerToken(&q, 8));
     try t.expect(diskBytesPerToken(&q, 16) > diskBytesPerToken(&q, 8));
     // The score bank is execution state, never in an entry.
     for ([_]?bool{ true, false }) |fused| {
         transformer_mod.qsa_score_fused_override = fused;
         for ([_]bool{ false, true }) |mtp| {
             configured_mtp = mtp;
-            try t.expectEqual(@as(u64, 13_824) + (if (mtp) head else 0), diskBytesPerToken(&q, 8));
+            try t.expectEqual(@as(u64, 13_824) + points + (if (mtp) head else 0), diskBytesPerToken(&q, 8));
         }
     }
     transformer_mod.qsa_score_fused_override = false;
     configured_mtp = false;
-    try t.expect(sessionBytesPerToken(&q, 8) > diskBytesPerToken(&q, 8));
+    try t.expect(sessionBytesPerToken(&q, 8) > diskBytesPerToken(&q, 8) - points);
 
     // A ringed arch pays per token only on its global layers; its head is a fixed window.
     const mimo = mimoV2FlashBillConfig();
@@ -4570,12 +4613,14 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
     // GLM: the latent rows (6,688 at kv8, 11,968 BF16) and the pooled index; DFlash2's window is fixed per entry.
     var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
     glm.dflash_loaded = false;
-    try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
-    try t.expectEqual(@as(u64, 5_280), diskBytesPerToken(&glm, 6));
-    try t.expectEqual(@as(u64, 11_968), diskBytesPerToken(&glm, 16));
+    const glm_points = (glm.ssmCheckpointBytes() + kv_disk_cache.POINT_GRID - 1) / kv_disk_cache.POINT_GRID;
+    try t.expect(glm_points > 0);
+    try t.expectEqual(@as(u64, 6_688) + glm_points, diskBytesPerToken(&glm, 8));
+    try t.expectEqual(@as(u64, 5_280) + glm_points, diskBytesPerToken(&glm, 6));
+    try t.expectEqual(@as(u64, 11_968) + glm_points, diskBytesPerToken(&glm, 16));
     glm.dflash_loaded = true;
     glm.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
-    try t.expectEqual(@as(u64, 6_688), diskBytesPerToken(&glm, 8));
+    try t.expectEqual(@as(u64, 6_688) + glm_points, diskBytesPerToken(&glm, 8));
 }
 
 test "diskContextForLoad pins the served context, so the Allocating line names what /props and /v1/models name" {
@@ -5225,6 +5270,44 @@ test "a loaded streamed row reports its effective budget, an unloaded one the se
     try std.testing.expectEqual(@as(u32, 48), rowSsdBudgetGb(0, 48));
     try std.testing.expectEqual(@as(u32, 60), rowSsdBudgetGb(60 << 30, 48));
     try std.testing.expectEqual(@as(u32, 0), rowSsdBudgetGb(0, 0));
+}
+
+test "the user-wire warning fires when the wired bytes pass the lower macOS limit" {
+    const t = std.testing;
+    const GiB: u64 = 1 << 30;
+    // M5 Max 128 GB: `vm.global_user_wire_limit` defaults to memsize less 20.62 GB.
+    const ram: u64 = 137_438_953_472;
+    const default_limit: u64 = 116_820_000_000;
+    // A streamed DeepSeek load's owned bytes are its ssd budget less the 1 GiB MLX pool.
+    const owned = struct {
+        fn at(budget_gib: u64) u64 {
+            return (budget_gib - 1) * (1 << 30);
+        }
+    }.at;
+    var buf: [384]u8 = undefined;
+    try t.expect(userWireWarning(&buf, owned(108), .{ default_limit, default_limit }, 125_000 << 20, ram) == null);
+    for ([_]u64{ 111, 114 }) |b| {
+        const line = userWireWarning(&buf, owned(b), .{ default_limit, default_limit }, 125_000 << 20, ram) orelse return error.TestExpectedWarning;
+        try t.expect(std.mem.indexOf(u8, line, "vm.global_user_wire_limit is 116.8 GB") != null);
+        try t.expect(std.mem.indexOf(u8, line, "sudo sysctl vm.global_user_wire_limit=125000000000 vm.user_wire_limit=125000000000") != null);
+    }
+    const line = userWireWarning(&buf, owned(111), .{ default_limit, default_limit }, 0, ram).?;
+    try t.expect(std.mem.indexOf(u8, line, "wires ~119.2 GB") != null);
+    try t.expect(std.mem.indexOf(u8, line, "limit=120000000000 ") != null);
+    try t.expect(userWireWarning(&buf, owned(114), .{ 125_000_000_000, 125_000_000_000 }, 125_000 << 20, ram) == null);
+    // The per-process limit binds when it is the lower one; unreadable limits never warn.
+    try t.expect(std.mem.indexOf(u8, userWireWarning(&buf, owned(111), .{ 125_000_000_000, default_limit }, 0, ram).?, "vm.user_wire_limit is") != null);
+    try t.expect(userWireWarning(&buf, owned(114), .{ 0, 0 }, 0, ram) == null);
+    // A 96 GB Mac: the default limit is 15% under memsize; the suggestion stays 12 GB under RAM.
+    const ram96: u64 = 103_079_215_104;
+    const limit96: u64 = 87_600_000_000;
+    try t.expect(userWireWarning(&buf, 80 * GiB, .{ limit96, limit96 }, 0, ram96) == null);
+    const l96 = userWireWarning(&buf, 83 * GiB, .{ limit96, limit96 }, 0, ram96).?;
+    try t.expect(std.mem.indexOf(u8, l96, "limit=91000000000 ") != null);
+    // Past what the Mac may wire, raising the limit cannot help: the line says so.
+    const none = userWireWarning(&buf, 95 * GiB, .{ limit96, limit96 }, 0, ram96).?;
+    try t.expect(std.mem.indexOf(u8, none, "sudo") == null);
+    try t.expect(std.mem.indexOf(u8, none, "--ssd-budget-gb") != null);
 }
 
 test "ssd budget parses GiB and admits against the wired limit" {
@@ -6449,11 +6532,11 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
     // Flash-Next advertises the context its own request bill admits at the floor rung, from the
     // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
     if (config.longCtxGated()) {
-        const budget = admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config);
+        const budget = admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config));
         return maxSushiContextAtWidth(config, kv_bits, budget, null, .{ .mtp_on = mtpHeadDefaultOn(config) });
     }
     // DeepSeek's request bill grows with the prompt (the indexer's scores), so its context is the longest that bill admits.
-    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxSizingCacheReserve(config), chunk, .{});
+    if (config.isDsv41()) return maxSushiContextAtWidth(config, kv_bits, admissionAvailable(ceiling, active_mem) -| ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)), chunk, .{});
     //   KV cache: the arch's own caching-layer count and K/V widths, billed at the active kv-quant width.
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
     return safeContextForBudget(
@@ -6464,11 +6547,16 @@ fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceil
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
         // budget and not the ask: the ask starved the context, the resolved budget was a
         // one-step loop. Gated: off the gate this is the raw ask, so `/v1/models` is unchanged.
-        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
+        ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)) +| prefillTransientReserve(config, kv_bits, chunk),
         per_tok,
         // 0 = do not clamp to the checkpoint's max here; the caller applies it after the margin.
         0,
     );
+}
+
+/// The share of the room `reserve` may claim: the context is the primary claimant, so the cache never takes more than half.
+fn ctxCacheShare(ceiling: u64, active_mem: u64, reserve: u64) u64 {
+    return @min(reserve, admissionAvailable(ceiling, active_mem) / 2);
 }
 
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
@@ -6602,6 +6690,8 @@ pub const WarmPrefix = struct {
     /// The prefill moves each checkpoint to SSD as it is produced and frees the RAM copy, so at most
     /// `glm5_prefix.checkpoint_ram_held` states are in RAM at once.
     released: bool = false,
+    /// The request takes a thought point mid-decode: one more checkpoint state, held to its commit.
+    thought: bool = false,
 
     /// Rows of KV this request will not allocate: the rows the restored buffer already holds.
     /// Capacity is a ceiling on the credit, never a switch: a growing chain outruns its capacity
@@ -6862,6 +6952,19 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     return n * per_cp;
 }
 
+/// The checkpoint state a thinking request holds past its prefill's: the restore point behind its thought's closer, taken
+/// mid-decode and held to the commit (`generate.ThoughtPoint`).
+fn qwenThoughtPointBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    if (!warm.thought or !config.isQwen4() or ssm_checkpoint_stride == 0) return 0;
+    return config.ssmCheckpointBytes();
+}
+
+/// GLM's twin: held from the closer to the commit beside the checkpoints the commit lists, only for a request that keeps any.
+fn glmThoughtPointBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    if (!warm.thought or effectiveSsmCheckpointStride(ssm_checkpoint_stride, prefix_cache_capacity, prefix_cache_ram_enabled, diskBytesFor(config)) == 0 or warm.checkpoints == 0) return 0;
+    return config.ssmCheckpointBytes();
+}
+
 /// The most checkpoint states a Qwen request holds at once when its model runs an SSD tier: the write-through
 /// frees each one once its file is written, and a request it cannot serve is thinned to the same number
 /// (`scheduler.qwenCheckpointCap`). Null = every checkpoint stays in RAM.
@@ -6873,7 +6976,7 @@ fn ssmResidentCap(config: *const model_mod.ModelConfig) ?u64 {
 /// The checkpoints a GLM prefill of `seq` tokens takes after restoring `matched`: the one schedule the generator runs.
 fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) generate_mod.GlmCaptureSchedule {
     const offset: usize = @intCast(@min(matched, seq));
-    return generate_mod.glmCaptureSchedule(generate_mod.glm_checkpoint_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
+    return generate_mod.glmCaptureSchedule(generate_mod.glm_capture_stride, cap, offset, @as(usize, @intCast(seq)) - offset);
 }
 
 /// The restore points a DeepSeek prefill holds in RAM while it runs: with a RAM tier the capped list plus the copy
@@ -7118,7 +7221,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .state_bytes = reserved * (statePerTokenBilled(config) +| head_state_per_tok) +|
             (if (mtp_on) mimo_mtp.State.billedBytes(config) else 0),
         // The warm span, not the prompt; read regardless of `will_donate` (a shared restore skips the same rows).
-        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +| qwenThoughtPointBytes(config, warm),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
@@ -7371,6 +7474,44 @@ pub const AdmissionBill = struct {
     }
 };
 
+/// Unloads idle resident models, least recently used first, until `fits` holds; false when
+/// nothing idle is left. An idle model is memory its next request reloads.
+pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadOne: fn (@TypeOf(ctx)) bool) bool {
+    while (!fits(ctx)) if (!unloadOne(ctx)) return false;
+    return true;
+}
+
+test "a prompt that does not fit unloads idle models, oldest first, until it fits" {
+    const t = std.testing;
+    const Fake = struct {
+        needed: u64,
+        available: u64,
+        idle: []const u64, // resident bytes, least recently used first
+        unloaded: usize = 0,
+        fn fits(f: *@This()) bool {
+            return f.needed <= f.available;
+        }
+        fn unloadOne(f: *@This()) bool {
+            if (f.unloaded == f.idle.len) return false;
+            f.available += f.idle[f.unloaded];
+            f.unloaded += 1;
+            return true;
+        }
+    };
+    // Already fits: nothing is unloaded.
+    var a = Fake{ .needed = 5, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(fitAfterUnloadingIdle(&a, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 0), a.unloaded);
+    // One idle model is enough: the second stays resident.
+    var b = Fake{ .needed = 10_558, .available = 9_466, .idle = &.{ 14_730, 8_000 } };
+    try t.expect(fitAfterUnloadingIdle(&b, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 1), b.unloaded);
+    // Every idle model goes and it still does not fit: refused.
+    var c = Fake{ .needed = 50, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(!fitAfterUnloadingIdle(&c, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 2), c.unloaded);
+}
+
 test "a refusal names the credit it COMPARED, never the residency it cannot take" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
@@ -7421,7 +7562,7 @@ pub fn prefillNeededAtChunk(
     if (config.isGlm5()) {
         return (glmCacheBytes(config, seq, max_tokens, kv_bits) +| @max(
             glm5TransientBytes(config, seq, chunk, kv_bits) +| glmPrefixStateBytes(config, seq, warm),
-            glmCommitStateBytes(config, seq, warm, kv_bits),
+            glmCommitStateBytes(config, seq, warm, kv_bits) +| glmThoughtPointBytes(config, warm),
         )) *| 5 / 4 +|
             (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +|
             cadenceInflightBytes(mlx_mb_per_buffer);
@@ -7866,6 +8007,7 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
         .mtp_on = enable_mtp,
         .checkpoints = checkpoints.keep,
         .released = checkpoints.released,
+        .thought = checkpoints.thought,
     }).fits();
 }
 
@@ -7894,6 +8036,7 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
         .mtp_on = enable_mtp,
         .checkpoints = checkpoints.keep,
         .released = checkpoints.released,
+        .thought = checkpoints.thought,
     };
     const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, warm);
     const mb = 1024 * 1024;
@@ -7916,7 +8059,31 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     return context;
 }
 
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
+/// `fitAfterUnloadingIdle`'s context for one request: each unload re-bills the same prompt.
+const IdleUnloadFit = struct {
+    sch: *scheduler_mod.Scheduler,
+    keep_id: []const u8,
+    bill: *AdmissionBill,
+    config: *const model_mod.ModelConfig,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    kv_override: ?transformer_mod.KVQuantConfig,
+    unchunked_prefill: bool,
+    enable_mtp: bool,
+
+    fn fits(self: *IdleUnloadFit) bool {
+        return self.bill.fitsAfterEviction();
+    }
+
+    fn unloadOne(self: *IdleUnloadFit) bool {
+        const gone = self.sch.unloadLruIdleModel(self.keep_id) orelse return false;
+        log.info("  prompt {d} tokens does not fit: unloaded idle model {s} ({d} MB)\n", .{ self.prompt_ids.len, gone.id, gone.bytes / (1024 * 1024) });
+        self.bill.* = prefillAdmissionBill(self.config, self.prompt_ids.len, self.max_tokens, self.kv_override, self.unchunked_prefill, self.prompt_ids, .{ .mtp_on = self.enable_mtp });
+        return true;
+    }
+};
+
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, keep_id: []const u8, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
     if (config.isGlm5() and (kv_override orelse configuredKvQuantFor(config)).glmLatentBits() == null) {
         const msg = "GLM native MLA cache supports kv_quant 8, 6 or off.";
         if (is_anthropic) {
@@ -7929,7 +8096,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
     const prompt_len: usize = prompt_ids.len;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
+    var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
     logAdmissionDecision(bill);
     const needed = bill.needed;
     const available = bill.available;
@@ -7950,9 +8117,15 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         });
         return true;
     }
-    if (needed > available) {
-        const needed_mb = needed / (1024 * 1024);
-        const avail_mb = available / (1024 * 1024);
+    // Idle resident models are memory too: a connection thread asks the inference thread to unload
+    // them, least recently used first, before it refuses.
+    if (needed > available) if (global_scheduler) |sch| {
+        var unloading = IdleUnloadFit{ .sch = sch, .keep_id = keep_id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
+        if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
+    };
+    if (bill.needed > bill.available) {
+        const needed_mb = bill.needed / (1024 * 1024);
+        const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm). The cache
@@ -9084,6 +9257,18 @@ fn busyForUpdate(io: std.Io) bool {
 
 /// `POST /v1/update`: `update.guard` decides. On accept the answer is 202 and the server shuts down through its
 /// SIGTERM path; main then replaces the process with the updater (`update.relaunchIfRequested`).
+/// Turns metrics on for the running server; 200 whether this call did it or it was already on. Counters start
+/// from zero at the moment of the first enable.
+fn handleMetricsEnable(stream: *Conn) !void {
+    const changed = instr.process.enable();
+    startGaugeSampler() catch |err| {
+        log.err("metrics gauge sampler failed to start: {s}\n", .{@errorName(err)});
+        return sendResponse(stream, "500 Internal Server Error", "application/json", "{\"error\":\"metrics enabled but the gauge sampler did not start; retry\"}");
+    };
+    if (changed) log.info("Prometheus metrics: ENABLED at runtime (POST /metrics/enable)\n", .{});
+    try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
+}
+
 fn handleUpdate(allocator: std.mem.Allocator, stream: *Conn, headers: []const u8, raw_path: []const u8) !void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     var rbuf: [512]u8 = undefined;
@@ -10325,7 +10510,7 @@ fn handleChatCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -10583,7 +10768,7 @@ fn handleCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty_c, .frequency_penalty = frequency_penalty_c }, logprobs_n);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, root);
     var sampling = generate_mod.SamplingParams{
@@ -13054,9 +13239,40 @@ fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u
     } else try stream.flush();
 }
 
-fn logHttpRequest(method: []const u8, path: []const u8, body: []const u8) void {
+/// `raw_path` with the value of every `api_key` / `key` query parameter replaced by `***`; a query too long for
+/// `buf` is dropped whole rather than risk logging a key.
+fn redactQueryKeys(buf: []u8, raw_path: []const u8) []const u8 {
+    const qpos = std.mem.indexOfScalar(u8, raw_path, '?') orelse return raw_path;
+    const fail_closed = raw_path[0 .. qpos + 1];
+    if (qpos + 1 > buf.len) return fail_closed[0..@min(fail_closed.len, buf.len)];
+    @memcpy(buf[0 .. qpos + 1], fail_closed);
+    var n = qpos + 1;
+    var it = std.mem.splitScalar(u8, raw_path[qpos + 1 ..], '&');
+    var first = true;
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=');
+        const secret = eq != null and (std.mem.eql(u8, pair[0..eq.?], "api_key") or std.mem.eql(u8, pair[0..eq.?], "key"));
+        const kept = if (secret) pair[0 .. eq.? + 1] else pair;
+        const tail = if (secret) "***" else "";
+        const need = @intFromBool(!first) + kept.len + tail.len;
+        if (n + need > buf.len) return fail_closed;
+        if (!first) {
+            buf[n] = '&';
+            n += 1;
+        }
+        @memcpy(buf[n..][0..kept.len], kept);
+        n += kept.len;
+        @memcpy(buf[n..][0..tail.len], tail);
+        n += tail.len;
+        first = false;
+    }
+    return buf[0..n];
+}
+
+fn logHttpRequest(method: []const u8, raw_path: []const u8, body: []const u8) void {
     if (!log.isDebug()) return;
-    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, path, body.len });
+    var buf: [1024]u8 = undefined;
+    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, redactQueryKeys(&buf, raw_path), body.len });
     logHttpBody("[http] request body", body);
 }
 
@@ -13255,6 +13471,39 @@ fn idleEvictLoop(ctx: IdleEvictCtx) void {
             };
         }
     }
+}
+
+const sampler_idle = 0;
+const sampler_spawning = 1;
+const sampler_running = 2;
+const sampler_closed = 3;
+var sampler_state = std.atomic.Value(u8).init(sampler_idle);
+var sampler_thread: std.Thread = undefined;
+var sampler_stop = std.atomic.Value(bool).init(false);
+
+/// Starts the gauge sampler once, from `--metrics` at boot or from `POST /metrics/enable`, whichever gets
+/// there first. A no-op while metrics are off, before the scheduler exists, and after shutdown began.
+fn startGaugeSampler() !void {
+    const m = instr.current() orelse return;
+    const sch = global_scheduler orelse return;
+    if (sampler_state.cmpxchgStrong(sampler_idle, sampler_spawning, .acquire, .monotonic) != null) return;
+    errdefer sampler_state.store(sampler_idle, .release);
+    sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{GaugeSamplerCtx{ .metrics = m, .scheduler = sch, .stop = &sampler_stop }});
+    sampler_state.store(sampler_running, .release);
+}
+
+fn stopGaugeSampler() void {
+    sampler_stop.store(true, .monotonic);
+    while (true) switch (sampler_state.load(.acquire)) {
+        sampler_idle => if (sampler_state.cmpxchgStrong(sampler_idle, sampler_closed, .acq_rel, .monotonic) == null) return,
+        sampler_spawning => std.atomic.spinLoopHint(),
+        sampler_running => {
+            sampler_thread.join();
+            sampler_state.store(sampler_closed, .release);
+            return;
+        },
+        else => return,
+    };
 }
 
 fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
@@ -13591,6 +13840,91 @@ test "dashboard page: --api-key leaves the page open and keeps the metrics feed 
         defer t.allocator.free(response);
         try t.expect(std.mem.startsWith(u8, response, c.status));
     }
+}
+
+test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
+        const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
+        defer t.allocator.free(request);
+        const off = try serveOneForTest(request);
+        defer t.allocator.free(off);
+        try t.expect(std.mem.startsWith(u8, off, "HTTP/1.1 503 "));
+        try t.expect(std.mem.indexOf(u8, responseBody(off), "POST /metrics/enable") != null);
+    }
+    const first = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(first);
+    try t.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200 OK\r\n"));
+    try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":false}", responseBody(first));
+    try t.expect(instr.current() != null);
+    for ([_][]const u8{ "/metrics", "/metrics.json" }) |path| {
+        const request = try std.fmt.allocPrint(t.allocator, "GET {s} HTTP/1.1\r\n\r\n", .{path});
+        defer t.allocator.free(request);
+        const on = try serveOneForTest(request);
+        defer t.allocator.free(on);
+        try t.expect(std.mem.startsWith(u8, on, "HTTP/1.1 200 OK\r\n"));
+    }
+    const core = instr.current().?;
+    core.recordRejected();
+    const again = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(again);
+    try t.expect(std.mem.startsWith(u8, again, "HTTP/1.1 200 OK\r\n"));
+    try t.expectEqualStrings("{\"metrics\":true,\"already_enabled\":true}", responseBody(again));
+    try t.expect(instr.current().? == core);
+    try t.expectEqual(@as(u64, 1), core.requests_rejected_total.load());
+}
+
+test "metrics enable: any other method is a 405 and leaves metrics off" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    for ([_][]const u8{ "GET", "PUT", "DELETE" }) |method| {
+        const request = try std.fmt.allocPrint(t.allocator, "{s} /metrics/enable HTTP/1.1\r\n\r\n", .{method});
+        defer t.allocator.free(request);
+        const response = try serveOneForTest(request);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.startsWith(u8, response, "HTTP/1.1 405 "));
+    }
+    try t.expect(instr.current() == null);
+}
+
+test "metrics enable: --api-key binds the route, and a foreign Origin is refused before it acts" {
+    const t = std.testing;
+    instr.process = .{};
+    defer instr.process = .{};
+    const prev_key = g_api_key;
+    const prev_strict = g_api_key_strict;
+    const old_host = listen_host;
+    const old_port = listen_port;
+    defer {
+        g_api_key = prev_key;
+        g_api_key_strict = prev_strict;
+        listen_host = old_host;
+        listen_port = old_port;
+    }
+    g_api_key = "s3cret";
+    g_api_key_strict = true;
+    listen_host = "127.0.0.1";
+    listen_port = 12345;
+    const keyless = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(keyless);
+    try t.expect(std.mem.startsWith(u8, keyless, "HTTP/1.1 401 "));
+    const wrong = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer nope\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(wrong);
+    try t.expect(std.mem.startsWith(u8, wrong, "HTTP/1.1 401 "));
+    try t.expect(instr.current() == null);
+
+    const foreign = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nOrigin: http://evil.test\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(foreign);
+    try t.expect(std.mem.startsWith(u8, foreign, "HTTP/1.1 403 "));
+    try t.expect(instr.current() == null);
+
+    const ok = try serveOneForTest("POST /metrics/enable HTTP/1.1\r\nAuthorization: Bearer s3cret\r\nOrigin: http://localhost:12345\r\nContent-Length: 0\r\n\r\n");
+    defer t.allocator.free(ok);
+    try t.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK\r\n"));
+    try t.expect(instr.current() != null);
 }
 
 test "chat page: another method on the page paths is refused before any model resolves" {
@@ -14116,7 +14450,7 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
 
 /// A request refused before it owned a slot. A null sink (metrics off) is one branch.
 fn countRejected() void {
-    if (g_metrics) |m| m.recordRejected();
+    if (instr.current()) |m| m.recordRejected();
 }
 
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
@@ -14676,12 +15010,12 @@ fn imageCountFault(n_images: usize) MediaFault {
 
 /// Why an image URL did not decode, in words a client can act on.
 fn imageRejectReason(url: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, url, "data:")) return "remote URLs are not fetched; send a base64 data URL (data:image/jpeg|png|webp;base64,...)";
-    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return "the data URL is not base64 (data:image/jpeg|png|webp;base64,...)";
+    if (!std.mem.startsWith(u8, url, "data:")) return "remote URLs are not fetched; send a base64 data URL (data:image/jpeg|png|gif|bmp|webp;base64,...)";
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return "the data URL is not base64 (data:image/jpeg|png|gif|bmp|webp;base64,...)";
     for (url[sep + 8 ..]) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '/' and c != '=') return "the base64 payload is malformed";
     }
-    return "the payload is not a readable JPEG, PNG or WebP image";
+    return "the payload is not a readable JPEG, PNG, GIF, BMP or WebP image";
 }
 
 fn responsesMediaRefusal(pi: *const responses_mod.ParsedInput) ?MediaFault {
@@ -15421,7 +15755,7 @@ fn prepareRequestMedia(
     }
     var bad_image: usize = 0;
     const chain = keyMedia(allocator, config, placed.items, flat.images, flat.videos, &bad_image) catch |err| switch (err) {
-        error.ImageUndecodable => return .{ .refused = MediaFault.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG or WebP image", .{bad_image + 1}) },
+        error.ImageUndecodable => return .{ .refused = MediaFault.init(false, "image {d} could not be decoded: the payload is not a readable JPEG, PNG, GIF, BMP or WebP image", .{bad_image + 1}) },
         else => return err,
     };
     var ready: PreparedMedia = .{ .chain = chain };
@@ -15520,7 +15854,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
     return .{ .samples = raw_buf };
 }
 
-/// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
+/// Decode a JPEG/PNG/GIF/BMP image buffer to float32 CHW pixels, resized to target_size.
 /// Uses stb_image for decoding, then nearest-neighbor resize + CHW conversion.
 /// Decode an image content URL into preprocessed float32 CHW pixels. Supports:
 ///   data:image/x-mlx-pixels;base64,... (already-preprocessed float32 CHW)
@@ -15678,7 +16012,7 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_
     }
 
     if (std.mem.startsWith(u8, mime, "data:image/")) {
-        // JPEG/PNG/WebP — decode + resize + convert to float32 CHW (Gemma) or
+        // JPEG/PNG/GIF/BMP/WebP — decode + resize + convert to float32 CHW (Gemma) or
         // smart-resized merge-order pixel_values (Qwen3-VL).
         const started = monotonicNs();
         const img = decodeImageToPixels(allocator, raw_buf, vp);
@@ -15703,7 +16037,7 @@ fn isDecodedImageMime(mime: []const u8) bool {
     return std.mem.startsWith(u8, mime, "data:image/") and !std.mem.eql(u8, mime, "data:image/x-mlx-pixels");
 }
 
-/// The pixel size of a JPEG/PNG/WebP file, read from its header: stb first, as the decode tries them.
+/// The pixel size of a JPEG/PNG/GIF/BMP/WebP file, read from its header: stb first, as the decode tries them.
 fn imageHeaderSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -15752,7 +16086,7 @@ fn decodeEncodedImage(allocator: std.mem.Allocator, encoded: []const u8, config:
     return decodeImageToPixels(allocator, encoded, visionPreprocFromConfig(config));
 }
 
-/// One `image_url` as the request holds it: a patch-grid tower's JPEG/PNG/WebP stays encoded until its
+/// One `image_url` as the request holds it: a patch-grid tower's JPEG/PNG/GIF/BMP/WebP stays encoded until its
 /// tower call, anything else decodes here.
 fn imageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     if (vp.mode != .gemma) if (std.mem.indexOf(u8, url, ";base64,")) |sep| {
@@ -15964,7 +16298,7 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF/BMP) — 4 channels so transparency composites onto white.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
@@ -16357,7 +16691,7 @@ test "an undecodable image is refused naming its message and the reason" {
     const cases = [_]Case{
         .{ .url = "https://example.com/shot.png", .reason = "remote URLs are not fetched" },
         .{ .url = "data:image/png;base64,@@@@", .reason = "base64 payload is malformed" },
-        .{ .url = "data:image/png;base64,AAAA", .reason = "not a readable JPEG, PNG or WebP" },
+        .{ .url = "data:image/png;base64,AAAA", .reason = "not a readable JPEG, PNG, GIF, BMP or WebP" },
     };
     for (cases) |c| {
         const body = try std.fmt.allocPrint(std.testing.allocator, "{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}},{{\"role\":\"assistant\",\"content\":\"ok\"}},{{\"role\":\"user\",\"content\":[{{\"type\":\"image_url\",\"image_url\":{{\"url\":\"{s}\"}}}}]}}]}}", .{c.url});
@@ -16980,7 +17314,7 @@ fn handleAnthropicMessages(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, true, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -18971,7 +19305,7 @@ fn handleResponsesInner(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm.id, false, kv_quant_override, generate_mod.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -20655,6 +20989,7 @@ fn storeResponse(
         history[i] = .{
             .role = try a.dupe(u8, m.role),
             .content = try a.dupe(u8, m.content),
+            .reasoning_content = if (m.reasoning_content) |rc| try a.dupe(u8, rc) else null,
             .tool_call_id = if (m.tool_call_id) |tid| try a.dupe(u8, tid) else null,
             .tool_calls = if (m.tool_calls) |tcs| blk: {
                 const copied = try a.alloc(chat_mod.ToolCall, tcs.len);
@@ -20670,16 +21005,8 @@ fn storeResponse(
         };
     }
     if (keep_assistant) {
-        // Build the assistant message that produced this response.
-        var assistant_text_parts = std.ArrayList(u8).empty;
-        defer assistant_text_parts.deinit(a);
-        if (reasoning_text) |rt| {
-            try assistant_text_parts.appendSlice(a, "<think>");
-            try assistant_text_parts.appendSlice(a, rt);
-            try assistant_text_parts.appendSlice(a, "</think>");
-        }
-        try assistant_text_parts.appendSlice(a, visible_text);
-        const assistant_content = try a.dupe(u8, assistant_text_parts.items);
+        const assistant_content = try a.dupe(u8, visible_text);
+        const assistant_reasoning: ?[]const u8 = if (reasoning_text) |rt| try a.dupe(u8, rt) else null;
 
         var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
         if (tool_calls) |tcs| if (tcs.len > 0) {
@@ -20697,6 +21024,7 @@ fn storeResponse(
         history[total_msgs - 1] = .{
             .role = try a.dupe(u8, "assistant"),
             .content = assistant_content,
+            .reasoning_content = assistant_reasoning,
             .tool_calls = assistant_tool_calls,
         };
     }
@@ -21758,6 +22086,89 @@ test "Responses history omits loop cuts while retaining the response and input" 
     try testing.expectEqual(@as(usize, 2), next.history.len);
     try testing.expectEqualStrings("hi", next.history[0].content);
     try testing.expectEqualStrings("answer", next.history[1].content);
+}
+
+fn renderQwenForResponsesTest(a: std.mem.Allocator, messages: []const chat_mod.Message) ![]const u8 {
+    const config = chat_mod.ChatConfig{
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = a,
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
+    return chat_mod.renderChatTemplate(a, messages, &config, tools, null, true, null, false);
+}
+
+test "Responses: a stored chain and an input replay render the same Qwen prompt" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const a = testing.allocator;
+    const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
+    const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
+    try storeResponse(testing.io, a, "r1", "model", "completed", "{}", &first, "", "inspect it", &calls, null);
+    const stored = global_response_store.?.map.get("r1").?;
+
+    const out = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"function_call_output","call_id":"c1","output":"done"}]
+    , .{});
+    defer out.deinit();
+    var chained = try responses_mod.parseInput(a, out.value, null, stored.history, null, .{});
+    defer chained.deinit();
+
+    const replay = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"inspect it"}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"id\":1}"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"done"}]
+    , .{});
+    defer replay.deinit();
+    var replayed = try responses_mod.parseInput(a, replay.value, null, null, null, .{});
+    defer replayed.deinit();
+
+    const by_chain = try renderQwenForResponsesTest(a, chained.messages.items);
+    defer a.free(by_chain);
+    const by_replay = try renderQwenForResponsesTest(a, replayed.messages.items);
+    defer a.free(by_replay);
+    try testing.expectEqualStrings(by_replay, by_chain);
+    try testing.expect(std.mem.indexOf(u8, by_chain, "inspect it") != null);
+}
+
+test "Responses: a stored reasoning turn renders as the model's own think block" {
+    const a = testing.allocator;
+    const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
+    // The Qwen3.8 template reads only reasoning_content; an inline <think> in content renders as literal text.
+    const inline_think = [_]chat_mod.Message{
+        .{ .role = "user", .content = "compare" },
+        .{ .role = "assistant", .content = "<think>inspect it</think>", .tool_calls = &calls },
+        .{ .role = "tool", .content = "done", .tool_call_id = "c1" },
+    };
+    const field = [_]chat_mod.Message{
+        inline_think[0],
+        .{ .role = "assistant", .content = "", .reasoning_content = "inspect it", .tool_calls = &calls },
+        inline_think[2],
+    };
+    const r_inline = try renderQwenForResponsesTest(a, &inline_think);
+    defer a.free(r_inline);
+    const r_field = try renderQwenForResponsesTest(a, &field);
+    defer a.free(r_field);
+    try testing.expect(std.mem.indexOf(u8, r_field, "<think>\ninspect it\n</think>\n\n<tool_call>") != null);
+    try testing.expect(std.mem.indexOf(u8, r_inline, "<think>\ninspect it\n</think>") == null);
+}
+
+test "Responses history keeps reasoning as reasoning_content, as an input replay does" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+    const messages = [_]chat_mod.Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "replayed thought" },
+    };
+    try storeResponse(testing.io, testing.allocator, "r1", "model", "completed", "{}", &messages, "answer", "fresh thought", null, null);
+    const stored = global_response_store.?.map.get("r1").?;
+    try testing.expectEqual(@as(usize, 3), stored.history.len);
+    try testing.expectEqualStrings("replayed thought", stored.history[1].reasoning_content.?);
+    try testing.expectEqualStrings("answer", stored.history[2].content);
+    try testing.expectEqualStrings("fresh thought", stored.history[2].reasoning_content.?);
 }
 
 test "deinitGlobalResponseStore frees stored responses" {
@@ -23785,7 +24196,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
     // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ceiling, active_mem, ctxSizingCacheReserve(config)) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
 }
 
 test "the chunk the guard BILLS is the chunk the forward will RUN" {
@@ -27340,6 +27751,8 @@ test "cross-origin policy: a foreign Origin is refused on the state-changing rou
         .{ .method = "POST", .path = "/v1/unload-model", .headers = "Origin: null\r\n", .refused = true },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "ORIGIN: http://127.0.0.1:12346\r\n", .refused = true },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://evil.test\r\n", .refused = true },
+        .{ .method = "POST", .path = "/metrics/enable", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/load-model", .headers = "Origin: http://localhost:12345\r\n", .refused = false },
         .{ .method = "POST", .path = "/v1/models/rescan", .headers = "Origin: http://127.0.0.1:12345\r\n", .refused = false },
         .{ .method = "GET", .path = "/v1/responses", .headers = ws ++ "Origin: http://127.0.0.1:12345\r\n", .refused = false },
@@ -27839,9 +28252,9 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
     const cap = glm5_prefix.checkpointMax(16);
     try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }));
     prefix_cache_capacity = 32;
-    // Every 2048-token chunk boundary and the prompt end, thinned to the GLM cap; the newest
+    // Every 8192-token grid point and the prompt end, thinned to the GLM cap; the newest
     // copy exists before each thin.
-    const held = (@as(u64, cap) + 1) * per_cp + cfg.dflash_window_bytes;
+    const held = @as(u64, glmPrefillSchedule(65536, 0, cap).peak) * per_cp + cfg.dflash_window_bytes;
     try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = cap }));
     const on = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{ .checkpoints = cap });
     try std.testing.expect(on - off >= held * 5 / 4 - 1 and on - off <= held * 5 / 4 + 1);
@@ -27852,8 +28265,8 @@ test "GLM admission bills the checkpoints and assistant window a request keeps; 
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
     try std.testing.expectEqual(ctx_off, memoryContextAtChunk(&cfg, 8, 120 << 30, 100 << 30, 2048));
-    // A warm restore at 61440 captures only over its own span: 63488 and the prompt-end checkpoint (65536 is past the loop's end).
-    try std.testing.expectEqual(2 * per_cp, retainedSsmCheckpointBytes(&cfg, 65536, 61440, 2048));
+    // A warm restore at 61440 captures only over its own span: the prompt-end checkpoint (the grid point 65536 is past the loop's end).
+    try std.testing.expectEqual(per_cp, retainedSsmCheckpointBytes(&cfg, 65536, 61440, 2048));
     try std.testing.expect(prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, .{ .matched_tokens = 61440, .checkpoints = cap }) < on);
 }
 
@@ -27882,7 +28295,7 @@ test "GLM billed checkpoint peak equals the checkpoints its prefill captures, wh
         ssm_checkpoint_stride = stride;
         for (cases) |c| for (0..9) |cap_usize| {
             const cap: u32 = @intCast(cap_usize);
-            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, c.matched, c.seq - c.matched, 2048);
+            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, c.matched, c.seq - c.matched, 2048);
             const billed = glmPrefixStateBytes(&cfg, c.seq, .{ .matched_tokens = c.matched, .checkpoints = cap });
             const want: u64 = if (cap == 0) 0 else @as(u64, oracle.peak) * per_cp;
             std.testing.expectEqual(want, billed) catch |e| {
@@ -27922,7 +28335,7 @@ test "GLM admission bills the commit's row copy, so a long generation cannot com
         const staged: u64 = 0;
         for ([_]u64{ 64, 131_072, 900_000, 1_040_000 }) |seq| {
             const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
-            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, cap, 0, seq, 2048);
+            const oracle = generate_mod.glmCaptureOracle(generate_mod.glm_checkpoint_stride, generate_mod.glm_capture_stride, cap, 0, seq, 2048);
             // Eight spread checkpoints below the newest, each at its real size.
             var positions: [8]usize = undefined;
             const bytes: [8]u64 = @splat(per_cp);
@@ -27981,7 +28394,7 @@ test "GLM SSD-only bills its checkpoints and window, no writer term (the shared 
     prefix_cache_capacity = 32;
     prefix_cache_disk_bytes = 12 << 30;
     prefix_cache_ram_enabled = false;
-    const held = (@as(u64, glm5_prefix.checkpointMax(16)) + 1) * cfg.ssmCheckpointBytes() + cfg.dflash_window_bytes;
+    const held = @as(u64, glmPrefillSchedule(65536, 0, glm5_prefix.checkpointMax(16)).peak) * cfg.ssmCheckpointBytes() + cfg.dflash_window_bytes;
     try std.testing.expectEqual(held, glmPrefixStateBytes(&cfg, 65536, .{ .checkpoints = glm5_prefix.checkpointMax(16) }));
     try std.testing.expectEqual(@as(u64, 0), glmPrefixStateBytes(&cfg, 65536, .{}));
     try std.testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(&cfg));
@@ -27989,7 +28402,7 @@ test "GLM SSD-only bills its checkpoints and window, no writer term (the shared 
     try std.testing.expectEqual(sizer_off, prefillTransientReserve(&cfg, 8, 2048));
 }
 
-test "GLM bills two KDA states, not nine, while its prefill moves each to SSD and frees the RAM copy" {
+test "GLM bills two KDA states, not eight, while its prefill moves each to SSD and frees the RAM copy" {
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.dflash_loaded = true;
     cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
@@ -28011,18 +28424,18 @@ test "GLM bills two KDA states, not nine, while its prefill moves each to SSD an
     const cap = glm5_prefix.checkpointMax(16);
     const keeps = WarmPrefix{ .checkpoints = cap };
     const releases = WarmPrefix{ .checkpoints = cap, .released = true };
-    // 65,536 tokens capture 32 grid points and the prompt end: nine held before, two now.
-    try std.testing.expectEqual(9 * per_cp + window, glmPrefixStateBytes(&cfg, 65536, keeps));
+    // 65,536 tokens capture 7 grid points and the prompt end: eight held before, two now.
+    try std.testing.expectEqual(8 * per_cp + window, glmPrefixStateBytes(&cfg, 65536, keeps));
     try std.testing.expectEqual(2 * per_cp + window, glmPrefixStateBytes(&cfg, 65536, releases));
     // A prompt that captures one checkpoint holds one either way.
     try std.testing.expectEqual(per_cp + window, glmPrefixStateBytes(&cfg, 100, releases));
     // The commit after the response: the checkpoints it lists, its two newest still in RAM.
     try std.testing.expectEqual(8 * per_cp + window, glmCommitStateBytes(&cfg, 65536, keeps, 8));
     try std.testing.expectEqual(2 * per_cp + window, glmCommitStateBytes(&cfg, 65536, releases, 8));
-    // Admission follows the storage: the difference is the seven states that are no longer held (a 5/4 margin rides the checkpoints).
+    // Admission follows the storage: the difference is the six states that are no longer held (a 5/4 margin rides the checkpoints).
     const kept_bill = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, keeps);
     const released_bill = prefillNeededAtChunk(&cfg, 65536, 1024, 8, 2048, releases);
-    try std.testing.expect(kept_bill - released_bill >= 7 * per_cp * 5 / 4 - 1 and kept_bill - released_bill <= 7 * per_cp * 5 / 4 + 1);
+    try std.testing.expect(kept_bill - released_bill >= 6 * per_cp * 5 / 4 - 1 and kept_bill - released_bill <= 6 * per_cp * 5 / 4 + 1);
 }
 
 test "GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused" {
@@ -28213,14 +28626,12 @@ test "a non-stream generation without a stop in its text runs to the end" {
 }
 
 test "countRejected moves only the rejected counter, and does nothing with metrics off" {
-    const saved = g_metrics;
-    defer g_metrics = saved;
-
-    g_metrics = null;
+    instr.process = .{};
+    defer instr.process = .{};
     countRejected();
 
-    var m = instr.Metrics.init();
-    g_metrics = &m;
+    _ = instr.process.enable();
+    const m = instr.current().?;
     countRejected();
     try std.testing.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
     try std.testing.expectEqual(@as(u64, 0), m.requests_failed_total.load());
@@ -28833,4 +29244,91 @@ test "count_tokens: both routes render a body to the same prompt, schema, tools,
         try t.expectEqual(served.enable_thinking, counted.enable_thinking);
         try t.expectEqual(served.has_tools, counted.has_tools);
     }
+}
+
+const test_gif_2x2 = [_]u8{ 71, 73, 70, 56, 57, 97, 2, 0, 2, 0, 129, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 44, 0, 0, 0, 0, 2, 0, 2, 0, 0, 2, 3, 68, 52, 5, 0, 59 };
+const test_bmp_2x2 = [_]u8{ 66, 77, 70, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 24, 0, 0, 0, 0, 0, 16, 0, 0, 0, 19, 11, 0, 0, 19, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0, 255, 0, 255, 0, 0, 0 };
+
+test "image input decodes GIF and BMP: red, green over blue, white" {
+    const a = std.testing.allocator;
+    const want = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    for ([_][]const u8{ &test_gif_2x2, &test_bmp_2x2 }) |bytes| {
+        const img = decodeRgbOwned(a, bytes) orelse return error.DecodeFailed;
+        defer img.deinit(a);
+        try std.testing.expectEqual(@as(u32, 2), img.w);
+        try std.testing.expectEqual(@as(u32, 2), img.h);
+        try std.testing.expectEqualSlices(u8, &want, img.rgb);
+        const size = imageHeaderSize(bytes) orelse return error.DecodeFailed;
+        try std.testing.expectEqual(@as(u32, 2), size.w);
+        try std.testing.expectEqual(@as(u32, 2), size.h);
+    }
+}
+
+test "the debug log redacts api_key and key query values and keeps the rest" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("/metrics", redactQueryKeys(&buf, "/metrics"));
+    try std.testing.expectEqualStrings("/metrics?api_key=***", redactQueryKeys(&buf, "/metrics?api_key=s3cret"));
+    try std.testing.expectEqualStrings("/m?a=1&key=***&b=2", redactQueryKeys(&buf, "/m?a=1&key=abc&b=2"));
+    try std.testing.expectEqualStrings("/m?api_key=***&key=***", redactQueryKeys(&buf, "/m?api_key=x&key=y"));
+    try std.testing.expectEqualStrings("/m?apikey=1&flag", redactQueryKeys(&buf, "/m?apikey=1&flag"));
+    try std.testing.expectEqualStrings("/m?", redactQueryKeys(&buf, "/m?" ++ "a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&a=1&" ++ "key=zzzz"));
+}
+
+test "auto context on a room of about 1.8 GB neither advertises a few tokens nor lets the cache reserve eat it" {
+    const GiB: u64 = 1 << 30;
+    const per_tok: u64 = 278528;
+    const room: u64 = GiB * 18 / 10;
+    // The 2 GiB cache reserve alone exceeds the room: the context, not the cache, gets the half.
+    const share = ctxCacheShare(room + 5 * GiB, 5 * GiB, 2 * GiB);
+    try testing.expectEqual(room / 2, share);
+    try testing.expectEqual(@as(u64, GiB), ctxCacheShare(64 * GiB, 5 * GiB, GiB));
+    const auto = resolvedContextForLoad(0, 0, room + 5 * GiB, 5 * GiB, share, 0, per_tok, 0);
+    try testing.expectEqual(@as(u32, 2048), auto);
+    // A room that fits a few tokens past the reserve floors at 1024 instead of advertising them.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(2 * GiB + 100 * (1 << 20), 0, 2 * GiB, per_tok, 0));
+}
+
+test "a thought point is one more checkpoint state in the bill: every Qwen request, a GLM request that keeps checkpoints" {
+    const t = std.testing;
+    const saved = .{ prefix_cache_capacity, ssm_checkpoint_stride, ssm_checkpoint_max, prefix_cache_disk_bytes, prefix_cache_ram_enabled };
+    defer {
+        prefix_cache_capacity = saved[0];
+        ssm_checkpoint_stride = saved[1];
+        ssm_checkpoint_max = saved[2];
+        prefix_cache_disk_bytes = saved[3];
+        prefix_cache_ram_enabled = saved[4];
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    prefix_cache_capacity = 32;
+    prefix_cache_disk_bytes = 12 << 30;
+    prefix_cache_ram_enabled = false;
+
+    var qwen = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/model-configs/qwen4_exp.json"));
+    defer qwen.deinit(t.allocator);
+    qwen.expert_layout = .exl3_k4;
+    const q_per = qwen.ssmCheckpointBytes();
+    try t.expect(q_per > 0);
+    try t.expectEqual(q_per, qwenThoughtPointBytes(&qwen, .{ .thought = true }));
+    try t.expectEqual(@as(u64, 0), qwenThoughtPointBytes(&qwen, .{}));
+    const q_terms = prefillRequestTerms(&qwen, 4096, 1024, 8, 512, .{ .thought = true });
+    try t.expectEqual(retainedSsmCheckpointBytes(&qwen, 4096, 0, 512) + q_per, q_terms.checkpoint_bytes);
+    try t.expectEqual(retainedSsmCheckpointBytes(&qwen, 4096, 0, 512), prefillRequestTerms(&qwen, 4096, 1024, 8, 512, .{}).checkpoint_bytes);
+    ssm_checkpoint_stride = 0;
+    try t.expectEqual(@as(u64, 0), qwenThoughtPointBytes(&qwen, .{ .thought = true }));
+    ssm_checkpoint_stride = 256;
+
+    var glm = try model_mod.parseConfigFromJson(t.allocator, @embedFile("fixtures/glm5_config.json"));
+    defer glm.deinit(t.allocator);
+    glm.dflash_loaded = true;
+    const g_per = glm.ssmCheckpointBytes();
+    try t.expectEqual(@as(u64, 147_619_840), g_per);
+    try t.expectEqual(g_per, glmThoughtPointBytes(&glm, .{ .checkpoints = 8, .thought = true }));
+    try t.expectEqual(g_per, glmThoughtPointBytes(&glm, .{ .checkpoints = 1, .released = true, .thought = true }));
+    // A request that takes no thought point, keeps no checkpoints, or has no tier to take one bills nothing.
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .checkpoints = 8 }));
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .thought = true }));
+    prefix_cache_capacity = 0;
+    prefix_cache_disk_bytes = 0;
+    try t.expectEqual(@as(u64, 0), glmThoughtPointBytes(&glm, .{ .checkpoints = 8, .thought = true }));
 }

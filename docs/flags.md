@@ -20,7 +20,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--api-key` | none → required on every request, loopback exempt (main.zig:728) | operator | help, server-http-apis; 2 tests | keep |
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
-| `--metrics` | off → Prometheus `/metrics` and `/metrics.json` (main.zig:726) | operator | help, server-http-apis; 10 tests, 2 scripts | keep |
+| `--metrics` | off → Prometheus `/metrics` and `/metrics.json` (main.zig:726); `POST /metrics/enable` turns them on at runtime | operator | help, server-http-apis; 10 tests, 2 scripts | keep |
 | `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | help; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
 | `--parent-pid` | none → exit when that pid dies (main.zig:811) | operator | help, server-http-apis; 1 test | keep: for a host that embeds the engine |
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
@@ -40,6 +40,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--idle-evict-secs` | off → unload a model idle this long (main.zig:959) | machine | help; 1 test | keep |
 | `--ctx-size` | model max → context length; also `ctx_size` in settings (main.zig:663) | machine | help, usage, README; 40 tests | keep |
 | `--config-overrides` | none → JSON deep-merged into every model's `config.json`, e.g. YaRN extension (main.zig:666) | user | help; 0 tests | keep: the context-extension lever; add a test |
+| `--vision-bf16` | off: a bf16 tower is requantized to affine 8-bit at load; set keeps it as stored, billed as stored (DeepSeek-V4.1 +0.47 GB, Qwen +0.30 GB) → users who want the stored tower's exact image quality; no effect with `--no-vision` or on a tower not stored bf16 (GLM); no settings key | machine | help; 4 tests | keep |
 | `--vision` / `--no-vision` | tower loads on a resident model and on DeepSeek-V4.1, not on any other streamed one → force it on or save its memory; also `vision` in settings (main.zig:693) | machine | help, README, topic docs; 17 tests | keep |
 | `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |
@@ -47,7 +48,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904); engages on rate-grouped layers too (DeepSeek STQ, any group's pool); does nothing on streamed GLM | user | help, README, engine-expert-streaming; 2 tests | keep: a measured speed-for-exactness tradeoff |
 | `--drop-expert` | `0` off → never load, bill, cache or pick the n least-used routed experts of every layer, ranked by the pack's `expert_usage.json`; a multiple of 8; DeepSeek-V4.1 only, every other arch refuses it at load (main.zig:886, `archFlagRefusal`); `sushi kld compare` takes it, `capture` refuses it ([dsv41-arch](dsv41-arch.md#drop-expert)) | user | help, dsv41-arch, engine-expert-streaming, pack-format; 18 tests | keep: frees expert bytes for re-routed picks; answers change, so score it with `sushi kld compare` |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
-| `--prefill-decode-share` | `0` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
+| `--prefill-decode-share` | `0.25` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
 
 ## KV and attention
 
@@ -80,7 +81,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
 | `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep |
-| `--ssm-checkpoint-max` | `16` → checkpoints kept per entry, `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
+| `--ssm-checkpoint-max` | `16` → checkpoint states held in memory per entry (the SSD restore points are never thinned by it), `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
 
 ## Sampling and reasoning defaults
 

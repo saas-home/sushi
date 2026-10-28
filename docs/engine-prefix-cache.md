@@ -180,10 +180,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
     `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
-    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank is
-    execution state and never counts, so no QSA switch moves it. GLM's KDA checkpoints and
-    DFlash2 window, Qwen's GDN checkpoints and MiMo's ring files are fixed per entry, not per token; the 2 GB slack is
-    all the formula leaves them.
+    pooled QSA history an entry writes, the MTP head's KV and history where the head is on, and a recurrent state's
+    share of the point kept on every 8192 tokens (`ssmCheckpointBytes / POINT_GRID`). The QSA score bank is
+    execution state and never counts, so no QSA switch moves it. DFlash2's window and MiMo's ring files are fixed per
+    entry, not per token; the 2 GB slack is all the formula leaves them.
   - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at
     resolution, as `refreshDiskBudget` adds `total_bytes` live), and `DiskTier.operator_cap` is only the flag or the
     formula / 20 GB cap, never a free-space number; else a restart on a full volume evicts what the last boot stored.
@@ -222,10 +222,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   cache. MiMo-V2.6-Flash-Sushi-2.3bpw at the defaults (148,898 tokens; line `32 entries x 946176 tokens x 12.0 KB
   + 2 GB; bound: 20 GB cap`): 0.45 / 0.47 / 0.46 s from SSD, 0.67 s after a restart (restore 492 ms), 1.73 GB on disk.
   Qwen3.8-Flash-Next-Sushi-2.6bpw: `tests/test_prefix_cache_ssd_default.sh`.
-- Bytes per token at kv8 (`diskBytesPerToken`): Qwen3.8-Flash-Next 13,824 for the trunk rows and the pooled history, plus
-  the MTP head's KV and history when the head is on (about 15.5 KB deployed); MiMo-V2.6-Flash 12,240 (global layers
-  only; the head is a fixed window); GLM-5.3 6,688 (BF16: 11,968). With 32 entries the formula is past the cap at any
-  context over about 40K tokens, so all three get 20 GB: one 1M-token Qwen entry (16.7 GB at 15.5 KB) fits, or four of
+- Bytes per token at kv8 (`diskBytesPerToken`, before the point share above): Qwen3.8-Flash-Next 13,824 for the trunk
+  rows and the pooled history, plus the MTP head's KV and history when the head is on (about 15.5 KB deployed);
+  MiMo-V2.6-Flash 12,240 (global layers only; the head is a fixed window); GLM-5.3 6,688 (BF16: 11,968). With 32 entries
+  the formula is past the cap at any context over about 40K tokens, so all three get 20 GB: one 1M-token Qwen entry (16.7 GB at 15.5 KB) fits, or four of
   260K tokens, not 32. Fixed state is on top (a Qwen GDN checkpoint is 58.8 MB, a GLM KDA checkpoint 147.6 MB, a MiMo
   ring about 128 MB): a 20K-token Qwen turn measured 0.46 GB on disk against 0.32 GB of per-token bytes.
 
@@ -249,6 +249,26 @@ chain, so a text -> image -> text conversation restores past its images after a 
 
 Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with Sushi's ring checkpoint handling.
 
+<a id="thought-points"></a>
+### Thought points: a restore point behind a generated `</think>`
+
+Prefill saves only the grid and the prompt end, so a tool loop on Qwen (MTP) or GLM (DFlash2) re-prefilled the previous
+reply every turn. A thinking request with tools now takes one more point mid-decode, DeepSeek's
+([dsv41-arch](dsv41-arch.md#prefix-cache)) on a recurrent state.
+
+- **The closer is what every turn shares** (`replay` tests in `chat.zig`, pack tokenizer and real template): Qwen re-renders
+  `<think>\n` + trimmed thought + `\n</think>\n\n`, GLM `<think>` + thought + `</think>`, and both repeat the whole reply. A thought
+  starting in whitespace or ending in any the template does not write is re-rendered (`generate.thoughtEdgesSurvive`) and
+  its point dropped; a client must send `reasoning_content` back as delivered.
+- **Armed** by `scheduler.armThoughtPoint` for thinking + tools, a prompt of 512 tokens or more ending in `<think>`, and a
+  speculative round; a thought under 512 tokens takes none, and serial decode (state one token ahead) none either.
+- **The round carrying the closer ends on it** (`generate.thoughtRound`): Qwen's verified round accepts only through the
+  closer and the next accepted draft is pending (`cutMtpRound`), so the stream is the whole round's byte for byte; GLM's
+  budget is cut to the pool position at or below the closer, and a closer in the round's first rows can leave none.
+- **The state is the newest checkpoint, held from the closer to the commit and billed to a request that takes one** (`WarmPrefix.thought`, `server.qwenThoughtPointBytes`,
+  `glmThoughtPointBytes`: 58.8 or 110 MB, 147.6 MB). Both tiers treat it as any checkpoint under the cap of 160; an
+  over-budget conversation drops its oldest points first, so the newest stays.
+
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
 
@@ -260,6 +280,17 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   written, and the one just taken) where it held every one it captured (up to 16: 897 MiB at `--qwen-gdn 16`, 1.76 GiB
   at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
+- **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
+  checkpoint stride is `effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
+  coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek: `row_span`). The SSD
+  tier keeps 160 per entry (`SSM_DISK_MAX_PER_ENTRY`), so no count thins a conversation below 1M tokens.
+  `--ssm-checkpoint-max` (16) caps only the states held in memory (`generate.thinHeldCheckpoints` skips released ones);
+  it never thins what a write-through has put on disk.
+- **One conversation over the SSD budget drops its oldest points first.** Other conversations go whole, least recently
+  used first (`gcToBudget`). When one entry alone outgrows the tier, `DiskTier.pointBudget` prices the rows plus the
+  newest point and the newest grid point; if those fit, `ssmTargetPositions` drops the oldest other points until the
+  rest fit and logs one line naming `--prefix-cache-disk`. If the rows alone overflow, the old rule applies: the record
+  is cut back to the highest restore point that fits (`budgetTarget`).
 - **Every position stays listed.** The commit, the thinning and the hot entry read positions from the same list; a
   released one is skipped as a source of state (`ssmTargetPositions`, `highestCheckpointAtOrBelow`) and priced at the
   bytes it held (`released_bytes`). A restore at any position reads its file.

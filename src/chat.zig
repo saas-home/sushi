@@ -1863,6 +1863,7 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 /// parse has no reliable end, and shipping half of it is the same leak.
 const tool_markup_openers = [_][]const u8{
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
+    "</｜DSML｜", // lone closers the model emits after prose with no opener
     "<|tool_call", // Gemma 4
     "<tool_call", // Hermes XML + the plural variants
     "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
@@ -2933,6 +2934,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
+    if (std.mem.indexOf(u8, buf, "</｜DSML｜") != null) return true;
 
     // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
     if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
@@ -2977,6 +2979,8 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         // splits too in case the tokenizer spells the marker in pieces)
         "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
         "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+        "</", "</\xef", "</\xef\xbd", "</｜", "</｜D", "</｜DS", "</｜DSM",
+        "</｜DSML", "</｜DSML\xef", "</｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -3316,6 +3320,33 @@ pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
     return reasoning[already..];
 }
 
+/// `<tool_call>` followed by a special token spelled where `<` belongs
+/// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.
+fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const wrapper = "<tool_call>";
+    var out: ?std.ArrayList(u8) = null;
+    errdefer if (out) |*o| o.deinit(allocator);
+    var copied: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, wrapper)) |at| {
+        var p = at + wrapper.len;
+        from = p;
+        while (p < text.len and std.ascii.isWhitespace(text[p])) p += 1;
+        if (!std.mem.startsWith(u8, text[p..], "<|")) continue;
+        const close = std.mem.indexOfPos(u8, text, p + 2, "|>") orelse continue;
+        if (close - p > 32 or std.mem.indexOfAny(u8, text[p + 2 .. close], "<>\n ") != null) continue;
+        if (!std.mem.startsWith(u8, text[close + 2 ..], "function=")) continue;
+        if (out == null) out = .empty;
+        try out.?.appendSlice(allocator, text[copied..p]);
+        try out.?.append(allocator, '<');
+        copied = close + 2;
+        from = copied;
+    }
+    var o = out orelse return null;
+    try o.appendSlice(allocator, text[copied..]);
+    return try o.toOwnedSlice(allocator);
+}
+
 /// Parse tool calls from model output text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
@@ -3325,6 +3356,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     } else if (indexOfThinkCloseTag(text, 0)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
+
+    const special_fixed = try hermesSpecialOpenerRepair(allocator, effective_text);
+    defer if (special_fixed) |r| allocator.free(r);
+    if (special_fixed) |r| effective_text = r;
 
     var calls = std.ArrayList(ParsedToolCall).empty;
     errdefer {
@@ -3382,7 +3417,6 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
     try parseArgKeyToolCalls(allocator, effective_text, &calls);
-    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -3758,6 +3792,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
+
+    // Inferred `<invoke>` runs last among the tag families: a native call can carry
+    // invoke-shaped text inside a value.
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
 
     // If no <tool_call> tags, try to find raw JSON tool call(s).
     if (calls.items.len == 0) {
@@ -5237,6 +5275,15 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
         var args_json: ?[]const u8 = null;
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
+            // An inferred opener must own a parameter or close before the next opener,
+            // else it is prose and would borrow the next call's body.
+            if (d.inferred) {
+                const own = body_all[0 .. std.mem.indexOf(u8, body_all, d.invoke) orelse body_all.len];
+                if (std.mem.indexOf(u8, own, d.param ++ " ") == null and std.mem.indexOf(u8, own, d.invoke_close) == null) {
+                    pos = after_tag;
+                    continue;
+                }
+            }
             const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
             args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
@@ -5587,7 +5634,13 @@ fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
             const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
             const ak_close_len = tagLenAt(text[ak_close..], "</arg_key") orelse
                 tagLenAt(text[ak_close..], "</arg_value") orelse break;
-            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+            // A doubled opener (`<arg_key><arg_key>K`) keys on the last one.
+            var real_start = key_start;
+            while (std.mem.indexOfPos(u8, text, real_start, "<arg_key")) |n| {
+                if (n >= ak_close) break;
+                real_start = n + (tagLenAt(text[n..], "<arg_key") orelse break);
+            }
+            const key = std.mem.trim(u8, text[real_start..ak_close], " \t\n\r");
             i = ak_close + ak_close_len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
             const av_len = tagLenAt(text[i..], "<arg_value") orelse break;
@@ -12701,6 +12754,16 @@ test "parseToolCalls dsml: zero-arg call and thinking prefix" {
     try testing.expectEqualStrings("{}", calls[0].arguments);
 }
 
+test "streamShouldBufferForTools: lone DSML closer holds, ordinary closing tags flush" {
+    try testing.expect(streamShouldBufferForTools("Done.\n\n</｜DSML｜ parameter>"));
+    try testing.expect(streamShouldBufferForTools("Done. </"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DS"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DSML\xef\xbd"));
+    try testing.expect(!streamShouldBufferForTools("Use </div> here"));
+    try testing.expect(!streamShouldBufferForTools("a </b> then more"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n</｜DSML｜ calls>"));
+}
+
 test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hold" {
     try testing.expect(streamShouldBufferForTools("Sure.\n\n<｜DSML｜tool_calls>"));
     try testing.expect(streamShouldBufferForTools("<｜DSML｜invoke name=\"x\">"));
@@ -15056,4 +15119,138 @@ test "dsv41 replay: what the next prompt shares with a generated turn (DeepSeek 
         // The point behind the closer is inside what the next prompt shares, unless the thought's edge is whitespace.
         if (c.thinking and c.tools != null and c.reuse != .thought_less_trim) try testing.expect(r.reused > r.think_close_at.?);
     }
+}
+
+/// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the
+/// generated tokens for `raw`, the server's split and parse of its text, and the next request's prompt.
+const Replay = struct {
+    gen: []u32,
+    /// Generated tokens the next prompt repeats, from the first one.
+    reused: usize,
+    /// The next prompt starts with the first prompt.
+    prefix_kept: bool,
+    think_close_at: ?usize,
+
+    fn deinit(self: *Replay, a: std.mem.Allocator) void {
+        a.free(self.gen);
+    }
+};
+
+fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatConfig, tools: ?[]const u8, thinking: bool, raw: []const u8) !Replay {
+    const first = [_]Message{.{ .role = "user", .content = "q" }};
+    const p1_text = try renderChatTemplate(a, &first, cfg, tools, null, thinking, null, false);
+    defer a.free(p1_text);
+    const p1 = try tok.encodeMarked(a, p1_text);
+    defer a.free(p1);
+    const gen = try tok.encodeMarked(a, raw);
+    errdefer a.free(gen);
+
+    const split = splitThinkBlock(raw, true, thinking);
+    const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
+    defer if (parsed) |calls| {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    };
+    var calls: [4]ToolCall = undefined;
+    if (parsed) |pc| for (pc, 0..) |c, i| {
+        calls[i] = .{ .id = "call_1", .name = c.name, .arguments = c.arguments };
+    };
+    const assistant: Message = .{
+        .role = "assistant",
+        .content = split.content,
+        .reasoning_content = split.reasoning_content,
+        .tool_calls = if (parsed) |pc| calls[0..pc.len] else null,
+    };
+    const tail: Message = if (parsed != null) .{ .role = "tool", .content = "ok", .tool_call_id = "call_1" } else .{ .role = "user", .content = "next" };
+    const second = [_]Message{ first[0], assistant, tail };
+    const p2_text = try renderChatTemplate(a, &second, cfg, tools, null, thinking, null, false);
+    defer a.free(p2_text);
+    const p2 = try tok.encodeMarked(a, p2_text);
+    defer a.free(p2);
+
+    const keep = p1.len <= p2.len and std.mem.eql(u32, p1, p2[0..p1.len]);
+    var reused: usize = 0;
+    if (keep) {
+        const tail_ids = p2[p1.len..];
+        while (reused < gen.len and reused < tail_ids.len and gen[reused] == tail_ids[reused]) reused += 1;
+    }
+    const close_id = tok.specialTokenId("</think>");
+    return .{
+        .gen = gen,
+        .reused = reused,
+        .prefix_kept = keep,
+        .think_close_at = if (close_id) |id| std.mem.indexOfScalar(u32, gen, id) else null,
+    };
+}
+
+const NextReuse = enum {
+    /// Every generated token comes back.
+    whole,
+    /// Through the thought, short of the closer: the template re-renders the thought's edges.
+    thought_short,
+    /// The turn is not re-rendered as it was generated.
+    none,
+};
+
+const replay_tools =
+    \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"tags":{"type":"array"}}}}}]
+;
+
+const ReplayCase = struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: NextReuse };
+
+fn expectReplays(pack: []const u8, cases: []const ReplayCase) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, pack);
+    const a = testing.allocator;
+    var tok = tokenizer_mod.loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    var cfg = loadChatConfig(testing.io, a, dir) catch return error.SkipZigTest;
+    defer cfg.deinit();
+    for (cases) |c| {
+        var r = try replayTurn(a, &tok, &cfg, c.tools, c.thinking, c.raw);
+        defer r.deinit(a);
+        errdefer std.debug.print("{s}: {d} tokens, prefix kept {}, reused {d}, </think> at {?d}\n", .{ c.name, r.gen.len, r.prefix_kept, r.reused, r.think_close_at });
+        switch (c.reuse) {
+            .whole => try testing.expectEqual(r.gen.len, r.reused),
+            .thought_short => try testing.expect(r.reused <= r.think_close_at.?),
+            .none => try testing.expect(!r.prefix_kept or r.reused == 0),
+        }
+        // The state behind the closer is a restore point the next prompt reaches only when it repeats the closer.
+        if (c.thinking and c.reuse != .thought_short and c.reuse != .none) try testing.expect(r.reused > r.think_close_at.?);
+    }
+}
+
+test "qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n</function>\n</tool_call>";
+    const call_json = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n<parameter=limit>\n40\n</parameter>\n</function>\n</tool_call>";
+    const call_code = "<tool_call>\n<function=write_file>\n<parameter=content>\nconst s = \"a\\nb\"; // <x> & 'y' \\ \xe2\x80\x94 \n\tfn f() void {}\n</parameter>\n</function>\n</tool_call>";
+    try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nI will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with code in a string", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_code, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, no tools", .tools = null, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, no newline before the closer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>\n\n" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "chat, no tools", .tools = null, .thinking = false, .raw = "The entry point is `src/main.zig`.", .reuse = .whole },
+    });
+}
+
+test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value></tool_call>";
+    const call_json = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value><arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value><arg_key>limit</arg_key><arg_value>40</arg_value></tool_call>";
+    try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, the thought ends in a newline", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },
+    });
 }

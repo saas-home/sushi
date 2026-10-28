@@ -13,6 +13,7 @@ const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const engram = @import("dsv41_engram.zig");
+const embed_ssd = @import("dsv41_embed.zig");
 const source = @import("dsv41_source.zig");
 const owned_mod = @import("dsv41_owned.zig");
 const model_mod = @import("model.zig");
@@ -100,21 +101,40 @@ pub const Stq = struct {
     }
 };
 
-/// The embedding as MLX's affine triple, gathered by row and dequantized.
+/// The embedding as MLX's affine triple, gathered by row and dequantized. A pack's triple stays in its shard (`ssd`):
+/// the rows of a forward are read from it and dequantized the same way.
 pub const Embed = struct {
     w: A,
     scales: A = none,
     biases: A = none,
     bits: c_int = 0,
     group: c_int = 0,
+    ssd: ?*embed_ssd.Ssd = null,
 
-    pub fn rows(self: *const Embed, sc: *Scope, ids: A, dt: mlx.mlx_dtype) !A {
-        if (self.scales.ctx == null) return sc.take(self.w, ids, 0);
+    /// `ids` as the array `ids_a` and as `host`; `raw` holds their rows when they were read ahead (the caller frees it).
+    pub fn rows(self: *const Embed, sc: *Scope, ids_a: A, host: []const u32, raw: ?embed_ssd.Ssd.Raw, dt: mlx.mlx_dtype) !A {
+        if (self.ssd) |ssd| {
+            const own = raw orelse try ssd.read(sc.a, host);
+            defer if (raw == null) own.deinit(sc.a);
+            const n: c_int = @intCast(host.len);
+            const words: c_int = @intCast(ssd.len[0] / 4);
+            const groups: c_int = @intCast(ssd.len[1] / @as(u32, if (ssd.sdtype == .float32) 4 else 2));
+            const wt = try sc.keep(mlx.mlx_array_new_data(own.w.ptr, &[_]c_int{ n, words }, 2, .uint32));
+            const sa = try sc.keep(mlx.mlx_array_new_data(own.s.ptr, &[_]c_int{ n, groups }, 2, ssd.sdtype));
+            const ba = try sc.keep(mlx.mlx_array_new_data(own.b.ptr, &[_]c_int{ n, groups }, 2, ssd.sdtype));
+            return self.dequantRows(sc, wt, try sc.astype(sa, dt), try sc.astype(ba, dt), dt);
+        }
+        if (self.scales.ctx == null) return sc.take(self.w, ids_a, 0);
+        return self.dequantRows(sc, try sc.take(self.w, ids_a, 0), try sc.take(self.scales, ids_a, 0), try sc.take(self.biases, ids_a, 0), dt);
+    }
+
+    fn dequantRows(self: *const Embed, sc: *Scope, wt: A, scales: A, biases: A, dt: mlx.mlx_dtype) !A {
         var o = mlx.mlx_array_new();
-        return sc.res(mlx.mlx_dequantize(&o, try sc.take(self.w, ids, 0), try sc.take(self.scales, ids, 0), try sc.take(self.biases, ids, 0), mlx.mlx_optional_int.some(self.group), mlx.mlx_optional_int.some(self.bits), "affine", none, .{ .value = dt, .has_value = true }, sc.s), &o);
+        return sc.res(mlx.mlx_dequantize(&o, wt, scales, biases, mlx.mlx_optional_int.some(self.group), mlx.mlx_optional_int.some(self.bits), "affine", none, .{ .value = dt, .has_value = true }, sc.s), &o);
     }
 
     pub fn vocab(self: *const Embed) usize {
+        if (self.ssd) |ssd| return ssd.rows;
         return dim(self.w, 0);
     }
 };
@@ -188,9 +208,9 @@ pub const Experts = union(enum) {
         can: *const fn (ctx: *anyopaque, layer: usize) bool,
         /// The routed sum plus `shared` (as `Hook.apply`) over the slots the map holds for the picks `idx`, with no host
         /// read; `map` is the host copy of that map, kept until the layer is settled.
-        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A) anyerror!Queued,
+        queue: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp) anyerror!Queued,
         /// The host's side of a queued layer: null when every pick sat in the slot the GPU read, else the exact sum.
-        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: A, map: []const i32) anyerror!?A,
+        settle: *const fn (ctx: *anyopaque, sc: *Scope, layer: usize, x: A, idx: A, wts: A, shared: SharedOp, map: []const i32) anyerror!?A,
     };
 
     pub const Queued = struct {
@@ -230,7 +250,7 @@ const Layer = struct {
     ratio: u8,
     comp: ?CompW,
     idx: ?IdxW,
-    gate_w: A, // f32 [E, dim]
+    gate_w: A, // [E, dim] as stored; the kernels widen it
     gate_bias: A, // f32 [1, E]
     /// The bias an image span's rows pick experts by (`noaux_tc_for_vl`); none on a pack without a tower.
     gate_bias_vl: A = none,
@@ -635,6 +655,8 @@ pub const Model = struct {
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
     engram_ahead_used: u64 = 0,
+    /// The next chunk's embedding rows, read from the SSD table while this one runs (`aheadEmbed`).
+    embed_ahead: ?*embed_ssd.Ahead = null,
     /// Host time the forwards waited on Engram rows, and the decode forwards since the last report.
     engram_wait_ns: u64 = 0,
     engram_forwards: u64 = 0,
@@ -666,6 +688,11 @@ pub const Model = struct {
         if (self.profile) |pf| self.gpa.destroy(pf);
         if (self.dec_state) |*st| st.deinit();
         self.dropAhead();
+        self.dropEmbedAhead();
+        if (self.embed.ssd) |ssd| {
+            ssd.close();
+            self.gpa.destroy(ssd);
+        }
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -687,6 +714,11 @@ pub const Model = struct {
     fn dropAhead(self: *Model) void {
         if (self.engram_ahead) |pf| pf.finish();
         self.engram_ahead = null;
+    }
+
+    fn dropEmbedAhead(self: *Model) void {
+        if (self.embed_ahead) |ah| ah.finish();
+        self.embed_ahead = null;
     }
 
     fn own(self: *Model, x: A) !A {
@@ -812,8 +844,21 @@ fn loadLin(m: *Model, w: *model_mod.Weights, base: []const u8, dense: ?mlx.mlx_d
     return .{ .w = if (dense) |dt| try m.ownCast(wt, dt) else try m.ownCast(wt, mlx.mlx_array_dtype(wt)) };
 }
 
+/// `name` kept in its stored dtype.
+fn loadStored(m: *Model, w: *model_mod.Weights, name: []const u8) !A {
+    return loadDense(m, w, name, mlx.mlx_array_dtype(try getW(w, name)));
+}
+
 /// `embed.weight` dense, or MLX's affine triple with `embed.scales` and `embed.biases` (bits and group from the shapes).
-fn loadEmbed(m: *Model, w: *model_mod.Weights) !Embed {
+fn loadEmbed(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !Embed {
+    // The loader leaves a pack's affine triple in its shard: the rows come from there.
+    if (w.get("embed.weight") == null) {
+        const ssd = try m.gpa.create(embed_ssd.Ssd);
+        errdefer m.gpa.destroy(ssd);
+        ssd.* = try embed_ssd.Ssd.open(m.gpa, dir_path, m.cfg.dim);
+        log.info("[dsv41] token embedding on SSD ({d:.2} GB freed to the expert cache)\n", .{@as(f64, @floatFromInt(ssd.stored)) / 1e9});
+        return .{ .w = none, .bits = ssd.bits, .group = ssd.group, .ssd = ssd };
+    }
     const scales = w.get("embed.scales") orelse return .{ .w = try loadDense(m, w, "embed.weight", m.act) };
     defer for ([_][]const u8{ "embed.weight", "embed.scales", "embed.biases" }) |n| source.drop(w, n);
     const wt = try getW(w, "embed.weight");
@@ -984,7 +1029,7 @@ fn loadLayer(m: *Model, w: *model_mod.Weights, pfx: []const u8, id: usize, li: u
         .ratio = r,
         .comp = null,
         .idx = null,
-        .gate_w = try loadDense(m, w, try lkey(&b, pfx, id, "ffn.gate.weight"), .float32),
+        .gate_w = try loadStored(m, w, try lkey(&b, pfx, id, "ffn.gate.weight")),
         .gate_bias = undefined,
         .shared = .{
             try loadLin(m, w, try lkey(&base, pfx, id, "ffn.shared_experts.w1"), act),
@@ -1112,7 +1157,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     };
     errdefer m.deinit();
     const c = &m.cfg;
-    m.embed = try loadEmbed(m, weights);
+    m.embed = try loadEmbed(m, weights, dir_path);
     m.head = if (try loadStq(m, weights, "head")) |q| .{ .w = none, .stq = q } else .{ .w = try loadDense(m, weights, "head.weight", .float32) };
     m.norm = try loadDense(m, weights, "norm.weight", m.act);
     if (m.embed.vocab() != c.vocab or m.head.outDim() != c.vocab) {
@@ -1142,6 +1187,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (opts.dspark) try initDspark(m, weights);
     if (c.engram.n > 0) try initEngram(m, weights, dir_path);
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
+    if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
     m.ced_split = c.cedSplit();
     return m;
 }
@@ -1906,13 +1952,13 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A) !kernels.Routes 
         const logits = if (dim(h, 0) <= NARROW_ROWS and c.dim % 8 == 0)
             try kernels.gateLogits(sc, h, ly.gate_w)
         else
-            try sc.matmul(try sc.astype(h, .float32), try sc.t2(ly.gate_w));
+            try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32)));
         var r = try kernels.route(sc, logits, bias, K, norm, c.route_scale);
         r.logits = logits;
         try traceRoutes(m, li, logits, r);
         return r;
     }
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(ly.gate_w)); // [L, E]
+    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(ly.gate_w, .float32))); // [L, E]
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const idx = try topkRows(sc, m, try sc.add(scores, bias), K);
     var wts = try sc.takeAlong(scores, idx, -1);
@@ -2003,10 +2049,31 @@ fn moeWide(sc: *Scope, m: *const Model, li: usize, h: A, r: kernels.Routes, sy: 
     return out;
 }
 
+/// The shared expert's `[L, dim]` output, or the layer to run it from: at decode width the routed chain takes the
+/// expert into its own launches, so it is built only where that chain does not apply.
+pub const SharedOp = union(enum) {
+    array: A,
+    layer: struct { m: *const Model, li: usize },
+
+    fn value(self: SharedOp, sc: *Scope, x: A) !A {
+        return switch (self) {
+            .array => |a| a,
+            .layer => |l| sharedExpert(sc, l.m, &l.m.layers[l.li], x),
+        };
+    }
+};
+
+fn routedWithShared(sc: *Scope, ly: *const Layer, limit: c_int, rb: *const exl3.Ragged, x: A, flat: A, scores: A, k: c_int) !?A {
+    const q = [3]Stq{ ly.shared[0].stq orelse return null, ly.shared[1].stq orelse return null, ly.shared[2].stq orelse return null };
+    const se: exl3.rate_groups.SharedExpert = .{ .bank = .{ .gate = q[0].p, .up = q[1].p, .down = q[2].p }, .dec = q[0].dec };
+    const y = try exl3.rate_groups.moeDecodeClampedSharedFused(sc.s, x, rb, flat, scores, k, .float32, se, limit) orelse return null;
+    return try sc.keep(y);
+}
+
 /// `x` `[L, dim]` through the trellis banks `rb` at the picks `slots` (`[L, k]` ids of `rb`) weighted `wts`: the clamped
-/// SwiGLU of each, summed, plus the shared expert's `shared` (`[L, dim]`, f32). Decode-width chunks ride the
-/// one-dispatch-per-stage decode chain, whose reduce adds `shared`, wider ones the grouped GEMM.
-pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: A) !A {
+/// SwiGLU of each, summed, plus the shared expert's output (`[L, dim]`, f32). Decode-width chunks ride the
+/// one-dispatch-per-stage decode chain, whose reduce adds the shared expert, wider ones the grouped GEMM.
+pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const exl3.Ragged, x: A, slots: A, wts: A, shared: SharedOp) !A {
     const L = dim(x, 0);
     const k: c_int = @intCast(dim(slots, 1));
     const flat = try sc.reshape(try sc.astype(slots, .uint32), &.{ci(L) * k});
@@ -2014,9 +2081,19 @@ pub fn stqRouted(sc: *Scope, dec: exl3.format.Decode, limit: c_int, rb: *const e
     try dec.requireTable();
     exl3.kernels.setDecodeParams(dec);
     // The decode reduce returns one row as `[dim]`.
-    if (L <= exl3.kernels.DECODE_ROWS_MAX) return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, shared, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+    if (L <= exl3.kernels.DECODE_ROWS_MAX) {
+        if (shared == .layer) {
+            if (try routedWithShared(sc, &shared.layer.m.layers[shared.layer.li], limit, rb, x, flat, scores, k)) |y| return sc.reshape(y, &.{ ci(L), ci(dim(x, 1)) });
+        }
+        const sy = try shared.value(sc, x);
+        // The shared chain left its own codec active.
+        exl3.kernels.setDecodeParams(dec);
+        return sc.reshape(try sc.keep(try exl3.rate_groups.moeDecodeClamped(sc.s, x, rb, flat, scores, k, .float32, sy, null, limit)), &.{ ci(L), ci(dim(x, 1)) });
+    }
+    const sy = try shared.value(sc, x);
+    exl3.kernels.setDecodeParams(dec);
     const y = try sc.astype(try sc.keep(try exl3.rate_groups.moePrefillClamped(sc.s, x, rb, flat, scores, k, limit)), .float32);
-    return sc.add(y, try sc.astype(shared, .float32));
+    return sc.add(y, try sc.astype(sy, .float32));
 }
 
 /// Queues `x` on the GPU without waiting for it.
@@ -2065,22 +2142,20 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared) !A {
     if (pf) |p| try p.mark(.router, &.{ r.idx, r.wts });
     if (c.expert_dec) |dec| {
         if (li >= c.layers) {
-            const sy = try sharedExpert(sc, m, ly, h);
-            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, sy), m.act);
+            return sc.astype(try stqRouted(sc, dec, @intFromFloat(c.swiglu_limit), &m.dspark.?.stq[li - c.layers], h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } }), m.act);
         }
         const hk = switch (m.experts) {
             .resident => return error.Dsv41StqExpertsStream,
             .hook => |hk| hk,
         };
         if (sh.spec_on) {
-            const sy = try sharedExpert(sc, m, ly, h);
             const target = prefetchTarget(m, li, dim(h, 0));
             // Submitted ahead of the chain, so the host's read of it waits for nothing but the router.
             const pred = if (target) |j| try predictLogits(sc, m, h, j) else none;
             if (pred.ctx != null) try submit(pred);
-            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, sy);
+            const q = try hk.spec.?.queue(hk.ctx, sc, li, h, r.idx, r.wts, .{ .layer = .{ .m = m, .li = li } });
             const out = try sc.astype(q.out, m.act);
-            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts), .sy = sc.out(sy) };
+            sh.spec = .{ .li = li, .map = q.map, .h = sc.out(h), .idx = sc.out(q.idx), .wts = sc.out(r.wts) };
             if (pred.ctx != null) {
                 sh.spec.?.pred = sc.out(pred);
                 sh.spec.?.pred_layer = target.?;
@@ -2609,7 +2684,13 @@ pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: u
     defer sc.a.free(host);
     for (host, ids) |*o, t| o.* = @intCast(t);
     const id_arr = try sc.ints(host, &.{ci(L)});
-    var emb = try m.embed.rows(&sc, id_arr, m.act); // [L, dim]
+    var read_ahead: ?embed_ssd.Ssd.Raw = null;
+    defer if (read_ahead) |r| r.deinit(gpa);
+    if (m.embed_ahead) |ah| {
+        read_ahead = ah.take(ids);
+        m.dropEmbedAhead();
+    }
+    var emb = try m.embed.rows(&sc, id_arr, ids, read_ahead, m.act); // [L, dim]
     var img: A = none;
     errdefer if (img.ctx != null) {
         _ = mlx.mlx_array_free(img);
@@ -2694,7 +2775,6 @@ const Unresolved = struct {
     h: A,
     idx: A,
     wts: A,
-    sy: A,
     x1: A = none,
     post: A = none,
     comb: A = none,
@@ -2704,7 +2784,7 @@ const Unresolved = struct {
     pred_layer: usize = 0,
 
     fn deinit(self: *Unresolved) void {
-        for ([_]A{ self.h, self.idx, self.wts, self.sy, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
+        for ([_]A{ self.h, self.idx, self.wts, self.x1, self.post, self.comb, self.pre, self.pred }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
     }
@@ -2806,7 +2886,7 @@ fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
 fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
     const w = m.layers[j].gate_w;
     if (fusedOn(sc, m) and m.cfg.dim % 8 == 0) return kernels.gateLogits(sc, h, w);
-    return sc.matmul(try sc.astype(h, .float32), try sc.t2(w));
+    return sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(w, .float32)));
 }
 
 /// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first.
@@ -2849,7 +2929,7 @@ fn settleRecord(m: *const Model, u: *const Unresolved) !?A {
     var sc = Scope.init(m.gpa, m.s);
     defer sc.deinit();
     const t0 = readStart();
-    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, u.sy, u.map);
+    const sum = try hk.spec.?.settle(hk.ctx, &sc, u.li, u.h, u.idx, u.wts, .{ .layer = .{ .m = m, .li = u.li } }, u.map);
     readDone(settle_site, t0);
     if (sum == null) spec_kept += 1 else spec_rebuilt += 1;
     if ((spec_kept + spec_rebuilt) % 4096 == 0) log.info("[dsv41] route-spec: {d} layers kept, {d} rebuilt after a pick left the map\n", .{ spec_kept, spec_rebuilt });
@@ -3043,17 +3123,28 @@ pub fn extendVision(m: *Model, ids: []const u32, want: Want, span: usize, vision
 /// this chunk runs, and the next pass starts with them when it is that chunk. Any other pass reads its own.
 pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision: ?VisionRows, ahead: []const u32) !A {
     errdefer m.dropAhead();
+    errdefer m.dropEmbedAhead();
     const st = try ensureState(m);
     transient_peak.begin();
     var pass = try beginPassWith(m, st, ids, st.n, span, vision);
     defer pass.deinit(m.gpa);
     pass.ahead = ahead;
+    aheadEmbed(m, ahead);
     planCed(m, &pass, want);
     try prefetchEngram(m, &pass);
     for (0..m.cfg.layers) |li| try passLayer(m, &pass, li);
     const logits = try finishPass(m, &pass, want);
     transient_peak.end(if (st.verify != null) .dspark_verify else if (ids.len > NARROW_ROWS) .prefill_chunk else .decode, ids.len);
     return logits;
+}
+
+/// Starts reading the SSD embedding rows of `ids`, the request's next chunk, so they arrive while this one runs.
+/// Host memory: one chunk's rows, ~2.3 KB a token. A failure leaves the next pass to read its own.
+fn aheadEmbed(m: *Model, ids: []const u32) void {
+    const ssd = m.embed.ssd orelse return;
+    m.dropEmbedAhead();
+    if (ids.len == 0) return;
+    m.embed_ahead = embed_ssd.Ahead.start(m.gpa, ssd, ids) catch null;
 }
 
 /// At debug level: the Engram wait of each wide chunk, and the mean of every 64 decode forwards.
@@ -3260,7 +3351,9 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const hc = c.hc_mult;
     var in: [cfg_mod.max_block]i32 = undefined;
     for (in[0..B], 0..) |*v, k| v.* = @intCast(if (k == 0) t1 else c.dspark.noise_id);
-    const emb = try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), m.act);
+    var in_ids: [cfg_mod.max_block]u32 = undefined;
+    for (in_ids[0..B], in[0..B]) |*o, v| o.* = @intCast(v);
+    const emb = try m.embed.rows(&sc, try sc.ints(in[0..B], &.{ci(B)}), in_ids[0..B], null, m.act);
     var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(c.dim) }));
     var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0)), .float32), &.{ ci(B), ci(hc) });
     var dummy = try Shared.init(gpa, 1);
@@ -5194,7 +5287,7 @@ fn expectMaskedRoute(sc: *Scope, full: *Model, cut: *Model, d: *const expert_usa
     const idx = try sc_mod.hostI32(try sc.astype(r.idx, .int32));
     const wts = try sc_mod.hostF32(r.wts);
 
-    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(full.layers[li].gate_w));
+    const logits = try sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(full.layers[li].gate_w, .float32)));
     const scores = try sc.op1(mlx.mlx_sqrt, try sc.op2(mlx.mlx_logaddexp, logits, try sc.f(0)));
     const sel = try sc_mod.hostF32(try sc.add(scores, full.layers[li].gate_bias));
     for (0..rows) |row| {
@@ -5230,6 +5323,53 @@ fn routerRows(sc: *Scope, dim_: usize, rows: usize, seed: u64) !A {
     var prng = std.Random.DefaultPrng.init(seed);
     for (data) |*v| v.* = prng.random().floatNorm(f32);
     return sc.floats(data, &.{ ci(rows), ci(dim_) });
+}
+
+/// Every router of `dir`'s model, as stored, against the same router widened to f32: the bytes of the logits,
+/// the picks and their weights, at each row count's arm, fused kernels on and off.
+fn expectStoredRouterExact(dir: []const u8) !void {
+    const s = mlx.gpuStream();
+    const m = try tinyModel(dir, .{ .act = .float32, .experts = false, .dspark = true }, s);
+    defer m.deinit();
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const Bits = struct { logits: []const f32, idx: []const i32, wts: []const f32 };
+    const bits = struct {
+        fn of(sc_: *Scope, m_: *Model, li: usize, h: A) !Bits {
+            const r = try router(sc_, m_, li, h, none);
+            return .{ .logits = try sc_mod.hostF32(r.logits), .idx = try sc_mod.hostI32(try sc_.astype(r.idx, .int32)), .wts = try sc_mod.hostF32(r.wts) };
+        }
+    }.of;
+    for (m.layers, 0..) |*ly, li| {
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(ly.gate_w));
+        const stored = ly.gate_w;
+        defer ly.gate_w = stored;
+        const widened = try sc.astype(stored, .float32);
+        for ([_]bool{ true, false }) |fused| {
+            m.fused = fused;
+            for ([_]usize{ 1, 2, 6, 16, 17, 64 }) |rows| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
+                const h = try sc.astype(try routerRows(&sc, m.cfg.dim, rows, 0x6a7e + rows + li), dt);
+                const got = try bits(&sc, m, li, h);
+                ly.gate_w = widened;
+                const want = try bits(&sc, m, li, h);
+                ly.gate_w = stored;
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(got.logits));
+                try testing.expectEqualSlices(i32, want.idx, got.idx);
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.wts), std.mem.sliceAsBytes(got.wts));
+            };
+        }
+    }
+}
+
+test "dsv41 router: a bf16 router stays bf16 once loaded and routes bit for bit as its f32 widening (DSV41_TINY, DSV41_STQ_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var ran = false;
+    for ([_][:0]const u8{ "DSV41_TINY", "DSV41_STQ_TINY" }) |env| {
+        const raw = std.c.getenv(env) orelse continue;
+        try expectStoredRouterExact(std.mem.span(raw));
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 test "dsv41 drop: the router with experts masked picks the top-k of the kept experts and weights them as the normal path, bit for bit on the CPU stream (DSV41_TINY)" {
@@ -5521,4 +5661,59 @@ test "dsv41 owned: every weight array of an STQ load with DSpark lies in a sushi
     try testing.expect(m.built.ragged > 0 and m.built.widened > 0 and m.built.stacks > 0);
     const audit = try memoryAudit(m);
     try testing.expectEqual(outside, audit.mlx_arrays);
+}
+
+test "dsv41 embed: the rows gathered from the SSD table are the resident table's bits, read cold or ahead" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    for ([_]struct { name: []const u8, esize: usize }{ .{ .name = "BF16", .esize = 2 }, .{ .name = "F16", .esize = 2 }, .{ .name = "F32", .esize = 4 } }) |stored| {
+        var td = testing.tmpDir(.{});
+        defer td.cleanup();
+        try embed_ssd.writeTriple(io, td.dir, stored.name, stored.esize);
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try td.dir.realPath(io, &buf)];
+        var ssd = try embed_ssd.Ssd.open(testing.allocator, dir, embed_ssd.test_dim);
+        defer ssd.close();
+        const file = try td.dir.readFileAlloc(io, "model-00001-of-00001.safetensors", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(file);
+
+        var sc = Scope.init(testing.allocator, cpu);
+        defer sc.deinit();
+        const rows: c_int = embed_ssd.test_rows;
+        const groups: c_int = embed_ssd.test_groups;
+        const resident: Embed = .{
+            .w = try sc.keep(mlx.mlx_array_new_data(file[ssd.off[0]..].ptr, &[_]c_int{ rows, embed_ssd.test_words }, 2, .uint32)),
+            .scales = try sc.astype(try sc.keep(mlx.mlx_array_new_data(file[ssd.off[1]..].ptr, &[_]c_int{ rows, groups }, 2, ssd.sdtype)), .bfloat16),
+            .biases = try sc.astype(try sc.keep(mlx.mlx_array_new_data(file[ssd.off[2]..].ptr, &[_]c_int{ rows, groups }, 2, ssd.sdtype)), .bfloat16),
+            .bits = ssd.bits,
+            .group = ssd.group,
+        };
+        const served: Embed = .{ .w = none, .bits = ssd.bits, .group = ssd.group, .ssd = &ssd };
+        try testing.expectEqual(resident.vocab(), served.vocab());
+        // The first and last rows, repeats, and a run past the threading threshold.
+        var ids: [70]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast((i * 13 + i / 7) % embed_ssd.test_rows);
+        ids[0] = 0;
+        ids[1] = embed_ssd.test_rows - 1;
+        ids[2] = 0;
+        for ([_][]const u32{ ids[0..1], ids[0..3], &ids }) |set| {
+            var as_i32: [70]i32 = undefined;
+            for (set, 0..) |id, i| as_i32[i] = @intCast(id);
+            const id_arr = try sc.ints(as_i32[0..set.len], &.{@intCast(set.len)});
+            const want = try hostRows(&sc, try resident.rows(&sc, id_arr, set, null, .bfloat16));
+            defer testing.allocator.free(want);
+            const got = try hostRows(&sc, try served.rows(&sc, id_arr, set, null, .bfloat16));
+            defer testing.allocator.free(got);
+            try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
+            const ahead = try embed_ssd.Ahead.start(testing.allocator, &ssd, set);
+            defer ahead.finish();
+            const raw = ahead.take(set).?;
+            defer raw.deinit(testing.allocator);
+            const warm = try hostRows(&sc, try served.rows(&sc, id_arr, set, raw, .bfloat16));
+            defer testing.allocator.free(warm);
+            try testing.expectEqualSlices(f32, want, warm);
+            try testing.expect(std.mem.indexOfNone(u8, std.mem.sliceAsBytes(want), &.{0}) != null);
+        }
+    }
 }

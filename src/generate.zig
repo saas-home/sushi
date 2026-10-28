@@ -38,6 +38,7 @@ const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const glm5_forward = @import("glm5_forward.zig");
 const glm5_prefix = @import("glm5_prefix.zig");
 const dsv41_prefix = @import("dsv41_prefix.zig");
+const kv_disk_cache_mod = @import("kv_disk_cache.zig");
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
 const dspark_rows = @import("dspark_rows.zig");
@@ -782,6 +783,11 @@ test "decode tick ubench count is off unless a positive integer" {
     try std.testing.expectEqual(@as(u32, 8), tickUbenchN("8"));
 }
 
+test "a planner-owned slot rejoins the planner after a forced commit, any other takes the serial ramp" {
+    try testing.expectEqual(Generator.MtpSerialExit.none, Generator.mtpSerialExitAfterForced(true));
+    try testing.expectEqual(Generator.MtpSerialExit.drain, Generator.mtpSerialExitAfterForced(false));
+}
+
 test "forced recovery leaves room for the whole transition and one answer token" {
     try std.testing.expect(forcedBoundaryCanContinue(0, 2, 1));
     try std.testing.expect(forcedBoundaryCanContinue(8, 10, 1));
@@ -851,7 +857,87 @@ pub const ThinkBound = struct {
     pub fn due(self: *const ThinkBound) bool {
         return !self.fired and self.in_think and self.count >= self.budget;
     }
+
+    /// Thought tokens left before the bound is due; null once it cannot fire. `observe` first.
+    pub fn room(self: *const ThinkBound) ?u32 {
+        if (self.fired or !self.in_think) return null;
+        return self.budget -| self.count;
+    }
 };
+
+/// Drafts an MTP round may carry so it emits at most `room` tokens (t1 plus accepted drafts) and the
+/// bound fires at the token serial decode fires at. Null = no draft fits: the round runs serial.
+pub fn mtpDraftCapForRoom(room: u32) ?u32 {
+    return if (room > 1) room - 1 else null;
+}
+
+/// A hybrid request's restore point behind its generated thought's closer
+/// ([engine-prefix-cache](../docs/engine-prefix-cache.md#thought-points)). The scheduler arms it after the prefill;
+/// the speculative round that carries the closer is cut to end on it, and the state there joins the checkpoints.
+pub const ThoughtPoint = struct {
+    closer: u32,
+    /// Positions a point may sit on: 1 where the recurrent state restores anywhere, the pool size on GLM.
+    grid: u32,
+    /// A thought shorter than this is cheaper to prefill than to keep.
+    min_tokens: u32,
+    /// Absolute position of the state the thought starts from.
+    base: usize,
+    state: State = .armed,
+    /// Where the cut round leaves the state.
+    at: usize = 0,
+
+    pub const State = enum { armed, cut, taken, passed };
+};
+
+pub const ThoughtRound = union(enum) {
+    /// The closer is not in the round: it runs whole.
+    whole,
+    /// The closer is in the round and no point can sit behind it.
+    skip,
+    /// Emit this many of the round's tokens, then take the point.
+    keep: usize,
+};
+
+/// What a round whose emitted tokens `path` start at absolute position `anchor` does about the thought point: end on
+/// the closer, or on the grid position at or below it.
+pub fn thoughtRound(tp: ThoughtPoint, path: []const u32, anchor: usize) ThoughtRound {
+    const at = std.mem.indexOfScalar(u32, path, tp.closer) orelse return .whole;
+    const closer_pos = anchor + at;
+    if (closer_pos -| tp.base < tp.min_tokens) return .skip;
+    const end = (closer_pos + 1) / tp.grid * tp.grid;
+    if (end <= anchor) return .skip;
+    return .{ .keep = end - anchor };
+}
+
+/// Thoughts shorter than this are cheaper to prefill than to keep a state for.
+pub const thought_point_min_tokens: u32 = 512;
+
+/// How a template writes a thought's closer back: the Qwen template trims the thought and writes `\n</think>`, GLM's
+/// writes the trimmed thought and `</think>`.
+pub const CloserStyle = enum { newline_before_closer, bare_closer };
+
+/// Does the next prompt repeat the generated thought? The server trims the reasoning it delivers and the template
+/// trims it again, so a thought that starts in whitespace, or ends in any the style does not write, is re-rendered
+/// differently. `first` is the thought's first token as text, `tail` its last two.
+pub fn thoughtEdgesSurvive(style: CloserStyle, first: []const u8, tail: []const u8) bool {
+    const white = struct {
+        fn at(c: u8) bool {
+            return c == ' ' or c == '\n' or c == '\t' or c == '\r';
+        }
+    }.at;
+    if (first.len == 0 or white(first[0])) return false;
+    return switch (style) {
+        .bare_closer => tail.len > 0 and !white(tail[tail.len - 1]),
+        .newline_before_closer => tail.len >= 2 and tail[tail.len - 1] == '\n' and !white(tail[tail.len - 2]),
+    };
+}
+
+/// A round of `t1` and its `accepted` drafts, ending in `pending`, cut to emit `keep` tokens: the draft the round accepted
+/// after the cut is the pending token, so the stream is the whole round's.
+fn cutMtpRound(drafts: []const u32, accepted: u32, pending: u32, keep: usize) struct { accepted: u32, pending: u32 } {
+    if (keep >= accepted + 1) return .{ .accepted = accepted, .pending = pending };
+    return .{ .accepted = @intCast(keep - 1), .pending = drafts[keep - 1] };
+}
 
 /// A forced tool call (`tool_choice` required or named) enforced while
 /// decoding: the thought runs free, and the position after its closer (or
@@ -1361,6 +1447,24 @@ fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.Thi
     return transformer_mod.ssmCheckpointDropIndex(items, policy, null);
 }
 
+/// Drops checkpoints until at most `max` hold a state (`max` 0 = no cap). A released one is a restore point
+/// already on SSD and costs no memory, so it is never the one dropped nor counted.
+fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy) void {
+    if (max == 0) return;
+    while (true) {
+        var held: usize = 0;
+        var first: usize = list.items.len;
+        for (list.items, 0..) |*cp, i| {
+            if (cp.isReleased()) continue;
+            held += 1;
+            first = @min(first, i);
+        }
+        if (held <= max) return;
+        var dropped = list.orderedRemove(first + checkpointDropIndex(list.items[first..], policy));
+        dropped.deinit(allocator);
+    }
+}
+
 test "a capped list thins span-preserving whether or not the prompt carries media" {
     // The SSD record no longer ends at the first media row, so there is no boundary to protect:
     // a checkpoint above the media is a restore point like any other.
@@ -1473,10 +1577,14 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     return SSM_SNAPSHOT_BACKOFF;
 }
 
-/// GLM's checkpoint grid: absolute multiples of its widest prefill chunk. A narrower chunk divides
+/// GLM's chunk grid: absolute multiples of its widest prefill chunk. A narrower chunk divides
 /// it and `nextChunkEnd` ends a chunk on every grid point, so a grid point is a chunk boundary in
 /// every request whatever widths it runs. A test seam; serving never changes it.
 pub var glm_checkpoint_stride: usize = glm5_forward.prefill_chunk;
+
+/// GLM's restore-point grid: the chunk grid points a checkpoint is captured at (a multiple of it), the
+/// same 8192 grid every arch keeps on SSD. A test seam; serving never changes it.
+pub var glm_capture_stride: usize = kv_disk_cache_mod.POINT_GRID;
 
 /// GLM restores only on an IndexPool boundary, so its prompt-end snapshot backs off up to 3
 /// more tokens to land on an absolute multiple of 4.
@@ -1851,6 +1959,9 @@ pub const Generator = struct {
     /// A DSpark round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
     dspark_round_ends_at: ?u32 = null,
+    /// Armed by the scheduler for a hybrid thinking request with tools; the restore point it takes is the last
+    /// of `ssm_checkpoints` while `state` is `.taken`.
+    thought_point: ?ThoughtPoint = null,
     /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
     /// and `has_pending_logits` is false. Serial decode (`next`) emits it first.
     dspark_pending: bool = false,
@@ -2379,8 +2490,6 @@ pub const Generator = struct {
         /// object the admission guard bills against, so bill and forward cannot
         /// disagree. (Live 2026-08-14: pinned 4096, prefilled at 8192.)
         pinned_prefill_chunk: usize = 0,
-        /// A decode-share ceiling applied after explicit and environment chunk settings.
-        decode_share_width_cap: usize = 0,
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
@@ -2640,7 +2749,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = decodeShareCapped(requestPrefillChunk(
+        const PREFILL_CHUNK: usize = requestPrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -2648,7 +2757,7 @@ pub const Generator = struct {
             xfm.config.isMoe(),
             xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
-        ), options.decode_share_width_cap);
+        );
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
         const chunk_peak = trace_enabled and transformer_mod.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
@@ -2698,6 +2807,9 @@ pub const Generator = struct {
             glm_checkpoint_stride
         else
             effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override));
+        // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
+        // restore-point grid.
+        const cp_grid: usize = if (glm_request != null and want_ssm_cp) glm_capture_stride else ssm_cp_stride;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
         // scheduler after restoring a checkpoint) pass the matched prefix
         // length so the snapshots stamp positions valid in the full original
@@ -2790,7 +2902,7 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = if (glm_request != null and want_state_cp)
-                glmCaptureSchedule(glm_checkpoint_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
+                glmCaptureSchedule(glm_capture_stride, options.ssm_checkpoint_max, ssm_cp_offset, prompt_ids.len).backoff
             else
                 ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
             const loop_end = prefix_len - snapshot_backoff;
@@ -2837,7 +2949,7 @@ pub const Generator = struct {
             );
             // Admission billed the request's top at `default_chunk`; the chunks before it start at
             // the widest width and step down only where one no longer fits beside the reserved KV.
-            const start_chunk = if (width_is_adaptive) decodeShareCapped(cap_adapt, options.decode_share_width_cap) else 0;
+            const start_chunk = if (width_is_adaptive) cap_adapt else 0;
             if (start_chunk > cur_chunk) {
                 cur_chunk = start_chunk;
                 adapt_state.width_min = @intCast(start_chunk);
@@ -3039,7 +3151,7 @@ pub const Generator = struct {
                 // are realized; the snapshot is just a refcount-share of the
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
-                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
+                if (want_ssm_cp and cp_grid > 0 and abs_end_for_cp2 % cp_grid == 0 and restorableCheckpoint(glm_request, abs_end_for_cp2)) {
                     const cp = try capturePrefillCheckpoint(allocator, xfm, &ctx, glm_request, abs_end_for_cp2, options.write_through_hook != null);
                     ssm_checkpoints.append(allocator, cp) catch |e| {
                         var doomed = cp;
@@ -3057,14 +3169,7 @@ pub const Generator = struct {
                     };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
-                    if (options.ssm_checkpoint_max > 0 and
-                        ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                    {
-                        var dropped = ssm_checkpoints.orderedRemove(
-                            checkpointDropIndex(ssm_checkpoints.items, cp_thin),
-                        );
-                        dropped.deinit(allocator);
-                    }
+                    thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
                 }
 
                 if (vision_chunked) {
@@ -3176,14 +3281,7 @@ pub const Generator = struct {
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
-                    if (options.ssm_checkpoint_max > 0 and
-                        ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                    {
-                        var dropped = ssm_checkpoints.orderedRemove(
-                            checkpointDropIndex(ssm_checkpoints.items, cp_thin),
-                        );
-                        dropped.deinit(allocator);
-                    }
+                    thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
                 }
             }
         }
@@ -4153,6 +4251,72 @@ pub const Generator = struct {
         return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
     }
 
+    /// The absolute position the request's state stands at: GLM's request offset, else the model's position counter.
+    fn thoughtStatePos(self: *const Generator) usize {
+        if (self.ctx.glm5_request) |request| return request.offset;
+        return self.ctx.moe_seq_offset.*;
+    }
+
+    /// A batched tick keeps the slot's recurrent state in the group's merged arrays, not in its entries.
+    fn thoughtStateInGroup(self: *const Generator) bool {
+        const entries = self.ctx.ssm_entries orelse return false;
+        for (entries) |*e| if (e.group) |g| if (g.live) return true;
+        return false;
+    }
+
+    /// A speculative round's part in the thought point: how many of its emitted tokens `path` (the first at absolute
+    /// position `anchor`) to keep so the state ends where the point sits; null runs the round whole.
+    pub fn thoughtRoundCut(self: *Generator, path: []const u32, anchor: usize) ?usize {
+        const tp = &(self.thought_point orelse return null);
+        if (tp.state != .armed or self.thoughtStateInGroup()) return null;
+        switch (thoughtRound(tp.*, path, anchor)) {
+            .whole => return null,
+            .skip => {
+                tp.state = .passed;
+                return null;
+            },
+            .keep => |n| {
+                tp.state = .cut;
+                tp.at = anchor + n;
+                return n;
+            },
+        }
+    }
+
+    /// After the cut round committed: the state it stands on becomes the newest checkpoint.
+    pub fn thoughtPointTake(self: *Generator) void {
+        const tp = &(self.thought_point orelse return);
+        if (tp.state != .cut) return;
+        tp.state = .passed;
+        const a = self.ssm_checkpoint_alloc orelse return;
+        const pos = self.thoughtStatePos();
+        if (pos != tp.at) {
+            log.debug("[prefix] no thought restore point: the state stands at {d}, not {d}\n", .{ pos, tp.at });
+            return;
+        }
+        var cp = capturePrefillCheckpoint(a, self.xfm, &self.ctx, self.ctx.glm5_request, pos, false) catch |err| {
+            log.warn("[prefix] thought restore point at {d} not taken: {s}\n", .{ pos, @errorName(err) });
+            return;
+        };
+        if (self.mtp_cache != null) self.xfm.qwen4MtpMarkQsaLeftover(pos -| self.mtp_position_base) catch {};
+        self.ssm_checkpoints.append(a, cp) catch {
+            cp.deinit(a);
+            return;
+        };
+        tp.state = .taken;
+        log.info("[prefix] thought restore point at {d} ({d} tokens in)\n", .{ pos, pos - tp.base });
+    }
+
+    /// Frees the thought point the commit must not carry.
+    pub fn dropThoughtPoint(self: *Generator) void {
+        const tp = &(self.thought_point orelse return);
+        if (tp.state != .taken) return;
+        tp.state = .passed;
+        const a = self.ssm_checkpoint_alloc orelse return;
+        var cp = self.ssm_checkpoints.pop() orelse return;
+        cp.deinit(a);
+    }
+
     /// The ONE place a partial accept rolls recurrent state back from the verify capture:
     /// the loop and the `partial_rounds` count travel together, so a caller cannot take the
     /// rollback without being counted.
@@ -4336,7 +4500,16 @@ pub const Generator = struct {
         const sampled = !isGreedyTemperature(self.sampling.temperature) and self.sampling.top_k != 1;
         if (sampled) try sampledGlmDecisions(self, layerwise, budget, self.eos_token_ids);
         const request = self.ctx.glm5_request.?;
-        var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, budget, self.eos_token_ids);
+        // A round that carries the thought's closer ends on the pool position at or below it; the verified targets
+        // already fix the path, so the cut commits a prefix of it with the same pending token.
+        var round_budget = budget;
+        if (self.thought_point != null) {
+            const full = try @import("glm5_dflash_tree.zig").accept(layerwise.tokens[0..layerwise.count], layerwise.parents[0..layerwise.count], layerwise.targets[0..layerwise.count], budget, self.eos_token_ids);
+            var path: [16]u32 = undefined;
+            for (full.rows[0..full.count], path[0..full.count]) |row, *t| t.* = layerwise.tokens[row];
+            if (self.thoughtRoundCut(path[0..full.count], request.offset)) |keep| round_budget = @min(budget, keep);
+        }
+        var round = try @import("glm5_dflash.zig").finishRound(self.timer.io, self.dflash.?, &self.dflash_ctx.?, self.xfm.glm5.?, request, proposal, layerwise, round_budget, self.eos_token_ids);
         round.draft_ns = draft_ns;
         round.verify_ns = verify_ns;
         if (!lookup and proposal.count > 1) self.dflash_calib.observeTree(&proposal.conf, &proposal.parents, proposal.count, round.rows[0..round.count]);
@@ -4386,6 +4559,7 @@ pub const Generator = struct {
             self.done = true;
             self.finish_reason = "stop";
         }
+        self.thoughtPointTake();
         return .{ .tokens = tokens, .accepted_tokens = @intCast(round.accepted_drafts) };
     }
 
@@ -6526,6 +6700,33 @@ pub const Generator = struct {
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
     }
 
+    /// Where an MTP slot re-enters after a forced commit: a planner-owned slot rejoins the planner, which drains
+    /// the commit's pending logits and primes a fresh hidden; a serial ramp would keep its whole group plain.
+    fn mtpSerialExitAfterForced(planner_owned: bool) MtpSerialExit {
+        return if (planner_owned) .none else .drain;
+    }
+
+    /// A forced commit (`commitForcedTokens`) ran plain through the trunk, so the head's history has a
+    /// hole. Re-seed a qwen4 head (its positions refuse a gap) and take the serial exit ramp back to
+    /// MTP. False = not an MTP slot that may resume: the caller disables speculation.
+    pub fn mtpResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !bool {
+        if (self.mtp == null or self.mtp_cache == null or !self.mtpAdaptiveHeadMayResume()) return false;
+        try self.mtpDetachHead(allocator, false);
+        switch (self.mtp_cache.?) {
+            .qwen4 => |r| {
+                if (self.mtp_hist_stash) |*st| st.deinit();
+                self.mtp_hist_stash = null;
+                r.t.qwen4MtpActivate(r.st);
+                try r.t.qwen4MtpReset();
+            },
+            .mimo => {},
+        }
+        self.spec_disabled_runtime = false;
+        self.spec_disable_reason = .none;
+        self.mtp_serial_exit = mtpSerialExitAfterForced(group_planner.enabled() and self.mtp_planner_owned);
+        return true;
+    }
+
     fn mtpSerialOneToken(allocator: std.mem.Allocator, tok: u32) !DrafterStepResult {
         const tokens = try allocator.alloc(u32, 1);
         tokens[0] = tok;
@@ -7533,7 +7734,7 @@ pub const Generator = struct {
         const stop_prefix = mtpStopPrefix(drafts, accepted, if (self.mtp_planner_owned) self.eos_token_ids else &.{});
         if (stop_prefix.stop) |token| log.debug("[mtp-stop] accepted EOS token={d} accepted={d}->{d}\n", .{ token, accepted, stop_prefix.accepted });
         accepted = stop_prefix.accepted;
-        const next_pending: u32 = blk: {
+        var next_pending: u32 = blk: {
             if (stop_prefix.stop) |stop| break :blk stop;
             if (stochastic) {
                 try mlx.check(mlx.mlx_array_eval(corr_batch));
@@ -7545,6 +7746,17 @@ pub const Generator = struct {
                 break :blk greedy_next_pending;
             }
         };
+        // A round that carries the thought's closer ends on it, so the state stands where the restore point sits.
+        if (self.thought_point != null and accepted < 64) {
+            var path: [64]u32 = undefined;
+            path[0] = t1;
+            @memcpy(path[1 .. 1 + accepted], drafts[0..accepted]);
+            if (self.thoughtRoundCut(path[0 .. 1 + accepted], moe_seq_offset_snap)) |keep| {
+                const cut = cutMtpRound(drafts, accepted, next_pending, keep);
+                accepted = cut.accepted;
+                next_pending = cut.pending;
+            }
+        }
 
         if (tracing) {
             self.mtp_trace.add(.eval, ph.read());
@@ -7647,6 +7859,7 @@ pub const Generator = struct {
                 if (chain.lookup) self.mtpLookupObserve(m, m + 1);
                 self.mtpRoundUntimed();
             }
+            self.thoughtPointTake();
             return DrafterStepResult{
                 .tokens = tokens,
                 .accepted_tokens = m,
@@ -7759,6 +7972,7 @@ pub const Generator = struct {
             if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
             self.mtpRoundUntimed();
         }
+        self.thoughtPointTake();
         return DrafterStepResult{
             .tokens = tokens,
             .accepted_tokens = accepted,
@@ -14059,7 +14273,7 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
 }
 
 /// The checkpoints a GLM prefill takes, replayed from the loop's own chunk ends (test oracle for `glmCaptureSchedule`).
-pub fn glmCaptureOracle(grid: usize, cap: u32, offset: usize, tail_len: usize, width: usize) GlmCaptureSchedule {
+pub fn glmCaptureOracle(chunk_grid: usize, grid: usize, cap: u32, offset: usize, tail_len: usize, width: usize) GlmCaptureSchedule {
     var r: GlmCaptureSchedule = .{ .backoff = 0, .events = 0, .peak = 0, .newest = 0 };
     if (tail_len <= 1) return r;
     const prefix_len = tail_len - 1;
@@ -14068,7 +14282,7 @@ pub fn glmCaptureOracle(grid: usize, cap: u32, offset: usize, tail_len: usize, w
     var held: u32 = 0;
     var pos: usize = 0;
     while (pos < loop_end) {
-        pos = glmChunkEnd(pos, loop_end, width, grid, offset, true);
+        pos = glmChunkEnd(pos, loop_end, width, chunk_grid, offset, true);
         if ((pos + offset) % grid != 0) continue;
         r.events += 1;
         r.newest = pos + offset;
@@ -14152,6 +14366,39 @@ test "a width that changes at every boundary never moves a checkpoint" {
             }
         }
     }
+}
+
+test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
+    for ([_]usize{ 8192, 4096, 2048, 512 }) |width| {
+        const stride = effectiveSsmCheckpointStride(256, @max(width, prefill_chunk_override));
+        try testing.expectEqual(@as(usize, kv_disk_cache_mod.POINT_GRID), stride);
+        var buf: [128]usize = undefined;
+        const ends = walkChunkEnds(&buf, 39969, &.{width}, true, stride, 0);
+        var grid: [8]usize = undefined;
+        var n: usize = 0;
+        for (ends) |end| {
+            if (end % stride != 0) continue;
+            grid[n] = end;
+            n += 1;
+        }
+        try testing.expectEqualSlices(usize, &.{ 8192, 16384, 24576, 32768 }, grid[0..n]);
+    }
+}
+
+test "the held-state cap thins only states in memory: restore points already on SSD are never dropped" {
+    const al = testing.allocator;
+    var list = std.ArrayList(SSMCheckpoint).empty;
+    defer list.deinit(al);
+    // 130 points written through (their states released), then the newest 20 still held.
+    for (0..130) |i| try list.append(al, .{ .pos = 8192 * (i + 1), .layers = &.{}, .released_bytes = 1 });
+    for (0..20) |i| try list.append(al, .{ .pos = 8192 * (131 + i), .layers = &.{} });
+    thinHeldCheckpoints(al, &list, 16, .min_span_recency);
+    try testing.expectEqual(@as(usize, 146), list.items.len);
+    for (list.items[0..130]) |cp| try testing.expect(cp.isReleased());
+    try testing.expectEqual(@as(usize, 8192 * 150), list.items[list.items.len - 1].pos);
+    // No cap, nothing thins.
+    thinHeldCheckpoints(al, &list, 0, .min_span_recency);
+    try testing.expectEqual(@as(usize, 146), list.items.len);
 }
 
 test "every ladder rung the adaptive width can take divides the checkpoint stride" {
@@ -19668,25 +19915,6 @@ test "upstream bugfix: constrained logprobs describe the returned token before m
     try testing.expectEqualSlices(u32, &.{ 1, 2 }, gen.generated_ids.items);
 }
 
-pub fn decodeShareCapped(width: usize, cap: usize) usize {
-    return if (cap == 0) width else @min(width, cap);
-}
-
-test "decodeShareCapped: the share cap narrows an explicit and an env width" {
-    const saved_override = prefill_chunk_override;
-    const saved_explicit = prefill_chunk_explicit;
-    defer {
-        prefill_chunk_override = saved_override;
-        prefill_chunk_explicit = saved_explicit;
-    }
-    prefill_chunk_override = 8192;
-    prefill_chunk_explicit = true;
-    const explicit = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), explicit);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
-    try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
-}
-
 /// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.
 const StepOutFrees = struct {
     var seen: [8]?*anyopaque = @splat(null);
@@ -19852,7 +20080,9 @@ test "GLM short prompts and odd chunk widths still checkpoint only on pool bound
     var prompt: [150]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
     glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]struct { len: usize, chunk: usize }{ .{ .len = 14, .chunk = 64 }, .{ .len = 150, .chunk = 37 } }) |case| {
         var xfm = try Transformer.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
@@ -19895,7 +20125,9 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
     const greedy = SamplingParams{ .temperature = 0.0 };
     const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 64, .ssm_checkpoint_max = 16 };
     glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
 
     var weights = model_mod.Weights.init(a);
     defer weights.deinit();
@@ -19934,12 +20166,14 @@ test "GLM prefill checkpoints sit on chunk boundaries, and a restore there prefi
 
 test "the GLM capture schedule is what the prefill loop captures: peak, newest and count, cold and warm, at every cap" {
     const widths = [_]usize{ 2048, 512, 64 };
-    for ([_]usize{ 64, 2048 }) |grid| for ([_]usize{ 0, 4, 60, 2044 }) |offset| {
-        for ([_]usize{ 1, 2, 15, 16, 31, 33, 34, 64, 65, 200, 2048, 2049, 5000, 18432 }) |tail| for (0..9) |cap_usize| {
+    for ([_][2]usize{ .{ 64, 64 }, .{ 2048, 2048 }, .{ 2048, 8192 } }) |grids| for ([_]usize{ 0, 4, 60, 2044 }) |offset| {
+        const chunk_grid = grids[0];
+        const grid = grids[1];
+        for ([_]usize{ 1, 2, 15, 16, 31, 33, 34, 64, 65, 200, 2048, 2049, 5000, 18432, 40000 }) |tail| for (0..9) |cap_usize| {
             const cap: u32 = @intCast(cap_usize);
             const got = glmCaptureSchedule(grid, cap, offset, tail);
             for (widths) |w| {
-                const want = glmCaptureOracle(grid, cap, offset, tail, w);
+                const want = glmCaptureOracle(chunk_grid, grid, cap, offset, tail, w);
                 testing.expectEqual(want, got) catch |e| {
                     std.debug.print("grid {d} offset {d} tail {d} cap {d} width {d}: want {any} got {any}\n", .{ grid, offset, tail, cap, w, want, got });
                     return e;
@@ -19949,6 +20183,9 @@ test "the GLM capture schedule is what the prefill loop captures: peak, newest a
     };
     // 18,432 cold tokens: eight grid points, then the prompt-end checkpoint beside them before the thin.
     try testing.expectEqual(@as(u32, 9), glmCaptureSchedule(2048, 8, 0, 18432).peak);
+    // A 40k prompt keeps the 8192 grid and the prompt end only: 8192 x 4, then the end.
+    const wide = glmCaptureSchedule(8192, 0, 0, 40000);
+    try testing.expectEqual(@as(u32, 5), wide.events);
     // A 16-token cold prompt captures one checkpoint, at 12.
     try testing.expectEqual(@as(usize, 12), glmCaptureSchedule(2048, 8, 0, 16).newest);
     // A grid point at a chunk's end is not absorbed by the tail merge that follows it.
@@ -19975,7 +20212,9 @@ test "the GLM prefill holds as many checkpoints as its schedule says, and ends o
     var prompt: [300]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
     glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]usize{ 14, 40, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
         var xfm = try Transformer.init(testing.io, a, cfg, &weights);
         defer xfm.deinit();
@@ -20017,7 +20256,9 @@ test "a GLM prefill whose hook releases landed checkpoints holds at most two sta
     var prompt: [300]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast((i * 5 + 1) % 4);
     glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     for ([_]usize{ 14, 70, 150, 300 }) |len| for ([_]u32{ 2, 16 }) |cap| {
         var kept_xfm = try Transformer.init(testing.io, a, cfg, &weights);
         defer kept_xfm.deinit();
@@ -20036,12 +20277,11 @@ test "a GLM prefill whose hook releases landed checkpoints holds at most two sta
         const sched = glmCaptureSchedule(64, cap, 0, len);
         try testing.expect(releasing.peak <= @min(sched.peak, 2));
         if (len >= 300) try testing.expectEqual(@as(usize, 2), releasing.peak);
-        try testing.expectEqual(kept.ssm_checkpoints.items.len, gen.ssm_checkpoints.items.len);
+        // The cap bounds the states in memory, not the restore points listed: every capture stays.
+        try testing.expectEqual(@as(usize, sched.events), gen.ssm_checkpoints.items.len);
+        try testing.expectEqual(kept.ssm_checkpoints.items[kept.ssm_checkpoints.items.len - 1].pos, gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].pos);
         var held: usize = 0;
-        for (kept.ssm_checkpoints.items, gen.ssm_checkpoints.items) |want, got| {
-            try testing.expectEqual(want.pos, got.pos);
-            held += @intFromBool(!got.isReleased());
-        }
+        for (gen.ssm_checkpoints.items) |got| held += @intFromBool(!got.isReleased());
         try testing.expect(held <= 2);
         try testing.expect(!gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].isReleased());
     };
@@ -20065,7 +20305,9 @@ test "GLM checkpoints stay on the grid when a request steps its chunk down, and 
     defer weights.deinit();
     const cfg = try glmGeneratorFixture(&weights);
     glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
     defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
     var first: [300]u32 = undefined;
     for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
     var next: [330]u32 = undefined;
@@ -21524,4 +21766,182 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
         try testing.expectEqualSlices(u32, first.tokens.items, again.tokens.items);
         try expectAnswer(a, first);
     }
+}
+
+test "thoughtRound: a round ends on the closer or the grid position at or below it, and a short thought or a passed grid takes no point" {
+    const recurrent: ThoughtPoint = .{ .closer = 9, .grid = 1, .min_tokens = 4, .base = 100 };
+    try testing.expectEqual(ThoughtRound.whole, thoughtRound(recurrent, &.{ 1, 2, 3 }, 110));
+    try testing.expectEqual(ThoughtRound{ .keep = 3 }, thoughtRound(recurrent, &.{ 1, 2, 9, 4, 5 }, 110));
+    try testing.expectEqual(ThoughtRound{ .keep = 1 }, thoughtRound(recurrent, &.{ 9, 4 }, 110));
+    try testing.expectEqual(ThoughtRound{ .keep = 5 }, thoughtRound(recurrent, &.{ 1, 2, 3, 4, 9 }, 110));
+    // The closer at 103 ends a thought of three tokens.
+    try testing.expectEqual(ThoughtRound.skip, thoughtRound(recurrent, &.{ 9, 4 }, 103));
+
+    const pooled: ThoughtPoint = .{ .closer = 9, .grid = 4, .min_tokens = 4, .base = 100 };
+    // The closer at 112: the state behind it is 113, the pool boundary at or below is 112.
+    try testing.expectEqual(ThoughtRound{ .keep = 2 }, thoughtRound(pooled, &.{ 1, 2, 9, 4, 5 }, 110));
+    try testing.expectEqual(ThoughtRound{ .keep = 2 }, thoughtRound(pooled, &.{ 1, 9, 4, 5 }, 110));
+    try testing.expectEqual(ThoughtRound{ .keep = 1 }, thoughtRound(pooled, &.{ 9, 4 }, 111));
+    // The boundary below the closer is behind the round's own start: no state stands there.
+    try testing.expectEqual(ThoughtRound.skip, thoughtRound(pooled, &.{ 9, 4 }, 110));
+}
+
+test "cutMtpRound: a round cut at any of its tokens streams what the whole round does" {
+    const drafts = [_]u32{ 41, 42, 43, 44 };
+    const stream = [_]u32{ 40, 41, 42, 43, 44, 45 };
+    for (1..6) |keep| {
+        const cut = cutMtpRound(&drafts, 4, 45, keep);
+        try testing.expectEqual(keep, 1 + @as(usize, cut.accepted));
+        try testing.expectEqual(stream[keep], cut.pending);
+    }
+    const whole = cutMtpRound(&drafts, 4, 45, 6);
+    try testing.expectEqual(@as(u32, 4), whole.accepted);
+    try testing.expectEqual(@as(u32, 45), whole.pending);
+}
+
+test "thoughtEdgesSurvive: the thought comes back only as the template writes it" {
+    try testing.expect(thoughtEdgesSurvive(.newline_before_closer, "The", "t.\n"));
+    try testing.expect(thoughtEdgesSurvive(.newline_before_closer, "The", ".\n"));
+    try testing.expect(!thoughtEdgesSurvive(.newline_before_closer, "The", "it."));
+    try testing.expect(!thoughtEdgesSurvive(.newline_before_closer, "The", ". \n"));
+    try testing.expect(!thoughtEdgesSurvive(.newline_before_closer, "The", ".\n\n"));
+    try testing.expect(!thoughtEdgesSurvive(.newline_before_closer, " The", ".\n"));
+    try testing.expect(!thoughtEdgesSurvive(.newline_before_closer, "\n", ".\n"));
+    try testing.expect(thoughtEdgesSurvive(.bare_closer, "The", "it."));
+    try testing.expect(!thoughtEdgesSurvive(.bare_closer, "The", ".\n"));
+    try testing.expect(!thoughtEdgesSurvive(.bare_closer, "", "it."));
+}
+
+/// A speculative round as the generators commit one: `tokens` go through the model in one forward and join the generated ids.
+fn commitTestRound(gen: *Generator, tokens: []const u32) !void {
+    const ids = try testing.allocator.alloc(i32, tokens.len);
+    defer testing.allocator.free(ids);
+    for (tokens, ids) |t, *i| i.* = @intCast(t);
+    const input = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(tokens.len) }, 2, .int32);
+    defer _ = mlx.mlx_array_free(input);
+    const logits = try gen.xfm.forwardWith(&gen.ctx, input);
+    defer _ = mlx.mlx_array_free(logits);
+    try mlx.check(mlx.mlx_array_eval(logits));
+    try gen.generated_ids.appendSlice(testing.allocator, tokens);
+    gen.advanceStep(@intCast(tokens.len));
+}
+
+test "GLM thought point: the round that carries the closer is cut to a pool boundary, its state is the newest checkpoint, and a restore from it is the live state" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 3);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const opts: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 64, .adaptive_chunk_width = true, .ssm_checkpoint_stride = 64, .ssm_checkpoint_max = 16 };
+    glm_checkpoint_stride = 64;
+    glm_capture_stride = 64;
+    defer glm_checkpoint_stride = glm5_forward.prefill_chunk;
+    defer glm_capture_stride = kv_disk_cache_mod.POINT_GRID;
+
+    var weights = model_mod.Weights.init(a);
+    defer weights.deinit();
+    const cfg = try glmGeneratorFixture(&weights);
+    var turn = try Transformer.init(testing.io, a, cfg, &weights);
+    defer turn.deinit();
+    var gen = try Generator.initWithOptions(testing.io, a, &turn, &tok, &prompt, 4, greedy, &.{}, opts);
+    defer gen.deinit(a);
+    const closer: u32 = 3;
+    const base = turn.glm5_request.?.offset;
+    gen.thought_point = .{ .closer = closer, .grid = @intCast(glm5_prefix.pool_size), .min_tokens = 8, .base = base };
+    const before = gen.ssm_checkpoints.items.len;
+
+    // A round with no closer runs whole and takes nothing.
+    const plain = [_]u32{ 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0 };
+    try testing.expectEqual(@as(?usize, null), gen.thoughtRoundCut(&plain, base));
+    try commitTestRound(&gen, &plain);
+    gen.thoughtPointTake();
+    try testing.expectEqual(before, gen.ssm_checkpoints.items.len);
+
+    // The round that carries the closer keeps the tokens up to the pool boundary at or below it.
+    const anchor = turn.glm5_request.?.offset;
+    const closing = [_]u32{ 1, 2, 0, 1, 2, closer, 0, 1 };
+    const want = (anchor + 5 + 1) / glm5_prefix.pool_size * glm5_prefix.pool_size - anchor;
+    try testing.expect(want > 0 and want < closing.len);
+    try testing.expectEqual(@as(?usize, want), gen.thoughtRoundCut(&closing, anchor));
+    try commitTestRound(&gen, closing[0..want]);
+    gen.thoughtPointTake();
+    try testing.expectEqual(before + 1, gen.ssm_checkpoints.items.len);
+    const point = &gen.ssm_checkpoints.items[before];
+    try testing.expectEqual(anchor + want, point.pos);
+    try testing.expectEqual(@as(usize, 0), point.pos % glm5_prefix.pool_size);
+    try testing.expectEqual(ThoughtPoint.State.taken, gen.thought_point.?.state);
+
+    // A restore from it is the live state, and the next token from both leaves them the same.
+    var rows = try glm5_prefix.MlaRows.capture(a, &turn.glm5_request.?, point.pos, turn.s);
+    defer rows.deinit();
+    var warm_xfm = try Transformer.init(testing.io, a, cfg, &weights);
+    defer warm_xfm.deinit();
+    try glm5_prefix.restore(&warm_xfm.glm5_request.?, &rows, point);
+    warm_xfm.cache.step = point.pos;
+    try glm5_prefix.expectSameLogicalState(&turn.glm5_request.?, &warm_xfm.glm5_request.?);
+    const next = [_]u32{closing[want]};
+    try commitTestRound(&gen, &next);
+    var warm_opts = opts;
+    warm_opts.ssm_checkpoint_pos_offset = point.pos;
+    var warm = try Generator.initWithOptions(testing.io, a, &warm_xfm, &tok, &next, 4, greedy, &.{}, warm_opts);
+    defer warm.deinit(a);
+    try glm5_prefix.expectSameLogicalState(&turn.glm5_request.?, &warm_xfm.glm5_request.?);
+
+    // The commit may drop the point; the checkpoints are what they were.
+    gen.dropThoughtPoint();
+    try testing.expectEqual(before, gen.ssm_checkpoints.items.len);
+}
+
+test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncut rounds do, and the state behind the closer is the newest checkpoint (MTP_TEST_MODEL)" {
+    const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, std.mem.span(path));
+    defer if (config.ngram_table_path) |name| a.free(name);
+    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, a, config, &weights);
+    defer xfm.deinit();
+    xfm.compileQwen4Hc();
+    xfm.compileGdnGate();
+    xfm.compileMoeRouting();
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    var prompt: [96]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(1 + (i * 7919) % 40000);
+    const want: usize = 48;
+
+    const whole = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer whole.deinit(a);
+    while (whole.gen.?.generated_ids.items.len < want) {
+        const round = (try whole.gen.?.nextMtp(a)) orelse return error.MtpRoundDeclined;
+        a.free(round.tokens);
+    }
+    const reference = whole.gen.?.generated_ids.items;
+    // A token the stream emits mid-way stands in for the closer; its first occurrence is where the point sits.
+    const closer = reference[20];
+    const at = std.mem.indexOfScalar(u32, reference, closer).?;
+
+    const cut = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
+    defer cut.deinit(a);
+    const gen = &cut.gen.?;
+    gen.thought_point = .{ .closer = closer, .grid = 1, .min_tokens = 0, .base = prompt.len };
+    while (gen.generated_ids.items.len < want) {
+        const round = (try gen.nextMtp(a)) orelse return error.MtpRoundDeclined;
+        a.free(round.tokens);
+        // The round that took the point ended on the closer, and the state stands right behind it.
+        if (gen.thought_point.?.state == .taken and gen.ssm_checkpoints.items.len == 1 and gen.generated_ids.items.len == at + 1) {
+            try testing.expectEqual(closer, gen.generated_ids.items[at]);
+            try testing.expectEqual(prompt.len + at + 1, gen.ssm_checkpoints.items[0].pos);
+            try testing.expectEqual(prompt.len + at + 1, cut.off);
+        }
+    }
+    try testing.expectEqual(ThoughtPoint.State.taken, gen.thought_point.?.state);
+    try testing.expectEqual(@as(usize, 1), gen.ssm_checkpoints.items.len);
+    try testing.expectEqual(prompt.len + at + 1, gen.ssm_checkpoints.items[0].pos);
+    try testing.expectEqualSlices(u32, reference[0..want], gen.generated_ids.items[0..want]);
 }

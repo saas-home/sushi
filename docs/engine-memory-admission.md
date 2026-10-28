@@ -16,6 +16,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
 - `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- **A load whose owned bytes plus 1 GiB pass the lower of `vm.global_user_wire_limit` and `vm.user_wire_limit` logs one
+  `[mem] warning:` with the `sudo sysctl` fix** (`userWireWarning`, read once after the load): the macOS user-wire cap
+  is independent of `iogpu.wired_limit_mb` and default memsize less `vm.global_no_user_wire_amount` (116.82 GB here).
+  Owned bytes are `ownedBytesTotal` (weight regions plus expert slabs); the 1 GiB is the MLX decode pool, the one ledger
+  term outside them. Warning only. The suggested value is the need or the declared wired limit, rounded up to a GB,
+  at most RAM less 12 GB; when even that is short the line says to shrink the pack or `--ssd-budget-gb`.
+  Measured slowdown past it: [dsv41-memory](dsv41-memory.md).
 - **A command buffer fails (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) once MLX's peak passes the wired limit less
   the GPU memory MLX does not own** (#61). The limit counts AGX "In use system memory", which is system-wide: other
   processes' Metal allocations (WindowServer, every app with a layer) count against it. Measured on an M1 Max 32 GB,
@@ -45,7 +52,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 - The preflight's available figure is free RAM CAPPED at Metal's working-set limit (`effectiveAvailableBytes`): a
   lowered `iogpu.wired_limit_mb` binds below free RAM, and a load past it failed warmup, then every request.
-- **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative) plus file-backed pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative), file-backed and purgeable pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **The auto-context sizer bills the cache reserve at most half the room** (`ctxCacheShare`: the context is the primary claimant), and `safeContextForBudget` floors any fit under 1024 tokens at 1024; a Flash-Next or DeepSeek bill-derived context is advertised as the bill admits it, with no floor.
 - **The file-backed share is grantable slowly, not at once.**
   - **Slow climb, clean:** MiMo's BF16 KV filled to 550K with no swap while the file cache drained to 3 GiB.
   - **Fast large load, swap:** a 24 GB streamed load beside an idle resident GLM read 32 GiB available, then swapped
@@ -349,6 +357,9 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
   and the scheduler's `admissionPassArmed` read that one predicate), crediting only
   provably reclaimable bytes; `PrefillDoesNotFit` → 400 by name. A warm share that does not fit is first taken
   over (`checkoutRestored`: its append donates, so the restored rows are not billed twice).
+- **A prompt that does not fit unloads idle resident models before it is refused** (`fitAfterUnloadingIdle`,
+  `Scheduler.unloadLruIdleModel`): least recently used first, re-billed after each, never the request's own model and
+  never one a request holds; the connection thread asks, the inference thread frees.
 - **DeepSeek STQ bills a request's state, not its prefill working set**: the working set comes out of decoder-layer
   expert pools each prefill forward releases when its need passes the live headroom, refused before anything is released
   where the pools cannot cover it; its transient cap (`Config.chunkCap`, the pool inside it) is that working set; admission bills that term only past the lendable bytes, plus a decode forward's
@@ -400,9 +411,12 @@ the full limit is reachable: on a real 64 GB Mac the free-RAM term can bind lowe
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
   ([engine-expert-streaming](engine-expert-streaming.md#vision)).
+- **Qwen's tower is billed as it is held**: the load requantizes the tower's big matrices to affine 8-bit
+  ([qwen4-arch](qwen4-arch.md#vision-tower)), so `indexedResidentSplit` bills 597,327,776 B, not the stored 897,862,112 B,
+  to a resident load and to a streamed `--vision` ledger alike (the rule is `qwen_vision.quantGroupAtLoad` on the shard headers).
 - **DeepSeek-V4.1's tower is billed in that term**: `dsv41_source.visionBytes` sums the pack's `vision.*`, `aligner.*`,
-  `image_*` and each layer's `bias_vl` as stored (bf16 tower 970,536,960 bytes plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
-  `[expert-stream] ssd budget` line reads `vision 0.97 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);
+  `image_*` and each layer's `bias_vl` as the load holds them (the 322 requantized matrices as affine 8-bit g128 codes, `dsv41_vision.quantizedBytes`, the rest bf16 as stored, plus 40 f32 biases of 1,536 bytes on an STQ pack), so the
+  `[expert-stream] ssd budget` line reads `vision 0.50 GB` by default (`0.00` under `--no-vision`, or with `vision: false`);
   a load without the tower bills 0 and leaves those tensors unread. A request's encode is `dsv41_vision.encodeScratchBytes`
   (activations of the widest block, the 512-query score sheet and the aligner, a bound for the 9,198 patches a 1024-token
   span can hold) plus the f32 patches and three copies of the 5120-wide span rows.

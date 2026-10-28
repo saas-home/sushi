@@ -31,7 +31,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 | FFN | every layer MoE: 384 routed experts, top-6, width 2304, one shared expert; `sqrtsoftplus` scores, the f32 bias picks only, normalized, ×1.5; gate clamp 10 |
 | Hyper-connections | 4 streams, 20 Sinkhorn iterations, `hc_eps` 1e-6; two collapses and expansions per layer |
 | Engram | layers 1 and 14: 384M rows × 256 FP8 each (~100 GB per table), 8 heads, 4-grams over a 99092-entry compressed vocabulary, hashed with numpy-seeded multipliers and primes |
-| Loaded by default, skippable | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16, 0.97 GB) and each layer's `bias_vl`, unless `--no-vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
+| Loaded by default, skippable | the vision tower (`vision.*`, `aligner.*`, `image_*`, bf16 on disk, 0.97 GB; held as affine 8-bit, 0.50 GB) and each layer's `bias_vl`, unless `--no-vision` ([image input](#image-input)); the 3 DSpark stages (`mtp.*`) only without `--no-mtp` |
 
 Storage in the checkpoint: trunk linears `F8_E4M3` with `F8_E8M0` scales on 32×32 blocks; routed experts `I8` holding
 two e2m1 nibbles (low first) with `F8_E8M0` scales per 32 columns; `embed`, `head`, gate bf16; hyper-connection
@@ -43,7 +43,21 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
-  expert). The head is widened to f32; the embedding stays bf16.
+  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) is [read from the shard by row](#embed-ssd), not loaded.
+<a id="embed-ssd"></a>
+- **Token embedding on SSD** (`src/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
+  is left out of the resident load and of the trunk term (`dsv41_source.embedOnSsd`, the one test for both), 0.37 GB on the
+  STQ pack. A forward `pread`s the rows of its token ids (`Ssd.read`: each distinct id once, 16 rows a thread, `F_RDADVISE`
+  first, page cache on, read-ahead off) and `Embed.rows` dequantizes them with the resident call, over the same stored bytes
+  (scales and biases cast to the activation dtype as the loader cast them), so the rows are bit-identical. The page cache
+  keeps the common tokens' rows hot. A prefill chunk's pass is told the prompt tokens after it (`ForwardCtx.ahead_ids`)
+  and reads the next chunk's rows on a thread while it runs (`aheadEmbed`, ~2.3 KB a token of host memory, unbilled);
+  the next pass takes them when its ids are the same, else reads its own. Decode and a DSpark draft read their few rows
+  inline. The DSpark draft embeds `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower
+  never touch it. A dense embedding (the FP8 checkpoint's bf16 table) stays resident. Load logs
+  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`. Live (873b0fd4 vs 09977e23, budget 108, AC, fans
+  max, one A then one B): +1 slot a layer (270 -> 271 serial, 260 -> 261 DSpark), 512-token decode byte-identical at
+  46.8 / 46.9 tok/s serial and 52.0 / 52.2 DSpark, cold 32,888-token prefill 792.7 / 790.4 tok/s.
 - **Routed experts** (`src/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
@@ -81,6 +95,7 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   262144 keys, 1 row 0.74 to 0.44 ms, 4 rows 2.35 to 1.27 ms per eval (about 0.2 ms of each is the eval floor); live serial b349f67e 42.8 tok/s at 209k, 47.8 at 4.7k, the same 600
   greedy tokens (one boot, GPU lock, QUIET, fans max, die 49 C, taskpolicy -a). Ruled out
   on the ubench: a 512-thread score threadgroup and a replicated top-k histogram (both unchanged).
+- **Top-k threadgroup width** (`topk_tg`, `probeTopk` at load): 1024 threads, halved where the GPU caps the kernel lower (M1/M2: 832); the picks are width-independent (`dsv41 topk: the picks do not depend` test).
 - **Decode top-k, split** (`topkIndicesSplit`, `topkSplits`): a decode block (up to 16 rows) of at least 131072 scores (262144 past
   one row) with k <= 512 splits each row over 8 chunks; each chunk's threadgroup selects its own top-k and one merge
   threadgroup selects over the chunks' picks, which are ascending in row index, so the indices, their order and the ties
@@ -275,7 +290,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 |---|---|---|---|
 | `dsv41_moe_gu`, `dsv41_moe_dn` | routed gate/up/SwiGLU/down, sum, shared expert, hyper-connection expand | one token (decode) | no further from an f64 truth than the chain; bf16 within 2 ulps of its peak |
 | `dsv41_moe_act`, `dsv41_moe_combine` | the SwiGLU x weight and the unsort/sum/shared add of the sorted-gather MoE | many rows (prefill) | bit for bit |
-| `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits, softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
+| `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits (the router read as stored, bf16, and widened in the kernel), softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
 | `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
 | `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
@@ -470,6 +485,9 @@ and its embedding through the affine row gather. The FP4 fused kernels do not en
 trellis bank); the FFN is the routed sum plus the shared expert, which at decode width (<= 16 rows) is one expert of the fused
 trellis chain (`sharedFused`: pair GEMV, fused mid and down, reduce; the clamped SwiGLU stays in f32) and over more rows the
 three linears and the SwiGLU ops; the routed decode reduce adds it in f32 (`stqRouted`), the byte-equal of a separate add.
+On the route-spec queue and in the DSpark stage layers the shared expert rides the routed chain's own launches (5 fewer
+launches a layer, byte-identical; [engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)); the waiting schedule keeps
+it a chain of its own.
 Trunk linears take the multi-row kernel up to 8 rows. Up to 8 rows, `wq_a` and `wkv` (and a ratio-1 KV source's compressor
 `wkv`) run as one stacked launch, as do a pooling compressor's `wkv` and `wgate` (`Layer.in_shared`, `CompW.shared`,
 stacked at load; each linear keeps a view of the stack for wider chunks). `dsv41 real` holds both stacks of layer 2's own
@@ -686,7 +704,7 @@ as the GLM and Qwen verify kernels have); it is not in this port.
 ## Image input
 
 Images are served by default: the tower loads on every DeepSeek-V4.1 load, streamed or resident, unlike MiMo and GLM
-whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-settings) skips it and saves its 0.97 GB,
+whose streamed loads leave it off. `--no-vision` (or `vision: false` in model-settings) skips it and saves its 0.50 GB,
 and an image without it is a 400; an explicit flag outranks the setting, which outranks the default. One image is `[start] + ([n_w aligner rows] +
 [newline]) * n_h + [end]`, every position of which is `image_token_id` (`<｜deepseek_image｜>`) in the prompt.
 
@@ -698,9 +716,16 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
   the grid, so a request holds each image as its file and `planGrid` runs on the size read from the header; the
   patches are built for the media key and again when the tower reaches the image, a window at a time ([server-lifecycle](server-lifecycle.md#request-ownership-and-media)).
 - **Tower** (`Dsv41Vision`, `vision.py`): 32 blocks of pre-norm attention (16 heads, 2-D rope: row angles in the first
-  half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, bf16 as stored, then `Aligner`
+  half of each rotate-half pair, column angles in the second, f32) and a SwiGLU MLP, then `Aligner`
   (zero-pad to multiples of 3, unfold channel-major, `w2(gelu(w1(x)))`). It returns the whole span including the three
   learned delimiter rows. Queries run in chunks of 512; `encodeScratchBytes` bills the worst block.
+- **Requantized at load** (`Dsv41Vision.init`, `quantizesAtLoad`): the pack keeps the tower bf16, and the load turns every
+  block `wqkv`, `wo`, `w1`, `w2` and the aligner's `w1`, `w2` (322 matrices, 483M of the 485M parameters) into MLX
+  affine 8-bit, group 128, run through `mlx_quantized_matmul`, and frees each bf16 copy as its codes exist. The patch
+  embedding (588 wide), norms, biases and delimiters stay bf16. One `[vision] tower requantized at load: ...` line
+  reports it. Against the bf16 tower on house.jpeg at 642 tokens: cosine 0.99906 after the final norm, 0.99957 on the
+  span; the tower runs ~3% slower (a quantized matmul over 5,394 rows is compute-bound, [measured](dsv41-memory.md#vision-requant)).
+  The reference-parity tests build the tower with `initWith(.., false)`.
 - **Trunk** (`dsv41_model.beginPassWith`): the chunk's image positions take the span rows in order
   (`VisionRows.offset` = rows earlier chunks consumed, so a prompt chunks anywhere); they pick experts by the layer's
   `gate_bias_vl` instead of `gate_bias` (the route kernel reads a `[L, E]` bias row by row; `--drop-expert` masks it
@@ -715,7 +740,7 @@ and an image without it is a 400; an explicit flag outranks the setting, which o
 - **Chat**: the template reads `content` as a string, so `ChatConfig.image_placeholder` renders each image as the atom
   where it sat, blank-line joined with its text (the release's `process_image_messages`); `placeMedia` expands the atom
   to `spanRows` tokens.
-- **Bill**: the tower and the image biases (0.97 GB) are the budget line's `vision` term (`dsv41_source.visionBytes`,
+- **Bill**: the tower as requantized and the image biases (0.50 GB) are the budget line's `vision` term (`dsv41_source.visionBytes`,
   `streamingResidentSplit`), a request's encode is billed by `visionEncodeBill`, and a load with the tower keeps
   `largestImageEncodeBytes` beside the budget ([engine-memory-admission](engine-memory-admission.md)).
 

@@ -83,6 +83,7 @@ test {
     _ = @import("dsv41_config.zig");
     _ = @import("dsv41_qat.zig");
     _ = @import("dsv41_engram.zig");
+    _ = @import("dsv41_embed.zig");
     _ = @import("dsv41_source.zig");
     _ = @import("dsv41_owned.zig");
     _ = @import("dsv41_model.zig");
@@ -102,6 +103,7 @@ test {
     _ = @import("glm5_router.zig");
     _ = @import("glm5_activation.zig");
     _ = @import("glm5_shared.zig");
+    _ = @import("qwen4_shared.zig");
     _ = @import("glm5_kda_project.zig");
     _ = @import("glm5_dflash_tree.zig");
     _ = @import("glm5_dflash_topk.zig");

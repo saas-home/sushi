@@ -180,6 +180,8 @@ fn printUsage(io: std.Io) void {
         \\                      span (default 0 = off). Request think_penalty > this
         \\                      flag > model-settings.json
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
+        \\                      it to affine 8-bit at load (more memory, exact tower)
         \\  --vision            Load the vision tower on an SSD-streamed load too (off by
         \\                      default there, except for DeepSeek-V4.1: its weights
         \\                      come out of the expert cache)
@@ -288,8 +290,8 @@ fn printUsage(io: std.Io) void {
         \\                        any value (default: 1).
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
-        \\                        request's prefill (0..0.9); narrows chunks too.
-        \\                        Default 0.
+        \\                        request's prefill (0..0.9); never narrows
+        \\                        chunks. Default 0.25.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -309,12 +311,14 @@ fn printUsage(io: std.Io) void {
         \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
         \\  --ssm-checkpoint-max <n>
-        \\                      Cap on SSM checkpoints retained per cache entry
-        \\                        (default: 16). The first and the newest
-        \\                        positions are always kept; beyond the cap the
+        \\                      Cap on SSM checkpoint states held in memory per
+        \\                        cache entry (default: 16). The first and the
+        \\                        newest are always kept; beyond the cap the
         \\                        interior is thinned. 0 = unlimited, bounded only
-        \\                        by the prefix cache's byte budget. With an SSD
-        \\                        tier Qwen holds only the newest in RAM.
+        \\                        by the prefix cache's byte budget. It never
+        \\                        thins the restore points on SSD, which keep
+        \\                        every 8192 tokens and each prompt's end
+        \\                        (--prefix-cache-disk sizes them).
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 1, integers 1..32).
@@ -669,6 +673,8 @@ pub fn main(init: std.process.Init) !void {
             no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--vision")) {
             vision = true;
+        } else if (std.mem.eql(u8, args[i], "--vision-bf16")) {
+            @import("vision_common.zig").vision_bf16 = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
@@ -1111,18 +1117,9 @@ pub fn main(init: std.process.Init) !void {
         if (t) |thread| thread.detach();
     }
 
-    // Observability: allocate the metrics core once (when --metrics is on) and
-    // publish it via the server-global `g_metrics`. Declared here — above every
-    // serve-dispatch path (headless and the primary MLX
-    // path) — so `server_mod.serve()` spawns the gauge sampler + routes /metrics
-    // regardless of engine, and each LoadParams builder reads it back into the
-    // scheduler's per-request sink via `.metrics = server_mod.g_metrics`. The
-    // instance lives on this stack frame for the whole process lifetime; the
-    // defer clears the global so an early serve() failure can't leave it
-    // dangling. Off (the default) → null: a single per-request branch, no cost.
-    var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
-    if (metrics_instance) |*m| server_mod.g_metrics = m;
-    defer server_mod.g_metrics = null;
+    // Observability: `--metrics` turns the process-wide core on before serving; without it the core stays off
+    // until POST /metrics/enable. Every LoadParams builder reads it back as the scheduler's initial sink.
+    if (metrics_enabled) _ = metrics_mod.process.enable();
 
     // An unsupported file format is refused by name before any config.json read.
     if (isGgufPath(io, model_dir)) {
@@ -1344,6 +1341,7 @@ pub fn main(init: std.process.Init) !void {
         else blk: {
             var dev = mlx.mlx_device{ .ctx = null };
             _ = mlx.mlx_get_default_device(&dev);
+            defer _ = mlx.mlx_device_free(dev);
             var info = mlx.mlx_device_info_new();
             defer _ = mlx.mlx_device_info_free(info);
             if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
@@ -1424,7 +1422,7 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-            .metrics = server_mod.g_metrics,
+            .metrics = metrics_mod.current(),
         };
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
@@ -1563,6 +1561,7 @@ fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     if (explicit) return val;
     var dev = mlx.mlx_device{ .ctx = null };
     _ = mlx.mlx_get_default_device(&dev);
+    defer _ = mlx.mlx_device_free(dev);
     var info = mlx.mlx_device_info_new();
     defer _ = mlx.mlx_device_info_free(info);
     if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
@@ -1706,7 +1705,7 @@ fn runHeadlessServe(
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .metrics = server_mod.g_metrics,
+        .metrics = metrics_mod.current(),
     };
 
     var serve_cfg = launch_serve.serverConfig();
