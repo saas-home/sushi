@@ -12,7 +12,7 @@ const qat_mod = @import("dsv41_qat.zig");
 const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_stages };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -445,6 +445,79 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
     }
 }
 
+// ── dsv41.attn_decode ───────────────────────────────────────────────────
+
+pub const attn_decode: report.Bench = .{
+    .name = "dsv41.attn_decode",
+    .scope = .dsv41,
+    .what = "one decode token's attention core (1 row, 64 heads x 512, window 128, sink, folded inverse rotation and fp8 round trip, bf16) at the release's split count; dependent calls, each reading the last's heads",
+    .unit = .us,
+    .steps = 40,
+    .axes = &.{.{ .name = "keys", .values = &.{ "k512c4k", "k512c250k", "k64c4k" }, .numeric = false }},
+    .arms = &.{"decode"},
+    .ref = "decode",
+    .run = runAttnDecode,
+};
+
+const AttnDecodeSample = struct { gpu: mlx.mlx_stream, q: A, ring: A, comp: A, topk: A, sink: A, freqs: A, steps: usize, splits: usize };
+
+fn sampleAttnDecode(s: *const AttnDecodeSample, _: usize) anyerror!f64 {
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var sw = io_util.Stopwatch.init(io());
+    var q = s.q;
+    for (0..s.steps) |_| q = try kernels.attnDecodeSplit(&sc, .{
+        .q = q,
+        .ring = s.ring,
+        .comp = s.comp,
+        .topk = s.topk,
+        .sink = s.sink,
+        .p0 = 100000,
+        .window = 128,
+        .scale = 1.0 / @sqrt(@as(f32, 512)),
+        .freqs = s.freqs,
+        .rd = 64,
+        .qat_fp8 = true,
+        .out_dt = .bfloat16,
+    }, s.splits);
+    try evalAll(&.{q});
+    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(s.steps));
+}
+
+fn runAttnDecode(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const Case = struct { name: []const u8, k: usize, nc: usize };
+    const cases = [_]Case{
+        .{ .name = "k512c4k", .k = 512, .nc = 4096 },
+        .{ .name = "k512c250k", .k = 512, .nc = 250000 },
+        .{ .name = "k64c4k", .k = 64, .nc = 4096 },
+    };
+    var f: [32]f32 = undefined;
+    qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+    const f32t = mlx.mlx_dtype.float32;
+    for (cases) |cs| {
+        if (!listed(run.axis("keys"), cs.name)) continue;
+        var sc = Scope.init(alloc, gpu);
+        defer sc.deinit();
+        var picks: [512]i32 = undefined;
+        for (picks[0..cs.k], 0..) |*v, i| v.* = @intCast((i * 7919 + 3) % cs.nc);
+        const d: AttnDecodeSample = .{
+            .gpu = gpu,
+            .q = try sc.astype(try kernels.randn(&sc, &.{ 1, 64, 512 }, f32t, 301, 1.5), .bfloat16),
+            .ring = try sc.astype(try kernels.randn(&sc, &.{ 128, 512 }, f32t, 302, 1.5), .bfloat16),
+            .comp = try sc.astype(try kernels.randn(&sc, &.{ ci(cs.nc), 512 }, f32t, 303, 1.5), .bfloat16),
+            .topk = try sc.ints(picks[0..cs.k], &.{ 1, ci(cs.k) }),
+            .sink = try kernels.randn(&sc, &.{ 1, 64, 1 }, f32t, 304, 1.0),
+            .freqs = try sc.floats(&f, &.{32}),
+            .steps = run.steps(40),
+            .splits = kernels.attnSplits(128 + cs.k),
+        };
+        try evalAll(&.{ d.q, d.ring, d.comp, d.topk, d.sink, d.freqs });
+        const label = try std.fmt.allocPrint(run.a, "keys {s}", .{cs.name});
+        try run.interleave(label, &d, sampleAttnDecode);
+    }
+}
+
 // ── dsv41.attn_epilogue ─────────────────────────────────────────────────
 
 pub const attn_epilogue: report.Bench = .{
@@ -573,6 +646,98 @@ fn runPicksSpan(run: *report.Run) anyerror!void {
             try s.peak[2].metrics(run, "packed_nax", "peak");
         }
     }
+}
+
+// ── dsv41.picks_glue ────────────────────────────────────────────────────
+
+pub const picks_glue: report.Bench = .{
+    .name = "dsv41.picks_glue",
+    .scope = .dsv41,
+    .what = "a decode layer's picks glue at the release geometry (512 picks of 512-wide FP4 rows, some -1) as a chain of dependent layers: the op chain (clamp, two gathers, unpack, mask, arange, select) against one kernel, and the link between layers alone",
+    .unit = .us,
+    .steps = 40,
+    .axes = &.{
+        .{ .name = "rows", .values = &.{ "1024", "16384", "262144" } },
+        .{ .name = "L", .values = &.{ "1", "4" } },
+    },
+    .arms = &.{ "chain", "kernel", "link" },
+    .ref = "chain",
+    .run = runPicksGlue,
+};
+
+const LINK_SOURCE: [:0]const u8 =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(topk_shape[0]) * uint(topk_shape[1])) return;
+    \\out[i] = topk[i];
+    \\if (i == 0u && float(rows[0]) == 1.5e30f) out[0] = ids[0];
+    \\if (i == 0u && ids[0] == -7) out[0] = topk[1];
+;
+
+var link_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `prev` again, but only once `rows` and `ids` exist: the next layer's picks, so the layers run one after another.
+fn picksLink(sc: *Scope, prev: A, rows: A, ids: A) !A {
+    const k = try qat_mod.kernelNew(&link_kernel, "dsv41_ubench_picks_link", &.{ "topk", "rows", "ids" }, &.{"out"}, LINK_SOURCE, "");
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const sh = mlx.getShape(prev);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, sh.ptr, sh.len, .int32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(@max(mlx.mlx_array_size(prev), 1)), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    var o: [1]A = undefined;
+    try qat_mod.applyKernel(sc, k, &.{ prev, rows, ids }, cfg, &o);
+    return o[0];
+}
+
+const PicksGlueSample = struct { gpu: mlx.mlx_stream, rows: *const model.Rows, topk: A, steps: usize };
+
+fn samplePicksGlue(s: *PicksGlueSample, arm: usize) anyerror!f64 {
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    const pk = s.rows.pack.?;
+    const fixed = try qat_mod.unpackPicks(&sc, s.rows.buf, s.rows.sbuf, s.topk, pk.mode, pk.group, s.rows.dtype);
+    try evalAll(&.{ fixed.rows, fixed.ids });
+    var x = s.topk;
+    var sw = io_util.Stopwatch.init(io());
+    for (0..s.steps) |_| {
+        const p: model.Picks = switch (arm) {
+            0 => try model.packedPicksOps(&sc, s.rows, x),
+            1 => blk: {
+                const u = try qat_mod.unpackPicks(&sc, s.rows.buf, s.rows.sbuf, x, pk.mode, pk.group, s.rows.dtype);
+                break :blk .{ .topk = u.ids, .comp_rows = u.rows };
+            },
+            else => .{ .topk = fixed.ids, .comp_rows = fixed.rows },
+        };
+        x = try picksLink(&sc, s.topk, p.comp_rows, p.topk);
+    }
+    try mlx.check(mlx.mlx_array_eval(x));
+    return @as(f64, @floatFromInt(sw.read())) / @as(f64, @floatFromInt(s.steps));
+}
+
+fn runPicksGlue(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    var rows_buf: [8]usize = undefined;
+    var l_buf: [8]usize = undefined;
+    for (try axisInts(run, "rows", &rows_buf)) |nc| for (try axisInts(run, "L", &l_buf)) |L| {
+        const c: model.AttnCase = .{ .L = L, .wp = 127, .K = 512, .nc = nc };
+        var base = Scope.init(alloc, gpu);
+        defer base.deinit();
+        const d = try model.attnCaseData(&base, c, 0xa77);
+        var store = try model.packedStore(&base, d.comp);
+        defer store.deinit();
+        try evalAll(&.{ d.topk, store.buf, store.sbuf });
+        const pk = store.pack.?;
+        const want = try model.packedPicksOps(&base, &store, d.topk);
+        const got = try qat_mod.unpackPicks(&base, store.buf, store.sbuf, d.topk, pk.mode, pk.group, store.dtype);
+        const wr = try sc_mod.hostF32(try base.astype(want.comp_rows, .float32));
+        const gr = try sc_mod.hostF32(try base.astype(got.rows, .float32));
+        const wi = try sc_mod.hostI32(want.topk);
+        const gi = try sc_mod.hostI32(got.ids);
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(wr), std.mem.sliceAsBytes(gr)) or !std.mem.eql(i32, wi, gi)) run.invalid("the kernel's rows or ids differ from the op chain's");
+        var s: PicksGlueSample = .{ .gpu = gpu, .rows = &store, .topk = d.topk, .steps = run.steps(40) };
+        const label = try std.fmt.allocPrint(run.a, "rows {d} L {d}", .{ nc, L });
+        try run.interleave(label, &s, samplePicksGlue);
+    };
 }
 
 // ── dsv41.topk ──────────────────────────────────────────────────────────
@@ -706,6 +871,71 @@ fn runHcExpand(run: *report.Run) anyerror!void {
             try run.interleave(label, &s, sampleHcExpand);
         }
     }
+}
+
+// ── dsv41.hc_expand_decode ──────────────────────────────────────────────
+
+pub const hc_expand_decode: report.Bench = .{
+    .name = "dsv41.hc_expand_decode",
+    .scope = .dsv41,
+    .what = "the hyper-connection expand of one decode row (hc 4 x 5120, bf16 stream), 40 chained calls: a thread a column against a thread an output element",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{.{ .name = "rows", .values = &.{"1"} }},
+    .arms = &.{ "column", "element", "copy" },
+    .ref = "column",
+    .run = runHcExpandDecode,
+};
+
+const hc_decode_chain = 40;
+
+const HcExpandDecodeSample = struct { gpu: mlx.mlx_stream, d: HcExpandData };
+
+fn sampleHcExpandDecode(s: *HcExpandDecodeSample, arm: usize) anyerror!f64 {
+    const d = s.d;
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var sw = io_util.Stopwatch.init(io());
+    var x = d.x;
+    const one = try sc.astype(try sc.f(1.0), .bfloat16);
+    for (0..hc_decode_chain) |_| x = switch (arm) {
+        0 => try kernels.hcExpandPerColumn(&sc, x, d.y, d.post, d.comb),
+        1 => try kernels.hcExpandFused(&sc, x, d.y, d.post, d.comb),
+        else => try sc.add(x, one),
+    };
+    try evalAll(&.{x});
+    return @as(f64, @floatFromInt(sw.read())) / hc_decode_chain;
+}
+
+fn runHcExpandDecode(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const D = 5120;
+    try kernels.probeHc(alloc, gpu, 4, D, 20);
+    var sc = Scope.init(alloc, gpu);
+    defer sc.deinit();
+    const f32t = mlx.mlx_dtype.float32;
+    const d: HcExpandData = .{
+        .x = try sc.astype(try kernels.randn(&sc, &.{ 1, 4, D }, f32t, 201, 1.5), .bfloat16),
+        .y = try sc.astype(try kernels.randn(&sc, &.{ 1, D }, f32t, 202, 1.0), .bfloat16),
+        .post = try kernels.randn(&sc, &.{ 1, 4 }, f32t, 203, 0.3),
+        .comb = try kernels.randn(&sc, &.{ 1, 4, 4 }, f32t, 204, 0.45),
+        .cpre = undefined,
+        .w = undefined,
+        .hw = undefined,
+        .eps = undefined,
+    };
+    try evalAll(&.{ d.x, d.y, d.post, d.comb });
+    var a = d.x;
+    var b = d.x;
+    for (0..hc_decode_chain) |_| {
+        a = try kernels.hcExpandPerColumn(&sc, a, d.y, d.post, d.comb);
+        b = try kernels.hcExpandFused(&sc, b, d.y, d.post, d.comb);
+    }
+    const want = try sc_mod.hostF32(try sc.astype(a, f32t));
+    const got = try sc_mod.hostF32(try sc.astype(b, f32t));
+    if (!std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) run.invalid("the per-element expand's bytes differ from the per-column's");
+    var s: HcExpandDecodeSample = .{ .gpu = gpu, .d = d };
+    try run.interleave("expand 1 row x40", &s, sampleHcExpandDecode);
 }
 
 // ── dsv41.hc_stages ─────────────────────────────────────────────────────

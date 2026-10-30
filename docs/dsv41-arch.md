@@ -43,21 +43,14 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the Engram rows, the MTP/DSpark tensors and (under `--no-vision`) the vision/aligner/image tensors and `bias_vl`, read by name from the shard headers. FP8
   linears become MLX `mxfp8`: the u8 codes viewed as u32 and each 32-row scale row repeated down its 32 rows. FP4 experts
   are MLX `mxfp4` exactly (the int8 viewed as u32, low nibble first; proven bit for bit against a numpy decode of a real
-  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) is [read from the shard by row](#embed-ssd), not loaded.
-<a id="embed-ssd"></a>
-- **Token embedding on SSD** (`src/dsv41/dsv41_embed.zig`): a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`)
-  is left out of the resident load and of the trunk term (`dsv41_source.embedOnSsd`, the one test for both), 0.37 GB on the
-  STQ pack. A forward `pread`s the rows of its token ids (`Ssd.read`: each distinct id once, 16 rows a thread, `F_RDADVISE`
-  first, page cache on, read-ahead off) and `Embed.rows` dequantizes them with the resident call, over the same stored bytes
-  (scales and biases cast to the activation dtype as the loader cast them), so the rows are bit-identical. The page cache
-  keeps the common tokens' rows hot. A prefill chunk's pass is told the prompt tokens after it (`ForwardCtx.ahead_ids`)
-  and reads the next chunk's rows on a thread while it runs (`aheadEmbed`, ~2.3 KB a token of host memory, unbilled);
-  the next pass takes them when its ids are the same, else reads its own. Decode and a DSpark draft read their few rows
-  inline. The DSpark draft embeds `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower
-  never touch it. A dense embedding (the FP8 checkpoint's bf16 table) stays resident. Load logs
-  `[dsv41] token embedding on SSD (0.37 GB freed to the expert cache)`. Live (873b0fd4 vs 09977e23, budget 108, AC, fans
-  max, one A then one B): +1 slot a layer (270 -> 271 serial, 260 -> 261 DSpark), 512-token decode byte-identical at
-  46.8 / 46.9 tok/s serial and 52.0 / 52.2 DSpark, cold 32,888-token prefill 792.7 / 790.4 tok/s.
+  expert). The head is widened to f32; a dense embedding stays bf16. An affine embedding (an STQ pack's 4-bit g64 triple, `embed.weight/scales/biases`) loads with the trunk, [resident](#embed-resident).
+<a id="embed-resident"></a>
+- **Token embedding, resident**: a pack's affine triple (`embed.weight` u32, `embed.scales`, `embed.biases`; 0.37 GB on the
+  STQ pack) is loaded and billed with the trunk like a dense table, and `Embed.rows` gathers and dequantizes the rows of
+  its ids on the GPU, so the ids may be an array still being computed (`extendLazy`). The rows equal the ones the table
+  read by row from the shard gave (`dsv41 embed: a row gathered on the GPU ...`, host and lazy ids, bf16/f16/f32
+  scales). The cache gives back the 0.37 GB the SSD read had freed (at most one slot a layer). The DSpark draft embeds
+  `[t1, noise_id...]` through the same table; MTP stages, the head and the vision tower never touch it.
 - **Routed experts** (`src/dsv41/dsv41_stream.zig`): the shared expert cache reads each layer's picked experts from the shards
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
@@ -145,6 +138,11 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   rows within 5%. End to end, resident 32K stage profile (`--drop-expert 128 --ssd-budget-gb 94`, one boot each, A e7a7571c, B
   this change, GPU lock, QUIET, fans max): the 2048 chunk ending at 28,672 ran `hc_attn` 40.1 to 31.7 ms and `hc_ffn` 50.8
   to 42.3, total 1,342.4 to 1,327.3 ms; the 32,768-token prefill 1,458.0 to 1,486.2 tok/s.
+  `dsv41_hc_expand` runs one thread an output element (grid z = copy, same expression and order per element, bytes equal
+  the one-thread-a-column grid at 1 to 512 rows, D 40 to 5120, stream magnitudes 1e-3 to 400). `dsv41.hc_expand_decode`, one
+  decode row x 40 chained calls (quiet, AC, `taskpolicy -a`, 31 rounds, 76583044 plus this change): 9.14 us a call to 8.90 (paired 0.973,
+  23 of 31 rounds), a chain of `x + 1` 7.76 us, so the kernel body above dispatch is about 1.4 us and the grid recovers
+  0.24 of it: about 10 us a token over 40 layers, not the 0.2 ms the stage trace's 10.5 us a layer suggested.
 
 ### QAT round trips
 
@@ -356,6 +354,7 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_gate`, `dsv41_route`, `dsv41_topk`, `dsv41_topk_chunk`, `dsv41_topk_merge` | router logits (the router read as stored, bf16, and widened in the kernel), softplus scores/top-k/normalize, the indexer's top-k (a decode block over 131072+ scores splits each row over 8 chunks and merges their picks) | route: always; gate: <= 16 rows; topk: GPU | gate vs f64 truth; route experts equal, weights within 2e-6; topk the same set, ties to the lower index, the split the one-threadgroup picks in the same order |
 | `dsv41_dense_f32x` | the f32 matmul of the compressor projections | decode rows | vs f64 truth |
 | `dsv41_rope_tail`, `dsv41_kv_row` | `rotate` plus the QAT round trip (q, indexer q/k, compressed latent, inverse rotation of the heads); the window row's rms norm, rotation and fp8 round trip | every width | bit for bit (rms in MLX's accumulation order) |
+| `dsv41_unpack_picks` | a decode block's picks of the packed store: the id clamp, two gathers, FP4 unpack, mask and row numbering (7 dispatches a layer) | `packedPicks` when the picked rows are handed over unpacked (decode, narrow blocks) | bytes: rows and ids of `packedPicksOps` over both FP4 stores, clamped and masked ids |
 | `dsv41_attn_decode`, `_split`, `_merge` | one token's window and selected-row attention with the sink and the folded inverse rotation (1..8 splits of 160 rows) | one token | every split no further from the f64 truth than the chain; the folded rotation bit for bit; the attention output's fp8 round trip (`qat_fp8`, QAT on) folded into the kernel is the separate round trip's bytes |
 | `dsv41_attn_fused` (`_fp4`) | a wide span's whole `attnCore`: window band and picked rows read by index (`_fp4`: straight from the packed FP4 store), online f32 softmax with the sink, no gathered rows or logits | wide chunks (more than 16 rows) on the GPU stream, bf16 activations, 16 divides the heads | 4e-6 to 1.3e-5 of peak against the CPU f32 `attnCore`, where the GPU `attnCore` is 3.5e-4 to 7e-4; the tiny oracle (4 heads) never engages it |
 | `dsv41_attn_nax` (`_fp4`) | `dsv41_attn_fused`'s two products on NAX `matmul2d` fragments (arm `Model.attn_nax`, on where `attnNaxFits` and the load's trial pass); the same tiling, f32 softmax, sink, high + low bf16 P, epilogue store and packed rows | the fused kernel's wide chunks on an M5 (`attnNaxFits`: heads multiple of 16, width a multiple of 256) | 3.0e-6 to 6.6e-6 of peak against the CPU f32 `attnCore` (the fused kernel 3.1e-6 to 1.3e-5 on the same cases); packed rows and the epilogue store equal the NAX gather and op chain byte for byte |
@@ -363,8 +362,11 @@ exp/cos/sin are MLX's (`precise`), so an elementwise kernel is bit-identical to 
 | `dsv41_index_scores`, `dsv41_index_scores_fp4`, `dsv41_index_tile` | the indexer's relu-weighted scores over key tiles, with the unseen groups at -inf | scalar up to 16 rows (`_fp4` reads the packed keys), matrix tiles when 8 divides the heads and the width | scalar and tile no further from the f64 truth than the chain; `_fp4` the unpacked keys' scores bit for bit; a tile scored at its key offset the whole list's columns bit for bit |
 | `dsv41_hc_stage`, `dsv41_hc_stage_x`, `dsv41_hc_stage_z`, `dsv41_hc_split` | `hcMixes`, the previous-mix collapse and rms norm, and (`_x`) the `hcExpand` that feeds the FFN stage; the Sinkhorn split on one simdgroup; `_z` takes the attention's mixes and splits them in every threadgroup (no `dsv41_hc_split` dispatch after the attention stage) | up to 16 rows | mixes and normed collapse no further from the f64 truth than the chain; the expanded stream likewise; the split to 2e-6 of the thread-per-row split; `_z` bit for bit the split kernel plus `_x` (1, 3, 16 rows, bf16 and f32) |
 | `dsv41_hc_mix`, `dsv41_hc_norm` | the same for a wide block (a tile of rows and mixes a threadgroup; split + collapse + norm) | more than 16 rows | bit for bit the stage's z, split and normed collapse |
-| `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
+| `dsv41_hc_expand` | `hcExpand`'s op chain (post x y + comb^T x) on a wide block: the stream in one pass, one thread an output element (grid z = copy) | any rows, GPU stream, 4 copies, where `probeHc` finds the GPU's f32 matmul TF32-class and the kernel equal to the chain | bit for bit the chain (bf16 and f32; 1 to 4096 rows; D 40 to 5120) |
 | `dsv41_engram` | the Engram gate chain after `wkv` | up to 16 rows | bit for bit (MLX's row-reduction order) |
+
+`dsv41_unpack_picks` (decode picks glue, 7 dispatches to 1): `sushi-ubench run dsv41.picks_glue` (62f2245d code, quiet, 9 rounds of 40 dependent layers, `taskpolicy -a`, AC, GPU lock; 512 picks of 512-wide FP4 rows with holes, median us a layer including a 4 us link): op chain 26.7 / 23.0 / 18.6 / 23.0 to kernel 16.1 / 14.9 / 12.2 / 15.1 at 1024 and 16384 rows x 1 and 4 query rows; 27.1 to 23.3 at 262144 rows. One kernel a layer; bytes equal to the chain.
+Decode attention core, `sushi-ubench run dsv41.attn_decode` (`dsv41_attn_decode`/`_split`/`_merge`, 40 dependent calls, 15 rounds, quiet, `taskpolicy -a`, GPU lock, AC, 85ec48c1): 36.8 us a call at 512 picks over 4k compressed rows, 35.9 over 250k, 22.7 at 64 picks over 4k. Scoring RB of a simdgroup's rows (their dots) ahead of the serial recurrence, same expressions and bytes, was slower: RB 1/2/4/8 at 512 picks over 4k 39.2/42.0/42.0/46.0 us (a variant keeping the rows in registers 57 to 92 us). The serial walk is not what bounds the kernel.
 
 **Attention core on the matrix units (landed).** `Model.attn_nax` is on by default: a wide span's attention runs on `dsv41_attn_nax` wherever
 `attnNaxFits` holds (an M5 with NAX, 16 divides the heads, width a multiple of 256) and the load's trial passes
@@ -602,8 +604,20 @@ of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the
 (`Pass.engram_rows`). A layer the stream cannot queue (resident, released, lossy pick) settles its predecessor first; a
 pass that rebuilt 3 layers plus a third of those built (`Model.route_spec_rebuilds`) stops queueing. A decode pass does
 not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
-head again), so the GPU's only idle points are the logits read and the host's sampling. The bytes equal
-the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
+head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
+decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back
+unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar, DSpark
+verify and every wider pass keep the waited head. On the same gate (text, no tap/trace/profile, layer 0 not an Engram
+layer) the forward queues the argmax, the embedding gather and layer 0 before the host reads the token
+(`dsv41_model.extendLazy`, `Model.lazy_starts`); the host then reads the token, hashes it for the Engram rows and runs
+layer 1 on. A token the pass refuses (an image id without image rows) restores layer 0's state (`Undo`) and the next
+forward at that position gives the bytes of one that never saw it (`dsv41 generator: a one-row decode that hands its
+logits back unevaluated and queues layer 0 ahead of its token ...`, tokens and logits bit for bit). The FFN's hc split
+(`sf`: pre, post, comb) is submitted with the picks (`submitWith`, `Spec.queue`'s `ride`), so the one-simdgroup Sinkhorn
+runs beside the gate GEMV and not in a buffer of its own behind the routed chain; same kernel, same bytes
+(`dsv41 submit`). Together with the picks kernel and the hc expand grid, serial `--no-mtp` decode at 4.7k went
+52.65 / 51.85 -> 54.42 / 53.53 tok/s (r2 / r3, A B B A, one boot an arm, b95886f8 vs this stack, AC, GPU lock, fans max,
+die < 50 C at boot, `taskpolicy -a`), same text. The bytes equal the waiting schedule's (`dsv41 stq: queueing the routed chains ...`, `dsv41 stq: queued routed chains leave a verify
 round's kept rows ...`). Kernel shapes, arms and timings:
 [engine-exl3-experts](engine-exl3-experts.md#dsv41-stq).
 
