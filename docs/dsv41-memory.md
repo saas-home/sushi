@@ -76,7 +76,7 @@ the forward before it) and by `enterVision` around an image encode. The pool cou
 pool on demand and the phase's bytes plus the pool never pass the limit. A request that reaches it fails as
 `TransientCapExceeded` (503) and the server keeps serving. A request's end lifts the cap. There is no flag.
 
-The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `server.visionEncodeBill` for an image.
+The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `request_media.visionEncodeBill` for an image.
 
     prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
     decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
@@ -216,7 +216,7 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 (`Config.chunkCap`, [below](#transient-caps)), billed only where the decoder pools a prefill may still release
 (`ModelConfig.expert_borrow_bytes`, published live by the engine) do not cover it. At 1M: 3.4 GB in all.
 
-**The borrow** (`src/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
+**The borrow** (`src/dsv41/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
 - Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (6.6 GB at 2048 rows),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the

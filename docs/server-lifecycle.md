@@ -2,7 +2,7 @@
 
 How a model gets from a path to a serving slot and back: discovery, the arch gate, the one weight-loader decision,
 load and unload on the inference thread, settings precedence, the scheduler's slots and batching, threads, and the
-ownership rules that keep request data alive. Read this before touching `src/scheduler.zig`, `src/model_registry.zig`,
+ownership rules that keep request data alive. Read this before touching `src/scheduler.zig` or its split files below, `src/model_registry.zig`,
 `src/model_settings.zig`, `src/main.zig` or `src/cli.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-http-apis.md),
@@ -128,7 +128,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
-  settings.mtp.source`). Guard: `tests/test_cold_load_launch_flags.sh`, `tests/test_model_settings.sh`.
+  settings.mtp.source`). Guard: `tests/test_cold_load.sh`.
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
@@ -148,6 +148,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - `src/scheduler.zig`: slots, inference thread (sole MLX caller), queues, batching, admission, spec wiring, hot-cache
   budget revise.
+- `src/model_load.zig`: load plan, streaming plan, load bills; `src/slot_admission.zig`: slot and memory admission, batching
+  policy; `src/mtp_tick.zig`: grouped MTP tick; `src/slot_outcome.zig`: slot end, finish outcome, loop-stop reasons;
+  `src/vision_queue.zig`: vision encode queue, media deferral.
 - Text slots BATCH-decode on `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue. A resident
   `qwen4_exp` decodes plain slots as rows of one forward (`forwardQwen4DecodeRows`, up to eight, no padding, no cap):
   each row's recurrence, attention, PLE and KV append run as the slot's solo tick runs them, and the ops that read the
@@ -187,8 +190,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   token: a fresh DFlash2 slot whose prefill sampled EOS finishes `stop` with nothing published, as solo does.
 - **A slot the inference thread drops releases its GLM state there** (`releaseNativeState`: finish, error, cancel
   (also one landing after prefill, `postPrefillTerminal`), failed prefill), not when its connection thread completes it: an errored request's reserve once held 11 GB.
-- `src/generate.zig`: generation, sampling, MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers,
-  `commitForcedTokens`. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
+- `src/generate.zig`: generation, `commitForcedTokens`; `src/mtp_policy.zig` / `src/mtp_round.zig`: MTP policy and rounds; `src/sampler.zig`: sampling;
+  `src/prefill_plan.zig`: prefill chunking; `src/degenerate.zig`: `StallClock`, loop-stop tiers. `src/tokenize_cache.zig`: per-LoadedModel LRU of rendered+encoded prompts.
 
 ## Threads
 
@@ -209,7 +212,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - A `submit` that fails before a slot exists (`ModelNotReady`, `GlmKvQuantUnsupported`, `Slot.init`) parks the request's
   `vision_embeddings` in `Scheduler.orphan_vision` (fixed size, no allocation); the inference thread frees it.
 - A handler frees no embeddings array itself: a request refused after its media was encoded (`PreparedMedia.deinit`, the
-  sub-handlers' early returns) parks it through `server.disposeVision` in the same `orphan_vision` list.
+  sub-handlers' early returns) parks it through `Scheduler.orphanVision` in the same `orphan_vision` list.
 - A request's sampling state (`think_bound`, `constraint`) lives in its handler's frame: `complete` waits out any
   inference pass holding the slot (`Slot.in_pass`, taken under `queue_mu`) before the handler may free it.
   Guard: `tests/test_cancel_mid_tick.sh`.
@@ -229,7 +232,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 ## Request ownership and media
 
 - **`messages.deinit(allocator)` frees the Message array and NOTHING it points at**: request media is owned by ONE
-  `server.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
+  `request_media.RequestMedia`; `Message` BORROWS. Ownership by PROVENANCE (`{slice, owned}` returns), never
   free-unless-equals-literal.
 - **A media placeholder id occurs in ordinary TEXT**, so a media boundary is gated on the request CARRYING media
   (`firstMediaPlaceholder(has_media)`); media on a tower-less load is refused by NAME (`mediaRejectReason`; a streamed load that left the tower off by default names `--vision`).
@@ -261,9 +264,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   more than `chat.MAX_REQUEST_IMAGES` (1024) a 400 with both counts, a prompt the media pushes past the context a 400
   naming the media's tokens, an encode that does not fit a 400 (`towerFitFault`), a failed encode a 500
   (`MediaFault`); both of the last two are raised after the restore as the slot's `MediaRefused`; never a text-only answer.
-- Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen_vision.zig` / `src/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
+- Media INPUT code: `src/vision.zig` / `src/vision_common.zig` (shared preprocessing) / `src/qwen4/qwen_vision.zig` / `src/mimo2/mimo_vision.zig` / `src/mrope.zig` (Qwen3-VL
   image/video tower, M-RoPE positions over every block; MiMo-ViT images, [mimo2-arch](mimo2-arch.md#vision));
-  `src/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
+  `src/dsv41/dsv41_vision.zig` (DeepSeek-V4.1 images, [dsv41-arch](dsv41-arch.md#image-input));
   `stb_image` (JPEG, PNG, GIF first frame, BMP) + libwebp decode image input; `lib/stb_image_impl.c` names the formats compiled in.
 
 ## Config reading

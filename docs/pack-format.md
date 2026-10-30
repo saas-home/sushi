@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
-(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
+(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo2/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
 ## Routed-expert tensors
@@ -256,7 +256,7 @@ decodes or requantizes. See README.md.
 ## Fixtures
 
 `src/exl3/fixtures/exl3_*_linear.safetensors` are committed and `@embedFile`d by
-`src/exl3/expert_exl3.zig` (`fixtures`, which `src/transformer.zig` reads). They are produced by the
+`src/exl3/expert_exl3.zig` (`fixtures`, which `src/test_support.zig` reads). They are produced by the
 private converter; regenerate one only to change the format, and keep the one
 searched and decoded at window 12 (`exl3_k2p5_mcg_w12_linear.safetensors`),
 which is what certifies a narrowed window against the converter's own decode
@@ -287,7 +287,7 @@ composite.
   can't load a DENSE checkpoint (`getLayerScaleOpt`; every dense contracted
   weight owes `maybeTransposeForBf16`).
 - **A gather-read table may be quantized only where the READER has a
-  quantized-gather path**: LM `embed_tokens` via `gatherQuantizedRows` is a
+  quantized-gather path**: LM `embed_tokens` via `Transformer.rawEmbedding` is a
   SIZE decision (our packs quantize it).
 - A component pack's shared files are immutable: a converter replaces a
   hard-linked file, never modifies it in place.

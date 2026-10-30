@@ -1,7 +1,7 @@
 # Engine: KV cache and kv-quant
 
 What the KV cache stores, how a quantized cache is read, how it grows, and which settings give byte-stable
-output. Read this before touching `KVCache` in `src/transformer.zig`, `src/kv_quant.zig`, or any attention path that
+output. Read this before touching `KVCache` in `src/kv_cache.zig`, `src/kv_quant.zig`, or any attention path that
 reads cached keys.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engine-prefix-cache.md),
@@ -103,7 +103,7 @@ slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Bat
 - MiMo decode forward meter (`SUSHI_DECODE_FWD_UBENCH=40`, `_S=1,2,3,4`, `_KV=4096`, kv8 / kv6 / kv6 / kv8 boots): 20.33 /
   26.59 / 31.99 / 38.48 ms at 1-4 rows for kv8 against 20.30 / 26.38 / 31.83 / 39.15 for kv6.
 - kv4 and kv8 kernels unchanged by the shared unpack helper (interleaved main / branch / branch / main, main `d8b967a5`):
-  the MiMo matmul2d microbench (`SUSHI_KVQ_MPP_UBENCH=1`, `_KV4=1`) reads 0.97-1.03 x main at every context from 2k to 512k
+  the MiMo matmul2d microbench (`sushi-ubench run mimo2.global_decode_attn`, `--opt kv-quant=4`) reads 0.97-1.03 x main at every context from 2k to 512k
   (one cold first main run at 512k aside), and a Qwen QSA decode boot (`SUSHI_DECODE_FWD_UBENCH=40`, `_S=1,3,5,7`,
   `_KV=16384`) reads 17.20 / 24.37 / 31.37 / 38.73 ms (main) against 17.58 / 24.75 / 31.42 / 38.89 (branch) at kv8 and
   17.15 / 24.31 / 31.41 / 38.83 against 17.15 / 24.15 / 31.05 / 38.65 at kv4 (one kv4 branch boot read 1.5-1.9x slower while
@@ -121,8 +121,8 @@ slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Bat
   `[qsa-gather] engaged: sushi_qsa_nax_precise` (the dense-view gather; the packed gather did not engage on the llmprobe
   prompts at kv8 either). MiMo: `[kv-attn] matmul2d packed attention engaged: bits=6 gs=64 DK=192 DV=128 Hq=64 Hkv=4 Tq=1 Tk=4105` and
   `[mimo-verify] global rows in matmul2d row groups engaged: rows=3 keys=4108`, as at kv8; the split-K arm stays off on a NAX GPU.
-- `tests/test_glm_prefix_reuse.sh` passes at kv8 and at kv6 (every restore, the cold-vs-warm logprob bounds, and the BF16 request
-  that never restores the kv6 entry); `tests/test_kv_quant_per_request.sh` and `tests/test_kv_quant_equivalence.sh` pass on
+- `tests/glm5/test_glm_prefix_reuse.sh` passes at kv8 and at kv6 (every restore, the cold-vs-warm logprob bounds, and the BF16 request
+  that never restores the kv6 entry); `tests/test_kv_quant_per_request.sh` (plumbing and equivalence) passes on
   Sushi-2.6bpw with kv6 (first 30 tokens byte-identical to dense at 4, 6 and 8 bits).
 - GLM kv6 smoke on Sushi-2.4bpw: loads, answers, and DFlash2 engages (`[spec-stats] mode=dflash ... avg_per_round=2.38`);
   `[glm] native kv6 MLA: 4576 latent + 704 pooled-index bytes/token` (11 MLA layers at 416 bytes).

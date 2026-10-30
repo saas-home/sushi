@@ -17,13 +17,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - GDN decode = three fused dispatches (S 1..9 bit-identity is SAMPLING). At B=1,
   decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
-  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B seam: `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
+  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B'd in one process on the forward meter.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
   folds S=2), so the parity test skips a declined width above two. Parity includes every
   captured state. Wider captures keep the existing path after the S=5 regression
-  in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B: `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`.
+  in [the width sweep](qwen4-perf.md#gdn-verify-fold). Same-process A/B on the forward meter.
 - A fused kernel that replaces a capture chain carries the chain's per-step STORE rounding:
   `gated_delta_step_seq` carries the state at its stored width to the next token, so serial decode and rollback agree;
   Qwen stores f32 by default, so the rule bites at `--qwen-gdn 16` only, where upstream's verbatim verify kernel (it
@@ -101,7 +101,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
     against an f32 reference; a failed probe declines to the SIMD kernel by name.
 - At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
-  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
+  simdgroup) and ~12% softmax; K/V memory traffic is ~1% (kernel ablations,
   [perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)).
 - Each fragment row is ONE 8-byte vector load (`SushiNax::load2`); element-wise reads cost ~5% of the kernel
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn) has the ruled-out load layouts).
@@ -145,11 +145,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (its f32 matmul keeps ~11 bits).
 - A matrix's per-lane (row, column) is `fm = (lane / 4 & 4) + (lane / 2) % 4`, `fn = (lane / 4 & 2) * 2 + (lane % 2) * 2`
   with `thread_elements()`: the online rescale and the output store use it instead of a threadgroup round trip.
-- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `SUSHI_DSV41_ATTN_UBENCH=1`
-  test "dsv41 attention span timing": span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
+- Release shape (64 heads x 512, window 128, 512 picks), best of 16 interleaved on the M5 Max, `sushi-ubench run dsv41.attn_span`:
+  span 256 core 13-15 ms, f16 `attnWide` 5.9-6.8 ms, fused 2.7-3.3 ms; span 128
   core 6.3-7.2, wide 2.8-3.2, fused 1.5-1.7; window-only span 256 core 3.6-4.0, wide 2.1, fused 0.7-1.0. Peak bytes beyond
   the inputs a span: core 897 MB, wide 284 MB, fused 16 MB (the output). Four simdgroups were 15% slower than eight.
   The box was shared with other Metal compiles, so the fused arm spread up to 2x between runs; core and wide hold.
+- `dsv41_attn_fused_fp4` reads the picked rows straight from the packed FP4 store (codes and scales, by original row id)
+  and decodes each into the threadgroup tile as `unpackFp4` does, so its heads equal the unpack-and-gather path's byte
+  for byte; it replaces the gather on wide bf16 spans. `sushi-ubench run dsv41.picks_span` (c5fec957 + this kernel, quiet box, AC, 7
+  rounds): span 256 3.4 ms against 6.1 for gather + fused, span 128 1.8 against 3.1; peak beyond the inputs 16 MB
+  against 182 MB. Resident 32K prefill (`--drop-expert 128`, one boot an arm, profiled): 1016.5 to 1078.4 tok/s.
 
 ## Verify lanes
 
@@ -217,6 +222,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   MEASURED it.
 - MLX's mean over a NON-last axis sums a column in row order only while that axis is <= 8 (`col_reduce_small`,
   threadgroup_y = min(8, R)); longer columns pre-sum at stride 8 or in trees, so a serial mirror declines past 8.
+- On an M5 (NAX) MLX's f32 `matmul` is TF32-class: both operands keep their top 10 mantissa bits (truncated, not
+  rounded), the products are exact, and a K = 4 sum is `(p0 + p1) + (p2 + p3)`. A kernel that reproduces such a matmul
+  truncates the operands the same way and is bit-identical (DeepSeek's `hcExpand`, `dsv41_hc_expand`); a fma chain, a
+  sequential sum or round-to-nearest operands differ in 9% of bf16 and every f32 element. A true-f32 GPU (M1) does not
+  match, so the fused arm is gated by a load probe against the chain.
 - `mlx_fast_rope` is not the composed rope: it keeps cos/sin in f32 and rounds once; the chain rounds the bf16 table,
   each product and the sum.
 
@@ -236,8 +246,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
 - Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
   `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
-- Time MiMo's prefill attention for one chunk with `SUSHI_ATTN_PD_UBENCH=1` (test filter "MiMo prefill attention per
-  chunk"). Knobs: `_QL`, `_KL` (empty skips the main table), `_BUDGETS`, `_LEAN`, `_REPS`; kernel variants on the
-  dense chain at `_ABL_KL` keys: `_ABL=1` (ablations) and `_ALT=<a.metal>,...` (replacement sources, byte-checked
-  against the served kernel).
+- Time MiMo's prefill attention for one chunk with `sushi-ubench run mimo2.prefill_attn` (`--rungs ql=...`, `--rungs kl=...`;
+  kL = qL is the chunk alone): a global layer's served chain against pre-dequantized K/V, and a sliding layer's fused band
+  kernel against the composed SDPA. MiMo's global decode attention (dense, dequant rebuild, matmul2d, split-K, kv 2k to
+  512k) is `sushi-ubench run mimo2.global_decode_attn`.
 - Every timing run takes the GPU lock and restores QoS ([CLAUDE.md, Team process](../CLAUDE.md#team-process)).

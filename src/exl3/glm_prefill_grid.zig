@@ -2,6 +2,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const base = @import("expert_exl3_kernels.zig");
+const kernel_src = @import("kernel_source.zig");
 const log = @import("mlx_host").log;
 const api = @import("root.zig");
 const support = base.PrefillGridSupport;
@@ -19,8 +20,8 @@ fn replace(comptime source: []const u8, comptime old: []const u8, comptime value
     return source[0..at] ++ value ++ source[at + old.len ..] ++ "";
 }
 const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
-var kernels: [base.SLOT_ROWS][api.format.Window.count]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
-var failed: [base.SLOT_ROWS][api.format.Window.count]bool = @splat(@splat(false));
+var kernels: [kernel_src.SLOT_ROWS][api.format.Window.count]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
+var failed: [kernel_src.SLOT_ROWS][api.format.Window.count]bool = @splat(@splat(false));
 var build_attempts: usize = 0;
 var force_build_failure = false;
 fn build(dec: api.format.Decode) !mlx.mlx_fast_metal_kernel {
@@ -87,7 +88,7 @@ pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: A
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode) !?Arr {
     if (!dec.codebook.servesGlmFastPaths() or !eligible(s, x, bank, indices, scores)) return null;
     base.setDecodeParams(dec);
-    const c = base.slotRow(dec.codebook, false);
+    const c = kernel_src.slotRow(dec.codebook, false);
     const w = dec.window.index();
     // A probe eval drains the GPU, so a failed kernel is declined for good.
     if (failed[c][w]) return null;
@@ -251,9 +252,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
 const MCG_W12: api.format.Decode = .{ .codebook = .mcg, .window = .w12 };
 
 test "GLM prefill grid serves every admitted rate, mixed projections included, with the sorted chain's bytes" {
-    const expert = @import("expert_exl3.zig");
-    var n: c_int = expert.Rate.min_n;
-    while (n <= expert.Rate.max_n) : (n += 2) {
+    for ([_]c_int{ 16, 24, 32, 36, 40, 48, 64 }) |n| {
         try gridMatchesSortedChain(.{ n, n, n }, @mod(n, 8) == 0, MCG_W12);
     }
     try gridMatchesSortedChain(.{ 40, 40, 36 }, true, MCG_W12);

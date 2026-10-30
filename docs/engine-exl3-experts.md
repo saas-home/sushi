@@ -18,6 +18,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [pack-format](pack-format.
 | `src/exl3/rate_groups.zig` | Rate-grouped layers: the ragged bank (`Ragged`), the one-dispatch mixed-rate decode kernels, the per-group prefill GEMMs |
 | `src/exl3/expert_exl3.zig` | Host reference decoders (MUL1, MCG, STD1, SPEC1, PAIR1), `Rate`, `Window`, `Decode`, fixtures |
 | `src/exl3/expert_exl3_kernels.zig` | Prefill run-aligned 32-row window GEMM (NAX body, K4 fast branch; simdgroup-matrix body off NAX; scalar body), decode chain (`moeSwigluFused`), `DECODE_ROWS_MAX` (16), `usesPrefillArm` |
+| `src/exl3/kernel_source.zig` | Kernel source assembly: codebook and decode helpers, the slot table of built kernels, `CfgCache` |
+| `src/exl3/project_rows.zig` | The dense multi-row projection (`projectRows`, `PROJECT_ROWS_MAX`, `rows_exact`) behind `linear.zig` |
+| `src/exl3/sorted_windows.zig` | The GPU window table and the sorted-inverse finish (`gpuWindowPrefillOn`) that every model's prefill rides |
 | `src/expert_bf16_kernels.zig` | bf16 selected-expert kernels over a slab (`gateUpSwiglu`; `downReduce`) for the unquantized HF checkpoint |
 
 **`src/exl3` is a module** (`sushi_exl3`), so another MLX host (mlx-serve) can serve EXL3 packs through the same code.
@@ -62,7 +65,7 @@ kernel on supported hardware.
   (codebook + window) before each dispatch because several EXL3 packs can be resident at once; every weight kernel
   inlines `exl3_pairh` from `codebookHelpers`, built per (codebook, window). A codebook name this build does not decode is refused at load
   ([pack-format](pack-format.md#configjson)). A/B lever:
-  `SUSHI_EXL3_CODEBOOK_AB=1` on the `codebook A/B` test.
+  `sushi-ubench run shared.exl3_moe_layer` (every codebook on one layer, and MLX's affine-4 `gather_qmm` as the reference).
 - **`std1` and `spec1` decode through a (multiplier, mask) row of the pack's table** (`Decode.table`;
   [pack-format](pack-format.md#stq)). The kernels take the row as `exl3_hash_row_at(N)`, a constexpr lookup on the
   kernel's rate `N` placed ahead of the helpers, so each row is an immediate of its own pipeline and a new table needs
@@ -104,7 +107,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
 
 - **Prefill**: run-aligned 32-row windows, K-generic cooperative readers, the NAX 16x32x16 GEMM body with a K4 fast
   branch; ONE GEMM config reused across window counts (a per-row-count JIT compiled per novel prompt length).
-- **At the two served geometries (`mimoPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
+- **At the two served geometries (`gpuWindowPrefillOn`: MiMo, Flash-Next) the routing never leaves the GPU**: one
   threadgroup (a thread per expert, at most 512) builds the window table and the inverse sort order, and the finish
   reduce reads the sorted down plane through that inverse, bytes equal to un-sorting it first. Any other geometry
   builds the table on the host (a sync) and un-sorts with a copy ([perf-baselines](qwen4-perf.md#exl3-gpu-routing-meta)).
@@ -123,7 +126,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   ([perf-baselines](qwen4-perf.md#m2max-64gb)).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
   GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the SwiGLU mid is
-  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `mimoPrefillOn` it keys on geometry,
+  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `gpuWindowPrefillOn` it keys on geometry,
   never on the rate), and the pair input too, in its own dispatch (`pairPrepare`): five dispatches. A pair
   threadgroup would otherwise re-derive its K span of x (64 times per slot). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
   chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
@@ -151,17 +154,15 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   one k-tile per step) ran the one-row chain 1.27x n62's; through the funnel it runs 0.93x.
 - **A reader change is timed on every served pack's decode before it lands** (forward meter, against its parent): the
   byte-identity and engagement tests pass on a reader that runs at half speed. Speed is owed to K1.5 to K4, the
-  range the converters write: the test `every K1.5 to K4 rate decodes within a margin of n48` holds each even n from
-  24 to 64 within 1.12x of n48's GEMV steps. Rates below K1.5 and above K4 stay admitted and tested for correctness
-  (SPEC1 at every reader, GEMM, chain and f32-truth bar on `spec1-w15`'s rows); `SUSHI_EXL3_WIDE_UBENCH=1` times
-  K4.5/5/6/7/8 against K4 (decode, verify rows 3 and 4, prefill GEMM). `SUSHI_EXL3_LOWK_UBENCH=1` on the exl3 test binary prints n24..n48's decode chain and sorted prefill
-  GEMMs over n32's at Flash-Next geometry (w8, w12, w15), interleaved in one process; `SUSHI_EXL3_CHAIN_UBENCH=1`
-  times the one-row chain at every even n from 24 to 64, the lane funnel against the 64-bit merge.
+  range the converters write: `sushi-ubench run shared.exl3_decode_chain` times the decode chain of every even n from
+  24 to 64, and of K4.5/5/6/7/8, against n32, n48 and n64 in one process at Flash-Next geometry (MCG and SPEC1, 1, 3 and
+  4 rows), and each even n from 24 to 64 stays within 1.12x of n48's chain. Rates below K1.5 and above K4 stay admitted
+  and tested for correctness (SPEC1 at every reader, GEMM, chain and f32-truth bar on `spec1-w15`'s rows).
 - **Rates above K4 on the M5 Max** (pre-port tree, GPU lock, QUIET, fans max, AC, `taskpolicy -a`). The one-row chain,
   SPEC1 over SPEC1's K2, median of 7 repeats: K4.5 1.10, K5 1.13, K6 1.22, K6.5 1.27, K7 1.52, K7.5 1.73, K8 1.52.
   - There are two reader cliffs, the same on MCG: n110-112 (about 70 us against 61 at n108) and n114-126 (about 80 us,
     above n128's 70).
-  - `SUSHI_EXL3_WIDE_UBENCH`, at 512 experts, ratios over K4 in one process:
+  - At 512 experts, ratios over K4 in one process:
 
     | rate | decode, 1 row | verify, 3-4 rows | prefill GEMM |
     |---|---|---|---|
@@ -176,13 +177,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   one-row decode tick's. Served: buckets of 2 on MiMo only. Built and byte-tested at 2, 4, 8 and 16 members for any
   slot count up to 512 (one ballot per 32 slots), on every codec: a bucket above 2 runs one output tile per
   threadgroup, a block of `m` members takes the smallest rung (1, 2, 3, 4, 6, 8, 12, 16) that holds it, and rungs
-  above 8 decode a weight once and sweep the members over it. `SUSHI_EXL3_GROUP_UBENCH=1` on the exl3 test binary times
-  ungrouped, pairs and the member arms in one process at 1-8 rows on Flash-Next and DeepSeek geometry.
+  above 8 decode a weight once and sweep the members over it. `sushi-ubench run shared.exl3_grouped_decode` times
+  ungrouped, prepared, pairs and the member capacity sized to the rows in one process at 1-8 rows on Flash-Next and
+  DeepSeek geometry.
 - **A decode GEMV slot is bound by its own FMA and input path**, not the weight decode or DRAM, so deduplicating
   shared experts recovers only 4-7% of the expert kernels at 3-4 rows.
 - **GLM's one-row decode GEMVs are latency-bound, not ALU-bound**: two tiles per group and two k-tiles per iteration
   took the chain from 179 to 141 µs per layer ([glm5-clamped-experts](glm5-clamped-experts.md#glm)); judge a decode
-  GEMV change on the whole chain meter (`SUSHI_GLM_T1_UBENCH=1`, test binary), not on an instruction count.
+  GEMV change on the whole chain meter (`sushi-ubench run glm5.routed_t1`), not on an instruction count.
 - Dead for the decode GEMVs (microbenched): 4 or 8 tiles per threadgroup, software prefetch, 2 simdgroups, a
   threadgroup LUT decode, a 24-bit multiply split, half2 input reads, bitfield extracts.
 - Dead for the prefill GEMM on the NAX body (MiMo and Flash-Next, outputs bit-identical, all slower): 64-row windows
@@ -213,9 +215,10 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   (the 48k prefill cliff). Owned-copy hidden captures at the chunk boundary; kernel configs dropped on their error
   paths.
 - **Levers**: `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` (window geometry A/B); diagnostics
-  `SUSHI_EXL3_LAYER_UBENCH`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`, `SUSHI_EXL3_GEMM_ARMS` (served vs
-  reference NAX body, interleaved, at MiMo geometry; `SUSHI_EXL3_GEMM_COUNTS` replays the per-layer `[exl3-counts]`
-  lines `SUSHI_EXL3_UNION_HIST` logs on a prefill).
+  `SUSHI_EXL3_STAGE_PROFILE`, `SUSHI_EXL3_UNION_HIST`, `SUSHI_EXL3_SWIGLU_MAXABS`. `sushi-ubench run
+  shared.exl3_prefill_gemm` times the served GEMM body against the reference body, a rate against n32 and n64, at
+  Flash-Next and MiMo shapes; `--opt counts=<file>` replays the per-layer `[exl3-counts]` lines `SUSHI_EXL3_UNION_HIST`
+  logs on a prefill, and `--opt nax=off` times the non-NAX bodies on a NAX chip.
 
 <a id="rate-groups"></a>
 ## Rate-grouped layers (`.gN`)
@@ -259,8 +262,9 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   and SPEC1). The pack on disk is unchanged; the DSpark stage's resident bank and every other pack keep the pack order.
   A kernel keyed on a tile-major bank carries a `_tm` name. The non-funnel decode arms and a bank made by `Ragged.init`
   stay in pack order; `moeDecodeClamped` refuses a tile-major bank when the funnel is off (`Exl3TileMajorNeedsFunnel`).
-- Timing: `SUSHI_EXL3_RG_UBENCH=1` (decode) and `SUSHI_EXL3_RG_PREFILL_UBENCH=1` (prefill) on the exl3 test binary;
-  `SUSHI_EXL3_RG_ROWS_UBENCH=1` times a DeepSeek layer with every expert routed the same 1 to 48 rows.
+- Timing: `sushi-ubench run shared.exl3_rate_groups` (decode rows 1 and 4, prefill chunks, against uniform n32 and the
+  masked `moeGroups`); `sushi-ubench run shared.exl3_rate_groups_rows` times a DeepSeek layer with every expert routed the
+  same 1 to 48 rows.
 
 <a id="dense-rows"></a>
 ## Dense multi-row projection
@@ -278,7 +282,7 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   162 us chained.
   - Policy: k is split into ranges of at most 512 over at least 320 threadgroups, then one finish dispatch.
   - An output of at least 1024 128-blocks (lm_head) folds the finish into a single dispatch.
-  - Sweep: `SUSHI_EXL3_ROWS_SWEEP=qwen4|glm5|dsv41` (dsv41: SPEC1 n64 at rows 1, 2, 3, 5, 8).
+  - Time the served geometry with `sushi-ubench run shared.exl3_trunk_rows` (SPEC1 n64 at rows 1, 2, 3, 5, 8).
 - The parity bar scores each 128-wide output block in inner space: its error L2 (divided by svh) against the L2 of the
   block's summand magnitudes. The output transform is an orthonormal rotation, so this keeps the inner GEMV bar's
   scale. The composite is `projectIndexed` per row, which shares the bitstream, so it cannot convict a codeword flip;
@@ -321,10 +325,10 @@ row, which measured 1.2-4x faster than NAX there); wider chunks the sorted GEMM 
   (a longer row loop compiles 2-3x slower); from two rows a threadgroup spans two output tile pairs. Its bytes are the
   pre-split kernel's at every width, and a row equals the one-row launch bit for bit; the tests keep the old loop as
   their oracle. Timings: [perf-baselines](perf-baselines.md#simd-rows).
-- DeepSeek shapes at 2 to 8 rows (`SUSHI_EXL3_ROWS_SWEEP=dsv41`, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
+- DeepSeek shapes at 2 to 8 rows (a launch-geometry sweep, chained, on a loaded box so +-50% noise): the NAX policy is within noise of the best geometry at every shape and width; the SIMD kernel wins only some
   two-row cells, by less than the noise. The policy stands.
 
-- **DeepSeek trunk by width** (`SUSHI_DSV41_TRUNK_UBENCH=1 MLX_MAX_OPS_PER_BUFFER=16`, exl3 test binary at `d810c50c`, M5 Max, GPU
+- **DeepSeek trunk by width** (`SUSHI_DSV41_TRUNK_UBENCH=1 MLX_MAX_OPS_PER_BUFFER=16`, exl3 test binary at `d810c50c`; now `sushi-ubench run shared.exl3_trunk_rows`, M5 Max, GPU
   lock, QUIET, fans max, die under 50 °C, `taskpolicy -a`, best of 7 rounds of 96 calls chained over distinct banks): us a call,
   finish included, the served arm (SIMD at 1 row, NAX from 2) and the NAX arm at 1 row, against the same bytes streamed by
   16-byte loads. Without the buffer cap the host's encode time reads as kernel time.
@@ -398,7 +402,7 @@ trunk SPEC1 (`spec1-w15`) n64, head n96, DSpark stage experts PAIR1 n32 resident
 chain's). A pair threadgroup re-derived its K span of x (the Hadamard) and a down threadgroup the whole SwiGLU mid and
 its Hadamard, 72 and 160 times a slot; the chain now runs `pairPrepare` and a mid kernel (`midMixed`, the clamp in it)
 once per slot and the pair and down GEMVs read them through the same rate-class switch. Chain per layer, interleaved
-in one process (`SUSHI_DSV41_EXPERT_UBENCH=1`, QUIET, lock): rows 2/3/4/5/6/16 =
+in one process (`sushi-ubench run dsv41.experts`, QUIET, lock): rows 2/3/4/5/6/16 =
 285/413/544/672/798/2286 us self-preparing, 241/348/456/561/665/1878 prepared (0.82-0.85x) on layers 2, 5 and 23 and
 the DSpark stage bank; about 5 ms off a 6-row verify. Live, interleaved per sweep cycle in one boot (idle box, 180 s fans-max idle, ~1250 rounds), the verify ms are 2 to 7 ms lower at rows 2..8 (1k context: 2-row 53 -> 50, 4-row 75 -> 72, 6-row 103 -> 97; 16k inside noise). A repeated expert costs the same as a new one (the `shared` mode of
 the ubench, every row picks the same six: 273/395/515/734/1065 us at rows 2..6, level with distinct experts), so the slot
@@ -427,9 +431,9 @@ every rate group of layer 2): all against a dense f64 product of the host tile d
 
 Timing, on a loaded box (best of 40 four-step dependent chains per cell, link floor removed, no GPU lock;
 ratios and orderings are usable, absolute microseconds are not; commit and settings in
-[perf-baselines](perf-baselines.md#dsv41-stq)): `SUSHI_DSV41_STQ_UBENCH=<shape filter|1>` (trunk linears against the
-GEMM, the indexed GEMV, mxfp8 and affine-4) and `SUSHI_DSV41_EXPERT_UBENCH=1` (the grouped chain at the plan's layers 2,
-5, 23 and the stage), both on the exl3 test binary; `SUSHI_UBENCH_STEPS` / `SUSHI_UBENCH_ROUNDS` size the chains.
+[perf-baselines](perf-baselines.md#dsv41-stq)): `sushi-ubench run shared.exl3_trunk_rows` (trunk linears over distinct banks: the
+served arm, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor; `--rungs shape=`, `--steps`,
+`--rounds`); and `sushi-ubench run dsv41.experts` (the grouped chain at the plan's layers 2, 5, 23 and the stage).
 
 <a id="dsv41-shared-fused"></a>
 **The shared expert rides the routed chain's launches** (`rate_groups.moeDecodeClampedSharedFused`, 1 to 16 rows, the
@@ -447,7 +451,7 @@ into `moeDecodeClamped`'s reduce.
 - **Launches**: 10 a layer become 5, so 200 fewer per serial token (40 layers) and per verify round, and 15 fewer on a
   drafting round (three DSpark stage layers). A launch costs ~1.76 us of gap; the saving is larger because the shared
   chain's tails fill with routed work.
-- **Chain per layer** (`SUSHI_DSV41_SHARED_UBENCH=1`, exl3 test binary, base `2db0e8d5`, ReleaseFast, GPU lock, QUIET,
+- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=dsv41` times the routed-first order; this table, base `2db0e8d5`, ReleaseFast, GPU lock, QUIET,
   `taskpolicy -a`, fans auto, M5 Max, median of 21 interleaved rounds of 16 dependent steps, layer 2 plan, us):
 
   | rows | shared separate | fused (routed first) | fused (shared first) | routed only | fused / separate |

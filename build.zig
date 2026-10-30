@@ -95,14 +95,7 @@ pub fn build(b: *std.Build) void {
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     mod.linkSystemLibrary("webp", .{});
 
-    if (macos_sdk_frameworks) |fw_path| {
-        mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    mod.linkFramework("IOKit", .{});
-    mod.linkFramework("CoreFoundation", .{});
-    mod.linkFramework("Foundation", .{});
-    mod.linkFramework("Metal", .{});
-    mod.linkFramework("IOSurface", .{});
+    linkApple(mod, macos_sdk_frameworks);
 
     const exe = b.addExecutable(.{
         .name = "sushi",
@@ -145,20 +138,16 @@ pub fn build(b: *std.Build) void {
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     const exl3_test_mod = addExl3Module(b, test_mod, target, optimize);
+    const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
+    test_mod.addImport("sushi_encoder", encoder_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("webp", .{});
 
-    if (macos_sdk_frameworks) |fw_path| {
-        test_mod.addFrameworkPath(.{ .cwd_relative = fw_path });
-    }
-    test_mod.linkFramework("IOKit", .{});
-    test_mod.linkFramework("CoreFoundation", .{});
-    test_mod.linkFramework("Foundation", .{});
-    test_mod.linkFramework("Metal", .{});
-    test_mod.linkFramework("IOSurface", .{});
+    linkApple(test_mod, macos_sdk_frameworks);
 
     const test_filter = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat for several)");
+    const test_model = b.option(TestModel, "model", "Run one model folder's tests plus the shared ones (qwen4, mimo2, glm5, dsv41), or only the exl3 or encoder module's");
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -166,11 +155,33 @@ pub fn build(b: *std.Build) void {
     );
     const test_build = b.step("test-build", "Compile unit tests without running them");
     const test_step = b.step("test", "Run unit tests");
+    // The host root links no MLX: a file in it that reaches MLX fails the link, so this tier can run beside a live server.
+    const test_host_step = b.step("test-host", "Run the unit tests that link no MLX");
+    const host_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests_host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+        },
+    });
+    host_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
+    host_mod.addIncludePath(b.path("lib/jinja_cpp"));
+    host_mod.linkSystemLibrary("c++", .{});
+    const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = test_filter orelse &.{} });
+    test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+    const run_host_tests = b.addRunArtifact(host_tests);
+    test_host_step.dependOn(&run_host_tests.step);
+    if (test_filter == null) test_step.dependOn(&run_host_tests.step);
     // A filtered run stays one binary: bucket filters OR with the user's, they cannot narrow it.
-    const unit_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+    const unit_tests: []const *std.Build.Step.Compile = if (test_model == .exl3 or test_model == .enc)
+        &.{}
+    else if (test_filter) |f|
         b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .root_module = test_mod, .filters = f })}) catch @panic("OOM")
     else
-        addTestBuckets(b, test_mod);
+        addTestBuckets(b, test_mod, test_model);
     for (unit_tests) |unit_test| {
         test_build.dependOn(&b.addInstallArtifact(unit_test, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         const run_unit_tests = b.addRunArtifact(unit_test);
@@ -184,7 +195,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
-    const exl3_tests: []const *std.Build.Step.Compile = if (test_filter) |f|
+    const exl3_tests: []const *std.Build.Step.Compile = if (test_model != null and test_model != .exl3)
+        &.{}
+    else if (test_filter) |f|
         b.allocator.dupe(*std.Build.Step.Compile, &.{b.addTest(.{ .name = "exl3-test", .root_module = exl3_test_mod, .filters = f })}) catch @panic("OOM")
     else
         addExl3TestBins(b, exl3_test_mod);
@@ -193,34 +206,131 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(exl3_test).step);
     }
 
-    const encoder_mod = addEncoderModule(b, test_mod, exl3_test_mod, target, optimize);
     const encoder_tests = b.addTest(.{
         .name = "encoder-test",
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
     });
-    test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-    test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+    if (test_model == null or test_model == .enc) {
+        test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        test_step.dependOn(&b.addRunArtifact(encoder_tests).step);
+    }
+
+    guardBenchFiles(b);
+    const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
+    ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
+}
+
+/// `sushi-ubench`: the microbench harness and the bench bodies, a binary of its own. It stamps the commit it was
+/// built from so a stale or dirty binary refuses to take a number.
+fn addUbench(b: *std.Build, build_options: *std.Build.Step.Options, target: std.Build.ResolvedTarget, macos_sdk_frameworks: ?[]const u8) *std.Build.Step.Compile {
+    // A run step that always runs: a configure-time read would stay cached across commits.
+    const stamp_run = b.addSystemCommand(&.{ "sh", "-c", stamp_script });
+    stamp_run.setCwd(b.path("."));
+    stamp_run.has_side_effects = true;
+    const stamp = b.createModule(.{ .root_source_file = stamp_run.captureStdOut(.{ .basename = "ubench_stamp.zig" }) });
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/ubench_main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "ubench_stamp", .module = stamp },
+        },
+    });
+    addMlxLib(b, mod);
+    const exl3 = addExl3Module(b, mod, target, .ReleaseFast);
+    mod.addImport("sushi_encoder", addEncoderModule(b, mod, exl3, target, .ReleaseFast));
+    linkApple(mod, macos_sdk_frameworks);
+    return b.addExecutable(.{ .name = "sushi-ubench", .root_module = mod });
+}
+
+const stamp_script =
+    \\printf 'pub const commit = "%s";\npub const dirty = %s;\npub const repo = "%s";\n' \
+    \\  "$(git rev-parse HEAD)" "$(test -n "$(git status --porcelain --untracked-files=no)" && echo true || echo false)" "$(pwd -P)"
+;
+
+/// A microbench file holds no `test` block: a bench is timed by `sushi-ubench`, never run by the suite.
+/// `ubench_report.zig` is the harness's host tier and keeps its tests.
+fn guardBenchFiles(b: *std.Build) void {
+    const io = b.graph.io;
+    const files = [_][]const u8{ "src/ubench_qwen4.zig", "src/ubench_mimo2.zig", "src/ubench_glm5.zig", "src/ubench_dsv41.zig", "src/ubench_shared.zig", "src/exl3/ubench.zig", "src/encoder/ubench.zig" };
+    for (files) |path| {
+        const source = buildRootHandle(b).readFileAlloc(io, path, b.allocator, .limited(8 << 20)) catch continue;
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            const at = std.mem.indexOf(u8, line, "test \"") orelse continue;
+            if (std.mem.trim(u8, line[0..at], " ").len == 0)
+                std.debug.panic("{s} holds a test block: a microbench is never a test ({s})", .{ path, line });
+        }
+    }
+}
+
+fn linkApple(module: *std.Build.Module, macos_sdk_frameworks: ?[]const u8) void {
+    if (macos_sdk_frameworks) |fw_path| module.addFrameworkPath(.{ .cwd_relative = fw_path });
+    module.linkFramework("IOKit", .{});
+    module.linkFramework("CoreFoundation", .{});
+    module.linkFramework("Foundation", .{});
+    module.linkFramework("Metal", .{});
+    module.linkFramework("IOSurface", .{});
 }
 
 /// The unit tests compile as several binaries in parallel: one LLVM module is single-threaded.
-/// A test's name starts with `<file stem>.`, so a bucket is a list of stems used as filters, and
-/// the last bucket takes every src/*.zig stem the others do not name.
+/// A test's name is `<file stem>.test.<name>`, or `<file stem>.<Struct>.test.<name>` inside a struct, so a bucket is
+/// a list of `<stem>.test.` filters plus one filter per nested test; the last bucket takes every MLX stem the others
+/// do not name.
 const test_buckets = [_][]const []const u8{
-    &.{ "transformer", "gdn_decode", "cli", "repl_tools", "repl_input", "update", "launch" },
-    &.{ "generate", "scheduler", "prefix_cache", "kv_disk_cache", "kv_disk_writer", "restore_dump", "mtp", "dflash" },
-    &.{ "server", "chat", "format_corpus_test", "tool_traffic_replay_test", "responses", "ws", "reasoning_protocol", "json_grammar", "json_schema", "regex", "token_mask", "tokenizer" },
+    &.{ "transformer", "gdn_decode", "cli", "launch" },
+    &.{ "generate", "mtp_policy", "mtp_round", "scheduler", "prefix_cache", "kv_disk_cache", "disk_placement", "restore_dump", "mtp", "dflash" },
+    &.{ "server", "responses" },
 };
 
-fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Step.Compile {
+/// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
+const test_dirs = [_][]const u8{ "src", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
+
+/// A test's model is its file's folder; the src root is shared.
+const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
+
+fn addTestBuckets(b: *std.Build, root: *std.Build.Module, model: ?TestModel) []const *std.Build.Step.Compile {
     const io = b.graph.io;
+    const host_stems = hostStems(b);
     var stems: std.ArrayList([]const u8) = .empty;
-    var src = buildRootHandle(b).openDir(io, "src", .{ .iterate = true }) catch |e| std.debug.panic("src/: {t}", .{e});
-    defer src.close(io);
-    var it = src.iterate();
-    while (it.next(io) catch |e| std.debug.panic("src/: {t}", .{e})) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        stems.append(b.allocator, b.fmt("{s}.", .{entry.name[0 .. entry.name.len - ".zig".len]})) catch @panic("OOM");
+    var nested: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
+    // A scoped run names each test of a root file that another model's file name ends with ("model" in
+    // "dsv41_model"), since a filter matches anywhere in a test name.
+    var skipped: std.ArrayList([]const u8) = .empty;
+    var top: std.ArrayList(struct { stem: []const u8, filter: []const u8 }) = .empty;
+    for (test_dirs) |dir_path| {
+        const out_of_scope = if (model) |m| !std.mem.eql(u8, dir_path, "src") and !std.mem.eql(u8, dir_path["src/".len..], @tagName(m)) else false;
+        // The scan runs at configure time, whose cache would otherwise miss a new or edited test file.
+        b.dependOnDirectoryContents(b.path(dir_path));
+        var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e });
+        defer src.close(io);
+        var it = src.iterate();
+        while (it.next(io) catch |e| std.debug.panic("{s}: {t}", .{ dir_path, e })) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+            const stem = entry.name[0 .. entry.name.len - ".zig".len];
+            if (isHostStem(host_stems, stem)) continue;
+            if (std.mem.startsWith(u8, stem, "ubench_")) continue;
+            if (out_of_scope) {
+                skipped.append(b.allocator, b.allocator.dupe(u8, stem) catch @panic("OOM")) catch @panic("OOM");
+                continue;
+            }
+            stems.append(b.allocator, b.fmt("{s}.test.", .{stem})) catch @panic("OOM");
+            b.dependOnFileContents(b.path(b.fmt("{s}/{s}", .{ dir_path, entry.name })));
+            const source = src.readFileAlloc(io, entry.name, b.allocator, .limited(16 << 20)) catch |e| std.debug.panic("{s}: {t}", .{ entry.name, e });
+            var lines = std.mem.splitScalar(u8, source, '\n');
+            while (lines.next()) |line| {
+                const indent = std.mem.indexOf(u8, line, "test \"") orelse continue;
+                if (indent == 0 and model != null and std.mem.endsWith(u8, line, "\" {"))
+                    top.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt("{s}.test.{s}", .{ stem, line["test \"".len .. line.len - "\" {".len] }) }) catch @panic("OOM");
+                if (indent == 0 or std.mem.trim(u8, line[0..indent], " ").len != 0) continue;
+                if (!std.mem.endsWith(u8, line, "\" {") or std.mem.indexOfScalar(u8, line, '\\') != null)
+                    std.debug.panic("{s}: write `test \"name\" {{` on one line without escapes: {s}", .{ entry.name, line });
+                nested.append(b.allocator, .{ .stem = b.fmt("{s}.test.", .{stem}), .filter = b.fmt(".test.{s}", .{line[indent + "test \"".len .. line.len - "\" {".len]}) }) catch @panic("OOM");
+            }
+        }
     }
     // Directory order varies; the filters key the compile step's cache.
     std.mem.sortUnstable([]const u8, stems.items, {}, struct {
@@ -229,9 +339,9 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
         }
     }.lt);
     const bucket = b.allocator.alloc(usize, stems.items.len) catch @panic("OOM");
-    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - 1]);
-    // A filter matches anywhere in a name, so "dflash." also selects glm5_dflash's tests: stems
-    // that contain one another must share a bucket, or their tests would run twice.
+    for (stems.items, bucket) |stem, *k| k.* = namedBucket(stem[0 .. stem.len - ".test.".len]);
+    // A filter matches anywhere in a name, so "ws.test." also selects dspark_rows's tests: stems
+    // that end with one another must share a bucket, or their tests would run twice.
     var moved = true;
     while (moved) {
         moved = false;
@@ -246,15 +356,56 @@ fn addTestBuckets(b: *std.Build, root: *std.Build.Module) []const *std.Build.Ste
             }
         }
     }
+    // A host file's tests run only in test-host, so no MLX filter may select them.
+    for (host_stems) |h| for (stems.items) |a| {
+        if (std.mem.endsWith(u8, h, a[0 .. a.len - ".test.".len])) std.debug.panic("host test file {s} would also run in the MLX bucket of {s}", .{ h, a });
+    };
     var out: std.ArrayList(*std.Build.Step.Compile) = .empty;
     for (0..test_buckets.len + 1) |i| {
         var filters: std.ArrayList([]const u8) = .empty;
-        for (stems.items, bucket) |stem, k| if (k == i) filters.append(b.allocator, stem) catch @panic("OOM");
+        for (stems.items, bucket) |stem, k| if (k == i) {
+            const bare = stem[0 .. stem.len - ".test.".len];
+            const shadowed = for (skipped.items) |sk| {
+                if (std.mem.endsWith(u8, sk, bare)) break true;
+            } else false;
+            if (!shadowed) {
+                filters.append(b.allocator, stem) catch @panic("OOM");
+                continue;
+            }
+            for (top.items) |t| if (std.mem.eql(u8, t.stem, stem)) filters.append(b.allocator, t.filter) catch @panic("OOM");
+        };
+        for (nested.items) |n| {
+            const owner = for (stems.items, bucket) |stem, k| {
+                if (std.mem.eql(u8, stem, n.stem)) break k;
+            } else unreachable;
+            if (owner == i) filters.append(b.allocator, n.filter) catch @panic("OOM");
+        }
         if (filters.items.len == 0) continue;
         const name = if (i < test_buckets.len) b.fmt("test-{s}", .{test_buckets[i][0]}) else "test-rest";
         out.append(b.allocator, b.addTest(.{ .name = name, .root_module = root, .filters = filters.items })) catch @panic("OOM");
     }
     return out.items;
+}
+
+/// The host tier's files are the imports of src/tests_host.zig, the one list.
+fn hostStems(b: *std.Build) []const []const u8 {
+    b.dependOnFileContents(b.path("src/tests_host.zig"));
+    const source = buildRootHandle(b).readFileAlloc(b.graph.io, "src/tests_host.zig", b.allocator, .limited(1 << 20)) catch |e| std.debug.panic("src/tests_host.zig: {t}", .{e});
+    var stems: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const head = "    _ = @import(\"";
+        const tail = ".zig\");";
+        if (!std.mem.startsWith(u8, line, head) or !std.mem.endsWith(u8, line, tail)) continue;
+        const path = line[head.len .. line.len - tail.len];
+        stems.append(b.allocator, path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0..]) catch @panic("OOM");
+    }
+    return stems.items;
+}
+
+fn isHostStem(host_stems: []const []const u8, stem: []const u8) bool {
+    for (host_stems) |h| if (std.mem.eql(u8, h, stem)) return true;
+    return false;
 }
 
 fn namedBucket(stem: []const u8) usize {
@@ -267,21 +418,20 @@ fn namedBucket(stem: []const u8) usize {
 /// Seconds of the slow src/exl3 tests with the binaries running side by side; any other test weighs 1. Only the
 /// balance of the exl3 binaries reads this: a stale entry costs speed, never coverage.
 const exl3_test_weights = [_]struct { []const u8, u16 }{
-    .{ "group2 half4 composition preserves all-rate", 262 },
-    .{ "every admitted rate takes the fast arms", 175 },
-    .{ "every K1.5 to K2 rate takes the fast arms", 146 },
-    .{ "group2 cooperative projections preserve F16 bits", 140 },
-    .{ "prefill grid serves every admitted rate, mixed projections", 120 },
-    .{ "prefill rows hold the f32-truth bar for every codebook, past 24 groups", 94 },
-    .{ "the grouped chain at 5120x2304", 72 },
-    .{ "SPEC1 per-rate table: every reader decodes", 56 },
-    .{ "SPEC1 below K1.5 and above K4: the prefill GEMM", 48 },
-    .{ "SPEC1 below K1.5 and above K4: every reader decodes", 36 },
+    .{ "group2 half4 composition preserves all-rate", 13 },
+    .{ "every admitted rate takes the fast arms", 23 },
+    .{ "every K1.5 to K2 rate takes the fast arms", 30 },
+    .{ "group2 cooperative projections preserve F16 bits", 17 },
+    .{ "prefill grid serves every admitted rate, mixed projections", 4 },
+    .{ "prefill rows hold the f32-truth bar for every codebook, past 24 groups", 39 },
+    .{ "the grouped chain at 5120x2304", 108 },
+    .{ "SPEC1 per-rate table: every reader decodes", 13 },
+    .{ "SPEC1 below K1.5 and above K4: the prefill GEMM", 40 },
+    .{ "SPEC1 below K1.5 and above K4: every reader decodes", 2 },
     .{ "serves spec1 and std1 on the prefill grid", 36 },
     .{ "one-bank and grouped trellis linears", 35 },
     .{ "SIMD multi-row: the split row loops", 15 },
     .{ "every slot writes the served kernels' bytes", 35 },
-    .{ "512-row E=512 topk=10 layer within 2x affine", 32 },
     .{ "spec1's 2^12 folded into the stores", 28 },
     .{ "PAIR1 decode and prefill rows hold the f32-truth bar", 27 },
     .{ "PAIR1's 2^12 folded into the stores", 26 },
@@ -291,7 +441,6 @@ const exl3_test_weights = [_]struct { []const u8, u16 }{
     .{ "the shared expert as a one-expert fused chain", 19 },
     .{ "GLM serves spec1 and std1 on group2's routed chain", 18 },
     .{ "GLM serves spec1 and std1 on its lane chain", 17 },
-    .{ "512-row production-shape sorted gemm", 16 },
     .{ "GLM GPU windows preserve 288 expert bytes at every admitted rate", 15 },
     .{ "multi-row projection holds the bar at every admitted rate", 14 },
     .{ "PAIR1 weight readers decode every K1.5 to K4 rate", 14 },

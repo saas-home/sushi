@@ -6,7 +6,7 @@ const chat_mod = @import("chat.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const expert_stream_mod = @import("expert_stream.zig");
-const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
 const model_settings_mod = @import("model_settings.zig");
 const server_mod = @import("server.zig");
 const hidden_capture = @import("hidden_capture.zig");
@@ -168,7 +168,7 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
-                .drop_expert => o.drop_expert = @import("expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
+                .drop_expert => o.drop_expert = @import("dsv41/expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
@@ -930,10 +930,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;
     }
-    scheduler_mod.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
+    model_load.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 
-    const kld_budget = scheduler_mod.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
+    const kld_budget = model_load.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
     if (expert_stream_mod.expertStreamingEngaged(
         self.config.supportsExpertStreaming(),
         self.config.expertStreamingRequired(),
@@ -953,8 +953,8 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
-        scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
+        const plan = try model_load.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
+        model_load.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
             @as(f64, @floatFromInt(plan.cache.cache_bytes)) / 1e9,
@@ -992,6 +992,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     }
     if (self.xfm.moe_layers != null) self.xfm.compileMoeRouting();
     if (self.config.linear_num_key_heads > 0) self.xfm.compileGdnGate();
+    if (self.config.isQwen4()) self.xfm.compileQwen4Hc();
     return self;
 }
 
@@ -1045,7 +1046,7 @@ fn promptIds(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prompt)
 }
 
 fn renderPrompt(allocator: std.mem.Allocator, l: *Loaded, opts: Options, p: Prompt) ![]const u8 {
-    if (p.ids) |ids| return l.tok.decode(allocator, ids, false);
+    if (p.ids) |ids| return l.tok.decode(allocator, ids);
     const text = p.text;
     if (opts.no_template) return allocator.dupe(u8, text);
     const messages = [_]chat_mod.Message{.{ .role = "user", .content = text }};
@@ -1591,7 +1592,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.command == .capture) if (@import("imatrix.zig").envPath()) |path| {
         opts.imatrix_out = path;
     };
-    if (try @import("glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
+    if (try @import("glm5/glm5_kld_capture.zig").tryRun(allocator, io, opts, &out)) return;
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.wired_margin_bytes > 0) server_mod.wired_limit_margin_bytes = opts.wired_margin_bytes;
@@ -2143,7 +2144,7 @@ test "kld: the first EOS position bounds the scored span, and no EOS means the w
 
 test "kld records the budget that shaped the load, never the raw flag" {
     const GiB: u64 = 1 << 30;
-    var moe = model_mod.ModelConfig{ .model_type = "qwen3_5_moe" };
+    var moe = model_mod.ModelConfig{ .model_type = "not_a_served_arch" };
     try testing.expectEqual(@as(u64, 0), capturedSsdBudgetGb(&moe, 60 * GiB));
     moe.expert_ssd_budget_bytes = 60 * GiB;
     try testing.expectEqual(@as(u64, 0), capturedSsdBudgetGb(&moe, 60 * GiB));
@@ -2387,6 +2388,7 @@ fn appendAffine8(a: std.mem.Allocator, out: *std.ArrayList(TinyTensor), t: TinyT
 }
 
 test "kld: a resident mimo_v2 load takes the source trunk and its logits follow the routed experts" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2436,6 +2438,7 @@ test "kld: every served architecture prefills a prompt in its serving start widt
 }
 
 test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter one in one forward" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2479,6 +2482,7 @@ test "kld: a prompt longer than the chunk is forwarded chunk by chunk, a shorter
 }
 
 test "kld: an imatrix capture records every mimo_v2 o_proj input and the lm_head input the forward read" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2548,6 +2552,7 @@ fn bf16At(bytes: []const u8, i: usize) f32 {
 }
 
 test "kld: a hidden capture appends every block boundary of each prompt and leaves the teacher bit-identical" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2665,6 +2670,7 @@ test "kld: a hidden capture appends every block boundary of each prompt and leav
 }
 
 test "kld: a pack storing o_proj, lm_head and embed_tokens affine serves them packed beside its bf16 twin" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
@@ -2750,7 +2756,7 @@ test "kld standard4 bundled texts identifiers and limits" {
 }
 
 test {
-    _ = @import("glm5_kld_capture.zig");
+    _ = @import("glm5/glm5_kld_capture.zig");
 }
 
 fn jsonNumber(value: std.json.Value) !f64 {
@@ -2762,12 +2768,13 @@ fn jsonNumber(value: std.json.Value) !f64 {
 }
 
 test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and compare scores kv8 against it" {
+    try mlx.requireGpu();
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var metal: bool = false;
     mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;
     if (!metal) return error.SkipZigTest;
-    const glm = @import("glm5_forward.zig");
+    const glm = @import("glm5/glm5_forward.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -2841,9 +2848,10 @@ test "kld: a GLM pack captures its BF16-latent reference in prompt chunks and co
 }
 
 test "kld: GLM full-stream hidden capture retains chunked boundaries and native logits" {
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
-    const glm = @import("glm5_forward.zig");
+    const glm = @import("glm5/glm5_forward.zig");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(a);
@@ -2925,7 +2933,7 @@ test "kld: deepseek_v41 refuses by name what its module-owned state cannot honor
 }
 
 test "kld: a deepseek_v41 load names the missing streaming budget before touching the GPU (DSV41_TINY)" {
-    const dir = try @import("dsv41_model.zig").fixtureDir();
+    const dir = try @import("dsv41/dsv41_model.zig").fixtureDir();
     const io = std.Io.Threaded.global_single_threaded.io();
     try testing.expectError(error.ExpertStreamingRequired, loadModel(io, testing.allocator, .{ .model_dir = dir }));
     try testing.expectError(error.Dsv41KvQuantUnsupported, loadModel(io, testing.allocator, .{ .model_dir = dir, .kv_quant_config = transformer_mod.KVQuantConfig.affine(8), .ssd_budget_bytes = 1 << 30 }));
@@ -2934,8 +2942,8 @@ test "kld: a deepseek_v41 load names the missing streaming budget before touchin
 test "kld: a deepseek_v41 teacher captures and compare reads it back, fused against composed included (DSV41_TINY)" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const dsv41_model = @import("dsv41_model.zig");
-    const dsv41_stream = @import("dsv41_stream.zig");
+    const dsv41_model = @import("dsv41/dsv41_model.zig");
+    const dsv41_stream = @import("dsv41/dsv41_stream.zig");
     const dir = try dsv41_model.fixtureDir();
     var metal: bool = false;
     mlx.check(mlx.mlx_metal_is_available(&metal)) catch return error.SkipZigTest;

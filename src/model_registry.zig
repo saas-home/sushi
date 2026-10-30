@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const model_mod = @import("model.zig");
+const expert_quant = @import("expert_quant.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
@@ -100,7 +101,7 @@ pub const ReasoningMarker = struct {
             const ids = try tok.encode(gpa, marker[k..]);
             defer gpa.free(ids);
             if (ids.len == 0 or ids.len > rp_mod.MAX_FORCED_TOKENS) continue;
-            const decoded = try tok.decode(gpa, ids, false);
+            const decoded = try tok.decode(gpa, ids);
             defer gpa.free(decoded);
             if (!std.mem.eql(u8, decoded, marker[k..])) continue;
             suffixes[k] = .{ .offset = @intCast(tokens.items.len), .len = @intCast(ids.len) };
@@ -170,7 +171,7 @@ pub const LoadedModel = struct {
 
     /// Identifier exposed via `/v1/models` and the request `model` field.
     /// Allocator-owned dupe of the discovery id (path basename, e.g.
-    /// "gemma-4-e4b-it-4bit"). Also used as the StringHashMap key — the map
+    /// "Qwen3.8-Flash-Next-Sushi-4bpw"). Also used as the StringHashMap key — the map
     /// stores this slice directly, so it must outlive the entry's presence
     /// in `ModelRegistry.entries`.
     id: []const u8,
@@ -181,8 +182,7 @@ pub const LoadedModel = struct {
     bytes_on_disk: ?u64,
     /// `model_type` peeked from config.json at discovery time (allocator-
     /// owned dupe; empty when unknown). Lets /v1/models advertise
-    /// arch-derived capabilities — e.g. "bert" → embeddings — while the
-    /// entry is still an `.unloaded` stub.
+    /// arch-derived capabilities while the entry is still an `.unloaded` stub.
     arch_hint: []const u8,
     streaming_index_complete: bool = false,
 
@@ -236,7 +236,7 @@ pub const LoadedModel = struct {
     /// Iteration 2 (perf-plan Phase 4 #3): LRU cache of chat-template
     /// render+tokenize results, keyed by a digest of (messages, tools,
     /// flags). Targets the warm-reuse path where Jinja+BPE was
-    /// observed at 240 ms on a 1813-tok Gemma prompt — 7× the actual
+    /// observed at 240 ms on a 1813-tok prompt — 7× the actual
     /// Metal prefill on a KV-cache hit. Null when the load's
     /// `tokenize_cache_entries` is 0 (a test disables it).
     tokenize_cache: ?TokenizeCache = null,
@@ -747,9 +747,9 @@ pub const ModelRegistry = struct {
     /// registry's world, and we never re-point a live entry's path. Returns
     /// the entry's stable id slice (owned by the registry).
     ///
-    /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
-    /// a small embedding encoder and registers it here no matter which org
-    /// dir the chat model (and thus --model-dir) points at.
+    /// Exists for models OUTSIDE the --model-dir scan: the app registers a pack
+    /// from its download root here no matter which org dir the chat model (and
+    /// thus --model-dir) points at.
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
         var trimmed = abs_path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
@@ -762,7 +762,7 @@ pub const ModelRegistry = struct {
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
-        const streaming_index_complete = model_mod.isExpertStreamingArch(probe.model_type) and
+        const streaming_index_complete = expert_quant.isExpertStreamingArch(probe.model_type) and
             model_discovery.qwen4StreamingIndexComplete(io, self.allocator, trimmed) != null;
 
         self.mutex.lockUncancelable(io);
@@ -1125,9 +1125,8 @@ pub const ModelRegistry = struct {
         // user loads a chat model via /v1/load-model — the live gen-first→
         // chat-later hole (2026-07-05). The LATEST chat-capable load is the
         // default, so a model-less request never swaps back to an older model;
-        // embedding encoders never qualify, and an explicit
-        // default (`--model`, `setDefault`) is never stolen.
-        if ((self.default_id.len == 0 or self.default_promoted) and chatCapable(entry) and
+        // an explicit default (`--model`, `setDefault`) is never stolen.
+        if ((self.default_id.len == 0 or self.default_promoted) and entry.config != null and
             !std.mem.eql(u8, self.default_id, entry.id))
         {
             self.default_id = entry.id;
@@ -1135,12 +1134,6 @@ pub const ModelRegistry = struct {
             log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
         self.state_cond.broadcast(self.io);
-    }
-
-    /// Can this READY entry serve chat/completions? Embedding encoders cannot.
-    fn chatCapable(entry: *const LoadedModel) bool {
-        const cfg = entry.config orelse return false;
-        return !cfg.is_encoder_only;
     }
 
     /// Reserve `estimated` bytes against `reserved_bytes` for an entry that has
@@ -1435,8 +1428,8 @@ test "ModelRegistry: registerStub + setDefault" {
 test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
-    const encoder = try reg.registerStubWithArch("bge", "/path/to/bge", 64, "bert");
-    try testing.expectEqualStrings("bert", encoder.arch_hint);
+    const hinted = try reg.registerStubWithArch("q4", "/path/to/q4", 64, "qwen4_exp");
+    try testing.expectEqualStrings("qwen4_exp", hinted.arch_hint);
     // Plain registerStub keeps an empty hint (no arch known).
     const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
     try testing.expectEqualStrings("", plain.arch_hint);
@@ -1453,11 +1446,11 @@ test "ModelRegistry: registerByPath reuses an existing id without touching the f
     const io = std.Io.Threaded.global_single_threaded.io();
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
-    const stub = try reg.registerStubWithArch("bge-x", "/models/bge-x", 64, "bert");
+    const stub = try reg.registerStubWithArch("q4-x", "/models/q4-x", 64, "qwen4_exp");
     // The path's parent doesn't exist — proves the fast path resolves by
     // basename before any probe.
-    const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/");
-    try testing.expectEqualStrings("bge-x", id);
+    const id = try reg.registerByPath(io, "/nonexistent/parent/q4-x/");
+    try testing.expectEqualStrings("q4-x", id);
     try testing.expectEqual(stub.id.ptr, id.ptr);
 }
 
@@ -1466,20 +1459,20 @@ test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename 
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
     // Discovery registered this model under its org/name id (two-level scan).
-    const stub = try reg.registerStubWithArch("mlx-community/gemma-x", "/models/mlx-community/gemma-x", 64, "gemma4");
+    const stub = try reg.registerStubWithArch("mlx-community/q4-x", "/models/mlx-community/q4-x", 64, "qwen4_exp");
     // The --model path registration must find the SAME entry via its path
-    // (basename "gemma-x" doesn't match the org/name id) — otherwise the
+    // (basename "q4-x" doesn't match the org/name id) — otherwise the
     // same weights end up registered twice and can double-load.
-    const by_path = reg.peekByPath("/models/mlx-community/gemma-x");
+    const by_path = reg.peekByPath("/models/mlx-community/q4-x");
     try testing.expect(by_path != null);
     try testing.expectEqual(stub, by_path.?);
     // Trailing slash normalizes.
-    try testing.expectEqual(stub, reg.peekByPath("/models/mlx-community/gemma-x/").?);
+    try testing.expectEqual(stub, reg.peekByPath("/models/mlx-community/q4-x/").?);
     try testing.expect(reg.peekByPath("/models/elsewhere") == null);
     // registerByPath also resolves through the path before creating a stub
     // (basename fast path misses, path match hits, no filesystem probe).
-    const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/");
-    try testing.expectEqualStrings("mlx-community/gemma-x", id);
+    const id = try reg.registerByPath(io, "/models/mlx-community/q4-x/");
+    try testing.expectEqualStrings("mlx-community/q4-x", id);
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
 }
 
@@ -1897,7 +1890,7 @@ test "ModelRegistry: peek does not refcount" {
 /// to `lm`, the way the real loader hands ownership to the entry.
 fn attachTestTokenizer(lm: *LoadedModel, tokens: []const struct { u32, []const u8 }) !void {
     const tok = try lm.allocator.create(Tokenizer);
-    tok.* = Tokenizer.initEmptyForTests(lm.allocator, .byte_level_bpe);
+    tok.* = Tokenizer.initEmptyForTests(lm.allocator);
     for (tokens) |t| try tok.id_to_token.put(t[0], t[1]);
     lm.tokenizer = tok;
 }
@@ -1906,7 +1899,7 @@ test "grammar token-byte table is per MODEL, never a process-wide singleton" {
     // Two resident models, two vocabularies, the SAME ids meaning different
     // bytes. A table built for one and handed to the other maps every id to
     // the wrong bytes, so the JSON grammar mask allows tokens whose real
-    // bytes are off-schema — live 2026-08-11, muse served under LFM2.5's
+    // bytes are off-schema — live 2026-08-11, one model served under another's
     // table answered a `json_object` request with "## Attributes".
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -2093,31 +2086,19 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // gen-first→chat-later hole (live 2026-07-05): a server started headless
     // (no --model) has no default, so requests addressing the "sushi"
     // alias 503 with no_model even after the user loads a chat model via
-    // /v1/load-model. The FIRST chat-capable load is promoted; embedding
-    // encoders never qualify; an existing default is never stolen.
+    // /v1/load-model. The FIRST chat-capable load is promoted; an existing default is never stolen.
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
     defer reg.deinit();
 
-    // A ready embedding ENCODER must not become the default.
-    const bge = try reg.registerStub("bge", "/m/bge", 64);
-    var bge_cfg = model_mod.ModelConfig{};
-    bge_cfg.model_type = "bert";
-    bge_cfg.is_encoder_only = true;
-    bge.config = &bge_cfg;
-    reg.mutex.lockUncancelable(reg.io);
-    reg.markReadyLocked(bge, 64);
-    reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("", reg.default_id);
-
     // The first chat-capable load IS promoted...
-    const chat = try reg.registerStub("gemma", "/m/gemma", 64);
+    const chat = try reg.registerStub("mimo", "/m/mimo", 64);
     var chat_cfg = model_mod.ModelConfig{};
-    chat_cfg.model_type = "gemma4";
+    chat_cfg.model_type = "mimo_v2";
     chat.config = &chat_cfg;
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat, 64);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("gemma", reg.default_id);
+    try testing.expectEqualStrings("mimo", reg.default_id);
 
     // ...and the alias resolves to it now.
     const via_alias = try reg.ensureLoaded("sushi");
@@ -2127,7 +2108,7 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // A promoted default follows the latest chat load...
     const chat2 = try reg.registerStub("qwen", "/m/qwen", 64);
     var chat2_cfg = model_mod.ModelConfig{};
-    chat2_cfg.model_type = "qwen3";
+    chat2_cfg.model_type = "glm5_next";
     chat2.config = &chat2_cfg;
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
@@ -2135,15 +2116,14 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     try testing.expectEqualStrings("qwen", reg.default_id);
 
     // ...but an explicit default is never stolen.
-    try reg.setDefault("gemma");
+    try reg.setDefault("mimo");
     reg.mutex.lockUncancelable(reg.io);
     reg.markReadyLocked(chat2, 64);
     reg.mutex.unlock(reg.io);
-    try testing.expectEqualStrings("gemma", reg.default_id);
+    try testing.expectEqualStrings("mimo", reg.default_id);
 
     // The configs are STACK-allocated test doubles — detach them before
     // registry deinit tries to free entry-owned configs.
-    bge.config = null;
     chat.config = null;
     chat2.config = null;
 }
@@ -2158,7 +2138,7 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
 
     // One model present at boot.
     try tmp.dir.createDirPath(io, "org/first");
-    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "0123" });
 
     const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});

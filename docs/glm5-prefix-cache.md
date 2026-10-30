@@ -7,7 +7,7 @@ GLM-5.3 prefix cache, restore and spec state, split out of [engine-prefix-cache]
 ## GLM-5.3 (`glm5_next`)
 
 GLM's state lives in its slot's `glm5_forward.Request`, not a `KVCache`: 34 FP32 KDA states, 11 MLA latents and a
-pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
+pooled index (`src/glm5/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
 
 - **A restore point is a pool boundary** (a multiple of 4), where the IndexPool tail is empty. The state there is:
   - the KDA conv and recurrence of every linear layer, an `SSMCheckpoint` of 147,619,840 bytes;
@@ -16,9 +16,9 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
 - **Checkpoints sit on an 8192-token grid and at the prompt end, all the way to 1M tokens.**
   - Chunks end on a 2048 grid (`glm_checkpoint_stride`: absolute multiples of GLM's widest chunk, never a request's
     width); a checkpoint is captured and kept only at the 8192 multiples of it (`glm_capture_stride`) and the prompt end.
-  - A narrower chunk divides 2048, and `nextChunkEnd` ends a chunk on every grid point, so every restore point is a
+  - A narrower chunk divides 2048, and `prefill_plan.nextChunkEnd` ends a chunk on every grid point, so every restore point is a
     real chunk boundary whatever widths a request steps through.
-  - The prompt-end backoff grows to 30-33 so its position is a pool boundary (`glmSnapshotBackoff`).
+  - The prompt-end backoff grows to 30-33 so its position is a pool boundary (`glm5_generate.glmSnapshotBackoff`).
   - The SSD tier keeps up to 160 per entry (`kv_disk_cache.SSM_DISK_MAX_PER_ENTRY`: the grid to 1M plus the prompt-end
     points); no count thins it below that. `--ssm-checkpoint-max` and `glm5_prefix.checkpoint_cap` (8) bound only the
     states held in memory. When one conversation alone outgrows the SSD budget its oldest points go first
@@ -27,7 +27,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   holds at the 2048 default. The suffix runs the same absolute chunks, tail merge, backoff and final span.
   - A request stepped down to narrower tail chunks near 1M matches only a cold run that steps down the same way.
   - Guards: the generator fixture tests (including a mid-request step-down), the hot-cache fixture tests, and
-    `tests/test_glm_prefix_reuse.sh`.
+    `tests/glm5/test_glm_prefix_reuse.sh`.
 - **A thinking request with tools takes one more point mid-decode, at the pool position at or below its `</think>`**
   ([engine-prefix-cache](engine-prefix-cache.md#thought-points)): the DFlash2 round carrying the closer commits only up to
   that multiple of 4 (no file-format change), the KDA state there is the newest checkpoint and the commit's rows run
@@ -118,9 +118,9 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   cleanup drain's commit would otherwise read. The drop decision is taken once per slot under `queue_mu`; the commit
   and the release run outside it on the dropped slots, so a late cancel waits for the next tick.
 - **`commitImpl` owns the transferred checkpoints on every outcome**, including a failure of the retention snapshot.
-- **One schedule drives the capture and its bill** (`generate.glmCaptureSchedule`: the grid points in the tail, the
+- **One schedule drives the capture and its bill** (`glm5_generate.glmCaptureSchedule`: the grid points in the tail, the
   prompt-end checkpoint, pool alignment, cold/warm backoff, the cap). The configured stride never enters, and
-  `glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
+  `glm5_generate.glmChunkEnd` keeps the tail merge from absorbing a grid point, so the billed count is the captured count.
 - **Bills.** A GLM request holds up to 9 checkpoints during prefill (the cap plus the copy taken before each thin)
   and one assistant window; a prefill that writes through holds 2 (`WarmPrefix.released`, decided by the scheduler's
   `glmCheckpointsRelease`, the same answer that arms the hook). The commit moment is billed beside the live cache (`glmCommitStateBytes`): the RAM
@@ -133,5 +133,5 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
     thread, the context sizer and the cache clamp bill none, so the advertised context is the cache-off one.
   - The pass evicts RAM entries LRU first, sparing the one it restored from. If the request still does not fit, it
     keeps fewer checkpoints, down to the prompt end and then none, rather than be refused
-    (`scheduler.fewerCheckpointsToAdmit`). With none it commits nothing.
+    (`slot_admission.fewerCheckpointsToAdmit`). With none it commits nothing.
   - The checkpoints yield to the width: the prefill width is chosen as if the request kept none.

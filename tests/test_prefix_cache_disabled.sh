@@ -1,64 +1,39 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/private_cache.sh"
-# Usage: test_prefix_cache_disabled.sh MODEL [PORT] [extra server flags...]
+# sushi-test: tier=live boot=exact
+# The exact boot is the disabled arm: the prefix cache reports zero RAM, the server still answers, an identical
+# chat request three times never reports a cached token, and the log carries no `[hot-cache]` line.
 set -euo pipefail
-cd "$(dirname "$0")/.."
-model="${1:?pass a local model directory}"
-port="${2:-19286}"
-shift "$(( $# >= 2 ? 2 : 1 ))"
-python3 - "${BINARY:-./zig-out/bin/sushi}" "$model" "$port" "$@" <<'PY'
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+python3 - "$SUSHI_URL" "$SUSHI_NONCE" <<'PY'
 import json
-import subprocess
 import sys
-import tempfile
-import time
 import urllib.request
 
-binary, model, port, *extra = sys.argv[1:]
-base = f"http://127.0.0.1:{port}"
-with tempfile.TemporaryFile() as log:
-    proc = subprocess.Popen([
-        binary, "--model", model, "--serve", "--host", "127.0.0.1",
-        "--port", port, "--no-vision", "--no-mtp",
-        "--prefix-cache-entries", "0", "--prefix-cache-mem", "60GB",
-        *extra,
-    ], stdout=log, stderr=log)
-    try:
-        for _ in range(240):
-            if proc.poll() is not None:
-                raise RuntimeError("server exited before becoming ready")
-            try:
-                with urllib.request.urlopen(base + "/props", timeout=2) as r:
-                    props = json.load(r)
-                if "settings" in props:
-                    break
-            except (OSError, ValueError):
-                pass
-            time.sleep(1)
-        else:
-            raise RuntimeError("server did not become ready")
-        for _ in range(3):
-            with urllib.request.urlopen(base + "/props", timeout=5) as r:
-                props = json.load(r)
-            assert props["settings"]["prefix_cache"]["mem_bytes"] == 0, props
-            request = urllib.request.Request(
-                base + "/v1/completions",
-                data=json.dumps({"model": "default", "prompt": "Hello", "max_tokens": 2}).encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            with urllib.request.urlopen(request, timeout=120) as r:
-                response = json.load(r)
-            assert response.get("choices"), response
-        print("PASS: disabled prefix cache reports zero RAM and serves three requests")
-    except BaseException:
-        log.seek(0)
-        print(log.read().decode(errors="replace"), file=sys.stderr)
-        raise
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+base, nonce = sys.argv[1:]
+
+
+def post(path, body):
+    request = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=120) as r:
+        return json.load(r)
+
+
+for _ in range(3):
+    with urllib.request.urlopen(base + "/props", timeout=5) as r:
+        props = json.load(r)
+    assert props["settings"]["prefix_cache"]["mem_bytes"] == 0, props
+    response = post("/v1/completions", {"model": "default", "prompt": nonce + " Hello", "max_tokens": 2})
+    assert response.get("choices"), response
+    chat = post("/v1/chat/completions", {"model": "default", "temperature": 0, "max_tokens": 1,
+                                         "messages": [{"role": "user", "content": nonce + " Name a colour."}]})
+    cached = chat["usage"]["prompt_tokens_details"]["cached_tokens"]
+    assert cached == 0, chat["usage"]
+print("PASS: disabled prefix cache reports zero RAM, serves three requests and reports no cached token")
 PY
+LOGS=$(sushi_log_since)
+if grep -q '\[hot-cache\]' <<< "$LOGS"; then
+    echo "FAIL: the disabled cache logged a [hot-cache] line"
+    exit 1
+fi
+echo "PASS: no [hot-cache] line"

@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=host
 # test_test_runner_quiet.sh — a passing test prints NOTHING, on either stream.
 #
 # CLAUDE.md already bans stdout from a test: under `zig build test` fd 1 is the
@@ -14,7 +15,7 @@
 #
 # and no Build Summary, while exiting 0. That is indistinguishable from a real
 # failure at a glance and has been read as one. So: benchmark and diagnostic
-# lines in a test ride an env switch (SUSHI_EXL3_LAYER_UBENCH for the EXL3
+# lines in a test ride an env switch (SUSHI_EXL3_PARITY_TRACE for the EXL3
 # ones); only a test that is about to FAIL may print.
 #
 # Usage: ./tests/test_test_runner_quiet.sh [test-filter]   (default: the whole suite)
@@ -24,6 +25,7 @@ cd "$(dirname "$0")/.." || exit 1
 
 ZIG=${ZIG:-./.zig-toolchain/zig}
 FILTER=${1:-}
+STEP=${TEST_STEP:-test}
 
 if [ ! -x "$ZIG" ]; then
   echo "SKIP: no $ZIG (run ./scripts/fetch-zig.sh)"
@@ -36,11 +38,11 @@ fi
 LC_ALL=C grep -l -a -E 'o/[0-9a-f]+/(exl3-)?test' .zig-cache/h/* 2>/dev/null | xargs rm -f 2>/dev/null
 
 if [ -n "$FILTER" ]; then
-  WHAT="zig build test -Dtest-filter=$FILTER"
-  OUT=$("$ZIG" build test -Doptimize=ReleaseFast -Dtest-filter="$FILTER" 2>&1)
+  WHAT="zig build $STEP -Dtest-filter=$FILTER"
+  OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast -Dtest-filter="$FILTER" 2>&1)
 else
-  WHAT="zig build test"
-  OUT=$("$ZIG" build test -Doptimize=ReleaseFast 2>&1)
+  WHAT="zig build $STEP"
+  OUT=$("$ZIG" build "$STEP" -Doptimize=ReleaseFast 2>&1)
 fi
 RC=$?
 

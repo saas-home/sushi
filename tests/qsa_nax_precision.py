@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# sushi-test: tier=tool
 """Float64 oracle for the stock and NAX QSA gather kernels (mx.fast.metal_kernel + numpy).
 
 Default: production bf16-store bar vs numpy float64, then a named f32-output
@@ -24,8 +25,8 @@ INT_MAX = np.iinfo(np.int32).max
 BF16_STORE_FLOOR = 2.0e-3
 
 
-def zig_metal(name: str, path: str | None = None) -> str:
-    text = open(path or os.path.join(ROOT, "src/transformer.zig")).read()
+def zig_metal(name: str, path: str) -> str:
+    text = open(path).read()
     start = text.find("const " + name + " =")
     if start < 0:
         raise RuntimeError("missing kernel " + name)
@@ -69,8 +70,9 @@ def kernel(kind: str, terms: int = 3, out_f32: bool = True):
             header = header.replace("using PT = half;", "using PT = bfloat;")
         name = f"qsa_nax_t{terms}_{'f32' if out_f32 else 'bf16'}"
     else:
-        src = zig_metal("ATTN_QSA256_KERNEL_SOURCE")
-        header = zig_metal("ATTN_PD_KERNEL_HEADER") + zig_metal("ATTN_QSA256_KERNEL_HEADER")
+        src = zig_metal("ATTN_QSA256_KERNEL_SOURCE", os.path.join(ROOT, "src/qwen4/qwen4_qsa_gather.zig"))
+        attn = os.path.join(ROOT, "src/attn_kernels.zig")
+        header = zig_metal("ATTN_PD_KERNEL_HEADER", attn) + zig_metal("ATTN_QSA256_KERNEL_HEADER", attn)
         name = f"qsa_stock_{'f32' if out_f32 else 'bf16'}"
     if out_f32:
         src = f32_out(src)

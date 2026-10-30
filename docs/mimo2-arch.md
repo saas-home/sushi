@@ -4,7 +4,7 @@ How the engine serves MiMo-V2.6-Flash (the served pack is quantized from the MOP
 layout): the source checkpoint's layout, the resident trunk, the MXFP4 and EXL3
 expert paths, the hybrid global/sliding attention with its ring, the vision tower, and the bills that follow the
 storage. MiMo serves text and image input; the supported product is the MCG EXL3 pack. Read this before touching
-`src/mimo_source.zig`, `src/mimo_vision.zig`, `src/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/transformer.zig`, or anything that bills MiMo's KV.
+`src/mimo2/mimo_source.zig`, `src/mimo2/mimo_vision.zig`, `src/mimo2/mimo_forward.zig` (forward, attention arms, MoE dispatch), the shared `src/transformer.zig`, or anything that bills MiMo's KV.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-kv-cache](engine-kv-cache.md),
@@ -54,7 +54,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A MiMo EXL3 pack serves RESIDENT**: see [engine-exl3-experts](engine-exl3-experts.md#mimo). The trunk takes
   the source loader (`usesMimoSourceTrunk`), billed as stored by `mimoSourceResidentBytes`.
 - **A load holds ONE 2-bit coarse copy of the lm_head** (`Transformer.lm_head_coarse`, ~0.19 GB, billed with or
-  without MTP, `scheduler.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
+  without MTP, `model_load.mimoCoarseHeadBytes`): the heads draft on it and the trunk's greedy readout shortlists on it,
   so a greedy argmax is the same with MTP or without ([engine-mtp](engine-mtp.md#greedy-shortlist)). A streamed load
   keeps it too, billed as trunk in the SSD budget ledger.
 - **The weight loader is ONE decision** (`model.loadWeightsForConfig`): a MiMo pack read without its source trunk
@@ -192,7 +192,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   fresh quantized rows and `KVCache.appendQuantized` appends them through the usual slice updates, so the ring, its
   compaction and the packed-arm switch are untouched. Bit-identical to the composed rope + `quantizeAffine` (unit test
   at MiMo shapes, both rope bases, 1-8 rows). It removes ~380 primitives from a decode forward;
-  `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS=1` is its A/B.
+  A/B'd in one process on the forward meter.
 - A joined `[Q | K]` GEMV output with one rope over both passed its unit tests but moved live logits by ~0.05
   nats at the first token, cause unfound; it is not in the tree.
 
@@ -203,7 +203,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   row i attends and appends on slot i's own cache at its own position through the solo core (`mimoAttnCore`,
   `ForwardCtx.batch_rows`), so ring compaction and marks happen per slot as in a solo tick, and each row is read out
   as its tick reads it (the shortlist under `argmax_only`). Byte-identical to the solo ticks (`mimo batched decode
-  rows` on the real pack; `tests/test_mimo_batched_equivalence.sh`).
+  rows` on the real pack; `tests/mimo2/test_mimo_batched_equivalence.sh`).
 - A group holds at most four slots (`batchGroupCap`, independently of the MTP verify width); the rest decode serial by name
   (`row_cap`). Nothing pads: rows never share a key tensor. Groups of three or four eligible MTP slots take
   plain batched ticks and retain each row's hidden state so solo rounds can resume; smaller groups keep solo MTP.
@@ -219,7 +219,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 <a id="vision"></a>
 ## Vision (MiMo-ViT)
 
-- **Tower** (`src/mimo_vision.zig`, port of the checkpoint's `MiMoVisionTransformer`): Conv3d patch embed (2x16x16,
+- **Tower** (`src/mimo2/mimo_vision.zig`, port of the checkpoint's `MiMoVisionTransformer`): Conv3d patch embed (2x16x16,
   served as its [1280, 1536] Linear), 28 blocks of RMSNorm + GQA attention (32 q / 8 kv heads, head 64, qkv and proj
   biases) + SwiGLU (4608, biases), 2-D rotary positions as Qwen2-VL, then LayerNorm + 5120 -> 5120 -> GELU -> 4096
   over each 2x2 merge unit. The checkpoint ships the merger WITHOUT biases (the modeling code declares them): zero.
@@ -240,7 +240,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   checkpoint's own tower run in torch bf16 does the same (0.99697; per block ~1.000 through 13, 0.995 at 27).
   Real weights, 448x640 image (280 tokens), vs the reference on the CPU in f32: preprocessing max |diff| 3.6e-7;
   features cos 0.99718 all-bf16 -> 0.99945 f32 stream (RMS ratio 1.0032).
-- **Encode time**, one image, best of 5 (`mimo vision ubench`; `taskpolicy -a`, fans max, die <= 65 C at start;
+- **Encode time**, one image, best of 5 (`sushi-ubench run mimo2.vision_encode`; `taskpolicy -a`, fans max, die <= 65 C at start;
   all-bf16 = eee7d24, f32 stream = the served code, which also evaluates per block):
 
   | patches (tokens) | all-bf16 | f32 stream | cost |
@@ -274,7 +274,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **The prefill chunk is chosen per request** (`perRequestPrefillChunk` covers a ringed arch): the widest rung up
   to 2048 whose admission bill fits live memory, which is 2048 at every context to 256k on a 128 GB Mac. An
   explicit `--prefill-chunk` caps the ladder and may raise the default as far as the 4096 ceiling
-  (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
+  (`prefill_plan.boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
   hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback,
@@ -294,7 +294,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Evidence
 
-- `tests/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
+- `tests/mimo2/dump_mimo_v2_fixtures.py` supplies the independent HF oracle; `MIMO_V2_SOURCE` tests the downloaded Flash
   config/template. Native-byte preservation, forward parity, and live serving are separate gates; a header audit
   proves neither numerical parity nor generation. Test commands: [tests/CLAUDE.md](../tests/CLAUDE.md).
 - Quality: KLD through EOS on the 16x512 teacher, recorded in [quality-kld](mimo2-kld.md#mimo).

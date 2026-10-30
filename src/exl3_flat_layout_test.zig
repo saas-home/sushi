@@ -5,6 +5,7 @@
 const std = @import("std");
 const expert_quant = @import("expert_quant.zig");
 const model = @import("model.zig");
+const qwen4_config = @import("qwen4/qwen4_config.zig");
 const model_discovery = @import("model_discovery.zig");
 
 const TensorSpec = struct {
@@ -378,16 +379,16 @@ test "flat EXL3 routed-key filtering is independent of shard filename" {
     var key_buf: [256]u8 = undefined;
     for (EXL3_SPECS) |spec| {
         try std.testing.expect(
-            model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
+            qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, spec.key) == null,
         );
     }
     try std.testing.expectEqualStrings(
         EMBED_SPEC.key,
-        model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
+        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, EMBED_SPEC.key).?,
     );
     try std.testing.expectEqualStrings(
         "language_model.mtp.fc_hidden.weight",
-        model.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
+        qwen4_config.qwen4StreamingWeightKey(.exl3_k4, &key_buf, "language_model.mtp.fc_hidden.weight").?,
     );
 }
 
@@ -622,6 +623,7 @@ fn gpuExl3Bank(arrays: [9]@import("mlx.zig").mlx_array) @import("sushi_exl3").Ba
 
 test "EXL3 streaming GPU slab matches resident decode prefill hits misses and union" {
     const mlx = @import("mlx.zig");
+    try mlx.requireGpu();
     const exl3 = @import("sushi_exl3");
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
@@ -743,6 +745,7 @@ test "EXL3 streaming GPU slab matches resident decode prefill hits misses and un
 
 test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank across hits misses and union" {
     const mlx = @import("mlx.zig");
+    try mlx.requireGpu();
     const exl3 = @import("sushi_exl3");
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
@@ -863,10 +866,10 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
 
 test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     const registry = @import("model_registry.zig").ModelRegistry;
-    const server = @import("server.zig");
+    const generation_stream = @import("generation_stream.zig");
     inline for (.{ error.Exl3RateGroupsStreamingUnsupported, error.Exl3GateUpRateMismatch }) |err| {
         try std.testing.expectEqual(err, registry.loadErrorFromName(@errorName(err)));
-        const refusal = server.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
+        const refusal = generation_stream.loadRefusalFor(err) orelse return error.MissingNamedRefusal;
         try std.testing.expect(refusal.type.len > 0 and refusal.message.len > 0);
     }
 }

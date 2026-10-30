@@ -2,7 +2,7 @@
 
 What each HTTP surface promises its clients: the OpenAI chat/completions/Responses and Anthropic Messages contracts,
 streaming and usage chunks, logprobs, seeds and sampling, reasoning budgets and constrained JSON, plus the agent
-launcher. Read this before touching `src/server.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
+launcher. Read this before touching `src/server.zig`, `src/http_conn.zig`, `src/anthropic.zig`, `src/responses_api.zig`, `src/completions.zig`, `src/generation_stream.zig`, `src/request_policy.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](server-tool-calling.md),
 [server-lifecycle](server-lifecycle.md), [engine-mtp](engine-mtp.md).
@@ -16,8 +16,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
 - **Effort vocabulary** `off on minimal low medium high xhigh max` (`none` = off; `minimal` keeps the legacy 1024
-  budget on inherited arches): each served arch accepts a subset (`model.effortArms`), read through
-  `model.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
+  budget on inherited arches): each served arch accepts a subset (`effort.effortArms`), read through
+  `effort.selectEffort` on chat, Responses, Anthropic, `--think` and the REPL's `/think` alike. A word outside it
   is refused with the accepted list. Announced folds: Qwen `high` and `max` → `xhigh`, GLM `medium` → `high` and
   `xhigh` → `max`. The request is served, and every re-route logs `[effort]` and rides back as
   `X-Sushi-Effort-Notice` plus `effort_notice` (not in the answer text). MiMo's silent on-fold is unchanged.
@@ -119,7 +119,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's
   `providers.streamFirstEventTimeoutSeconds` controls it, with zero allowing unlimited initial buffering.
-  `--timeout` remains a token-progress STALL timeout (`StallClock`).
+  `--timeout` remains a token-progress STALL timeout (`degenerate.StallClock`).
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
   under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
   escaped at the SINK.
@@ -137,17 +137,17 @@ before reading a completed stream and requires clean EOF.
 
 ## Seeds, logprobs, sampling
 
-- **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`generate.seedKey`).
+- **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
 - Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
   token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
-- Logprobs are `logits - logsumexp` in f32 (`computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
+- Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
   apart between -16 and -32.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
-- Top-k and top-p are ONE pass (`filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
-  constantly; `ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
-  `top_p` 0 is GREEDY (`applyTopP` floors at `floatMin(f32)`).
-- A sampler never draws a RESERVED special or PADDING row (`installSuppressMask`; logprobs stay RAW).
+- Top-k and top-p are ONE pass (`sampler.filterTopKTopP`); a filter cuts by RANK, never by value (bf16 ties at the top
+  constantly; `sampler.ranksDescending` ties by lowest id); the nucleus is the mass STRICTLY above each rank, cumsum in f32;
+  `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).
+- A sampler never draws a RESERVED special or PADDING row (`sampler.installSuppressMask`; logprobs stay RAW).
 - **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
   (`requestEosSlice`); stop sequences and the loop stops still end it, and its text skips `special: true` tokens
@@ -155,7 +155,7 @@ before reading a completed stream and requires clean EOF.
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
 - **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
-  drafter path (`draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
+  drafter path (`mtp_plan.draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off. OpenAI's `presence_penalty` and
@@ -212,7 +212,7 @@ the early-stop line + the atomic closer commit as ONE multi-token forward (`comm
 thought is delivered. Every decode tick checks it with the loop stop (`loopGuardTick`), the plain batched tick too
 (`batchedTickRows`): skipped there, a budget under `--max-concurrent` overran by up to ~2.5k tokens while its slot
 batched plain. Guard: `tests/test_reasoning_budget_stream.sh`. Effort budgets = pi's ladder
-(`model.effortArms` for served arches, `responses.effortBudget` for the rest).
+(`effort.effortArms` for served arches, `responses.effortBudget` for the rest).
 Every surface arms it with one precedence: explicit budget (`reasoning_budget_tokens`, Anthropic `budget_tokens`) > the
 request effort word's budget. When the request omits effort, the architecture's `--think` budget supplies the default;
 uncapped effort words fall back to `--reasoning-budget` (unlimited by default). GLM effort words do not impose token caps.
@@ -280,8 +280,8 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   no request, so `request_id`, `max_tokens`, `generated_tokens` and `elapsed_seconds` are 0.
 - An entry a live row restored from is listed once, as that row: the dedupe keys on an internal entry id that
   `/metrics.json` does not emit.
-- `/props` `template_fallbacks` counts renders where the model's own chat template raised and the generic format
-  answered ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
+- `/props` `template_fallbacks` counts renders where a `<|im_end|>` model's own chat template raised and ChatML
+  answered (other models refuse with 500 `chat template unusable`, uncounted) ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
   every prompt is the checkpoint's own.
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state, published
   each tick with or without `--metrics`; a donated checkout's buffers, which the entry bills until release, count once.
@@ -358,7 +358,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - pi sends its thinking level as `reasoning_effort` through a per-model `thinkingLevelMap` built from the row's
   `reasoning_efforts` (`launch.piEffortFor`: exact, else the next accepted word up, else down, `on` being the lowest;
   Qwen3.8 high → xhigh, MiMo every level → on). pi's `thinkingFormat: qwen` sent only `enable_thinking`, so low/medium
-  never reached the server. The launch tests build their vocabularies from `model.effortArms`.
+  never reached the server. The launch tests build their vocabularies from `effort.effortArms`.
 - omp (a pi fork) has no off entry in its maps: off rides the qwen dialect (`enable_thinking: false`), `whenThinking`
   switches thinking requests to `reasoning_effort`, and a per-model `thinking` block remaps each level with the same
   rule; `requiresEffort: false` stops omp clamping off to the lowest effort.

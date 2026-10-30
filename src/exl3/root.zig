@@ -6,12 +6,15 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 pub const format = @import("expert_exl3.zig");
 pub const kernels = @import("expert_exl3_kernels.zig");
+pub const project_rows = @import("project_rows.zig");
 pub const glm_group2 = @import("glm_group2.zig");
 pub const glm_fold = @import("glm_fold.zig");
 pub const qwen_riders = @import("qwen_riders.zig");
 pub const qwen_fold = @import("qwen_fold.zig");
 pub const glm_prefill_grid = @import("glm_prefill_grid.zig");
 pub const codebook_tables = @import("codebook_tables.zig");
+/// The microbench bodies `sushi-ubench` runs; its host root supplies `report`.
+pub const ubench = @import("ubench.zig");
 
 /// One projection's bank, expert e on axis 0: `trellis` U16 [E, in/16, out/16, n],
 /// `suh` F16 [E, in], `svh` F16 [E, out].
@@ -457,6 +460,9 @@ test "exl3 a layer may pack below the rate the config bills, never above it" {
 test {
     _ = format;
     _ = kernels;
+    _ = @import("kernel_source.zig");
+    _ = project_rows;
+    _ = @import("sorted_windows.zig");
     _ = codebook_tables;
 }
 
@@ -518,6 +524,7 @@ test "sushi coder layouts refuse malformed missing mixed and unsupported groups"
 }
 
 test "sushi coder GPU two groups equal independently routed uniform banks" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var banks: [2]Bank = undefined;
@@ -776,7 +783,6 @@ test { _ = glm_group2; }
 test {
     _ = rate_groups;
     _ = linear;
-    _ = @import("dsv41_ubench.zig");
     _ = @import("dsv41_real.zig");
 }
 
