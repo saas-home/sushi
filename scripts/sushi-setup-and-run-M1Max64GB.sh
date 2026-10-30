@@ -133,13 +133,6 @@ print_error() {
     echo -e "${RED}[✗]${NC} $1"
 }
 
-check_command() {
-    if ! command -v "$1" &> /dev/null; then
-        print_error "$1 is not installed. Please install it and try again."
-        exit 1
-    fi
-}
-
 sushi_bin_version() {
     # Echo the version from `sushi --version`, or "unknown"; never fails the caller.
     local v=""
@@ -202,10 +195,6 @@ install_latest_sushi() {
     fi
 }
 
-install_prebuilt_binary() {
-    switch_to_release_binary
-}
-
 build_and_deploy_from_source() {
     if [ -z "${REPO_DIR}" ] || [ ! -d "${REPO_DIR}" ]; then
         print_error "Sushi git repository not found. Cannot build from source."
@@ -243,10 +232,19 @@ build_and_deploy_from_source() {
                 print_info "Stashing local customizations..."
                 (cd "${REPO_DIR}" && git stash push -m "sushi-local-customizations")
             fi
-            (cd "${REPO_DIR}" && git merge origin/main)
+            if ! (cd "${REPO_DIR}" && git merge origin/main); then
+                print_error "Merge with origin/main hit conflicts; aborting the merge and the build."
+                (cd "${REPO_DIR}" && git merge --abort 2>/dev/null || true)
+                if [ "${has_local_changes}" = "true" ]; then
+                    (cd "${REPO_DIR}" && git stash pop) \
+                        || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
+                fi
+                return 1
+            fi
             if [ "${has_local_changes}" = "true" ]; then
                 print_info "Restoring local customizations..."
-                (cd "${REPO_DIR}" && git stash pop 2>/dev/null || true)
+                (cd "${REPO_DIR}" && git stash pop) \
+                    || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
             fi
         else
             print_success "Main branch is already up to date with origin/main."
@@ -274,7 +272,7 @@ build_and_deploy_from_source() {
         return 1
     fi
 
-    # 4. Deploy and rewire dynamic libraries
+    # 5. Deploy and rewire dynamic libraries
     mkdir -p "${BIN_DIR}/lib"
     cp -f "${REPO_DIR}/zig-out/bin/sushi" "${BIN_DIR}/sushi"
     if [ -d "${REPO_DIR}/lib/mlx/lib" ]; then
@@ -293,7 +291,7 @@ build_and_deploy_from_source() {
     SUSHI_BIN="${BIN_DIR}/sushi"
 
     local new_ver
-    new_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "latest")
+    new_ver="$(sushi_bin_version "${SUSHI_BIN}")"
     local head_commit
     head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "main")
 
@@ -411,8 +409,9 @@ switch_to_main_binary() {
         fi
         build_and_deploy_from_source || return 1
     else
-        # Backup active binary to release cache if flavor was release
-        if [ -f "${BIN_DIR}/sushi" ]; then
+        # Only back up the active binary to the release cache when it IS the release;
+        # copying a main build here would destroy the sushi.release rollback.
+        if [ -f "${BIN_DIR}/sushi" ] && grep -q "^FLAVOR_TYPE=release$" "${BIN_DIR}/.sushi_flavor" 2>/dev/null; then
             cp -f "${BIN_DIR}/sushi" "${BIN_DIR}/sushi.release"
         fi
         cp -f "${BIN_DIR}/sushi.main" "${BIN_DIR}/sushi"
@@ -460,7 +459,7 @@ check_all_updates() {
     print_info "Inspecting updates across installed binary, GitHub releases, and git main branch..."
     
     local current_bin_ver
-    current_bin_ver=$("${SUSHI_BIN:-${BIN_DIR}/sushi}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "unknown")
+    current_bin_ver="$(sushi_bin_version "${SUSHI_BIN:-${BIN_DIR}/sushi}")"
 
     # 1. Check GitHub Release
     local release_info
@@ -578,7 +577,7 @@ ensure_latest_sushi_binary() {
     fi
 
     if [ "${flavor_type}" = "release" ]; then
-        print_success "Sushi Engine: Running official GitHub Release (v${current_ver})"
+        print_success "Sushi Engine: Running official GitHub Release (${current_ver})"
         if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
             local ahead_count
             ahead_count=$(cd "${REPO_DIR}" && git rev-list --count "v${current_ver}..HEAD" 2>/dev/null || echo 0)
@@ -785,11 +784,19 @@ sync_model_files() {
             print_warning "Failed to update model with 'sushi pull'"
             return 1
         }
+        # 'sushi pull' writes into ${SUSHI_DIR}/models/<repo>, not into the requested dest.
+        local pulled="${SUSHI_DIR}/models/${repo}"
+        if is_model_complete "${pulled}"; then
+            MODEL_PATH="${pulled}"
+        else
+            print_warning "'sushi pull' finished but ${pulled} is not a complete pack."
+            return 1
+        fi
     else
         print_error "No download tool found (hf, huggingface-cli, or sushi binary)."
         return 1
     fi
-    print_success "Model update complete at ${dest}"
+    print_success "Model update complete at ${MODEL_PATH}"
     return 0
 }
 
@@ -1043,6 +1050,18 @@ EOF
     print_success "Generated launchd plist at ${PLIST_PATH}"
 }
 
+# Poll /health for up to N seconds (default 120; model load on this box can take minutes).
+wait_for_health() {
+    local secs="${1:-120}"
+    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
+    local i
+    for ((i = 0; i < secs; i++)); do
+        curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1 && return 0
+        sleep 1
+    done
+    return 1
+}
+
 install_service() {
     print_info "Configuring macOS launchd daemon service..."
     generate_plist
@@ -1096,29 +1115,24 @@ start_service() {
     fi
 
     # 5. Wait for server to come up and verify health
-    print_info "Waiting for Sushi server to become healthy..."
-    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
-    for i in {1..60}; do
-        if curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1; then
-            print_success "Sushi server is active under launchd supervision!"
-            local cur_pid
-            cur_pid=$(cat "${PID_FILE}" 2>/dev/null || pgrep -f "sushi serve" | head -n 1 || echo "")
-            if [ -n "${cur_pid}" ]; then
-                print_success "Process PID: ${cur_pid}"
-            fi
-            print_success "Auto-restart is ACTIVE: if the server stops or crashes, macOS launchd will restart it immediately."
-            echo ""
-            echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
-            echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
-            echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
-            echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
-            echo "Health check:         curl http://127.0.0.1:${PORT}/health"
-            return 0
+    print_info "Waiting for Sushi server to become healthy (model load can take a few minutes)..."
+    if wait_for_health 120; then
+        print_success "Sushi server is active under launchd supervision!"
+        local cur_pid
+        cur_pid=$(cat "${PID_FILE}" 2>/dev/null || pgrep -f "sushi serve" | head -n 1 || echo "")
+        if [ -n "${cur_pid}" ]; then
+            print_success "Process PID: ${cur_pid}"
         fi
-        sleep 1
-    done
-
-    print_warning "Server starting up... Check logs: tail -f ${LOGS_DIR}/sushi-launchd.log"
+        print_success "Auto-restart is ACTIVE: if the server stops or crashes, macOS launchd will restart it immediately."
+        echo ""
+        echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
+        echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
+        echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
+        echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
+        echo "Health check:         curl http://127.0.0.1:${PORT}/health"
+    else
+        print_warning "Server starting up... Check logs: tail -f ${LOGS_DIR}/sushi-launchd.log"
+    fi
 }
 
 stop_service() {
@@ -1347,25 +1361,18 @@ start_server() {
     echo "${NEW_PID}" > "${PID_FILE}"
     
     # Wait for server to start
-    print_info "Waiting for server to start (this may take 30-60 seconds)..."
-    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
-    for i in {1..120}; do
-        if curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1; then
-            print_success "Sushi server started successfully (PID: ${NEW_PID})"
-            echo ""
-            echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
-            echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
-            echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
-            echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
-            echo "Health check:         curl http://127.0.0.1:${PORT}/health"
-            return 0
-        fi
-        if [ $((i % 10)) -eq 0 ]; then
-            echo -n "."
-        fi
-        sleep 1
-    done
-    
+    print_info "Waiting for server to start (model load can take a few minutes)..."
+    if wait_for_health 120; then
+        print_success "Sushi server started successfully (PID: ${NEW_PID})"
+        echo ""
+        echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
+        echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
+        echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
+        echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
+        echo "Health check:         curl http://127.0.0.1:${PORT}/health"
+        return 0
+    fi
+
     print_error "Server failed to start within 120 seconds"
     print_info "Check logs: tail -n 50 ${LOG_FILE}"
     exit 1
