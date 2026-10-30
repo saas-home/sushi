@@ -864,6 +864,51 @@ test "EXL3 streaming GPU rate-grouped layer matches the resident ragged bank acr
     }
 }
 
+test "EXL3 streaming GPU a staged wide route hands each rate group over before the last group's fill joins" {
+    const mlx = @import("mlx.zig");
+    const exl3 = @import("sushi_exl3");
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const hidden = 128;
+    const inter = 256;
+    const experts = 6;
+    const groups = [_]GroupSpec{ .{ .experts = 2, .n = .{ 32, 32, 32 } }, .{ .experts = 4, .n = .{ 48, 40, 64 } } };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pack = try writeGroupedPack(tmp.dir, a, hidden, inter, &groups);
+    defer pack.deinit();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const geom: stream.Geometry = .{ .layers = 1, .experts = experts, .hidden = hidden, .intermediate = inter, .exl3_n = 64 };
+    const per = try stream.expertBytesFor(a, path, geom, .exl3_k4);
+    for ([_]u64{ 3, 6 }) |layer_slots| {
+        var engine = try stream.Engine.initWithOptions(a, path, geom, layer_slots * per, s, .{ .layout = .exl3_k4, .bounce_size = 1 << 20 });
+        defer engine.deinit();
+        const rows = exl3.kernels.DECODE_ROWS_MAX + 1;
+        var routes: [rows * 2]u16 = undefined;
+        for (&routes, 0..) |*id, j| id.* = @intCast((j * 5 + 2) % experts);
+        var prepared = try engine.prepareHostStaged(0, &routes);
+        defer prepared.deinit();
+        const Seen = struct {
+            p: *stream.Prepared,
+            at: [2]?usize = .{ null, null },
+            fn ready(ctx: *anyopaque, group: usize) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                self.at[group] = self.p.staged.?.done;
+            }
+        };
+        var seen = Seen{ .p = &prepared };
+        const total = prepared.staged.?.stages();
+        try engine.fillStaged(&prepared, &seen, Seen.ready);
+        // Every group is handed over, the first before the last stage has run.
+        const first = @min(seen.at[0].?, seen.at[1].?);
+        try std.testing.expect(first < total);
+        try std.testing.expect(prepared.ragged != null);
+    }
+}
+
 test "EXL3 streaming CPU refusals survive the registry and HTTP boundary" {
     const registry = @import("model_registry.zig").ModelRegistry;
     const generation_stream = @import("generation_stream.zig");
@@ -983,6 +1028,28 @@ test "EXL3 streaming GPU a cache profile moves slots to the layer that reuses it
     }
     try std.testing.expectEqual(slots[0][0], slots[0][1]);
     try std.testing.expect(slots[1][1] > slots[0][1] and slots[1][0] < slots[0][0]);
+}
+
+test "Sushi quant memory bills a trellis trunk as stored and flags a trellis head" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const q_trellis = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.trellis", .dtype = "U16", .shape = TRELLIS_SHAPE[0..], .bytes = 256 };
+    const q_suh = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.suh", .dtype = "F16", .shape = SIDE_SHAPE[0..], .bytes = 64 };
+    const q_svh = TensorSpec{ .key = "language_model.model.layers.0.self_attn.q_proj.svh", .dtype = "F16", .shape = SIDE_SHAPE[0..], .bytes = 64 };
+    const head = TensorSpec{ .key = "language_model.lm_head.trellis", .dtype = "U16", .shape = TRELLIS_SHAPE[0..], .bytes = 256 };
+    const specs = [_]TensorSpec{ q_trellis, q_suh, q_svh, head, TRUNK_AUX_SPEC };
+    try writeSafetensors(io, a, tmp.dir, "model.safetensors", &specs);
+    var entries: [specs.len]IndexSpec = undefined;
+    for (specs, &entries) |spec, *e| e.* = .{ .key = spec.key, .file = "model.safetensors" };
+    try writeIndex(io, a, tmp.dir, &entries);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const bill = try model.qwenResidentWeightBytes(io, a, path, false, false);
+    // The trellis, both scale vectors and the head are billed as stored, beside the affine k_proj.
+    try std.testing.expectEqual(@as(u64, 256 + 64 + 64 + 256 + 1024), bill.trunk);
+    try std.testing.expect(bill.stq_head);
 }
 
 test "EXL3 streaming CPU bills a grouped store's floor, one expert of every rate group, and one workspace set per layer kind" {
