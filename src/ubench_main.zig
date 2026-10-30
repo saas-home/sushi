@@ -12,7 +12,7 @@ pub const log = @import("log.zig");
 pub const report = @import("ubench_report.zig");
 const box = @import("bench_box.zig");
 const exl3 = @import("sushi_exl3");
-const dsv41 = @import("ubench_dsv41.zig");
+const dsv_benches = @import("dsv41/ubench.zig");
 const glm5 = @import("ubench_glm5.zig");
 const shared = @import("ubench_shared.zig");
 const encoder = @import("sushi_encoder");
@@ -21,24 +21,15 @@ const ubench_mimo2 = @import("ubench_mimo2.zig");
 const registry = [_]report.Bench{
     exl3.ubench.dsv41_experts,
     exl3.ubench.dsv41_tail_routed,
-    dsv41.index_decode,
-    dsv41.index_peak,
-    dsv41.index_block_peak,
-    dsv41.rows_growth,
-    dsv41.attn_span,
-    dsv41.picks_span,
-    dsv41.topk,
-    dsv41.hc_expand,
+    exl3.ubench.dsv41_shared_prefill,
+} ++ dsv_benches.benches ++ [_]report.Bench{
     exl3.ubench.decode_chain,
     exl3.ubench.grouped_decode,
     exl3.ubench.moe_layer,
     exl3.ubench.prefill_gemm,
     exl3.ubench.trunk_rows,
     exl3.ubench.routed_t1,
-    ubench_mimo2.global_decode_attn,
-    ubench_mimo2.prefill_attn,
-    ubench_mimo2.fp8_gemv,
-    ubench_mimo2.vision_encode,
+} ++ ubench_mimo2.benches ++ [_]report.Bench{
     exl3.ubench.exl3_rate_groups,
     exl3.ubench.exl3_rate_groups_rows,
     encoder.ubench.factor,

@@ -3,14 +3,16 @@
 //! indexer's and the row stores' working set, the attention span arms, and the decode top-k. Run by `sushi-ubench`,
 //! never by a test.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const io_util = @import("io_util.zig");
-const report = @import("ubench_report.zig");
-const cfg_mod = @import("dsv41/dsv41_config.zig");
-const sc_mod = @import("dsv41/dsv41_scope.zig");
-const qat_mod = @import("dsv41/dsv41_qat.zig");
-const kernels = @import("dsv41/dsv41_kernels.zig");
-const model = @import("dsv41/dsv41_model.zig");
+const mlx = @import("../mlx.zig");
+const io_util = @import("../io_util.zig");
+const report = @import("../ubench_report.zig");
+const cfg_mod = @import("dsv41_config.zig");
+const sc_mod = @import("dsv41_scope.zig");
+const qat_mod = @import("dsv41_qat.zig");
+const kernels = @import("dsv41_kernels.zig");
+const model = @import("dsv41_model.zig");
+
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, picks_span, attn_epilogue, topk, hc_expand, hc_stages };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -124,7 +126,7 @@ fn sampleIndexDecode(c: *const IndexDecode, arm: usize) anyerror!f64 {
     var t = Scope.init(alloc, c.gpu);
     defer t.deinit();
     var sw = io_util.Stopwatch.init(io());
-    switch (@as(IndexStage, @enumFromInt(arm))) {
+    switch (@as(IndexStage, @fromBackingInt(@intCast(arm)))) {
         .scores => try evalAll(&.{try kernels.indexScoresPacked(&t, c.q, c.codes, c.scl, c.w, 0.01, c.nb - c.L, 1, c.mode, c.group)}),
         .mask => {
             var o = mlx.mlx_array_new();
@@ -387,18 +389,18 @@ fn runRowsGrowth(run: *report.Run) anyerror!void {
 pub const attn_span: report.Bench = .{
     .name = "dsv41.attn_span",
     .scope = .dsv41,
-    .what = "one attention span at the release geometry (64 heads x 512, window 128): the f32 composed core, the f16 wide arm, the fused kernel; MLX peak beyond the inputs",
+    .what = "one attention span at the release geometry (64 heads x 512, window 128): the f32 composed core, the f16 wide arm, the fused kernel, the fused kernel on the matrix units (NAX GPUs); MLX peak beyond the inputs",
     .unit = .ms,
     .steps = 1,
     .axes = &.{.{ .name = "span", .values = &.{ "256k512", "128k512", "256k0" }, .numeric = false }},
-    .arms = &.{ "core", "wide", "fused" },
+    .arms = &.{ "core", "wide", "fused", "nax" },
     .ref = "core",
     .run = runAttnSpan,
 };
 
-const AttnArm = enum { core, wide, fused };
+const AttnArm = enum { core, wide, fused, nax };
 
-const AttnSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, peak: [3]Range = @splat(.{}) };
+const AttnSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, peak: [4]Range = @splat(.{}) };
 
 fn sampleAttn(s: *AttnSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
@@ -408,10 +410,12 @@ fn sampleAttn(s: *AttnSample, arm: usize) anyerror!f64 {
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
-    const y = try switch (@as(AttnArm, @enumFromInt(arm))) {
+    if (arm == @backingInt(AttnArm.nax) and !kernels.attnNaxFits(c.H, c.hd)) return error.NaxUnavailable;
+    const y = try switch (@as(AttnArm, @fromBackingInt(@intCast(arm)))) {
         .core => model.attnCore(&sc, d.sink, d.q, d.keys, d.band, d.comp, d.topk, scale, .bfloat16),
         .wide => kernels.attnWide(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
-        .fused => kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16),
+        .fused => kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16, null, false),
+        .nax => kernels.attnFused(&sc, d.sink, d.q, d.keys, c.wp, c.window, d.comp, d.topk, scale, .bfloat16, null, true),
     };
     try mlx.check(mlx.mlx_array_eval(y));
     const ns = sw.read();
@@ -437,7 +441,78 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
         var s: AttnSample = .{ .gpu = gpu, .d = d, .c = cs.c };
         const label = try std.fmt.allocPrint(run.a, "span {d} K {d}", .{ cs.c.L, cs.c.K });
         try run.interleave(label, &s, sampleAttn);
-        for (std.enums.values(AttnArm)) |arm| try s.peak[@intFromEnum(arm)].metrics(run, @tagName(arm), "peak");
+        for (std.enums.values(AttnArm)) |arm| try s.peak[@backingInt(arm)].metrics(run, @tagName(arm), "peak");
+    }
+}
+
+// ── dsv41.attn_epilogue ─────────────────────────────────────────────────
+
+pub const attn_epilogue: report.Bench = .{
+    .name = "dsv41.attn_epilogue",
+    .scope = .dsv41,
+    .what = "one prefill span's heads as the grouped wo_a takes them, at the release geometry (64 heads x 512, 8 groups, QAT on, span at 30,720): the fused kernel then the rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; MLX peak beyond the inputs",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{.{ .name = "span", .values = &.{ "256k512", "128k512", "256k0" }, .numeric = false }},
+    .arms = &.{ "chain", "fold" },
+    .ref = "chain",
+    .run = runAttnEpilogue,
+};
+
+const epi_pos0: usize = 30720;
+const epi_groups = 8;
+
+const EpiSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: ?*const model.Rows, freqs: A, pos: A, peak: [2]Range = @splat(.{}) };
+
+fn sampleEpilogue(s: *EpiSample, arm: usize) anyerror!f64 {
+    const scale = 1.0 / @sqrt(@as(f32, 512));
+    const c = s.c;
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    const p = Peak.begin(s.gpu);
+    var sw = io_util.Stopwatch.init(io());
+    const picks: model.Picks = if (s.rows) |r| try model.packedPicks(&sc, r, s.d.topk, true) else .{};
+    const epi: kernels.Epilogue = .{ .freqs = s.freqs, .rd = 64, .pos0 = epi_pos0, .qat = true, .og = epi_groups };
+    const y = if (arm == 1)
+        try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, c.wp, c.window, picks, scale, .bfloat16, epi, false)
+    else blk: {
+        const heads = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, c.wp, c.window, picks, scale, .bfloat16, null, false);
+        const rot = try kernels.ropeTail(&sc, heads, s.freqs, s.pos, 64, true, .none, null);
+        const grouped = try sc.reshape(rot, &.{ ci(c.L), epi_groups, ci(c.H * c.hd / epi_groups) });
+        break :blk try sc.transpose(try qat_mod.qat(&sc, grouped, .fp8_ue8m0, 32), &.{ 1, 0, 2 });
+    };
+    try mlx.check(mlx.mlx_array_eval(y));
+    const ns = sw.read();
+    s.peak[arm].add(p.end());
+    return @floatFromInt(ns);
+}
+
+fn runAttnEpilogue(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const Case = struct { name: []const u8, c: model.AttnCase };
+    const cases = [_]Case{
+        .{ .name = "256k512", .c = .{ .L = 256, .wp = 127, .K = 512, .nc = 4096, .holes = false } },
+        .{ .name = "128k512", .c = .{ .L = 128, .wp = 127, .K = 512, .nc = 4096, .holes = false } },
+        .{ .name = "256k0", .c = .{ .L = 256, .wp = 127, .K = 0, .nc = 0 } },
+    };
+    var f: [32]f32 = undefined;
+    qat_mod.invFreqs(&f, 64, 65536, 160000, 16, 32, 1);
+    for (cases) |cs| {
+        if (!listed(run.axis("span"), cs.name)) continue;
+        var base = Scope.init(alloc, gpu);
+        defer base.deinit();
+        const d = try model.attnCaseData(&base, cs.c, 0xa77);
+        var store: ?model.Rows = if (cs.c.K > 0) try model.packedStore(&base, d.comp) else null;
+        defer if (store) |*r| r.deinit();
+        const freqs = try base.floats(&f, &.{32});
+        const pos = try model.posArray(&base, epi_pos0, cs.c.L, 1);
+        try evalAll(&.{ d.q, d.keys, d.sink, freqs, pos });
+        if (store) |r| try evalAll(&.{ d.topk, r.buf, r.sbuf });
+        var s: EpiSample = .{ .gpu = gpu, .d = d, .c = cs.c, .rows = if (store) |*r| r else null, .freqs = freqs, .pos = pos };
+        const label = try std.fmt.allocPrint(run.a, "span {d} K {d}", .{ cs.c.L, cs.c.K });
+        try run.interleave(label, &s, sampleEpilogue);
+        try s.peak[0].metrics(run, "chain", "peak");
+        try s.peak[1].metrics(run, "fold", "peak");
     }
 }
 
@@ -446,19 +521,19 @@ fn runAttnSpan(run: *report.Run) anyerror!void {
 pub const picks_span: report.Bench = .{
     .name = "dsv41.picks_span",
     .scope = .dsv41,
-    .what = "one prefill span's compressed picks and fused attention at the release geometry: the picked rows unpacked and gathered first, against the kernel decoding them from the packed store; MLX peak beyond the inputs",
+    .what = "one prefill span's compressed picks and fused attention at the release geometry: the picked rows unpacked and gathered first, against the kernel decoding them from the packed store, on the SIMD or the matrix units (NAX GPUs); MLX peak beyond the inputs",
     .unit = .ms,
     .steps = 1,
     .axes = &.{
         .{ .name = "span", .values = &.{ "256k512", "128k512" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "8192", "262144" } },
     },
-    .arms = &.{ "gather", "packed" },
+    .arms = &.{ "gather", "packed", "packed_nax" },
     .ref = "gather",
     .run = runPicksSpan,
 };
 
-const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: *const model.Rows, peak: [2]Range = @splat(.{}) };
+const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: *const model.Rows, peak: [3]Range = @splat(.{}) };
 
 fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
@@ -466,8 +541,10 @@ fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
-    const picks = try model.packedPicks(&sc, s.rows, s.d.topk, arm == 1);
-    const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16);
+    const nax = arm == 2;
+    if (nax and !kernels.attnNaxFits(s.c.H, s.c.hd)) return error.NaxUnavailable;
+    const picks = try model.packedPicks(&sc, s.rows, s.d.topk, arm >= 1);
+    const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16, null, nax);
     try mlx.check(mlx.mlx_array_eval(y));
     const ns = sw.read();
     s.peak[arm].add(p.end());
@@ -493,6 +570,7 @@ fn runPicksSpan(run: *report.Run) anyerror!void {
             try run.interleave(label, &s, samplePicks);
             try s.peak[0].metrics(run, "gather", "peak");
             try s.peak[1].metrics(run, "packed", "peak");
+            try s.peak[2].metrics(run, "packed_nax", "peak");
         }
     }
 }
@@ -626,6 +704,93 @@ fn runHcExpand(run: *report.Run) anyerror!void {
             var s: HcExpandSample = .{ .gpu = gpu, .d = d, .ffn = std.mem.eql(u8, stage, "ffn") };
             const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
             try run.interleave(label, &s, sampleHcExpand);
+        }
+    }
+}
+
+// ── dsv41.hc_stages ─────────────────────────────────────────────────────
+
+pub const hc_stages: report.Bench = .{
+    .name = "dsv41.hc_stages",
+    .scope = .dsv41,
+    .what = "the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16 stream): mix, norm, split, expand, the attention stage (mix + norm) and the FFN stage (expand + mix + norm), against a copy of the stream; the arms are the mix kernel's row x mix tile",
+    .unit = .ms,
+    .steps = 1,
+    .axes = &.{
+        .{ .name = "rows", .values = &.{ "512", "2048" } },
+        .{ .name = "stage", .values = &.{ "copy", "mix", "norm", "split", "expand", "attn", "ffn" }, .numeric = false },
+    },
+    .arms = &.{ "r4m6", "r2m12" },
+    .ref = "r4m6",
+    .run = runHcStages,
+};
+
+const hc_stage_names = [_][]const u8{ "copy", "mix", "norm", "split", "expand", "attn", "ffn" };
+const hc_tiles = [_]kernels.HcMixTile{ .{ .rows = 4, .cols = 6 }, .{ .rows = 2, .cols = 12 } };
+const hc_reps = 8;
+
+const HcStagesSample = struct { gpu: mlx.mlx_stream, d: HcExpandData, z: A, stage: []const u8 };
+
+fn sampleHcStages(s: *HcStagesSample, arm: usize) anyerror!f64 {
+    const d = s.d;
+    const tile = hc_tiles[arm];
+    var sc = Scope.init(alloc, s.gpu);
+    defer sc.deinit();
+    var ev: [hc_reps]A = undefined;
+    var sw = io_util.Stopwatch.init(io());
+    for (&ev) |*e| {
+        if (std.mem.eql(u8, s.stage, "copy")) {
+            e.* = try sc.add(d.x, try sc.astype(try sc.f(1.0), .bfloat16));
+        } else if (std.mem.eql(u8, s.stage, "mix")) {
+            e.* = try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, tile);
+        } else if (std.mem.eql(u8, s.stage, "norm")) {
+            e.* = (try kernels.hcNorm(&sc, s.z, d.x, d.cpre, d.w, 20, d.eps)).h;
+        } else if (std.mem.eql(u8, s.stage, "split")) {
+            e.* = (try kernels.hcSplitZ(&sc, s.z, 4, 20, d.eps)).comb;
+        } else if (std.mem.eql(u8, s.stage, "expand")) {
+            e.* = try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb);
+        } else {
+            const x1 = if (std.mem.eql(u8, s.stage, "ffn")) try kernels.hcExpandFused(&sc, d.x, d.y, d.post, d.comb) else d.x;
+            e.* = (try kernels.hcNorm(&sc, try kernels.hcMixTiled(&sc, x1, d.hw, d.eps, tile), x1, d.cpre, d.w, 20, d.eps)).h;
+        }
+    }
+    try evalAll(&ev);
+    return @as(f64, @floatFromInt(sw.read())) / hc_reps;
+}
+
+fn runHcStages(run: *report.Run) anyerror!void {
+    const gpu = mlx.gpuStream();
+    const D = 5120;
+    const mix = 24;
+    try kernels.probeHc(alloc, gpu, 4, D, 20);
+    var rows_buf: [8]usize = undefined;
+    for (try axisInts(run, "rows", &rows_buf)) |L| {
+        var sc = Scope.init(alloc, gpu);
+        defer sc.deinit();
+        const l: c_int = ci(L);
+        const f32t = mlx.mlx_dtype.float32;
+        const d: HcExpandData = .{
+            .x = try sc.astype(try kernels.randn(&sc, &.{ l, 4, D }, f32t, 201, 1.5), .bfloat16),
+            .y = try sc.astype(try kernels.randn(&sc, &.{ l, D }, f32t, 202, 1.0), .bfloat16),
+            .post = try kernels.randn(&sc, &.{ l, 4 }, f32t, 203, 0.7),
+            .comb = try kernels.randn(&sc, &.{ l, 4, 4 }, f32t, 204, 0.5),
+            .cpre = try sc.op1(mlx.mlx_abs, try kernels.randn(&sc, &.{ l, 4 }, f32t, 205, 0.6)),
+            .w = try sc.astype(try sc.add(try kernels.randn(&sc, &.{D}, f32t, 206, 0.2), try sc.f(1.0)), .bfloat16),
+            .hw = .{ .fn_w = try kernels.randn(&sc, &.{ mix, 4 * D }, f32t, 207, 0.02), .scale = try sc.floats(&.{ 0.3, 0.5, 0.7 }, &.{3}), .base = try kernels.randn(&sc, &.{mix}, f32t, 208, 0.5) },
+            .eps = try kernels.hcEps(&sc, 1e-6, 1e-6),
+        };
+        const z = try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, hc_tiles[0]);
+        try evalAll(&.{ d.x, d.y, d.post, d.comb, d.cpre, d.w, d.hw.fn_w, d.hw.scale, d.hw.base, d.eps, z });
+        const zbytes = std.mem.sliceAsBytes(try sc_mod.hostF32(z));
+        for (hc_tiles[1..]) |tile| {
+            const got = try sc_mod.hostF32(try kernels.hcMixTiled(&sc, d.x, d.hw, d.eps, tile));
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(got), zbytes)) run.invalid("a mix tile's bytes differ from the first arm's");
+        }
+        for (hc_stage_names) |stage| {
+            if (!listed(run.axis("stage"), stage)) continue;
+            var s: HcStagesSample = .{ .gpu = gpu, .d = d, .z = z, .stage = stage };
+            const label = try std.fmt.allocPrint(run.a, "{s} rows {d}", .{ stage, L });
+            try run.interleave(label, &s, sampleHcStages);
         }
     }
 }

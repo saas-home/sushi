@@ -58,6 +58,7 @@ const disk_qsa = @import("qwen4/qwen4_disk_qsa.zig");
 const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
+const write_stats = @import("disk_write_stats.zig");
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 
@@ -155,9 +156,9 @@ pub const IndexEntry = struct {
     rings: []RingFile = &.{},
     /// v10: the media chain this record's rows were computed under (`prefix_cache.MediaSpan`), as
     /// its last block's key, and the first media placeholder in `tokens`. 0 / null = no media row,
-    /// which is what every pre-v10 record is. The tier never interprets them: a lookup hands it
-    /// per-entry limits (`MediaLimits`) computed from these by the one owner of the rule,
-    /// `prefix_cache.crossKeyBoundary`.
+    /// which is what every pre-v10 record is. A lookup hands the tier per-entry limits
+    /// (`MediaLimits`) computed from these by the one owner of the rule,
+    /// `prefix_cache.crossKeyBoundary`; a commit applies that rule with no chain (`commitShares`).
     vision_key: u64 = 0,
     media_start: ?u32 = null,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
@@ -406,6 +407,8 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
+    /// Bytes this tier wrote, by kind. Heap-allocated: the background writer holds the pointer.
+    stats: *write_stats.Stats,
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -460,10 +463,14 @@ pub const DiskTier = struct {
             log.info("[disk-cache] {s} is in use by another sushi process: this one keeps a private SSD tier at {s}, removed at exit\n", .{ shared, root });
         }
         disk_placement.reapPrivateRoots(allocator, io, shared);
+        const stats = try allocator.create(write_stats.Stats);
+        errdefer allocator.destroy(stats);
+        stats.* = .{ .parent = &write_stats.process };
         var self: DiskTier = .{
             .allocator = allocator,
             .io = io,
             .root = root,
+            .stats = stats,
             .max_bytes = max_bytes,
             .operator_cap = max_bytes,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
@@ -494,6 +501,7 @@ pub const DiskTier = struct {
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
         w.permit_bytes = self.writer_permit_bytes;
+        w.stats = self.stats;
         w.start() catch {
             self.allocator.destroy(w);
             log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
@@ -696,6 +704,7 @@ pub const DiskTier = struct {
         if (self.private_root) disk_placement.deleteTreeAbsolute(self.io, self.root);
         if (self.root_lock) |f| f.close(self.io);
         self.root_lock = null;
+        self.allocator.destroy(self.stats);
         self.allocator.free(self.root);
     }
 
@@ -1811,6 +1820,7 @@ pub const DiskTier = struct {
         const has_tools = p.has_tools;
         const ssm_checkpoints = p.ssm_checkpoints;
         const ring = p.ring;
+        const media: CommitMedia = .{ .key = p.vision_key, .start = p.media_start };
         var tokens = all_tokens;
         var dflash_snap = p.dflash_snap;
         var mtp_snap = p.mtp_snap;
@@ -1880,7 +1890,7 @@ pub const DiskTier = struct {
         // pending SSM checkpoints (byte-capped across turns), which take a
         // dedicated SSM-only append path (the KV chunks are all present, so
         // the extend machinery would pointlessly rewrite the tail chunk).
-        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
         if (target.superseded) return .persisted;
         // Re-derive the budget before every store, and only a store: the probe is slow and the idle
         // spill reaches this point once per idle entry. It also gates the SSM-only append.
@@ -1888,7 +1898,7 @@ pub const DiskTier = struct {
             self.refreshDiskBudget();
             self.ssm_budget = self.pointBudget(kv_entries, kv_target, ssm_checkpoints, ring_srcs, spec_bytes);
             // Its eviction swap-removes: indices picked above may now name other entries.
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         // A sole entry never outgrows the tier: its oldest points go first (`ssm_budget`); a record whose rows
@@ -1909,7 +1919,7 @@ pub const DiskTier = struct {
                 self.allocator.free(ring_srcs);
                 ring_srcs = srcs;
             }
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         const extend_idx = target.extend_idx;
@@ -1934,7 +1944,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2022,10 +2032,7 @@ pub const DiskTier = struct {
             return if (chunk_complete) .persisted else .partial;
         }
 
-        const prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)))
-        else
-            kv_len;
+        const prefix_rows: u32 = if (donor) |d| @min(d.shared, kv_len) else kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
@@ -2046,8 +2053,8 @@ pub const DiskTier = struct {
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
-        // earlier chunks were committed against). Rewritten only on growth;
-        // tens of KB at most.
+        // earlier chunks were committed against). An extension appends only its new tail: the
+        // manifest still on disk names the old count, and the scan reads a longer record at it.
         const record: []const u32 = if (extend_idx) |i| blk: {
             const et = self.entries.items[i].tokens;
             break :blk if (et.len >= tokens.len) et else tokens;
@@ -2055,12 +2062,19 @@ pub const DiskTier = struct {
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
-            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{});
+            const have: usize = if (extend_idx) |i| self.entries.items[i].tokens.len else 0;
+            const from: usize = if (have * 4 <= (fileSize(self.io, tpath) orelse 0)) have else 0;
+            errdefer self.stats.recordFailed((record.len - from) * 4);
+            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{ .truncate = from == 0 });
             defer f.close(self.io);
             var wb: [8192]u8 = undefined;
             var fw = f.writer(self.io, &wb);
-            try fw.interface.writeSliceEndian(u32, record, .little);
+            try fw.seekTo(from * 4);
+            try fw.interface.writeSliceEndian(u32, record[from..], .little);
             try fw.interface.flush();
+            // Bytes past the record (a torn or stale tail) would never be billed or swept.
+            try f.setLength(self.io, record.len * 4);
+            self.stats.recordWritten(.meta, (record.len - from) * 4);
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -2320,7 +2334,7 @@ pub const DiskTier = struct {
             n_meta += 1;
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
-        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], s);
+        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], .spec, s);
         return res;
     }
 
@@ -2649,7 +2663,7 @@ pub const DiskTier = struct {
             try self.appendLayerSlices(&list, li, entry, config, c0, c1, s);
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
-        return self.saveNamed(path, list.items, no_meta, s);
+        return self.saveNamed(path, list.items, no_meta, .kv, s);
     }
 
     /// One layer's K/V rows `[r0, r1)` of its own buffers, every stored kind.
@@ -2675,8 +2689,18 @@ pub const DiskTier = struct {
 
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
-    pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, s);
+    pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s);
+        const size = self.saveSync(path, list, meta) catch |err| {
+            self.stats.recordFailed(dataLen(list));
+            return err;
+        };
+        self.stats.recordWritten(kind, size);
+        return size;
+    }
+
+    /// The synchronous arm of `saveNamed`; takes `path`.
+    fn saveSync(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair) !u64 {
         defer self.allocator.free(path);
         const tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -2815,7 +2839,7 @@ pub const DiskTier = struct {
 
     /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
     /// when larger, each allocated only once the permit has room for it. Takes `path`.
-    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
@@ -2845,7 +2869,7 @@ pub const DiskTier = struct {
                 return err;
             };
             if (last) path_owned = null;
-            w.submitPart(blob_path, bytes, part); // takes both buffers
+            w.submitPart(blob_path, bytes, part, kind); // takes both buffers
             staged += n;
         }
         return total;
@@ -2943,7 +2967,7 @@ pub const DiskTier = struct {
             }
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/g{d:0>5}.safetensors", .{ dir_rel, j });
-        return self.saveNamed(path, list.items, no_meta, s);
+        return self.saveNamed(path, list.items, no_meta, .ssm, s);
     }
 
     /// Writes the row segments `cp`'s point leans on that the entry lacks, from `cp`'s own rows; returns how many it leans on.
@@ -3002,14 +3026,27 @@ pub const DiskTier = struct {
 
     const StoreTarget = struct { superseded: bool = false, extend_idx: ?usize = null, ssm_only_idx: ?usize = null };
 
-    /// Which resident entry a commit of `tokens` supersedes, extends or tops up. Indices are valid
-    /// only until the next eviction.
+    /// A commit's media identity, as `CommitParams` carries it.
+    const CommitMedia = struct { key: u64, start: ?u32 };
+
+    /// Leading rows of `e` that are also a commit's rows: `prefix_cache.crossKeyBoundary` with no
+    /// chain. An equal key shares everything; any other pair only the text before either side's
+    /// first media row, since two same-size images render the same placeholder ids.
+    fn commitShares(e: *const IndexEntry, media: CommitMedia) u32 {
+        if (e.vision_key == media.key) return MediaLimits.UNBOUNDED;
+        const es = e.media_start orelse return media.start orelse 0;
+        return if (media.start) |cs| @min(es, cs) else es;
+    }
+
+    /// Which resident entry a commit of `tokens` supersedes, extends or tops up: only one whose
+    /// rows are the commit's wherever both records reach. Indices are valid only until the next eviction.
     fn selectStoreTarget(
         self: *DiskTier,
         tokens: []const u32,
         kv_target: u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
+        media: CommitMedia,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
@@ -3020,9 +3057,12 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
+            // Covering the commit needs its rows through `tokens`; resuming the entry keeps all of its own.
+            const shares = commitShares(e, media);
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
+                        if (shares < tokens.len) continue;
                         if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
                             !specWorkPending(e, dflash_snap, mtp_snap) and
                             !self.ringWorkPending(e, ring_srcs))
@@ -3036,9 +3076,9 @@ pub const DiskTier = struct {
                     }
                     // Same token record, SHORTER persisted KV — a byte-capped
                     // incremental flush in progress. Resume into its dir.
-                    t.extend_idx = i;
+                    if (shares >= e.tokens.len) t.extend_idx = i;
                 }
-            } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
+            } else if (shares >= e.tokens.len and std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
                 // This commit extends `e` — reuse its directory and chunks.
                 t.extend_idx = i;
             }
@@ -3272,7 +3312,7 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-        return self.saveNamed(path, list.items, meta.items, s);
+        return self.saveNamed(path, list.items, meta.items, .ssm, s);
     }
 
     pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
@@ -3431,7 +3471,7 @@ pub const DiskTier = struct {
         var lc_buf: [24]u8 = undefined;
         const lc = try std.fmt.bufPrint(&lc_buf, "{d}", .{src.entries.len});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/r{d:0>7}.safetensors", .{ dir_rel, src.pos });
-        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, s);
+        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, .ring, s);
     }
 
     fn deleteRingFile(self: *DiskTier, id: u64, pos: u32) void {
@@ -3517,25 +3557,27 @@ pub const DiskTier = struct {
     }
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
-    /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the synchronous legacy arm.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
+    /// same tool flag and kv-quant config, most whole chunks below the prefix whose rows are the
+    /// commit's (`commitShares`). Null on the synchronous legacy arm.
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
-            const whole: u32 = @intCast(shared / self.chunk_tokens);
+            const common: u32 = @min(@as(u32, @intCast(commonPrefixLen(e.tokens, tokens))), commitShares(e, media));
+            const shared = @min(common, kv_target, e.kv_len);
+            const whole: u32 = shared / self.chunk_tokens;
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
-            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable };
+            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable, .shared = common };
         }
         return best;
     }
 
-    pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32 };
+    /// `shared`: the leading tokens whose rows the donor and the heir provably agree on.
+    pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32, shared: u32 };
 
     /// Hard-link the donor's leading landed chunk files into `e<id>/`; returns how many. Stops
     /// at the first chunk not landed and never touches the donor's queue (`Writer.fence` would
@@ -3632,12 +3674,13 @@ pub const DiskTier = struct {
             errdefer self.allocator.free(final_path);
             w.waitForRoom(buf.items.len);
             const bytes = try buf.toOwnedSlice(self.allocator);
-            w.submit(final_path, bytes);
+            w.submit(final_path, bytes, .meta);
             return;
         }
         defer self.allocator.free(final_path);
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.{d}.tmp", .{ self.root, e.id, std.c.getpid() });
         defer self.allocator.free(tmp_path);
+        errdefer self.stats.recordFailed(buf.items.len);
         {
             const f = try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
             defer f.close(self.io);
@@ -3647,6 +3690,7 @@ pub const DiskTier = struct {
             try fw.interface.flush();
         }
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
+        self.stats.recordWritten(.meta, buf.items.len);
     }
 
     /// The lowest manifest version that describes this entry. The version is a compatibility
@@ -3921,7 +3965,8 @@ pub const DiskTier = struct {
             return null;
         };
         defer self.allocator.free(raw);
-        if (raw.len != n_tokens * 4) {
+        // Longer is an extend's append that died before its manifest landed: the first `n_tokens` are the record.
+        if (raw.len < n_tokens * 4) {
             self.allocator.free(chunk_bytes);
             return null;
         }
@@ -7527,8 +7572,10 @@ test "DiskTier hybrid lookup leaves a prompt token to compute logits" {
     var entry_list: std.ArrayList(IndexEntry) = .empty;
     defer entry_list.deinit(testing.allocator);
     try entry_list.appendSlice(testing.allocator, &entries);
+    var stats: write_stats.Stats = .{};
     const tier = DiskTier{
         .allocator = testing.allocator,
+        .stats = &stats,
         .io = testing.io,
         .root = &.{},
         .max_bytes = 0,
@@ -7739,4 +7786,418 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqualSlices(u32, c.want, tier.entries.items[0].ssm_positions);
     }
+}
+
+fn wroteKind(tier: *const DiskTier, kind: write_stats.Kind) u64 {
+    return tier.stats.snapshot().written[@intFromEnum(kind)];
+}
+
+fn sumBytes(items: []const u64) u64 {
+    var n: u64 = 0;
+    for (items) |b| n += b;
+    return n;
+}
+
+test "DiskTier write counters: a cold persist counts its kinds, an exact reuse adds nothing, an extension counts the tail and the new chunks" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var dfl = try KVCache.init(testing.allocator, 2);
+    defer dfl.deinit();
+    try fillCache(&dfl, s, 2, 600, 8, 3.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const dflash: SpecCommit = .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 };
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wcount", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
+    tier.drainWriter();
+
+    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/meta.json", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(meta_path);
+    const meta_json = fileSize(io, meta_path) orelse return error.TestUnexpectedResult;
+    const cold = tier.stats.snapshot();
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expect(e.spec_bytes > 0);
+    try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
+    for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
+    try testing.expectEqual(@as(u64, 0), cold.failed);
+
+    // The same commit again persists nothing.
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
+    tier.drainWriter();
+    try testing.expectEqual(cold, tier.stats.snapshot());
+
+    // 600 -> 800 tokens: chunks 0-3 are whole on disk; chunk 4 (the old partial tail) is written again with chunks 5 and 6.
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
+    tier.drainWriter();
+    const ext = tier.stats.snapshot();
+    const grown = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
+    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(@as(u64, 0), ext.failed);
+}
+
+test "DiskTier write counters: a spec sidecar replaced by an extension counts its full bytes again" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    var tokens: [800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wspec", 0, 128);
+    defer tier.deinit();
+    const first: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, null, first, s);
+    const spec_one = tier.entries.items[0].spec_bytes;
+    try testing.expect(spec_one > 0);
+    try testing.expectEqual(spec_one, wroteKind(&tier, .spec));
+
+    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
+    try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
+    const second: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, second, s);
+    const spec_two = tier.entries.items[0].spec_bytes;
+    try testing.expect(spec_two > spec_one);
+    try testing.expectEqual(spec_one + spec_two, wroteKind(&tier, .spec));
+}
+
+test "DiskTier write counters: a failed background write lands in failed, never in written" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wfail", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    tier.writer.?.injectFailure("c000003", .write);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const cb = tier.entries.items[0].chunk_bytes;
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expectEqual(cb[3], tier.stats.snapshot().failed);
+    try testing.expectEqual(sumBytes(cb) - cb[3], wroteKind(&tier, .kv));
+}
+
+test "DiskTier write counters: the synchronous manifest write counts meta on success and failed on error" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wmeta", 0, 128);
+    defer tier.deinit();
+    try testing.expect(tier.writer == null);
+    var toks = [_]u32{ 1, 2, 3 };
+    var cb = [_]u64{64};
+    var no_pos = [_]u32{};
+    var no_sz = [_]u64{};
+    const e = IndexEntry{
+        .id = 5,
+        .tokens = &toks,
+        .kv_len = 3,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .bytes = 64,
+        .chunk_bytes = &cb,
+        .ssm_positions = &no_pos,
+        .ssm_bytes = &no_sz,
+        .last_used = 0,
+    };
+    try testing.expectError(error.FileNotFound, tier.writeMeta(e));
+    const missing_dir = tier.stats.snapshot();
+    try testing.expect(missing_dir.failed > 0);
+    try testing.expectEqual(@as(u64, 0), missing_dir.totalWritten());
+
+    try tmp.dir.createDirPath(io, "fp-wmeta/e5");
+    try tier.writeMeta(e);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e5/meta.json", .{tier.root});
+    defer testing.allocator.free(path);
+    const landed = tier.stats.snapshot();
+    try testing.expectEqual(fileSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expectEqual(missing_dir.failed, landed.failed);
+}
+
+fn mediaCommit(tier: *DiskTier, cache: *const KVCache, tokens: []const u32, key: u64, start: ?u32, s: mlx.mlx_stream) !PersistOutcome {
+    return tier.appendCommitWith(.{
+        .kv_entries = cache.entries,
+        .step = tokens.len,
+        .config = cache.config,
+        .tokens = tokens,
+        .has_tools = false,
+        .vision_key = key,
+        .media_start = start,
+    }, s, .{});
+}
+
+fn keyedKvLen(tier: *const DiskTier, key: u64) ?u32 {
+    for (tier.entries.items) |*e| {
+        if (e.vision_key == key) return e.kv_len;
+    }
+    return null;
+}
+
+test "DiskTier: a commit under other pixels gets its own record, never superseded by or extending another image's" {
+    // Two images of one size render the same placeholder ids, so the token record cannot tell their rows apart.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-target", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    const kc: u64 = 0xC3C3_C3C3_C3C3_C3C3;
+
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
+    // B's longer commit would extend A's record.
+    _ = try mediaCommit(&tier, &cache, &tokens, kb, 100, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // A's own commit is still superseded by A's record.
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    // C's commit is covered by B's tokens, not by its rows.
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], kc, 100, s);
+    try testing.expectEqual(@as(usize, 3), tier.entryCount());
+    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, ka));
+    try testing.expectEqual(@as(?u32, 1200), keyedKvLen(&tier, kb));
+    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, kc));
+}
+
+test "DiskTier: a text record extends into the image turn after it, and that image's record extends under its own key" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-extend", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1800, 8, 0.0, .float32);
+    var tokens: [1800]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+
+    _ = try mediaCommit(&tier, &cache, tokens[0..600], 0, null, s);
+    const id = tier.entries.items[0].id;
+    _ = try mediaCommit(&tier, &cache, tokens[0..1200], ka, 700, s);
+    _ = try mediaCommit(&tier, &cache, &tokens, ka, 700, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(id, tier.entries.items[0].id);
+    try testing.expectEqual(@as(u32, 1800), tier.entries.items[0].kv_len);
+    try testing.expectEqual(ka, tier.entries.items[0].vision_key);
+}
+
+test "DiskTier chunk share: a donor under other pixels lends only the chunks wholly below the first image row" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    // The token records agree through 520 (4 whole chunks); the images start at 300.
+    const toks = chunkShareTokens(520);
+    _ = try mediaCommit(&tier, &cache, &toks.a, 0xA1A1_A1A1_A1A1_A1A1, 300, s);
+    _ = try mediaCommit(&tier, &cache, &toks.b, 0xB2B2_B2B2_B2B2_B2B2, 300, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    try testing.expectEqual(@as(u32, 2), tier.entries.items[1].inherited_chunks);
+}
+
+test "DiskTier: an extend still staged behind the writer leaves an entry the scan reads at the manifest's count" {
+    // A kill before the staged manifest lands leaves the previous one, whose count is shorter than the record.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-torn-record", 0, 128);
+    defer tier.deinit();
+    tier.enableBackgroundWriter();
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    tier.drainWriter();
+    tier.writer.?.setPaused(true);
+    defer tier.writer.?.setPaused(false);
+    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
+
+    var loaded = tier.loadEntry(1) orelse return error.TestExpectedEntry;
+    defer tier.freeIndexEntryOwned(&loaded.e);
+    try testing.expectEqualSlices(u32, tokens[0..600], loaded.e.tokens);
+}
+
+test "DiskTier: a token record longer than the manifest's count restores at the count" {
+    // A torn append: whole tokens past the count, then a partial one.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-longer/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0 } });
+    defer testing.allocator.free(torn);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-longer/e1/tokens.bin", .data = torn });
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqualSlices(u32, &tokens, tier2.entries.items[0].tokens);
+    var out = try KVCache.init(testing.allocator, 1);
+    defer out.deinit();
+    try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&out, 0, s));
+}
+
+test "DiskTier: an extend shorter than a stale token tail leaves a record of exactly its tokens" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 601, 8, 0.0, .float32);
+    var tokens: [601]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
+        defer tier.deinit();
+        _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-stale/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0, 0, 0, 12, 0 } });
+    defer testing.allocator.free(torn);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stale/e1/tokens.bin", .data = torn });
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
+    defer tier.deinit();
+    _ = try tier.appendCommit(cache.entries, 601, cache.config, &tokens, false, null, s);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e1/tokens.bin", .{tier.root});
+    defer testing.allocator.free(path);
+    try testing.expectEqual(@as(u64, tokens.len * 4), fileSize(io, path).?);
+}
+
+test "DiskTier: a token record shorter than the manifest's count drops the entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    const record = try tmp.dir.readFileAlloc(io, "fp-shorter/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shorter/e1/tokens.bin", .data = record[0 .. record.len - 2] });
+
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 0), tier2.entryCount());
+}
+
+test "DiskTier: an extend writes the new tail of the token record, not the whole record" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
+    var tokens: [1200]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-tail", 0, 128);
+    defer tier.deinit();
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    const kind = @intFromEnum(write_stats.Kind.meta);
+    const before = tier.stats.snapshot().written[kind];
+    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
+    const grown = tier.stats.snapshot().written[kind] - before;
+
+    const manifest = try std.fmt.allocPrint(testing.allocator, "{s}/e1/meta.json", .{tier.root});
+    defer testing.allocator.free(manifest);
+    try testing.expectEqual(600 * 4 + fileSize(io, manifest).?, grown);
+
+    const record = try tmp.dir.readFileAlloc(io, "fp-tail/e1/tokens.bin", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(record);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&tokens), record);
 }

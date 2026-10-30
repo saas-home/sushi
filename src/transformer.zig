@@ -812,6 +812,11 @@ pub const ForwardCtx = struct {
     /// DeepSeek-V4.1 chunked prefill: the prompt tokens after this chunk, whose Engram rows the model reads while the
     /// chunk runs. Empty for the last chunk and for decode.
     ahead_ids: []const i32 = &.{},
+    /// DeepSeek-V4.1 chunked prefill: the fewest rows the chunk after this one can have, 0 when none follows in the
+    /// prefill loop. A model whose decoder tail nothing reads may leave state only (`dsv41_model.extendState`).
+    ahead_min_rows: usize = 0,
+    /// A restore point is taken at this chunk's end.
+    holds_point: bool = false,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
@@ -931,6 +936,14 @@ pub fn slidingDecodeMask(s: mlx.mlx_stream, kv_len: c_int, window: c_int) !mlx.m
 
 
 // ── Transformer ──
+
+/// The encoder's view of the projections a forward runs: `record(ctx, w, x)` before each `x @ w` that goes
+/// through `Transformer.qmatmul`, with `w` the loaded weight handle. Null outside the encoder.
+pub var linear_tap: ?LinearTap = null;
+pub const LinearTap = struct {
+    ctx: *anyopaque,
+    record: *const fn (ctx: *anyopaque, w: mlx.mlx_array, x: mlx.mlx_array) void,
+};
 
 pub const Transformer = struct {
     config: ModelConfig,
@@ -1765,6 +1778,7 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        if (linear_tap) |tap| tap.record(tap.ctx, w, x);
         // u8 codes + f32 tile scales = an FP8 source linear (`mimo_source`).
         if (mlx.mlx_array_dtype(w) == .uint8) return fp8_block.linearServing(self.s, x, w, sc);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the

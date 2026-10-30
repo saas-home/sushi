@@ -68,6 +68,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 |---|---|---|
 | `dsv41.experts` | dsv41 | the 384-expert PAIR1 grouped chain at the plan's layers 2, 5, 23 and the DSpark stage bank, by rows and routing mode |
 | `dsv41.tail_routed` | dsv41 | the CED decoder tail's routed experts at the plan's layers 2, 5, 23: the prefill sorted GEMM against the multi-row decode chain, 8 to 256 rows |
+| `dsv41.shared_prefill` | dsv41 | the shared expert beside the routed prefill chain at the plan's layers 2, 5, 23: its own chain, riding the routed launches, and absent, 17 to 2048 rows |
 | `dsv41.picks_span` | dsv41 | one attention span over a packed compressed store: picked rows unpacked and gathered then the fused kernel, against the fused kernel reading them packed; peak MB |
 | `shared.exl3_decode_chain` | shared | the EXL3 decode chain at Flash-Next geometry for any rate (n24 to n128, MCG and SPEC1, 1 to 4 rows) against n32, n48 and n64 |
 | `shared.exl3_grouped_decode` | shared | the decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs, sized member capacity, on Flash-Next and DeepSeek geometry |
@@ -80,7 +81,9 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.index_block_peak` | dsv41 | a 16-row decode block's indexer with and without the candidate mask, by context; peak MB (min and max) |
 | `dsv41.rows_growth` | dsv41 | a full row store growing by one chunk: time, held MB and the peak beyond them (min and max) |
 | `dsv41.attn_span` | dsv41 | one attention span at the release geometry: composed core, f16 wide arm, fused kernel; peak MB (min and max) |
+| `dsv41.attn_epilogue` | dsv41 | one prefill span's heads as `wo_a` takes them (64 heads x 512, 8 groups, QAT on): the fused kernel then rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; peak MB (min and max) |
 | `dsv41.hc_expand` | dsv41 | the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16): the op chain against the fused kernel, alone (the layer tail) and with the FFN stage's mix and norm kernels, at 512 and 2048 rows |
+| `dsv41.hc_stages` | dsv41 | the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16): mix, norm, split, expand, the attention stage and the FFN stage against a copy of the stream; arms are the mix kernel's row x mix tile (4 x 6, 2 x 12), bytes checked equal, at 512 and 2048 rows |
 | `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
 | `glm5.verify_qmm` | glm5 | verify-row projections per stored width (A6, A5) at the trunk shapes: serial qmv rows, the row-streaming kernel, row tiles |
 | `glm5.a6_trunk` | glm5 | A6 g128 trunk projections at 2048 rows: qmm against dequantize + dense NAX GEMM, with the count of differing bf16 values |

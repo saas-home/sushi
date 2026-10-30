@@ -1611,7 +1611,7 @@ pub const Scheduler = struct {
             owned.config.expertStreamingRequired(),
             settings_budget,
         )) blk: {
-            if (settings_budget == 0) return error.ExpertStreamingRequired;
+            if (settings_budget == 0 and model_load.ramDefaultTierFor(owned.config) == null) return error.ExpertStreamingRequired;
             const mtp = model_load.mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             const verdict = model_load.mtpStreamingVerdict(mtp, model_load.streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
             switch (verdict) {
@@ -2947,7 +2947,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     }
 }
 
-/// Publish every resident model's SSD tier (budget, bytes in use, entries) onto its own `LoadedModel`.
+/// Publish every resident model's SSD tier (budget, bytes in use, entries, bytes written) onto its own `LoadedModel`.
 /// Inference thread.
 pub fn publishDiskStats(sch: *Scheduler) void {
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -2958,7 +2958,7 @@ pub fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount() };
+                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten() };
             };
         }
         entry.disk_stats.publish(snap);
@@ -4635,13 +4635,10 @@ pub fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (inner_err) |e| return e;
 }
 
-/// The stop check a slot with no pipeline state owes before its pending token is forwarded
-/// into a batch. Pad runs were counted when a batch sampled the token, not again here.
+/// Count the pending token once, immediately before forwarding it. Sampling and
+/// planner preflight must not count it: a slot may change decode paths between ticks.
 fn batchEntryStops(gen: *Generator) !bool {
-    const pad_run = gen.consecutive_pad;
-    if (try gen.checkStop()) return true;
-    gen.consecutive_pad = pad_run;
-    return false;
+    return gen.checkStop();
 }
 
 /// The slots a plain batched tick forwards, in `live`: each past the per-tick guards every decode
@@ -4686,7 +4683,10 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 slot_outcome.finishSlot(sch, slot, gen.finish_reason);
                 continue;
             }
-        } else if (try batchEntryStops(gen)) {
+        }
+        // A pipeline drain consumed the lookahead and sampled a NEW pending token.
+        // It needs the same accounting as a token carried from a previous batch.
+        if (try batchEntryStops(gen)) {
             slot.completion_tokens = gen.completion_tokens;
             slot.stop_path = "batch";
             slot_outcome.finishSlot(sch, slot, gen.finish_reason);
@@ -4696,6 +4696,20 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
         live_n += 1;
     }
     return live_n;
+}
+
+/// A GDN group with a slot that has no recurrent state yet cannot merge: it decodes serially this
+/// tick (skipping would advance nothing, so a group that never becomes ready would spin). Decided
+/// before `batchedTickRows` so a slot's pending token is stop-checked on exactly one path.
+fn serialFallback(sch: *Scheduler, xfm: *const Transformer, active: []*Slot, comptime serial: anytype) !bool {
+    if (!xfm.supportsBatchedGdnDecode()) return false;
+    const all_ready = for (active) |s| {
+        const gen = if (s.legacy_gen) |*g| g else continue;
+        if (!xfm.batchedGdnReady(&.{&gen.ctx})) break false;
+    } else true;
+    if (all_ready) return false;
+    for (active) |s| try serial(sch, s);
+    return true;
 }
 
 fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
@@ -4711,6 +4725,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     if (std.debug.runtime_safety) {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
+
+    if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return;
 
     const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
@@ -4774,13 +4790,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     // linear layer there, so it reads 0 forever and every batched token was
     // roped at position 0.
     for (batch, 0..) |slot, i| rope_offsets[i] = @intCast(if (use_gdn or use_mimo) slot.moe_seq_offset else slot.cache.step);
-    if (xfm_ptr.supportsBatchedGdnDecode() and !use_gdn) {
-        // A slot with no recurrent state yet cannot join the merge. Decode the
-        // group serially this tick instead of skipping it — skipping advances
-        // nothing, so a group that never becomes ready would spin forever.
-        for (batch) |s| try runSingleDecodeTick(sch, s);
-        return;
-    }
     var want_hidden = false;
     for (batch) |slot| {
         want_hidden = want_hidden or slot.mtp_plain_tick;
@@ -4893,17 +4902,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             slot.stop_path = "batch";
             slot_outcome.finishSlot(sch, slot, "stop");
             continue;
-        }
-        if (gen.next_token_id == 0) {
-            gen.consecutive_pad += 1;
-            if (gen.consecutive_pad >= 3) {
-                slot.stop_token = 0;
-                slot.stop_path = "batch";
-                slot_outcome.finishSlot(sch, slot, "stop");
-                continue;
-            }
-        } else {
-            gen.consecutive_pad = 0;
         }
         if (slot.completion_tokens >= slot.max_tokens) {
             slot_outcome.finishSlot(sch, slot, "length");
@@ -5264,6 +5262,46 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
 
+test "planner and batch entry count each pending punctuation token once" {
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.eos_token_ids = &.{2};
+    gen.step = 0;
+    gen.max_tokens = 100;
+    gen.consecutive_pad = 0;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
+    gen.done = false;
+    gen.finish_reason = "length";
+    const tokens = [_]u32{ 0, 17, 0, 0, 17, 0, 0, 0 };
+    const counts = [_]u32{ 1, 0, 1, 2, 0, 1, 2, 3 };
+    for (tokens, counts, 0..) |token, expected, i| {
+        gen.next_token_id = token;
+        const before = gen.consecutive_pad;
+        // A planner can inspect the same pending token repeatedly before dispatch.
+        try testing.expect(!(try gen.checkDispatchStop()));
+        try testing.expect(!(try gen.checkDispatchStop()));
+        try testing.expectEqual(before, gen.consecutive_pad);
+        // A slot can leave the batch for a solo/MTP tick without resetting the run.
+        const stopped = if (i % 2 == 0) try batchEntryStops(&gen) else try gen.checkStop();
+        try testing.expectEqual(i == tokens.len - 1, stopped);
+        try testing.expectEqual(expected, gen.consecutive_pad);
+        gen.step += 1;
+    }
+    gen.done = false;
+    gen.consecutive_pad = 0;
+    gen.next_token_id = 2;
+    try testing.expect(try gen.checkDispatchStop());
+    try testing.expectEqualStrings("stop", gen.finish_reason);
+    try testing.expectEqual(@as(u32, 0), gen.consecutive_pad);
+    gen.done = false;
+    gen.next_token_id = 17;
+    gen.step = gen.max_tokens;
+    try testing.expect(try gen.checkDispatchStop());
+    try testing.expectEqualStrings("length", gen.finish_reason);
+}
+
 test "a slot with no pipeline state is stop-checked before it joins a batch, EOS is never forwarded" {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(testing.allocator);
@@ -5286,12 +5324,12 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
     try testing.expectEqual(@as(u32, 0), gen.step);
     try testing.expectEqual(@as(usize, 0), gen.generated_ids.items.len);
 
-    // A real token joins the batch, and a pad the batch sampled is not counted a second time.
+    // Sampling does not account for the pending token; entry counts it once.
     gen.done = false;
     gen.next_token_id = 0;
     gen.consecutive_pad = 1;
     try testing.expect(!(try batchEntryStops(&gen)));
-    try testing.expectEqual(@as(u32, 1), gen.consecutive_pad);
+    try testing.expectEqual(@as(u32, 2), gen.consecutive_pad);
     try testing.expect(!gen.done);
 
     // A spent budget or stall ends it as the solo path does.
@@ -5299,6 +5337,50 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
     gen.step = 8;
     try testing.expect(try batchEntryStops(&gen));
     try testing.expectEqualStrings("length", gen.finish_reason);
+}
+
+test "a slot the batched tick hands back to the serial path counts its pending pad once" {
+    const Serial = struct {
+        var calls: usize = 0;
+        fn tick(_: *Scheduler, slot: *Slot) !void {
+            calls += 1;
+            _ = try slot.legacy_gen.?.checkStop();
+        }
+    };
+    var xfm: Transformer = undefined;
+    xfm.config.model_type = "qwen4_exp";
+    xfm.config.full_attention_interval = 4;
+    xfm.glm5 = null;
+    xfm.moe_layers = &.{};
+    var gen: Generator = undefined;
+    gen.generated_ids = .empty;
+    gen.eos_token_ids = &.{2};
+    gen.next_token_id = 0;
+    gen.step = 0;
+    gen.max_tokens = 100;
+    gen.consecutive_pad = 1;
+    gen.timeout_ns = 0;
+    gen.stall = .{};
+    gen.timer = io_util.Stopwatch.init(testing.io);
+    gen.done = false;
+    gen.finish_reason = "length";
+    gen.ctx.ssm_entries = null;
+    var slot: Slot = undefined;
+    slot.legacy_gen = gen;
+    var sch: Scheduler = undefined;
+    var active = [_]*Slot{&slot};
+
+    Serial.calls = 0;
+    try testing.expect(try serialFallback(&sch, &xfm, &active, Serial.tick));
+    try testing.expectEqual(@as(usize, 1), Serial.calls);
+    try testing.expectEqual(@as(u32, 2), slot.legacy_gen.?.consecutive_pad);
+    try testing.expect(!slot.legacy_gen.?.done);
+
+    // A group whose slots all carry state merges: nothing runs serially and nothing is counted.
+    slot.legacy_gen.?.ctx.ssm_entries = &.{};
+    try testing.expect(!(try serialFallback(&sch, &xfm, &active, Serial.tick)));
+    try testing.expectEqual(@as(usize, 1), Serial.calls);
+    try testing.expectEqual(@as(u32, 2), slot.legacy_gen.?.consecutive_pad);
 }
 
 test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media boundary" {

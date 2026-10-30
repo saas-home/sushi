@@ -75,6 +75,14 @@ pub const QuantMode = enum {
 /// DeepSeek-V4.1's MLX buffer pool in decode, which holds under 1 GB; the ledger bills it.
 pub const dsv41_pool_bytes: u64 = 1 << 30;
 
+/// What an architecture serves with no flag and no setting; 0 and false = nothing of its own.
+pub const ServeDefaults = struct {
+    context: u32 = 0,
+    max_tokens: u32 = 0,
+    /// Takes its `--ssd-budget-gb` from the Mac's RAM tier.
+    ram_budget: bool = false,
+};
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "",
@@ -214,6 +222,7 @@ pub const ModelConfig = struct {
     glm_fp8_trunk: bool = false,
     /// deepseek_v41's own geometry, parsed once from config.json.
     dsv41: ?dsv41_config.Config = null,
+    serve_defaults: ServeDefaults = .{},
 
     // Multi-head Latent Attention (GLM's full-attention layers,
     // DeepSeek-V3 shape): low-rank Q (q_a_proj → q_a_layernorm → q_b_proj) and
@@ -331,6 +340,8 @@ pub const ModelConfig = struct {
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
+    /// The special token that opens an assistant turn, for a checkpoint that can start a second turn after its answer; empty = none.
+    turn_opener: []const u8 = "",
 
     // Model-author sampling recommendations from generation_config.json
     // (e.g. temp 1.0 / top_p 0.95 / top_k 20).
@@ -778,6 +789,18 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
 
+    /// The context an auto boot serves when memory admits it, ahead of the margined memory ceiling; 0 = none.
+    pub fn defaultContext(self: *const ModelConfig) u32 {
+        const want = self.serve_defaults.context;
+        const cap = self.contextCap();
+        return if (want > 0 and cap > 0) @min(want, cap) else want;
+    }
+
+    /// The budget of a request that omits `max_tokens`, when `--max-tokens` is not given; 0 = the rest of the window.
+    pub fn defaultMaxTokens(self: *const ModelConfig) u32 {
+        return self.serve_defaults.max_tokens;
+    }
+
     /// Does this load keep deepseek_v41's DSpark stages resident? They are its MTP head: `--mtp` under streaming.
     pub fn dsparkOn(self: *const ModelConfig) bool {
         const c = self.dsv41 orelse return false;
@@ -964,6 +987,16 @@ pub const ModelConfig = struct {
 
     pub fn mergeEosTokens(self: *ModelConfig, ids: []const u32) void {
         for (ids) |id| if (!self.isEosToken(id)) self.addEosToken(id);
+    }
+
+    /// Resolves the stops a checkpoint's config files do not list, once the tokenizer is loaded.
+    pub fn mergeTokenizerStops(self: *ModelConfig, tok: *const tokenizer_mod.Tokenizer) void {
+        if (self.turn_opener.len > 0) self.stopAtTurnOpener(tok.specialTokenId(self.turn_opener));
+    }
+
+    /// A reply never holds a second assistant turn, so its opener ends the reply like an eos id.
+    pub fn stopAtTurnOpener(self: *ModelConfig, id: ?u32) void {
+        if (id) |i| self.mergeEosTokens(&.{i});
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -1669,6 +1702,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.qv_temporal_patch = 1;
         }
         config.dsv41 = c;
+        config.serve_defaults = @TypeOf(c).serveDefaults(ServeDefaults);
     } else {
         // Not served: the weight loader refuses it by name (`ArchitectureUnsupported`).
         config.model_type = "unsupported";
@@ -4218,6 +4252,21 @@ test "deepseek_v41 thinks by default, at its native high effort" {
     // A checkpoint that declares thinking off still outranks the arch default.
     const declared_off = ModelConfig{ .model_type = "deepseek_v41", .gen_enable_thinking = false };
     try testing.expect(!declared_off.defaultEnableThinking());
+}
+
+test "only an architecture with serve defaults carries its own default context and output budget" {
+    const defaults = dsv41_config.Config.serveDefaults(ServeDefaults);
+    const dsv41 = ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = defaults };
+    try testing.expectEqual(@as(u32, 1_000_000), dsv41.defaultContext());
+    try testing.expectEqual(@as(u32, 256_000), dsv41.defaultMaxTokens());
+    // A checkpoint whose window is shorter caps the default.
+    const short = ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 262_144, .serve_defaults = defaults };
+    try testing.expectEqual(@as(u32, 262_144), short.defaultContext());
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "" }) |arch| {
+        const other = ModelConfig{ .model_type = arch, .max_position_embeddings = 1_048_576 };
+        try testing.expectEqual(@as(u32, 0), other.defaultContext());
+        try testing.expectEqual(@as(u32, 0), other.defaultMaxTokens());
+    }
 }
 
 test "a shard loads only when one of its tensors survives the filter" {
