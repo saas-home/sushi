@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=hermetic
 # Static guard for .github/workflows/release.yml event gating.
 #
 # The release workflow doubles as (1) the tag/dispatch RELEASE pipeline and

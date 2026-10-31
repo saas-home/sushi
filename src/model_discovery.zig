@@ -22,19 +22,44 @@ const expert_stream = @import("expert_stream.zig");
 const expert_quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
 
-/// Architecture allow-list for discovery: the four served archs. Discovery
-/// silently skips any subdirectory whose `config.json` declares another
-/// `model_type`, so `--model-dir` never picks up a partially-downloaded or
-/// unsupported checkpoint that would crash the tokenizer load.
+/// Architecture allow-list for discovery. Must stay in sync with the
+/// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
+/// silently skips any subdirectory whose `config.json` declares a
+/// `model_type` outside this list — that prevents `--model-dir` from
+/// picking up partially-downloaded or unsupported checkpoints which would otherwise
+/// crash the server when the tokenizer for the unknown arch is loaded.
+///
+/// `gemma4_assistant` is deliberately excluded: those are speculative-
+/// decoding drafters, not standalone primary models. Bare `gemma4`/`qwen3`
+/// drafters can't decode on their own, and users shouldn't see them in
+/// `/v1/models`.
 const supported_model_types = [_][]const u8{
-    "qwen4_exp", // Qwen3.8-Flash-Next
-    "qwen4_exp_text",
+    "gemma3",           "gemma3_text",
+    "gemma4",           "gemma4_text",
+    "gemma4_unified",   "gemma4_unified_text",
+    "diffusion_gemma",  "qwen2",
+    "qwen3",            "qwen3_5",
+    "qwen3_5_text",     "qwen3_5_moe",
+    "qwen3_5_moe_text", "qwen3_moe",
+    "qwen3_moe_text",   "qwen3_next",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
+    "llama",     "mistral",
+    "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
+    "nemotron_h",
+    "bert",
+    "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
+    "muse_glimmer_text",
+    "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
+    "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
+    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
+    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "mimo_v2", // MiMo-V2.6-Flash: resident EXL3 packs (text + image), or the original checkpoint streamed.
-    "glm5_next", // GLM-5.3-Flash
-    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed.
+    "glm5_next", // GLM-5.3-Flash (MLA + KDA hybrid MoE)
+    "deepseek_v41", // DeepSeek-V4.1-Flash: the original checkpoint, experts streamed (text only).
 };
 
 fn isSupportedModelType(model_type: []const u8) bool {
+    if (std.mem.startsWith(u8, model_type, "lfm2")) return true;
     for (supported_model_types) |t| {
         if (std.mem.eql(u8, model_type, t)) return true;
     }
@@ -44,7 +69,7 @@ fn isSupportedModelType(model_type: []const u8) bool {
 /// Quantization modes the MLX loader supports. Must stay in sync with
 /// `model.zig:QuantMode` (discovery deliberately avoids importing model.zig,
 /// which would drag the mlx FFI into this filesystem-only module).
-const supported_quant_modes = [_][]const u8{ "affine", "mxfp4", "mxfp8" };
+const supported_quant_modes = [_][]const u8{ "affine", "nvfp4", "mxfp4", "mxfp8" };
 
 fn isSupportedQuantMode(mode: []const u8) bool {
     for (supported_quant_modes) |m| {
@@ -70,7 +95,7 @@ const ConfigPeek = union(enum) {
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (which crash the tokenizer)
 ///   - unsupported quantization modes (anything outside
-///     `supported_quant_modes` — affine, mxfp4, mxfp8).
+///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
 ///
 /// Returned strings are owned by `allocator`; the caller frees them via
 /// the helpers in `freeConfigPeek`.
@@ -87,9 +112,10 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
-    // The DFlash contract outranks model_type: a DFlash2 sidecar is
-    // config-indistinguishable from its trunk family without this probe (one
-    // predicate, shared with the loader's own detection).
+    // The DFlash contract outranks model_type: v1 assistants at least carry a
+    // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
+    // from its trunk family without this probe (one predicate, shared with
+    // the loader's own detection).
     if (dflash.isDflashConfigJson(root)) return .drafter;
     const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
     if (mt_val != .string) return .missing_or_unparseable;
@@ -262,9 +288,47 @@ pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, mod
     return layout;
 }
 
-/// True if `path` names a `.gguf` file or a directory holding one. The engine
-/// refuses these by name (`ModelFormatUnsupported`) instead of reading a
-/// config.json that is not there.
+/// Result of scanning a directory for LLM `.gguf` files (mmproj sidecars
+/// excluded). `pick` is the alphabetically-smallest LLM gguf basename — the
+/// same deterministic file `resolveGgufFile` loads — so callers can report
+/// the bytes that will actually become resident, not the sum of every quant
+/// in a multi-quant repo.
+const GgufScan = struct {
+    pick: ?[]u8 = null,
+    pick_bytes: u64 = 0,
+    saw_mmproj: bool = false,
+};
+
+/// Scan an iterable dir for LLM `.gguf` entries. Symlinked files count
+/// (statFile follows links) — users symlink multi-GB weights rather than
+/// copy them. Caller frees `pick`.
+fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !GgufScan {
+    var scan: GgufScan = .{};
+    errdefer if (scan.pick) |p| allocator.free(p);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        // Sidecars are never candidates. `saw_mmproj` stays mmproj-specific —
+        // it only drives the "this folder holds ONLY a CLIP encoder" error text.
+        if (isGgufSidecarBasename(entry.name)) {
+            if (isMmprojGgufBasename(entry.name)) scan.saw_mmproj = true;
+            continue;
+        }
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
+        if (scan.pick == null or std.mem.lessThan(u8, entry.name, scan.pick.?)) {
+            if (scan.pick) |p| allocator.free(p);
+            scan.pick = try allocator.dupe(u8, entry.name);
+            scan.pick_bytes = @intCast(st.size);
+        }
+    }
+    return scan;
+}
+
+/// True if `path` points at a .gguf file or a directory containing an LLM
+/// one (mmproj sidecars don't count — a folder holding only an mmproj file
+/// is not a valid LLM path). Accepts directories so users can pass the
+/// canonical `~/.sushi/models/<owner>/<repo>/` shape.
 ///
 /// Empty / non-absolute paths (e.g. headless boot with no --model) return
 /// false — guarded BEFORE `openDirAbsolute`, which ASSERTS the path is
@@ -272,23 +336,79 @@ pub fn qwen4StreamingIndexComplete(io: std.Io, allocator: std.mem.Allocator, mod
 /// miscompiles the caller (see the openDirAbsolute rule in docs/engine-mlx-gotchas.md).
 pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
+    // A direct .gguf file path always routes to the gguf branch so
+    // `resolveGgufFile` can emit a precise error if it's actually an
+    // mmproj sidecar (falling through to the MLX path would produce an
+    // opaque "no config.json" failure instead).
     if (std.mem.endsWith(u8, path, ".gguf")) return true;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (isGgufSidecarBasename(entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind == .file) return true;
     }
     return false;
 }
 
+/// Resolve the actual .gguf file path. When `path` is a directory, return
+/// the alphabetically-smallest non-mmproj `.gguf` entry within it (caller
+/// frees) — deterministic so "load order depends on readdir(3) iteration
+/// order" can't happen and the user can predict which quant loads when both
+/// `Q4_K_M.gguf` and `Q8_0.gguf` sit in one folder. When `path` is already
+/// a file, return a dup. Errors:
+///   error.NoGgufFile         — no .gguf files at all
+///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
+///
+/// Does NOT log on error — the caller decides whether the error is "fatal
+/// user load" (then call `logResolveGgufError`) or "silent probe".
+pub fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, path, ".gguf")) {
+        if (isMmprojGgufBasename(std.fs.path.basename(path))) {
+            return error.OnlyMmprojGgufFile;
+        }
+        return allocator.dupe(u8, path);
+    }
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    const scan = try scanLlmGguf(io, allocator, &dir);
+    if (scan.pick) |p| {
+        defer allocator.free(p);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(path), p });
+    }
+    if (scan.saw_mmproj) return error.OnlyMmprojGgufFile;
+    return error.NoGgufFile;
+}
+
+/// Emit a user-facing, actionable error message for the failures
+/// `resolveGgufFile` can return. Call from the fatal load path; probes
+/// should NOT log and let the eventual resolveGgufFile re-attempt surface
+/// the error once.
+pub fn logResolveGgufError(path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.OnlyMmprojGgufFile => {
+            // Discriminate between "user pointed at the mmproj file
+            // directly" and "directory had only mmproj sidecars".
+            if (std.mem.endsWith(u8, path, ".gguf")) {
+                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
+            } else {
+                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
+            }
+        },
+        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
+        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
+    }
+}
+
 /// Coarse classification of a model for UX surfaces — the `sushi list`
 /// TYPE column and the `run` chat-REPL preflight. Mirrors how serving
-/// actually routes the directory (drafter sidecars).
+/// actually routes the directory (embedded GGUF engines, encoder-only,
+/// drafter sidecars).
 pub const ModelKind = enum {
     chat,
+    embed,
     drafter,
     unsupported,
 
@@ -296,6 +416,7 @@ pub const ModelKind = enum {
     pub fn label(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "chat",
+            .embed => "embed",
             .drafter => "drafter",
             .unsupported => "unsupported",
         };
@@ -305,24 +426,30 @@ pub const ModelKind = enum {
     pub fn describe(self: ModelKind) []const u8 {
         return switch (self) {
             .chat => "a chat model",
-            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside its Qwen3.8-Flash-Next or GLM-5.3-Flash target)",
+            .embed => "an embedding encoder (use /v1/embeddings)",
+            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
             .unsupported => "an architecture sushi does not support",
         };
     }
 
 };
 
-/// Map a config.json `model_type` to its ModelKind.
+/// Map a config.json `model_type` to its ModelKind. "gguf" is the synthetic
+/// type discovery assigns to GGUF dirs — chat via the embedded engines.
 pub fn modelKindFromType(model_type: []const u8) ModelKind {
+    if (std.mem.eql(u8, model_type, "bert")) return .embed;
     if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
+    if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
 }
 
-/// Classify an ABSOLUTE model dir by config.json's model_type; null when the
-/// dir is not model-shaped at all.
+/// Classify an ABSOLUTE model dir. An LLM `.gguf` wins (embedded chat
+/// engine — same precedence as routing); else config.json's model_type;
+/// null when the dir is not model-shaped at all.
 pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) ?ModelKind {
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
+    if (isGgufModelPath(io, abs_path)) return .chat;
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
     const parent = std.fs.path.dirname(trimmed) orelse return null;
@@ -350,14 +477,14 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
 }
 
 pub const DiscoveredModel = struct {
-    /// Model id (subdirectory basename, e.g. "Qwen3.8-Flash-Next-4bit").
+    /// Model id (subdirectory basename, e.g. "gemma-4-e4b-it-4bit").
     id: []const u8,
     /// Absolute path to the model directory.
     path: []const u8,
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
-    /// `model_type` peeked from config.json (e.g. "qwen4_exp"), so registry stubs
+    /// `model_type` peeked from config.json (e.g. "bert"), so registry stubs
     /// can advertise arch-derived capabilities before a cold load. Empty
     /// when unknown.
     model_type: []const u8 = "",
@@ -386,6 +513,75 @@ pub const DiscoveryResult = struct {
         }
     }
 };
+
+/// True if a `.gguf` basename is a multimodal-projection sidecar (CLIP
+/// vision / audio encoder packaged separately so the language model can
+/// reference it at runtime). llama.cpp tooling, ollama, and LM Studio all
+/// use the `mmproj-*` prefix for this; no LM loader accepts one as a model.
+/// Filtering them out at directory-pick time lets a user point at a model
+/// folder (which commonly ships both the LLM and the mmproj sidecar —
+/// Gemma 4 VL, Qwen 3.6 VL, etc.) and have the right file get loaded.
+///
+/// Match is a case-insensitive `mmproj` prefix + `.gguf` suffix. `mmproj.gguf`
+/// itself matches; `model-mmproj.gguf` (suffix, not prefix) does NOT —
+/// only basenames starting with the prefix are sidecars in the wild.
+pub fn isMmprojGgufBasename(basename: []const u8) bool {
+    if (basename.len < 7 or !std.mem.endsWith(u8, basename, ".gguf")) return false;
+    const prefix = "mmproj";
+    if (basename.len < prefix.len) return false;
+    for (basename[0..prefix.len], prefix) |c, p| {
+        if (std.ascii.toLower(c) != p) return false;
+    }
+    return true;
+}
+
+/// True if `basename` is a non-LLM `.gguf` COMPANION file rather than a
+/// language-model quant. Two kinds ship today:
+///
+///   - `mmproj-*.gguf`  — multimodal-projection / CLIP encoder (see above).
+///   - `*tokenizer*.gguf` — audio/speech tokenizer shipped beside a TTS model
+///     (real: `qwen3-tts-tokenizer-f16.gguf` next to `qwen3-tts-0.6b-f16.gguf`).
+///
+/// `scanLlmGguf` picks the alphabetically-smallest candidate, so a folder whose
+/// tokenizer happens to sort first would otherwise be loaded AS the LLM. Mirrors
+/// the Swift `DownloadManager.isGgufSidecar` — the macOS app lists every quant
+/// in a folder as a separately selectable model, so the two must agree on which
+/// files are models or the app offers one the server can't load.
+/// True for an MTP draft-head GGUF — the ds4 speculative-decode sidecar
+/// (e.g. `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`). NOT loadable as a
+/// chat model: it's a dependency of the main quant, loaded beside it by the ds4
+/// engine for a faster decode. Matched as a delimited `-MTP-` token so a real
+/// model that merely contains the letters "mtp" isn't caught.
+pub fn isMtpGgufBasename(basename: []const u8) bool {
+    if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
+    // Delimited tokens only, so a chat quant whose scheme name merely
+    // contains the letters can't match. Covers the legacy MTP draft head
+    // (`…-MTP-….gguf`) AND the 0731 DSpark stage bundle
+    // (`DeepSeek-V4-Flash-DSpark-support.gguf`) — ds4 loads either via the
+    // same --mtp slot and classifies by tensors. Swift mirror:
+    // DownloadManager.isGgufSidecar — keep in sync.
+    return asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
+        asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
+}
+
+pub fn isGgufSidecarBasename(basename: []const u8) bool {
+    if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
+    if (isMmprojGgufBasename(basename)) return true;
+    if (asciiContainsIgnoreCase(basename, "tokenizer")) return true;
+    return isMtpGgufBasename(basename);
+}
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (haystack[i..][0..needle.len], needle) |c, n| {
+            if (std.ascii.toLower(c) != n) continue :outer;
+        }
+        return true;
+    }
+    return false;
+}
 
 /// Scan `model_dir` for subdirectories containing `config.json`.
 /// Returns DiscoveryResult; caller owns memory via deinit().
@@ -518,9 +714,10 @@ pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io
 }
 
 /// Inspect `parent/<name>` as a model-dir candidate; append to `found` if
-/// it holds a supported config.json. Returns true when the dir was
-/// model-shaped (config.json present — even if unsupported), so callers know
-/// not to descend into it looking for an org layout.
+/// it holds an LLM `.gguf` or a supported config.json. Returns true when
+/// the dir was model-shaped (gguf present, or config.json present — even
+/// if unsupported), so callers know not to descend into it looking for an
+/// org layout.
 fn tryAddModel(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -536,7 +733,20 @@ fn tryAddModel(
     var bytes: u64 = 0;
     var bytes_ok = false;
 
+    // GGUF first (issue #59) — mirrors `--model` routing, where isGgufPath
+    // is checked BEFORE any config.json parse ("GGUF files bypass the MLX
+    // dispatch entirely"). Pulled GGUF repos usually ship no config.json at
+    // all, and the ones that do (unsloth) ship the ORIGINAL model's — an
+    // MLX classification would cold-load into a missing-safetensors failure.
     const model_type: []const u8 = blk: {
+        const scan = scanLlmGguf(io, allocator, &sub) catch GgufScan{};
+        if (scan.pick) |p| {
+            allocator.free(p);
+            bytes = scan.pick_bytes;
+            bytes_ok = true;
+            break :blk try allocator.dupe(u8, "gguf");
+        }
+
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config) return false;
 
@@ -557,7 +767,7 @@ fn tryAddModel(
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, mxfp4, mxfp8)", .{ name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
                 return true;
             },
             .drafter => {
@@ -570,6 +780,7 @@ fn tryAddModel(
     errdefer if (model_type.len > 0) allocator.free(model_type);
 
     // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
+    // GGUF entries already carry the picked file's size instead.
     if (!bytes_ok) {
         var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
         if (sub_iter_dir) |*sd| {
@@ -626,8 +837,9 @@ pub const ProbeResult = struct {
 /// Validate an arbitrary absolute model directory the way discovery would
 /// (config.json present, supported model_type and quant mode) and report its
 /// weight bytes. Used by /v1/load-model's register-by-path branch for models
-/// OUTSIDE the --model-dir scan — e.g. a pack in the app's download root,
-/// whichever org dir the chat model came from.
+/// OUTSIDE the --model-dir scan — e.g. the app's auto-downloaded embedding
+/// encoder, which lands wherever the download root is regardless of which
+/// org dir the chat model came from.
 pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) !ProbeResult {
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
@@ -636,6 +848,20 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
     defer dir.close(io);
+
+    // GGUF first — same precedence as tryAddModel and `--model` routing.
+    gguf: {
+        var sub = dir.openDir(io, base, .{ .iterate = true }) catch break :gguf;
+        defer sub.close(io);
+        const scan = scanLlmGguf(io, allocator, &sub) catch break :gguf;
+        if (scan.pick) |p| {
+            allocator.free(p);
+            return .{
+                .model_type = try allocator.dupe(u8, "gguf"),
+                .bytes_on_disk = scan.pick_bytes,
+            };
+        }
+    }
 
     const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {
         .missing_or_unparseable => return error.ModelDirNotFound,
@@ -697,6 +923,15 @@ pub const StubMeta = struct {
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
     has_video: bool = false,
     has_chat: bool = false,
+    /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
+    /// advertises "embeddings" and no chat capabilities.
+    is_encoder: bool = false,
+    /// Embedding capability (issue #116): every encoder, PLUS a decoder with a
+    /// declared pooling contract (config.json `pooling_mode`, or — added by
+    /// `readStubMeta` — a `1_Pooling/config.json` sidecar). The name-based
+    /// fallback for metadata-less checkpoints lives at the server's stub-cap
+    /// site via `model.poolingFromDirName` (one shared rule, no copy here).
+    has_embedding: bool = false,
     /// generation_config.json's thinking default (`ModelConfig.gen_enable_thinking`).
     enable_thinking: ?bool = null,
     model_type_buf: [64]u8 = @splat(0),
@@ -716,7 +951,8 @@ fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
 
 /// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
 /// supplied by the caller (the template lives outside config.json), and
-/// determines chat/tool capabilities. Mirrors the loaded-path capability rules in `models_api.renderModelEntry`
+/// determines chat/tool capabilities — gated off for encoder-only (`bert`)
+/// archs. Mirrors the loaded-path capability rules in `server.renderModelEntry`
 /// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
 /// `.found=false` on any parse failure.
 pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
@@ -733,7 +969,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // `text_config` may omit fields the root still carries) — the same merge
     // `model.zig parseConfigFromJson` does. Reading the root alone made
     // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
-    // unloaded model with a nested `text_config`.
+    // unloaded Gemma 3/4 and Qwen-VL model.
     const text_cfg: ?std.json.ObjectMap = if (root.get("text_config")) |tc|
         (if (tc == .object) tc.object else null)
     else
@@ -784,7 +1020,28 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // MiMo serves images only; its video pads are not wired.
     meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0 and
         !std.mem.eql(u8, mt, "mimo_v2");
-    meta.has_chat = has_chat_template;
+    const bidirectional = blk: {
+        const cfgBool = struct {
+            fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
+                if (tc) |t| {
+                    if (t.get(key)) |v| {
+                        if (v == .bool) return v.bool;
+                    }
+                }
+                if (r.get(key)) |v| {
+                    if (v == .bool) return v.bool;
+                }
+                return false;
+            }
+        }.get;
+        break :blk cfgBool(root, text_cfg, "use_bidirectional_attention");
+    };
+    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional;
+    meta.has_chat = has_chat_template and !meta.is_encoder;
+    meta.has_embedding = meta.is_encoder;
+    if (root.get("pooling_mode")) |v| {
+        if (v == .string) meta.has_embedding = true;
+    }
     return meta;
 }
 
@@ -837,6 +1094,14 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
             meta.enable_thinking = @import("model.zig").parseGenerationDefaultsFromJson(gen_bytes).enable_thinking;
         } else |_| {}
     } else |_| {}
+    // A sentence-transformers pooling sidecar marks embedding capability even
+    // when config.json says nothing (the load path parses its mode; the stub
+    // only needs existence). Issue #116.
+    if (meta.found and !meta.has_embedding) {
+        if (dir.statFile(io, "1_Pooling/config.json", .{})) |st| {
+            if (st.kind == .file) meta.has_embedding = true;
+        } else |_| {}
+    }
     return meta;
 }
 
@@ -872,11 +1137,11 @@ test "discoverModels finds flat and org/repo model dirs" {
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "flat-model");
-    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"gemma3\"}" });
     // HF-style org/repo layout — the DownloadManager / `sushi pull`
     // convention. Must be discovered with id "org/name".
     try tmp.dir.createDirPath(io, "mlx-community/nested-model");
-    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
     // Junk that must not surface: an org dir with a non-model child, and a
     // dot-dir.
     try tmp.dir.createDirPath(io, "empty-org/not-a-model");
@@ -888,10 +1153,10 @@ test "discoverModels finds flat and org/repo model dirs" {
     try std.testing.expectEqual(@as(usize, 2), result.models.len);
     try std.testing.expectEqualStrings("flat-model", result.models[0].id);
     try std.testing.expectEqualStrings("/models-root/flat-model", result.models[0].path);
-    try std.testing.expectEqualStrings("mimo_v2", result.models[0].model_type);
+    try std.testing.expectEqualStrings("gemma3", result.models[0].model_type);
     try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
     try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
-    try std.testing.expectEqualStrings("glm5_next", result.models[1].model_type);
+    try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
 }
 
 fn writeStreamingQuantFixture(io: std.Io, dir: std.Io.Dir, model_type: []const u8) !void {
@@ -969,7 +1234,7 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
     var moe_dir = try root.dir.openDir(io, "moe", .{ .iterate = true });
     defer moe_dir.close(io);
     try writeStreamingQuantFixture(io, q4_dir, "qwen4_exp");
-    try writeStreamingQuantFixture(io, moe_dir, "not_qwen4");
+    try writeStreamingQuantFixture(io, moe_dir, "qwen3_5_moe");
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try root.dir.realPath(io, &root_buf);
@@ -985,7 +1250,7 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
         expert_quant.Layout.quantized_split,
         expert_quant.layoutOfDir(allocator, io, "qwen4_exp", q4_path, 1).?,
     );
-    try std.testing.expect(expert_quant.layoutOfDir(allocator, io, "not_qwen4", moe_path, 1) == null);
+    try std.testing.expect(expert_quant.layoutOfDir(allocator, io, "qwen3_5_moe", moe_path, 1) == null);
 
     try std.testing.expectEqual(
         expert_quant.Layout.quantized_split,
@@ -995,10 +1260,15 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
 
     var result = try discoverModels(io, allocator, root_path);
     defer result.deinit();
-    // The foil's type is no served arch, so discovery lists only the qwen4 pack.
-    try std.testing.expectEqual(@as(usize, 1), result.models.len);
-    try std.testing.expectEqualStrings("qwen4_exp", result.models[0].model_type);
-    try std.testing.expect(result.models[0].streaming_index_complete);
+    try std.testing.expectEqual(@as(usize, 2), result.models.len);
+    for (result.models) |m| {
+        if (std.mem.eql(u8, m.model_type, "qwen4_exp")) {
+            try std.testing.expect(m.streaming_index_complete);
+        } else {
+            try std.testing.expectEqualStrings("qwen3_5_moe", m.model_type);
+            try std.testing.expect(!m.streaming_index_complete);
+        }
+    }
 }
 
 test "qwen4 streaming index completeness requires every target bank and PLE shard" {
@@ -1061,13 +1331,13 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     // a duplicate entry — it fails the whole registry init, i.e. the server
     // does not start. De-dup is not tidiness here.
     try a_dir.dir.createDirPath(io, "org/shared");
-    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"qwen3\"}" });
     try a_dir.dir.createDirPath(io, "org/only-in-a");
-    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"gemma3\"}" });
     try b_dir.dir.createDirPath(io, "org/shared");
-    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"llama\"}" });
     try b_dir.dir.createDirPath(io, "org/only-in-b");
-    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"mistral\"}" });
 
     // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
     // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
@@ -1097,7 +1367,7 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
         // registry stores a path nothing can open.
         try std.testing.expect(m.path.len > 0 and m.path[0] == '/');
     }
-    try std.testing.expectEqualStrings("glm5_next", shared_type);
+    try std.testing.expectEqualStrings("qwen3", shared_type);
     try std.testing.expect(saw_a and saw_b);
 
     // One root behaves exactly like `discoverModels` — the multi path is the
@@ -1127,9 +1397,9 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
 
     // HF hub-cache snapshot shape: every file is a symlink into ../../blobs.
     // bytes_on_disk feeds /v1/models, the app's RAM column AND
-    // model_load.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
+    // scheduler.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
     try tmp.dir.createDirPath(io, "blobs");
-    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"qwen3\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "blobs/w1", .data = "0123456789" });
     try tmp.dir.createDirPath(io, "org/snap-model");
     try tmp.dir.symLink(io, "../../blobs/cfg", "org/snap-model/config.json", .{});
@@ -1143,17 +1413,153 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
     try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
 }
 
+test "discoverModels finds GGUF dirs without config.json (issue #59)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Pulled GGUF repo layout: `<org>/<repo>/<quant>.gguf`, NO config.json
+    // (bartowski / unsloth-style multi-quant repos ship only .gguf files).
+    // `sushi list` already counts these as models; discovery must agree.
+    try tmp.dir.createDirPath(io, "bartowski/some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-IQ2_M.gguf", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+    // Flat single-file layout.
+    try tmp.dir.createDirPath(io, "flat-gguf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-gguf/tiny.gguf", .data = "x" });
+    // mmproj sidecar ONLY → not an LLM dir, must not be discovered.
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    // Interrupted pull → .partial is not a .gguf, must not be discovered.
+    try tmp.dir.createDirPath(io, "partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "partial/model.gguf.partial", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("bartowski/some-model-GGUF", result.models[0].id);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+    // bytes = the file the loader will pick (alphabetically-smallest LLM
+    // .gguf — resolveGgufFile's rule), NOT the sum of every quant in the dir.
+    try testing.expectEqual(@as(?u64, 4), result.models[0].bytes_on_disk);
+    try testing.expectEqualStrings("flat-gguf", result.models[1].id);
+    try testing.expectEqualStrings("gguf", result.models[1].model_type);
+}
+
+test "discoverModels: a .gguf beside config.json wins (mirrors --model routing)" {
+    // `--model <dir>` checks isGgufPath BEFORE parsing config.json, so a dir
+    // holding both routes to the embedded engine. Discovery must classify it
+    // identically — some GGUF repos (unsloth) ship the original config.json
+    // next to the quants, and an MLX classification would cold-load into a
+    // missing-safetensors failure.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "both");
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+}
+
+test "probeModelDir accepts a GGUF dir (register-by-path / /api/pull)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const abs = try std.fmt.allocPrint(allocator, "{s}/some-model-GGUF", .{path_buf[0..root_len]});
+    defer allocator.free(abs);
+
+    const probe = try probeModelDir(io, allocator, abs);
+    defer allocator.free(probe.model_type);
+    try testing.expectEqualStrings("gguf", probe.model_type);
+    try testing.expectEqual(@as(?u64, 8), probe.bytes_on_disk);
+}
+
+test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "multi");
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q4_K_M.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/mmproj-model.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "empty");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+
+    // Directory: alphabetically-smallest non-mmproj .gguf wins.
+    const multi = try std.fmt.allocPrint(allocator, "{s}/multi", .{root});
+    defer allocator.free(multi);
+    const picked = try resolveGgufFile(io, allocator, multi);
+    defer allocator.free(picked);
+    try testing.expect(std.mem.endsWith(u8, picked, "/multi/model-Q4_K_M.gguf"));
+    try testing.expect(isGgufModelPath(io, multi));
+
+    // Direct file path: dup'd through; mmproj file rejected precisely.
+    const direct = try std.fmt.allocPrint(allocator, "{s}/multi/model-Q8_0.gguf", .{root});
+    defer allocator.free(direct);
+    const direct_res = try resolveGgufFile(io, allocator, direct);
+    defer allocator.free(direct_res);
+    try testing.expectEqualStrings(direct, direct_res);
+    const mmproj_file = try std.fmt.allocPrint(allocator, "{s}/multi/mmproj-model.gguf", .{root});
+    defer allocator.free(mmproj_file);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, mmproj_file));
+
+    // Sidecar-only dir vs genuinely empty dir: distinct errors, and neither
+    // counts as a GGUF model path.
+    const sidecar = try std.fmt.allocPrint(allocator, "{s}/sidecar-only", .{root});
+    defer allocator.free(sidecar);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, sidecar));
+    try testing.expect(!isGgufModelPath(io, sidecar));
+    const empty = try std.fmt.allocPrint(allocator, "{s}/empty", .{root});
+    defer allocator.free(empty);
+    try testing.expectError(error.NoGgufFile, resolveGgufFile(io, allocator, empty));
+    try testing.expect(!isGgufModelPath(io, empty));
+
+    // Empty / relative paths: never a GGUF path (the openDirAbsolute
+    // ReleaseFast-UB guard).
+    try testing.expect(!isGgufModelPath(io, ""));
+    try testing.expect(!isGgufModelPath(io, "relative/dir"));
+}
+
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen4_exp"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("mimo_v2"));
-    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("gemma4"));
-    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("qwen3_5_moe"));
-    // Drafter sidecars, and genuinely unsupported archs (media
+    // Chat: MLX archs, the synthetic gguf type, and DiffusionGemma (which
+    // was missing from the discovery allowlist despite being servable).
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gemma4"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gguf"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
+    try testing.expect(isSupportedModelType("diffusion_gemma"));
+    // Encoders, drafter sidecars, and genuinely unsupported archs (media
     // generation included: it is no longer served).
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("flux2-klein-4b"));
+    try testing.expectEqual(ModelKind.embed, modelKindFromType("bert"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
     // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
     // as primary models.
-    try testing.expectEqual(ModelKind.drafter, modelKindFromType("glm5_next_assistant"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("muse_glimmer_assistant"));
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
     // Labels stay column-friendly.
     try testing.expectEqualStrings("chat", ModelKind.chat.label());
@@ -1163,14 +1569,16 @@ test "every served arch classifies as chat, so `sushi run` accepts it" {
     for (@import("model.zig").served_model_types) |t| try testing.expectEqual(ModelKind.chat, modelKindFromType(t));
 }
 
-test "classifyModelPath: drafter dirs classify; junk is null" {
+test "classifyModelPath: gguf/drafter dirs classify; junk is null" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
+    try tmp.dir.createDirPath(io, "g");
+    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
     try tmp.dir.createDirPath(io, "drafter");
-    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"glm5_next_assistant\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
     try tmp.dir.createDirPath(io, "junk");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1178,6 +1586,7 @@ test "classifyModelPath: drafter dirs classify; junk is null" {
     const root = path_buf[0..root_len];
 
     const cases = .{
+        .{ "g", ModelKind.chat },
         .{ "drafter", ModelKind.drafter },
     };
     inline for (cases) |c| {
@@ -1227,37 +1636,6 @@ test "a DFlash2 sidecar (bare chat model_type + dflash_config) classifies as dra
     try testing.expectEqual(@as(usize, 0), result.models.len);
 }
 
-test "a .gguf path or a directory holding one is a GGUF path, refused by name" {
-    const io = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io, "quants");
-    try tmp.dir.writeFile(io, .{ .sub_path = "quants/model-Q4_K_M.gguf", .data = "GGUF" });
-    try tmp.dir.createDirPath(io, "mlx");
-    try tmp.dir.writeFile(io, .{ .sub_path = "mlx/config.json", .data = "{}" });
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(io, &path_buf);
-    const root = path_buf[0..root_len];
-    const quants = try std.fmt.allocPrint(allocator, "{s}/quants", .{root});
-    defer allocator.free(quants);
-    const mlx_dir = try std.fmt.allocPrint(allocator, "{s}/mlx", .{root});
-    defer allocator.free(mlx_dir);
-
-    try testing.expect(isGgufModelPath(io, quants));
-    try testing.expect(isGgufModelPath(io, "/models/x.gguf"));
-    try testing.expect(!isGgufModelPath(io, mlx_dir));
-    try testing.expect(!isGgufModelPath(io, ""));
-    try testing.expect(!isGgufModelPath(io, "relative/dir"));
-
-    // Discovery does not list it: no config.json, so it is not model-shaped.
-    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
-    defer result.deinit();
-    for (result.models) |m| try testing.expect(!std.mem.eql(u8, m.id, "quants"));
-}
-
 test "trimTrailingSlash" {
     try testing.expectEqualStrings("foo", trimTrailingSlash("foo/"));
     try testing.expectEqualStrings("foo", trimTrailingSlash("foo//"));
@@ -1273,20 +1651,103 @@ test "lessThanById sorts ascending" {
     try testing.expect(!lessThanById({}, a, a));
 }
 
-test "the supported model_type list is the served four" {
-    for (@import("model.zig").served_model_types) |t| try testing.expect(isSupportedModelType(t));
-    try testing.expect(isSupportedModelType("qwen4_exp_text"));
-    try testing.expectEqual(@as(usize, 5), supported_model_types.len);
-    for ([_][]const u8{ "qwen3", "qwen3_moe", "qwen3_5_moe", "gemma3_text", "gemma4", "llama", "lfm2", "lfm2_vl", "bert", "totally_made_up_arch" }) |t| {
-        try testing.expect(!isSupportedModelType(t));
-    }
+test "isMmprojGgufBasename catches the multimodal-projection sidecars" {
+    // Real mmproj files seen in the wild (Gemma 4 VL, Qwen 3.6 VL, ...).
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E2B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-F32.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-Qwen3.6-27B-VL-BF16.gguf"));
+    // Case-insensitive on the prefix only.
+    try testing.expect(isMmprojGgufBasename("MMPROJ-foo.gguf"));
+    try testing.expect(isMmprojGgufBasename("MmProj-bar.gguf"));
+    // Bare prefix.gguf — also a sidecar.
+    try testing.expect(isMmprojGgufBasename("mmproj.gguf"));
+
+    // Real LLM .gguf — must NOT match (this is the regression class:
+    // pre-fix, the directory-picker grabbed the alphabetically-first
+    // file and that file was the mmproj sidecar).
+    try testing.expect(!isMmprojGgufBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isMmprojGgufBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isMmprojGgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    // Not a .gguf → not a sidecar.
+    try testing.expect(!isMmprojGgufBasename("mmproj-readme.md"));
+    try testing.expect(!isMmprojGgufBasename("mmproj"));
+    // Suffix-only — model-mmproj.gguf is NOT the convention.
+    try testing.expect(!isMmprojGgufBasename("model-mmproj.gguf"));
 }
 
-test "isSupportedQuantMode accepts affine, mxfp4 and mxfp8, rejects nvfp4 and unknown" {
+test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
+    // A GGUF folder ships non-LLM `.gguf` companions beside the quants. mmproj
+    // (CLIP) was the known one; a SPEECH TOKENIZER is the other — live, on a
+    // real Mac: `qwen3-tts-tokenizer-f16.gguf` (341 MB) sits next to
+    // `qwen3-tts-0.6b-f16.gguf`. Neither is a language model, and the
+    // alphabetical directory pick only avoids the tokenizer by luck of the
+    // name — a repo whose tokenizer sorts first would load it as the LLM.
+    try testing.expect(isGgufSidecarBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isGgufSidecarBasename("qwen3-tts-tokenizer-f16.gguf"));
+    try testing.expect(isGgufSidecarBasename("TOKENIZER-f16.gguf"));
+
+    // MTP draft-head sidecar (llama.cpp / ds4 speculative decode) — live in
+    // antirez/deepseek-v4-gguf, sitting beside the chat quants. Not a chat
+    // model; it must never appear as a selectable quant.
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    try testing.expect(isGgufSidecarBasename("some-model-mtp.gguf"));
+    // isMtpGgufBasename is the specific predicate the engine uses to FIND the
+    // draft head (a subset of the sidecar filter).
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    try testing.expect(!isMtpGgufBasename("mmproj-F16.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+
+    // DSpark support GGUF (upstream lib/ds4 `download_model.sh dspark-support`
+    // → `DeepSeek-V4-Flash-DSpark-support.gguf`): the 0731 replacement for the
+    // legacy MTP sidecar. It must be FOUND by the draft matcher (ds4 loads it
+    // via --mtp and `--dspark` selects the runtime) AND filtered as a sidecar
+    // — its name starts with "deepseek-v4-flash", so without the filter it
+    // classifies as a servable chat quant and becomes a pickable tray entry
+    // that can only fail.
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-dsparkle-chat.gguf"));
+
+    try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isGgufSidecarBasename("qwen3-tts-0.6b-f16.gguf"));
+    // A real chat quant whose scheme name merely contains the letters "mtp"
+    // (no delimited `-MTP-` token) is NOT a sidecar.
+    try testing.expect(!isGgufSidecarBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+    try testing.expect(!isGgufSidecarBasename("tokenizer.json"));
+}
+
+test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
+    // Regression for the "[discovery] skip ...: unsupported model_type
+    // 'qwen3_moe'" warning: Qwen3-30B-A3B / Qwen3-Coder-30B-A3B must be
+    // discoverable by the model manager, not silently skipped.
+    try testing.expect(isSupportedModelType("qwen3_moe"));
+    try testing.expect(isSupportedModelType("qwen3_moe_text"));
+    // Sibling arches still recognized.
+    try testing.expect(isSupportedModelType("qwen3_5_moe"));
+    try testing.expect(isSupportedModelType("qwen3"));
+    // A genuinely unknown arch is still rejected.
+    try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
+    // Regression for "[discovery] skip ...: unsupported model_type
+    // 'gemma3_text'": text-only Gemma 3 abliterated checkpoints
+    // (mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit) ship a flat
+    // top-level model_type "gemma3_text" and must be discoverable, not skipped.
+    try testing.expect(isSupportedModelType("gemma3_text"));
+    try testing.expect(isSupportedModelType("gemma3"));
+}
+
+test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
+    // Regression for "[discovery] skip ...: unsupported quantization mode
+    // 'nvfp4'": nvfp4 / mxfp4 / mxfp8 checkpoints are loadable and must be
+    // discoverable.
     try testing.expect(isSupportedQuantMode("affine"));
+    try testing.expect(isSupportedQuantMode("nvfp4"));
     try testing.expect(isSupportedQuantMode("mxfp4"));
     try testing.expect(isSupportedQuantMode("mxfp8"));
-    try testing.expect(!isSupportedQuantMode("nvfp4"));
     try testing.expect(!isSupportedQuantMode("fp99"));
 }
 
@@ -1358,7 +1819,7 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // MoE chat model (Qwen3-Coder-30B-A3B shape), chat template present.
     {
         const json =
-            \\{"model_type":"qwen4_exp","vocab_size":151936,"hidden_size":2048,
+            \\{"model_type":"qwen3_moe","vocab_size":151936,"hidden_size":2048,
             \\"num_hidden_layers":48,"max_position_embeddings":262144,
             \\"num_experts":128,"num_experts_per_tok":8,"quantization":{"bits":8,"group_size":64}}
         ;
@@ -1376,7 +1837,7 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // Dense model, no template → no chat caps; no quant block → 0 bits.
     {
         const json =
-            \\{"model_type":"qwen4_exp","hidden_size":5120,"num_attention_heads":40,
+            \\{"model_type":"qwen2","hidden_size":5120,"num_attention_heads":40,
             \\"max_position_embeddings":32768}
         ;
         const m = parseStubMeta(a, json, false);
@@ -1388,24 +1849,65 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     }
     // Vision: vision_config on a non-_text arch → has_vision.
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"vision_config\":{\"hidden_size\":1152}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma4\",\"vision_config\":{\"hidden_size\":1152}}", true);
         try testing.expect(m.has_vision);
     }
     // …but a `_text` arch with a vestigial vision_config must NOT report vision.
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp_text\",\"vision_config\":{}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe_text\",\"vision_config\":{}}", true);
         try testing.expect(!m.has_vision);
+    }
+    // Encoder (bert): chat/tool caps suppressed even with a template present.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
+        try testing.expect(!m.has_chat);
+        try testing.expect(m.is_encoder);
+        try testing.expect(m.has_embedding);
+    }
+    // Decoder embedding checkpoint (issue #116): an explicit `pooling_mode`
+    // marks embeddings capability WITHOUT turning the stub into an encoder —
+    // Qwen3-Embedding keeps its causal arch (and its chat template).
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560,\"pooling_mode\":\"last_token\"}", true);
+        try testing.expect(m.has_embedding);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
+    }
+    // A plain chat qwen3 advertises no embeddings capability.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560}", true);
+        try testing.expect(!m.has_embedding);
+    }
+    // Bidirectional embedding model (EmbeddingGemma): a gemma3_text config
+    // with use_bidirectional_attention — the stub must advertise embeddings,
+    // never chat, WITHOUT cold-loading (issue #79).
+    {
+        const json =
+            \\{"model_type":"gemma3_text","use_bidirectional_attention":true,
+            \\"hidden_size":768,"num_hidden_layers":24,"max_position_embeddings":2048}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.is_encoder);
+        try testing.expect(!m.has_chat);
+        try testing.expectEqual(@as(u32, 768), m.hidden_size);
+    }
+    // A chat gemma3_text WITHOUT the flag stays a chat model.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the
     // root alone reported hidden=0, layers=0, ctx=0, is_moe=false on /v1/models
-    // for EVERY unloaded multimodal model (which is most of them),
+    // for EVERY unloaded Gemma 3/4 and Qwen-VL model (which is most of them),
     // so a client couldn't tell a 128-expert MoE from a dense model without
     // cold-loading 16 GB of weights. Same class as the "Config fields omitted
     // by nested text_config" gotcha, different parser.
     {
+        // gemma-4-26B-A4B-it-qat-4bit's real shape.
         const json =
-            \\{"model_type":"qwen4_exp","vision_config":{"hidden_size":1152},
+            \\{"model_type":"gemma4","vision_config":{"hidden_size":1152},
             \\"quantization":{"bits":4,"group_size":32},
             \\"text_config":{"vocab_size":262144,"hidden_size":2560,"num_hidden_layers":62,
             \\"max_position_embeddings":131072,"num_experts":128,"top_k_experts":8}}
@@ -1425,16 +1927,16 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     // reporting 0 (mirrors the model.zig text_config merge).
     {
         const json =
-            \\{"model_type":"qwen4_exp","max_position_embeddings":8192,
+            \\{"model_type":"gemma3","max_position_embeddings":8192,
             \\"text_config":{"hidden_size":3840}}
         ;
         const m = parseStubMeta(a, json, true);
         try testing.expectEqual(@as(u32, 3840), m.hidden_size);
         try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
     }
-    // A MoE nests its expert count too.
+    // Qwen3.5/3.6 MoE nests its expert count too (Ornith-1.0-35B: 256 experts).
     {
-        const m = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"text_config\":{\"num_experts\":256}}", true);
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe\",\"text_config\":{\"num_experts\":256}}", true);
         try testing.expect(m.is_moe);
     }
     // Malformed → found=false.
@@ -1450,7 +1952,7 @@ test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "m");
-    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen4_exp\",\"hidden_size\":8}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(io, &path_buf);
     const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});

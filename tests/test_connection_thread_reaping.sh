@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Regression: one completed HTTP request must not retain one pthread stack.
 #

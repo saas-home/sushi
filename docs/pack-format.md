@@ -10,7 +10,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related:
 [qwen4-arch](qwen4-arch.md), [mimo2-arch](mimo2-arch.md).
 
 Readers in this repo: `src/expert_quant.zig` (layout), `src/exl3/root.zig`
-(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo2/mimo_source.zig` (`validateShardStamps`),
+(`expert_quant` parse), `src/exl3/codebook_tables.zig` (STQ tables), `src/exl3/expert_exl3.zig` (decode), `src/mimo_source.zig` (`validateShardStamps`),
 `src/model.zig` (weight loading).
 
 ## Routed-expert tensors
@@ -38,64 +38,6 @@ rather than refused; a wider one refuses.
 
 `in` and `out` are the tile grid times 16, and the Hadamard block is 128
 (`H128`), so both must be multiples of it.
-
-<a id="tile-order"></a>
-### Tile order: `trellis` and `trellis_pm`
-
-A pack stores a routed expert's tiles either in the pack order above, `[IT][OT][n]` per expert (`IT` = in/16, `OT` =
-out/16), or in the order the decode and prefill kernels read, `pair_major`: `[OT/2][IT][2][n]` per expert, so an
-output tile pair's whole K range is one run (`layout.tileMajor` maps the first into the second). `expert_quant.tile_order`
-names it; absent is the pack order.
-
-| `expert_quant.tile_order` | trellis tensor | dtype | shape |
-|---|---|---|---|
-| absent | `…{P}[.gN].trellis` | `U16` | `[E, IT, OT, n]` |
-| `"pair_major"` | `…{P}[.gN].trellis_pm` | `U16` | `[E, OT/2, IT, 2, n]` |
-
-- The bytes of expert `e` of a `trellis_pm` tensor are `layout.tileMajor` of the bytes of expert `e` of the `trellis` it
-  replaces. `suh`, `svh` and every other tensor keep their names, shapes and bytes. The rename is deliberate: a build
-  that does not know `trellis_pm` finds no `trellis` and refuses the pack, never reading tiles in the wrong order.
-- It covers every routed trellis of the pack, the layers' and an MTP or DSpark head's (`mtp.{i}.mlp.switch_mlp…`).
-- A shard that holds routed trellis tensors carries `tile_order` in its safetensors `__metadata__` (`pair_major`; the
-  pack order stamps nothing).
-- A reader takes `IT`, `OT` and `n` from the 5-D shape (`OT = 2 * shape[1]`, `IT = shape[2]`, `shape[3] = 2`).
-- **Shard layout.** A layer shard's data runs, for gate, up, down, each by group `gN` ascending: `trellis_pm`, its
-  `.suh`, its `.svh`; then every other tensor in source order. The header is padded with spaces to a 16 KiB multiple
-  and every `trellis_pm` starts on a 16 KiB page of the file. Where the previous tensor does not end on a page, a
-  zero-filled `__pad__.<shard stem>.<i>` tensor (`U8`, 1-D, under 16384 bytes) fills the gap and is listed in the index
-  (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
-- Only `deepseek_v41` reads `pair_major`. Its streaming engine lands the bytes in the slot pools unchanged: no CPU
-  reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
-  pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per
-  projection), so a trellis that is off its page costs only its own reads their direct path.
-- Refused by name: `Exl3TileOrderUnsupported` (a value other than `pair_major`, or `pair_major` under another
-  architecture), `Exl3TileOrderMixed` (both keys in one pack or layer), `Exl3TileOrderMismatch` (the index names the
-  other order than the config), `Exl3GroupGeometry` (a `trellis_pm` shape that is not its projection's grid),
-  `Exl3ShardStampMismatch` (a shard of routed trellis tensors whose stamp is not the config's order),
-  `Exl3TileOrderNeedsGroups` (a `pair_major` layer that is not rate-grouped).
-
-<a id="repack"></a>
-#### `sushi repack <pack>`
-
-`sushi repack <pack>` (one positional, no flags; a path, relative directory or known alias, never downloaded) turns a
-pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the one repacker.
-
-- It writes the shard layout above (trellis, scales, pads; `__metadata__` keeps its source fields and adds `tile_order`).
-- Refusals before any write: `RepackNotDownloaded`, `RepackArchitectureUnsupported`, `Exl3TileOrderUnsupported` (not
-  STQ, or another `tile_order`), `Exl3ShardStampMismatch`, `Exl3TileOrderMixed` (a shard with both orders, or a
-  pair-major shard not written by this command), `Exl3TileOrderNeedsGroups`, `RepackShardIsLink` (a routed shard that
-  is a symlink), `RepackNoSpace` (free disk under the largest remaining shard plus 1 GiB), `RepackPackLocked`
-  (`.sushi-repack.lock` holds a live pid; a dead pid's lock is taken over), `RepackPackInUse` (another process has a
-  shard open: a running server would read pair-major bytes under the pack order). A pack whose config already says
-  `pair_major` prints "already pair-major" and exits 0.
-- Per shard: write `<shard>.repack-tmp` (parallel workers at fixed offsets, so the bytes do not depend on the thread
-  count), `F_FULLFSYNC`, re-read it with `F_NOCACHE` and compare with the original (every `trellis_pm` expert through
-  `layout.tileMajorInverse`, every other tensor byte for byte, pads zero, header equal to the plan), rename over the
-  shard, fsync the directory. Peak extra disk is one shard. Then the index (renamed keys, pads), then `config.json`
-  (`tile_order` inserted into `expert_quant`, every other byte unchanged), then the loader's own pre-load checks.
-- A run cut short leaves shards in both orders under a pack-order index and config, which the loader refuses
-  (`Exl3TileOrderMixed` / `Exl3TileOrderMismatch`); repeating the command skips the pair-major shards that pass the
-  structure check and finishes. The output is byte-identical run to run and box to box.
 
 ### MTP bank
 
@@ -154,8 +96,6 @@ stacked bank per projection with its own rate, read from its own trellis shape.
   (`expert_exl3_kernels.setDecodeParams`) before every dispatch, so packs with
   different codebooks can be resident together, and every weight kernel
   inlines its `exl3_pairh`.
-- `tile_order` — `pair_major` when the routed trellises are stored `trellis_pm` ([tile order](#tile-order)); absent
-  for the pack order. Any other value is `Exl3TileOrderUnsupported`.
 - `window` — the codeword width the search hashed, 8..16. **Absent means 16.**
   The same bitstream decodes to different weights at each width, so a window
   this build cannot decode is `Exl3WindowUnsupported`, never a fallback to 16.
@@ -223,31 +163,6 @@ does not convert keeps the release's own name and format (FP8 + scale, or dense)
   a stage group set that does not cover the stage's experts), `UnsupportedDsv41Config` (a fractional clamp, a quant
   block naming a non-STQ codebook), `ExpertLayoutUnsupported` (an index without every routed group).
 
-<a id="qwen4-stq"></a>
-### Flash-Next trellis trunk (`qwen4_exp`)
-
-A `qwen4_exp` pack may store dense trunk projections as trellis banks, the DeepSeek-V4.1 contract above, beside affine ones.
-A pack without `trunk_quant` is read exactly as before.
-- `trunk_quant`: an STQ block (a tabled codebook; EXL3 codebooks are `InvalidQwen4ConfigField`). Its table must hold a row
-  for every bank's rate (`Exl3CodebookTableRateMissing`: STD1 stops at K4); `k` is the widest bank, the head included.
-- A projection `<base>` stored as `<base>.trellis` U16 `[in/16, out/16, n]`, `<base>.suh` F16 `[in]`, `<base>.svh` F16
-  `[out]` replaces `<base>.weight`, `.scales` and `.biases`, which the index must not list beside it. Each bank's rate is its
-  own `n`; both sides on the 128 grid. The choice is per tensor:
-
-| `<base>` under `language_model.model.layers.{L}` | trellis? |
-|---|---|
-| `self_attn.{q,k,v,o}_proj`, `self_attn.indexer.index_qk_proj` | yes |
-| `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` | yes |
-| `mlp.shared_expert.{gate,up,down}_proj`, a dense layer's `mlp.{gate,up,down}_proj` | yes |
-| `language_model.lm_head`; the MTP head's layer as `language_model.mtp.layers.0.<same bases>` | yes |
-| `linear_attn.in_proj_{a,b}` (48 rows), hyper-connection `input_mix_weight_*` and `block_inject_weight`, `mlp.gate`, `mlp.shared_expert_gate`, PLE `key_proj`/`value_proj`, `mtp.fc_*`, `embed_tokens`, norms | no, stays as stored |
-
-- A bank without `trunk_quant` is `TrunkQuantMissing`; a bank that is not U16 with F16 scales, is off the 128 grid, has a
-  scale missing or a rate no tile carries is `TrunkStqLayout`. Shard stamps of a trunk shard are not checked.
-- The decode widths (up to eight rows) stack the projections that share an input into one launch (q/k/v, GDN qkv/z, shared
-  expert gate/up, dense gate/up) when all are trellis banks of one input width and one rate: give those the same rate.
-- The bill is the stored bytes; a trellis head keeps no coarse rerank copy ([engine-memory-admission](engine-memory-admission.md)).
-
 ### Stored-affine trunk linears (`mimo_v2`)
 
 A MiMo pack may STORE `o_proj` (every layer's `model.layers.{L}.self_attn.o_proj`),
@@ -284,7 +199,6 @@ string, because that is all safetensors stores. The engine reads these keys:
 | `k` | the rate as written, e.g. `2.25` or `4` |
 | `codebook` | `mul1` \| `mcg` \| `std1` \| `spec1` \| `pair1` |
 | `window` | the codeword width, e.g. `12` |
-| `tile_order` | `pair_major` on a shard holding `trellis_pm` tensors ([tile order](#tile-order)); absent otherwise |
 
 A converter adds its own provenance keys beside them; the engine reads none of
 those. `sushi convert exl3` writes `encoder`, `quantizer`, `global_scale_search`, `calib_sha256`, `calib_tokens` and
@@ -342,7 +256,7 @@ decodes or requantizes. See README.md.
 ## Fixtures
 
 `src/exl3/fixtures/exl3_*_linear.safetensors` are committed and `@embedFile`d by
-`src/exl3/expert_exl3.zig` (`fixtures`, which `src/test_support.zig` reads). They are produced by the
+`src/exl3/expert_exl3.zig` (`fixtures`, which `src/transformer.zig` reads). They are produced by the
 private converter; regenerate one only to change the format, and keep the one
 searched and decoded at window 12 (`exl3_k2p5_mcg_w12_linear.safetensors`),
 which is what certifies a narrowed window against the converter's own decode
@@ -373,7 +287,7 @@ composite.
   can't load a DENSE checkpoint (`getLayerScaleOpt`; every dense contracted
   weight owes `maybeTransposeForBf16`).
 - **A gather-read table may be quantized only where the READER has a
-  quantized-gather path**: LM `embed_tokens` via `Transformer.rawEmbedding` is a
+  quantized-gather path**: LM `embed_tokens` via `gatherQuantizedRows` is a
   SIZE decision (our packs quantize it).
 - A component pack's shared files are immutable: a converter replaces a
   hard-linked file, never modifies it in place.

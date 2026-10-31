@@ -201,7 +201,7 @@ max with 10 s idle from 64 °C and restored to auto after. CONTENDED box: a syst
 throughout, other workers' builds and tests beside the first meter and live boots.
 
 Decode meter, the chain and the step alternated off / on / on / off per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9`, `--prefix-cache-entries 0`), three boots per length, ms per
+(`SUSHI_DECODE_FWD_UBENCH=40 _S=1,3,5,7,9 _GDN_ARMS=1`, `--prefix-cache-entries 0`), three boots per length, ms per
 forward, mean over boots:
 
 | rows | 4096 keys | 32768 keys |
@@ -234,7 +234,7 @@ M5 Max 128 GB, 2026-09-27, Sushi-3bpw, kv8, `--mtp`, `SUSHI_ROUND_COST_PERSIST=0
 followed a KLD run at 90.6 °C) and restored to auto after; load 1.9-3.5 with other workers' builds beside.
 
 Decode meter on B, the composed chain and the kernel alternated A B B A per width in one process
-(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5`, ctx 131072), one boot per length, two rounds per
+(`SUSHI_DECODE_FWD_UBENCH=48 _S=1,3,5,1,3,5 _QSA_POOL_ARMS=1`, ctx 131072), one boot per length, two rounds per
 width; the context grows ~7.3k keys over a boot. ms per forward:
 
 | keys prefilled | rows | chain | kernel | delta | per round | graph ops |
@@ -305,7 +305,7 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
 - Metal System Trace over a 2.5k prefill on f42cd8e (`--instrument 'Metal GPU Counters'`): the scalar sorted EXL3
   GEMM took 90.7% of sampled GPU time (gate/up 59.5%, down 31.2%), MLX's bf16 GEMM 5.1%, everything else 4%.
 - The simdgroup-matrix body against the scalar body, one process (f22a383 + the body), A B B A, paired per-block ratio,
-  window table built outside the timed calls (a since-removed `SUSHI_EXL3_LAYER_UBENCH=1` meter, MCG w15, 512 experts, top-10):
+  window table built outside the timed calls (`SUSHI_EXL3_LAYER_UBENCH=1`, MCG w15, 512 experts, top-10):
 
 | prompt chunk | n48 2560->640 | n48 640->2560 | n64 2560->640 | n64 640->2560 |
 |---|---|---|---|---|
@@ -450,7 +450,7 @@ and 4-8% of a depth-3 verify; a matmul2d QSA prototype (branch `qsa-mpp-proto`) 
 `e79b345002454001b49cf3b1bde86fcc407fb7b3cd7087385de4eaad86926638`), M5 Max 128 GB,
 Sushi-3bpw, `--ctx-size 65536 --kv-quant 8 --prefix-cache-entries 0 --no-mtp`.
 The forward meter prefills 32768 tokens, captures verify state, and runs 40 forwards
-per arm, widths `1,2,3,5,7,9` and
+per arm with `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS=1`, widths `1,2,3,5,7,9` and
 `SUSHI_ROUND_COST_PERSIST=0`. A B B A in one process: A is the existing fused
 recurrence plus norm-gate and convolution concat; B folds both epilogues into it.
 There was no recorded fold-only comparison on this base, so both arms were measured.
@@ -693,7 +693,7 @@ multiply and add tail is the reduce's (`gate[row]`); at one row the router kerne
   `moeWithGatedShared` / `moeRagged`), real 2560/640/top-10 geometry, 1 to 8 rows, MCG at n64, n32 and n44/n44/n64, spec1
   grouped at n32/44/64 (down n48), shared g128 and g64, large and small gains, router logit and rider logit, either
   part's threadgroups first, three launches a layer; one decline test.
-- **Chain per layer** (`sushi-ubench run shared.shared_expert_fold --rungs model=qwen4`; this table, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
+- **Chain per layer** (`SUSHI_QWEN_FOLD_UBENCH=1`, main test binary, ReleaseFast, GPU lock `qwen-fold`, `taskpolicy -a`,
   fans auto, M5 Max, median of 21 interleaved rounds of 8 dependent layers over distinct banks, 64 experts, random
   routes; separate = production shared chain incl. its N=1 logit; uncommitted tree on `a9853b3e`, us):
 

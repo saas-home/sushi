@@ -2,7 +2,7 @@
 
 # SUSHI
 
-A local AI server for low-bit, very high quality Sushi quants, using custom Sushi Trellis Quant (STQ) or EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
+A local AI server for low-bit, very high quality Sushi quants, using custom EXL3-Affine hybrid converter. It is a detached fork of [ddalcu's mlx-serve](https://github.com/ddalcu/mlx-serve). Sushi runs stand-alone and also as a guest engine inside mlx-serve, Apple Silicon M1+ and macOS 26.2 or later are required.
 
 ## Model support list
 
@@ -85,16 +85,6 @@ N plus the context must fit under the GPU limit.
 | 32 GB | Qwen3.8-Flash-Next-Sushi-2bpw | 18 | 27,000 | 66k | ~20 tok/s |
 | 96 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 80 | 93,000 | 1M | 45 code / 45 prose |
 | 128 GB | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 108 (or 96) | 125,000 | 1M | 77 code / 49 prose |
-
-## Serve on your network
-
-```bash
-export SUSHI_KEY=<pick a secret>
-sushi serve <pack> --host 0.0.0.0 --api-key-env SUSHI_KEY
-```
-
-Other computers then reach `http://<your-mac-ip>:12345/v1` (`ipconfig getifaddr en0` prints the IP) and send the key
-as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server runs with no key.
 
 ## Benchmarks
 

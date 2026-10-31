@@ -18,7 +18,6 @@
 const std = @import("std");
 const chat = @import("chat.zig");
 const model = @import("model.zig");
-const effort_mod = @import("effort.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 const dflash = @import("dflash.zig");
@@ -965,15 +964,24 @@ fn treeEntryDescends(kind: std.Io.File.Kind) bool {
 }
 
 fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
-    const st = dir.statFile(io, "config.json", .{}) catch return false;
-    return st.kind == .file;
+    if (dir.statFile(io, "config.json", .{})) |st| {
+        if (st.kind == .file) return true;
+    } else |_| {}
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind == .file) return true;
+    }
+    return false;
 }
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
     const bytes = dirBytesOneLevel(io, dir);
-    // TYPE from the same classification serving uses (chat, embed, drafter,
-    // unsupported) so the list is honest about which rows `run` can actually
-    // chat with.
+    // TYPE from the same classification serving uses (gguf → chat via the
+    // embedded engines, media modalities, embed, drafter, unsupported) so
+    // the list is honest about which rows `run` can actually chat with.
     const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
     defer if (abs) |a| allocator.free(a);
     const kind_label: []const u8 = blk: {
@@ -1069,7 +1077,7 @@ pub const Turn = struct {
 };
 
 /// The REPL's thinking request. `model_default` sends no thinking field.
-pub const Think = union(enum) { model_default, on, effort: effort_mod.Effort };
+pub const Think = union(enum) { model_default, on, effort: model.Effort };
 
 pub const ReplOptions = struct {
     think: Think = .model_default,
@@ -1147,7 +1155,7 @@ pub const ThinkFlag = struct { think: Think, consumed: bool };
 
 /// `--think <effort>` requires an explicit effort word.
 pub fn parseThinkFlag(next: ?[]const u8) error{Usage}!ThinkFlag {
-    if (next) |w| if (effort_mod.parseEffort(w)) |e| return .{ .think = .{ .effort = e }, .consumed = true };
+    if (next) |w| if (model.parseEffort(w)) |e| return .{ .think = .{ .effort = e }, .consumed = true };
     return error.Usage;
 }
 
@@ -1155,40 +1163,40 @@ pub const ThinkCommand = union(enum) { show, set: Think, refuse: []const u8 };
 
 /// `/think [effort]`; null when the line is not that command. An empty
 /// `accepted` (the server listed none) leaves the whole vocabulary to the server.
-pub fn parseThinkCommand(line: []const u8, accepted: []const effort_mod.Effort) ?ThinkCommand {
+pub fn parseThinkCommand(line: []const u8, accepted: []const model.Effort) ?ThinkCommand {
     if (!std.mem.startsWith(u8, line, "/think")) return null;
     const rest = line["/think".len..];
     if (rest.len > 0 and rest[0] != ' ') return null;
     const word = std.mem.trim(u8, rest, " \t");
     if (word.len == 0) return .show;
-    const e = effort_mod.parseEffort(word) orelse return .{ .refuse = word };
+    const e = model.parseEffort(word) orelse return .{ .refuse = word };
     return .{ .set = .{ .effort = acceptedEffort(e, accepted) orelse return .{ .refuse = word } } };
 }
 
-/// The effort `e` selects among the server's listed words (`effort_mod.selectEffort`); null = refused.
-pub fn acceptedEffort(e: effort_mod.Effort, accepted: []const effort_mod.Effort) ?effort_mod.Effort {
+/// The effort `e` selects among the server's listed words (`model.selectEffort`); null = refused.
+pub fn acceptedEffort(e: model.Effort, accepted: []const model.Effort) ?model.Effort {
     if (accepted.len == 0) return e;
-    return effort_mod.selectEffort(accepted, e);
+    return model.selectEffort(accepted, e);
 }
 
-fn writeEffortOptions(w: *std.Io.Writer, accepted: []const effort_mod.Effort) !void {
-    const all = std.enums.values(effort_mod.Effort);
+fn writeEffortOptions(w: *std.Io.Writer, accepted: []const model.Effort) !void {
+    const all = std.enums.values(model.Effort);
     const list = if (accepted.len > 0) accepted else all;
     for (list, 0..) |e, i| try w.print("{s}{s}", .{ if (i > 0) ", " else "", @tagName(e) });
 }
 
-/// Same text as the server's 400 (`request_policy.effortRefusal`).
-pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const u8, accepted: []const effort_mod.Effort) !void {
+/// Same text as the server's 400 (`server.effortRefusal`).
+pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const u8, accepted: []const model.Effort) !void {
     try w.print("reasoning effort '{s}' is not supported by {s}; use one of: ", .{ word, model_id });
     try writeEffortOptions(w, accepted);
 }
 
 /// The server's `[effort]` line, when `/think` re-routed `asked`. False when the word was accepted as itself.
-pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: effort_mod.Effort, accepted: []const effort_mod.Effort) !bool {
+pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: model.Effort, accepted: []const model.Effort) !bool {
     if (accepted.len == 0) return false;
-    const pick = effort_mod.selectEffortPick(accepted, asked) orelse return false;
+    const pick = model.selectEffortPick(accepted, asked) orelse return false;
     const from = pick.rerouted_from orelse return false;
-    try w.print("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ model_id, @tagName(from), @tagName(pick.effort) });
+    try w.print("[effort] " ++ model.effort_reroute_notice ++ "\n", .{ model_id, @tagName(from), @tagName(pick.effort) });
     return true;
 }
 
@@ -1203,7 +1211,7 @@ fn writeResponseEffortNotice(w: *std.Io.Writer, head: anytype) !void {
     }
 }
 
-pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const effort_mod.Effort) !void {
+pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const model.Effort) !void {
     try w.writeAll("thinking: ");
     try w.writeAll(switch (think) {
         .model_default => "model default",
@@ -1218,7 +1226,7 @@ pub fn writeThinkSetting(w: *std.Io.Writer, think: Think, accepted: []const effo
 pub const ModelEfforts = struct {
     id: []u8,
     /// Empty when the row lists none.
-    efforts: []effort_mod.Effort,
+    efforts: []model.Effort,
     /// The row lists the `vision` capability.
     vision: bool = false,
 
@@ -1236,11 +1244,11 @@ pub fn parseModelEfforts(allocator: std.mem.Allocator, body: []const u8) !ModelE
     if (data == null or data.? != .array or data.?.array.items.len == 0 or data.?.array.items[0] != .object) return error.ReplNoModel;
     const row = data.?.array.items[0].object;
     const id = if (row.get("id")) |v| (if (v == .string) v.string else "") else "";
-    var efforts = std.ArrayList(effort_mod.Effort).empty;
+    var efforts = std.ArrayList(model.Effort).empty;
     errdefer efforts.deinit(allocator);
     if (row.get("reasoning_efforts")) |list| if (list == .array) for (list.array.items) |v| {
         if (v != .string) continue;
-        if (effort_mod.parseEffort(v.string)) |e| try efforts.append(allocator, e);
+        if (model.parseEffort(v.string)) |e| try efforts.append(allocator, e);
     };
     var vision = false;
     if (row.get("capabilities")) |caps| if (caps == .array) for (caps.array.items) |v| {
@@ -1620,7 +1628,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
     else |_|
         null;
     defer if (models_info) |m| m.deinit(allocator);
-    const accepted: []const effort_mod.Effort = if (models_info) |m| m.efforts else &.{};
+    const accepted: []const model.Effort = if (models_info) |m| m.efforts else &.{};
     var think = opts.think;
     if (think == .effort) {
         const asked = think.effort;
@@ -1690,7 +1698,7 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
                     think = t;
                     try writeThinkSetting(w, think, accepted);
                     const word = std.mem.trim(u8, trimmed["/think".len..], " \t");
-                    if (effort_mod.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
+                    if (model.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
                 },
                 .refuse => |word| try writeEffortRefusal(w, word, if (models_info) |m| m.id else "this model", accepted),
             }
@@ -2046,7 +2054,7 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     // Unknown alias-shaped name → null; upstream families are not served.
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
-    try testing.expect(resolveShortName("unlisted-pack") == null);
+    try testing.expect(resolveShortName("gemma4") == null);
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
@@ -2058,7 +2066,7 @@ test "pull: only the beamster org, an alias or beamster/<repo>, before anything 
     try testing.expectError(error.NotBeamster, checkPullable("https://huggingface.co/Qwen/Qwen3.8-Flash-Next"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster-fake/pack"));
     try testing.expectError(error.NotBeamster, checkPullable("beamster/a/b"));
-    try testing.expectError(error.UnknownModel, checkPullable("unlisted-pack"));
+    try testing.expectError(error.UnknownModel, checkPullable("gemma4"));
     try testing.expect(!isBeamsterRepo("beamster/"));
     try testing.expect(!isBeamsterRepo("beamster"));
 }
@@ -2415,7 +2423,7 @@ test "cli: --think requires an effort word" {
 }
 
 test "cli: /think shows, sets an accepted word, and refuses the rest" {
-    const qwen = [_]effort_mod.Effort{ .off, .low, .medium, .xhigh };
+    const qwen = [_]model.Effort{ .off, .low, .medium, .xhigh };
     try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("/thinking about it", &qwen));
     var notice: [160]u8 = undefined;
     var nw: std.Io.Writer = .fixed(&notice);
@@ -2424,7 +2432,7 @@ test "cli: /think shows, sets an accepted word, and refuses the rest" {
     nw = .fixed(&notice);
     try testing.expect(!try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .low, &qwen));
     try testing.expect(!try writeEffortReroute(&nw, "MiMo", .high, &.{ .off, .on }));
-    const glm = [_]effort_mod.Effort{ .low, .high, .max };
+    const glm = [_]model.Effort{ .low, .high, .max };
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .high } }), parseThinkCommand("/think medium", &glm));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think xhigh", &glm));
     nw = .fixed(&notice);
@@ -2483,7 +2491,7 @@ test "cli: the REPL reads the model's efforts from /v1/models and streams reason
     );
     defer info.deinit(allocator);
     try testing.expectEqualStrings("MiMo", info.id);
-    try testing.expectEqualSlices(effort_mod.Effort, &.{ .off, .low, .max }, info.efforts);
+    try testing.expectEqualSlices(model.Effort, &.{ .off, .low, .max }, info.efforts);
     try testing.expect(info.vision);
     const bare = try parseModelEfforts(allocator, "{\"data\":[{\"id\":\"old\",\"capabilities\":[\"chat\"]}]}");
     defer bare.deinit(allocator);
@@ -2938,6 +2946,20 @@ test "cli: list tree walk descends into symlinked model dirs" {
     try testing.expect(treeEntryDescends(.directory));
     try testing.expect(treeEntryDescends(.sym_link));
     try testing.expect(!treeEntryDescends(.file));
+
+    // Source scan: the org-level and leaf-level loops in listModels must both
+    // consult the predicate — a reintroduced raw `!= .directory` check is the
+    // regression this pins. Needle split so the scan cannot match itself.
+    const src = @embedFile("cli.zig");
+    const needle = "treeEntry" ++ "Descends(";
+    var found: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, needle)) |p| {
+        found += 1;
+        idx = p + needle.len;
+    }
+    // 1 definition + 3 in this test + at least 2 call sites in the walk.
+    try testing.expect(found >= 6);
 }
 
 pub fn isPromptFlag(arg: []const u8) bool {
@@ -3099,18 +3121,18 @@ test "cli: one-shot and REPL omission keep the model default" {
 test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words" {
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, try parseThinkFlag("on"));
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, try parseThinkFlag("minimal"));
-    const mimo = [_]effort_mod.Effort{ .off, .on };
+    const mimo = [_]model.Effort{ .off, .on };
     for ([_][]const u8{ "/think on", "/think minimal", "/think low", "/think medium", "/think high", "/think xhigh", "/think max" }) |line| {
         try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, &mimo));
     }
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think none", &mimo));
-    try testing.expectEqual(@as(?effort_mod.Effort, .on), acceptedEffort(.high, &mimo));
+    try testing.expectEqual(@as(?model.Effort, .on), acceptedEffort(.high, &mimo));
     try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
     try testing.expect(parseThinkCommand("/think minimal", &.{ .low, .high, .max }).? == .refuse);
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }));
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
     try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
-    try testing.expectEqual(@as(?effort_mod.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+    try testing.expectEqual(@as(?model.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
 }
 
 test "hf token: env var, then HF_TOKEN_PATH, then HF_HOME/token, then the default file, then none" {
@@ -3212,7 +3234,7 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try tmp.dir.createDir(io, "pack", .default_dir);
     var pack = try tmp.dir.openDir(io, "pack", .{});
     defer pack.close(io);
-    try @import("glm5/glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
+    try @import("glm_stream_fixture.zig").writeStorage(a, pack, .none, 128, 128, .fp8);
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.Io.Dir.cwd().realPath(io, &cwd_buf);

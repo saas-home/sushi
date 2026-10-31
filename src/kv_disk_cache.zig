@@ -29,11 +29,12 @@
 //! claims (crash between chunk write and meta rename) is sliced down at
 //! restore, never trusted.
 //!
-//! Phase 3 — hybrid SSM archs (GatedDeltaNet):
+//! Phase 3 — hybrid SSM archs (qwen3_5/3_6 GatedDeltaNet, lfm2, nemotron_h):
 //! the RAM tier's per-position `SSMCheckpoint`s persist beside the chunks as
 //!   <base>/<fingerprint>/e<id>/s0002048.safetensors   SSM state at pos 2048
-//! keyed "l{i}.conv"/"l{i}.ssm" (absent key = null state — plain-attention
-//! layers in the hybrid have neither), with the per-layer `initialized` flags in the safetensors
+//! keyed "l{i}.conv"/"l{i}.ssm" (absent key = null state — LFM2 gated-conv
+//! layers have no ssm_state, plain-attention layers in the hybrid have
+//! neither), with the per-layer `initialized` flags in the safetensors
 //! metadata map ("init"). Checkpoint files are immutable once written (keyed
 //! by position); extend commits append only NEW positions, bounded per entry
 //! by `SSM_DISK_MAX_PER_ENTRY` (evict-lowest — the newest positions are where
@@ -54,13 +55,11 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const transformer_mod = @import("transformer.zig");
-const disk_qsa = @import("qwen4/qwen4_disk_qsa.zig");
 const model = @import("model.zig");
+const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
-const write_stats = @import("disk_write_stats.zig");
 const log = @import("log.zig");
-const disk_placement = @import("disk_placement.zig");
 
 const KVCache = transformer_mod.KVCache;
 
@@ -105,6 +104,160 @@ pub const GrownSpec = struct {
     /// Row bytes one token adds across the growing layers.
     row_bytes: u64,
 };
+
+/// One piece of a writer-armed commit: the bytes it stages before its manifest commits. The
+/// commit runs pieces until the entry is whole, so a crash keeps every finished piece.
+pub const FLUSH_PIECE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Guard against a commit that never completes: 64 pieces is 128 GiB, past any tier.
+const MAX_FLUSH_PIECES: usize = 64;
+
+/// Free space the tier never uses, for resolution, every store and the report alike. Sizes are binary
+/// (1 GB = 1 GiB), as the flag parser reads them.
+pub const DISK_FREE_RESERVE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// What the volume leaves the tier: free space less the reserve.
+pub fn freeDiskRoom(free_bytes: u64) u64 {
+    return free_bytes -| DISK_FREE_RESERVE;
+}
+
+/// Bytes this tier may occupy given the operator cap (0 = none) and the volume's free space; null when
+/// nothing is left ("do not store"), never 0.
+pub fn diskBudgetFromFreeSpace(operator_cap: u64, free_bytes: u64) ?u64 {
+    const avail = freeDiskRoom(free_bytes);
+    const budget = if (operator_cap == 0) avail else @min(operator_cap, avail);
+    if (budget == 0) return null;
+    return budget;
+}
+
+/// The unnamed SSD budget's ceiling, the slack added to the per-token formula, and the free space it leaves.
+pub const DEFAULT_DISK_CAP: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_SLACK: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Which term set the SSD budget.
+pub const DiskBound = enum {
+    formula,
+    cap,
+    free_disk,
+    flag,
+
+    pub fn label(self: DiskBound) []const u8 {
+        return switch (self) {
+            .formula => "the formula",
+            .cap => "20 GB cap",
+            .free_disk => "free disk - 4 GB",
+            .flag => "the flag",
+        };
+    }
+};
+
+/// `bytes` is the budget now; `cap` is the operator's ceiling (the flag, or the formula / 20 GB cap), never
+/// derived from free space, which the tier re-reads before every store.
+pub const DefaultDiskBudget = struct { bytes: u64, bound: DiskBound, cap: u64 };
+
+/// An operator's `--prefix-cache-disk` is the budget as given; unnamed it is
+/// `min(entries x context x bytes_per_token + 2 GB, 20 GB, free + held - 4 GB)`, where `held` is what the tier
+/// already occupies on the volume. Null when that is not positive.
+pub fn resolveDiskBudget(explicit: bool, ask: u64, entries: u32, context: u64, bytes_per_token: u64, free_bytes: u64, held_bytes: u64) ?DefaultDiskBudget {
+    if (explicit) return if (ask == 0) null else .{ .bytes = ask, .bound = .flag, .cap = ask };
+    const formula = @as(u64, entries) *| context *| bytes_per_token +| DEFAULT_DISK_SLACK;
+    const room = freeDiskRoom(free_bytes +| held_bytes);
+    if (room == 0) return null;
+    const cap = @min(formula, DEFAULT_DISK_CAP);
+    var out: DefaultDiskBudget = .{ .bytes = cap, .bound = if (DEFAULT_DISK_CAP < formula) .cap else .formula, .cap = cap };
+    if (room < cap) out = .{ .bytes = room, .bound = .free_disk, .cap = cap };
+    return out;
+}
+
+fn toGb(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0 * 1024.0);
+}
+
+/// The startup line for the SSD tier: the sizing terms and the bound that set the number.
+pub fn allocatingDiskLine(buf: []u8, plan: DefaultDiskBudget, entries: u32, context: u64, bytes_per_token: u64, dir: []const u8) []const u8 {
+    const text = if (plan.bound == .flag)
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache (--prefix-cache-disk) at {s}", .{ toGb(plan.bytes), dir })
+    else
+        std.fmt.bufPrint(buf, "Allocating {d:.1} GB SSD for the prefix cache ({d} entries x {d} tokens x {d:.1} KB + 2 GB; bound: {s}) at {s}", .{ toGb(plan.bytes), entries, context, @as(f64, @floatFromInt(bytes_per_token)) / 1024.0, plan.bound.label(), dir });
+    return text catch buf[0..0];
+}
+
+/// The per-turn usage line, also what the web page shows.
+pub fn diskUsageLine(buf: []u8, used: u64, budget: u64, entries: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "[disk-cache] usage {d:.2} / {d:.1} GB, {d} entries", .{ toGb(used), toGb(budget), entries }) catch buf[0..0];
+}
+
+/// The startup line when no SSD budget remains.
+pub fn diskOffLine(buf: []u8, free_bytes: u64, dir: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "SSD prefix cache OFF: {d:.1} GB free at {s} leaves nothing after the 4 GB reserve", .{ toGb(free_bytes), dir }) catch buf[0..0];
+}
+
+/// `volumeSpace` of the nearest existing ancestor: the cache directory is created on first store.
+pub fn volumeSpaceNear(path: []const u8) ?VolumeSpace {
+    var p = path;
+    while (true) {
+        if (volumeSpace(p)) |v| return v;
+        p = std.fs.path.dirname(p) orelse return null;
+    }
+}
+
+/// macOS `struct statfs`, leading fields only; the rest is slack. std has no binding for it.
+const DarwinStatfs = extern struct {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    tail: [4096]u8,
+};
+extern "c" fn statfs(path: [*:0]const u8, buf: *DarwinStatfs) c_int;
+extern fn sushi_volume_free_for_use(path: [*:0]const u8) u64;
+
+pub const VolumeSpace = struct { free: u64, total: u64 };
+
+/// Free and total bytes of the volume holding `path`, or null when the query fails or returns
+/// implausible numbers (the plausibility check is the ABI guard).
+pub fn volumeSpace(path: []const u8) ?VolumeSpace {
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    var st: DarwinStatfs = undefined;
+    if (statfs(buf[0..path.len :0].ptr, &st) != 0) return null;
+    const bsize: u64 = st.f_bsize;
+    if (bsize < 512 or bsize > (1 << 20) or !std.math.isPowerOfTwo(bsize)) return null;
+    if (st.f_blocks == 0 or st.f_bavail > st.f_blocks) return null;
+    const total = bsize *| st.f_blocks;
+    // statfs excludes purgeable space the OS releases on demand; ask what a write really gets.
+    const granted = sushi_volume_free_for_use(buf[0..path.len :0].ptr);
+    return .{ .free = freeForUse(granted, total, bsize *| st.f_bavail), .total = total };
+}
+
+/// Which of the two answers a write really gets: the OS grant when it is one, else statfs.
+fn freeForUse(granted: u64, total: u64, statfs_free: u64) u64 {
+    if (granted > 0 and granted <= total) return granted;
+    return statfs_free;
+}
+
+/// How a `DiskTier` asks what the volume has left. Injectable: with the live probe hard-wired
+/// every SSD-first test asserted a property of the tester's free disk space.
+pub const SpaceProbeFn = *const fn (path: []const u8) ?VolumeSpace;
+
+/// Test hook, armed through `DiskTier.armTestSpace`.
+var test_space: ?VolumeSpace = null;
+var test_qsa_overlay_mismatch = false;
+var test_ssm_write_qsa_aux = false;
+
+/// How many free-space probes the test hook answered.
+var test_space_probes: usize = 0;
+
+fn testSpaceProbe(path: []const u8) ?VolumeSpace {
+    _ = path;
+    test_space_probes += 1;
+    return test_space;
+}
 
 pub const IndexEntry = struct {
     /// Directory id — the `e<id>` component.
@@ -156,9 +309,9 @@ pub const IndexEntry = struct {
     rings: []RingFile = &.{},
     /// v10: the media chain this record's rows were computed under (`prefix_cache.MediaSpan`), as
     /// its last block's key, and the first media placeholder in `tokens`. 0 / null = no media row,
-    /// which is what every pre-v10 record is. A lookup hands the tier per-entry limits
-    /// (`MediaLimits`) computed from these by the one owner of the rule,
-    /// `prefix_cache.crossKeyBoundary`; a commit applies that rule with no chain (`commitShares`).
+    /// which is what every pre-v10 record is. The tier never interprets them: a lookup hands it
+    /// per-entry limits (`MediaLimits`) computed from these by the one owner of the rule,
+    /// `prefix_cache.crossKeyBoundary`.
     vision_key: u64 = 0,
     media_start: ?u32 = null,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
@@ -407,8 +560,6 @@ pub const DiskTier = struct {
     ssm_budget_drops: usize = 0,
     /// Bytes of restore-point and row-segment files staged so far, for the write-through log line.
     point_bytes_written: u64 = 0,
-    /// Bytes this tier wrote, by kind. Heap-allocated: the background writer holds the pointer.
-    stats: *write_stats.Stats,
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -418,7 +569,7 @@ pub const DiskTier = struct {
     /// never a free-space number (`init` seeds it with `max_bytes`; the loader sets the real one).
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
-    space_probe: disk_placement.SpaceProbeFn = disk_placement.volumeSpace,
+    space_probe: SpaceProbeFn = volumeSpace,
     /// The volume has nothing left after `DISK_FREE_RESERVE`: no new entry persists, existing ones stay restorable.
     store_declined: bool = false,
     /// `<base>` (the parent of `root`), for the root-wide sweep. Null when the dupe failed.
@@ -455,22 +606,18 @@ pub const DiskTier = struct {
         defer if (root.ptr != shared.ptr) allocator.free(shared);
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().createDirPath(io, root);
-        var lock = try disk_placement.lockRoot(io, shared);
+        var lock = try lockRoot(io, shared);
         if (lock == null) {
-            const own = try disk_placement.ownPrivateRoot(allocator, io, shared);
+            const own = try ownPrivateRoot(allocator, io, shared);
             root = own.root;
             lock = own.lock;
             log.info("[disk-cache] {s} is in use by another sushi process: this one keeps a private SSD tier at {s}, removed at exit\n", .{ shared, root });
         }
-        disk_placement.reapPrivateRoots(allocator, io, shared);
-        const stats = try allocator.create(write_stats.Stats);
-        errdefer allocator.destroy(stats);
-        stats.* = .{ .parent = &write_stats.process };
+        reapPrivateRoots(allocator, io, shared);
         var self: DiskTier = .{
             .allocator = allocator,
             .io = io,
             .root = root,
-            .stats = stats,
             .max_bytes = max_bytes,
             .operator_cap = max_bytes,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
@@ -491,8 +638,8 @@ pub const DiskTier = struct {
 
     /// Test hook: answer every free-space probe with these numbers. Every SSD-first test must call this.
     pub fn armTestSpace(self: *DiskTier, free: u64, total: u64) void {
-        disk_placement.test_space = .{ .free = free, .total = total };
-        self.space_probe = disk_placement.testSpaceProbe;
+        test_space = .{ .free = free, .total = total };
+        self.space_probe = testSpaceProbe;
     }
 
     /// Arm the background writer. A spawn failure keeps the synchronous path.
@@ -501,14 +648,13 @@ pub const DiskTier = struct {
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
         w.permit_bytes = self.writer_permit_bytes;
-        w.stats = self.stats;
         w.start() catch {
             self.allocator.destroy(w);
             log.warn("[disk-cache] background writer unavailable — writing synchronously\n", .{});
             return;
         };
         self.writer = w;
-        self.max_flush_bytes = disk_placement.FLUSH_PIECE_BYTES;
+        self.max_flush_bytes = FLUSH_PIECE_BYTES;
         log.info("[disk-cache] background writer armed (permit {d} MB, {d} MB pieces, whole entries per commit)\n", .{
             w.permit_bytes / (1024 * 1024),
             self.max_flush_bytes / (1024 * 1024),
@@ -701,10 +847,9 @@ pub const DiskTier = struct {
         }
         self.entries.deinit(self.allocator);
         // Removed under its lock, so no other tier reaps it mid-delete.
-        if (self.private_root) disk_placement.deleteTreeAbsolute(self.io, self.root);
+        if (self.private_root) deleteTreeAbsolute(self.io, self.root);
         if (self.root_lock) |f| f.close(self.io);
         self.root_lock = null;
-        self.allocator.destroy(self.stats);
         self.allocator.free(self.root);
     }
 
@@ -729,10 +874,10 @@ pub const DiskTier = struct {
 
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a volume with
     /// nothing left after the reserve declines new stores without touching what is already persisted.
-    pub fn refreshDiskBudget(self: *DiskTier) void {
+    fn refreshDiskBudget(self: *DiskTier) void {
         const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
-        const budget = disk_placement.diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes);
+        const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.total_bytes);
         if (budget) |b| {
             self.store_declined = false;
             if (b != self.max_bytes) {
@@ -744,7 +889,7 @@ pub const DiskTier = struct {
             log.warn("[disk-cache] {s}: {d} MB free leaves nothing after the {d} MB reserve — no NEW entries persist (already-persisted entries stay restorable)\n", .{
                 self.root,
                 vs.free >> 20,
-                disk_placement.DISK_FREE_RESERVE >> 20,
+                DISK_FREE_RESERVE >> 20,
             });
         }
     }
@@ -755,7 +900,7 @@ pub const DiskTier = struct {
         if (!self.ssd_first) return;
         const base = self.base_dir orelse return;
         self.refreshDiskBudget();
-        disk_placement.sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
+        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -1052,7 +1197,7 @@ pub const DiskTier = struct {
                 } else |_| return error.DiskCacheQsaHistoryGap;
             }
         }
-        if (disk_placement.test_qsa_overlay_mismatch) {
+        if (test_qsa_overlay_mismatch) {
             if (qsa_overlay) |*q| q.deinit(self.allocator);
             qsa_overlay = .{ .pos = 0, .layers = try self.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 0) };
         }
@@ -1365,7 +1510,7 @@ pub const DiskTier = struct {
     /// (caller frees via `deinit`). The recorded layer count must match the
     /// target model's `ssm_entries` — a mismatch inside a fingerprint dir
     /// means corruption, never a different model.
-    pub fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !transformer_mod.SSMCheckpoint {
+    fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !transformer_mod.SSMCheckpoint {
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
         const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
@@ -1394,8 +1539,8 @@ pub const DiskTier = struct {
         var cp: transformer_mod.SSMCheckpoint = .{ .pos = pos, .layers = layers };
         errdefer cp.deinit(self.allocator);
 
-        // Absent key = null state (plain-attention layers in the hybrid have
-        // neither) — that's a valid
+        // Absent key = null state (LFM2 gated-conv layers have no ssm_state;
+        // plain-attention layers in the hybrid have neither) — that's a valid
         // shape, not corruption.
         for (layers, 0..) |*l, li| {
             const ckey = try std.fmt.allocPrint(self.allocator, "l{d}.conv\x00", .{li});
@@ -1667,7 +1812,7 @@ pub const DiskTier = struct {
         if (!whole) return out;
         const first = self.last_store_id orelse return out;
         var pieces: usize = 1;
-        while (out == .partial and pieces < disk_placement.MAX_FLUSH_PIECES) : (pieces += 1) {
+        while (out == .partial and pieces < MAX_FLUSH_PIECES) : (pieces += 1) {
             const before = self.storeProgress(first) orelse break;
             out = try self.appendCommitWithSpecBounded(p, s, self.max_flush_bytes);
             // A piece that landed nothing, or an entry the budget evicted, ends the flush.
@@ -1820,7 +1965,6 @@ pub const DiskTier = struct {
         const has_tools = p.has_tools;
         const ssm_checkpoints = p.ssm_checkpoints;
         const ring = p.ring;
-        const media: CommitMedia = .{ .key = p.vision_key, .start = p.media_start };
         var tokens = all_tokens;
         var dflash_snap = p.dflash_snap;
         var mtp_snap = p.mtp_snap;
@@ -1838,7 +1982,7 @@ pub const DiskTier = struct {
         // land in `tokens`). Persist the prefix covered by the record —
         // positions beyond it are unusable for matching anyway.
         // The KV extent is the initialized layers' offset, NOT `step`: on
-        // hybrid archs (GDN) `cache.step` only bumps on layer 0,
+        // hybrid archs (qwen3_5/3_6 GDN) `cache.step` only bumps on layer 0,
         // which is a GatedDeltaNet layer that never writes KV, so it stays 0
         // while the full-attention layers carry offset == prompt position.
         // `max(step, max initialized offset)` is correct for both — equal on
@@ -1890,7 +2034,7 @@ pub const DiskTier = struct {
         // pending SSM checkpoints (byte-capped across turns), which take a
         // dedicated SSM-only append path (the KV chunks are all present, so
         // the extend machinery would pointlessly rewrite the tail chunk).
-        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+        var target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
         if (target.superseded) return .persisted;
         // Re-derive the budget before every store, and only a store: the probe is slow and the idle
         // spill reaches this point once per idle entry. It also gates the SSM-only append.
@@ -1898,7 +2042,7 @@ pub const DiskTier = struct {
             self.refreshDiskBudget();
             self.ssm_budget = self.pointBudget(kv_entries, kv_target, ssm_checkpoints, ring_srcs, spec_bytes);
             // Its eviction swap-removes: indices picked above may now name other entries.
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         // A sole entry never outgrows the tier: its oldest points go first (`ssm_budget`); a record whose rows
@@ -1919,7 +2063,7 @@ pub const DiskTier = struct {
                 self.allocator.free(ring_srcs);
                 ring_srcs = srcs;
             }
-            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, media, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
+            target = self.selectStoreTarget(tokens, kv_target, has_tools, config, ssm_checkpoints, dflash_snap, mtp_snap, ring_srcs);
             if (target.superseded) return .persisted;
         }
         const extend_idx = target.extend_idx;
@@ -1944,7 +2088,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2032,7 +2176,10 @@ pub const DiskTier = struct {
             return if (chunk_complete) .persisted else .partial;
         }
 
-        const prefix_rows: u32 = if (donor) |d| @min(d.shared, kv_len) else kv_len;
+        const prefix_rows: u32 = if (donor) |d|
+            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)))
+        else
+            kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
@@ -2053,8 +2200,8 @@ pub const DiskTier = struct {
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
-        // earlier chunks were committed against). An extension appends only its new tail: the
-        // manifest still on disk names the old count, and the scan reads a longer record at it.
+        // earlier chunks were committed against). Rewritten only on growth;
+        // tens of KB at most.
         const record: []const u32 = if (extend_idx) |i| blk: {
             const et = self.entries.items[i].tokens;
             break :blk if (et.len >= tokens.len) et else tokens;
@@ -2062,19 +2209,12 @@ pub const DiskTier = struct {
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
-            const have: usize = if (extend_idx) |i| self.entries.items[i].tokens.len else 0;
-            const from: usize = if (have * 4 <= (fileSize(self.io, tpath) orelse 0)) have else 0;
-            errdefer self.stats.recordFailed((record.len - from) * 4);
-            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{ .truncate = from == 0 });
+            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{});
             defer f.close(self.io);
             var wb: [8192]u8 = undefined;
             var fw = f.writer(self.io, &wb);
-            try fw.seekTo(from * 4);
-            try fw.interface.writeSliceEndian(u32, record[from..], .little);
+            try fw.interface.writeSliceEndian(u32, record, .little);
             try fw.interface.flush();
-            // Bytes past the record (a torn or stale tail) would never be billed or swept.
-            try f.setLength(self.io, record.len * 4);
-            self.stats.recordWritten(.meta, (record.len - from) * 4);
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -2334,7 +2474,7 @@ pub const DiskTier = struct {
             n_meta += 1;
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
-        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], .spec, s);
+        res.bytes = try self.saveNamed(path, list.items, meta[0..n_meta], s);
         return res;
     }
 
@@ -2633,9 +2773,9 @@ pub const DiskTier = struct {
     }
 
     /// One staged tensor on the way to a safetensors file.
-    pub const NamedTensor = struct { key: []u8, arr: mlx.mlx_array };
+    const NamedTensor = struct { key: []u8, arr: mlx.mlx_array };
 
-    pub fn freeNamed(self: *DiskTier, list: *std.ArrayList(NamedTensor)) void {
+    fn freeNamed(self: *DiskTier, list: *std.ArrayList(NamedTensor)) void {
         for (list.items) |*t| {
             self.allocator.free(t.key);
             _ = mlx.mlx_array_free(t.arr);
@@ -2663,7 +2803,7 @@ pub const DiskTier = struct {
             try self.appendLayerSlices(&list, li, entry, config, c0, c1, s);
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
-        return self.saveNamed(path, list.items, no_meta, .kv, s);
+        return self.saveNamed(path, list.items, no_meta, s);
     }
 
     /// One layer's K/V rows `[r0, r1)` of its own buffers, every stored kind.
@@ -2689,18 +2829,8 @@ pub const DiskTier = struct {
 
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
-    pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s);
-        const size = self.saveSync(path, list, meta) catch |err| {
-            self.stats.recordFailed(dataLen(list));
-            return err;
-        };
-        self.stats.recordWritten(kind, size);
-        return size;
-    }
-
-    /// The synchronous arm of `saveNamed`; takes `path`.
-    fn saveSync(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair) !u64 {
+    fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, s);
         defer self.allocator.free(path);
         const tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -2839,7 +2969,7 @@ pub const DiskTier = struct {
 
     /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
     /// when larger, each allocated only once the permit has room for it. Takes `path`.
-    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
@@ -2869,7 +2999,7 @@ pub const DiskTier = struct {
                 return err;
             };
             if (last) path_owned = null;
-            w.submitPart(blob_path, bytes, part, kind); // takes both buffers
+            w.submitPart(blob_path, bytes, part); // takes both buffers
             staged += n;
         }
         return total;
@@ -2967,7 +3097,7 @@ pub const DiskTier = struct {
             }
         }
         const path = try std.fmt.allocPrint(self.allocator, "{s}/g{d:0>5}.safetensors", .{ dir_rel, j });
-        return self.saveNamed(path, list.items, no_meta, .ssm, s);
+        return self.saveNamed(path, list.items, no_meta, s);
     }
 
     /// Writes the row segments `cp`'s point leans on that the entry lacks, from `cp`'s own rows; returns how many it leans on.
@@ -3026,27 +3156,14 @@ pub const DiskTier = struct {
 
     const StoreTarget = struct { superseded: bool = false, extend_idx: ?usize = null, ssm_only_idx: ?usize = null };
 
-    /// A commit's media identity, as `CommitParams` carries it.
-    const CommitMedia = struct { key: u64, start: ?u32 };
-
-    /// Leading rows of `e` that are also a commit's rows: `prefix_cache.crossKeyBoundary` with no
-    /// chain. An equal key shares everything; any other pair only the text before either side's
-    /// first media row, since two same-size images render the same placeholder ids.
-    fn commitShares(e: *const IndexEntry, media: CommitMedia) u32 {
-        if (e.vision_key == media.key) return MediaLimits.UNBOUNDED;
-        const es = e.media_start orelse return media.start orelse 0;
-        return if (media.start) |cs| @min(es, cs) else es;
-    }
-
-    /// Which resident entry a commit of `tokens` supersedes, extends or tops up: only one whose
-    /// rows are the commit's wherever both records reach. Indices are valid only until the next eviction.
+    /// Which resident entry a commit of `tokens` supersedes, extends or tops up. Indices are valid
+    /// only until the next eviction.
     fn selectStoreTarget(
         self: *DiskTier,
         tokens: []const u32,
         kv_target: u32,
         has_tools: bool,
         config: kv_quant.KVQuantConfig,
-        media: CommitMedia,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         dflash_snap: ?SpecCommit,
         mtp_snap: ?SpecCommit,
@@ -3057,12 +3174,9 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // dead: never superseded, never extended
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            // Covering the commit needs its rows through `tokens`; resuming the entry keeps all of its own.
-            const shares = commitShares(e, media);
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
-                        if (shares < tokens.len) continue;
                         if (!self.ssmWorkPending(e, ssm_checkpoints, @intCast(e.tokens.len)) and
                             !specWorkPending(e, dflash_snap, mtp_snap) and
                             !self.ringWorkPending(e, ring_srcs))
@@ -3076,9 +3190,9 @@ pub const DiskTier = struct {
                     }
                     // Same token record, SHORTER persisted KV — a byte-capped
                     // incremental flush in progress. Resume into its dir.
-                    if (shares >= e.tokens.len) t.extend_idx = i;
+                    t.extend_idx = i;
                 }
-            } else if (shares >= e.tokens.len and std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
+            } else if (std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) {
                 // This commit extends `e` — reuse its directory and chunks.
                 t.extend_idx = i;
             }
@@ -3210,7 +3324,7 @@ pub const DiskTier = struct {
     /// Per-layer tensors keyed "l{i}.conv"/"l{i}.ssm"; the `initialized` bitmap rides the
     /// metadata map. Staged because this runs inside the prefill chunk loop, where a
     /// synchronous ~56 MB write was the largest term of the mid-prefill write-through.
-    pub fn writeSsmFile(
+    fn writeSsmFile(
         self: *DiskTier,
         dir_rel: []const u8,
         cp: *const transformer_mod.SSMCheckpoint,
@@ -3270,7 +3384,7 @@ pub const DiskTier = struct {
             const names = .{ "conv", "ssm", "aux", "pooled" };
             const arrs = .{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled };
             inline for (names, arrs) |name, arr| {
-                const skip_qsa = qsa_hist and !disk_placement.test_ssm_write_qsa_aux and (comptime std.mem.eql(u8, name, "pooled"));
+                const skip_qsa = qsa_hist and !test_ssm_write_qsa_aux and (comptime std.mem.eql(u8, name, "pooled"));
                 // A growing array keeps the rows its segments do not hold; nothing is written when none remain.
                 const cut = grown_k > 0 and growable(divs, span, li, arr);
                 const from: usize = if (cut) @as(usize, grown_k) * span / divs[li] else 0;
@@ -3312,10 +3426,180 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-        return self.saveNamed(path, list.items, meta.items, .ssm, s);
+        return self.saveNamed(path, list.items, meta.items, s);
     }
 
-    pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
+    fn qsaHistoryRowsOf(cp: *const transformer_mod.SSMCheckpoint) c_int {
+        var r: c_int = 0;
+        for (cp.layers) |*l| {
+            if (l.qsa_rows > r) r = l.qsa_rows;
+            if (!transformer_mod.snapshotHasQsaHistory(l)) continue;
+            if (l.aux_state.ctx != null) {
+                const sh = mlx.getShape(l.aux_state);
+                if (sh.len >= 2 and sh[1] > r) r = sh[1];
+            }
+        }
+        return r;
+    }
+
+    fn newestQsaCheckpoint(cps: []const transformer_mod.SSMCheckpoint) ?*const transformer_mod.SSMCheckpoint {
+        var i = cps.len;
+        while (i > 0) {
+            i -= 1;
+            if (transformer_mod.checkpointHasQsaPooled(&cps[i])) return &cps[i];
+        }
+        return null;
+    }
+
+    const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
+
+    fn writeQsaHistoryFile(
+        self: *DiskTier,
+        dir_rel: []const u8,
+        cp: *const transformer_mod.SSMCheckpoint,
+        s: mlx.mlx_stream,
+    ) !u64 {
+        var list = std.ArrayList(NamedTensor).empty;
+        defer self.freeNamed(&list);
+        var meta = std.ArrayList(MetaPair).empty;
+        defer meta.deinit(self.allocator);
+        var ratio_buf: [16]u8 = undefined;
+        var rows_buf: [16]u8 = undefined;
+        var ratio_written = false;
+        const rows = DiskTier.qsaHistoryRowsOf(cp);
+        if (rows > 0) {
+            const rs = try std.fmt.bufPrint(&rows_buf, "{d}\x00", .{rows});
+            try meta.append(self.allocator, .{ .key = "qsa_rows", .value = rs[0 .. rs.len - 1] });
+        }
+        for (cp.layers, 0..) |l, li| {
+            const names = .{ "aux", "pooled" };
+            const arrs = .{ l.aux_state, l.qsa_pooled };
+            inline for (names, arrs) |name, arr| {
+                if (arr.ctx != null) {
+                    const key = try std.fmt.allocPrint(self.allocator, "l{d}." ++ name, .{li});
+                    errdefer self.allocator.free(key);
+                    var owned = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(owned);
+                    try mlx.check(mlx.mlx_array_set(&owned, arr));
+                    try list.append(self.allocator, .{ .key = key, .arr = owned });
+                }
+            }
+            if (!ratio_written and (l.aux_state.ctx != null or l.qsa_pooled.ctx != null)) {
+                const rs = try std.fmt.bufPrint(&ratio_buf, "{d}\x00", .{l.qsa_ratio});
+                try meta.append(self.allocator, .{ .key = "qsa_ratio", .value = rs[0 .. rs.len - 1] });
+                ratio_written = true;
+            }
+        }
+        if (list.items.len == 0) return 0;
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
+        return self.saveNamed(path, list.items, meta.items, s);
+    }
+
+    fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !transformer_mod.SSMCheckpoint {
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors\x00", .{ self.root, id });
+        defer self.allocator.free(path);
+        if (fileSize(self.io, path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
+        var tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        var meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+
+        const layers = try self.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, n_layers);
+        for (layers) |*l| l.* = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = false,
+        };
+        var cp: transformer_mod.SSMCheckpoint = .{ .pos = 0, .layers = layers };
+        errdefer cp.deinit(self.allocator);
+        for (layers, 0..) |*l, li| {
+            const akey = try std.fmt.allocPrint(self.allocator, "l{d}.aux\x00", .{li});
+            defer self.allocator.free(akey);
+            var aux = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&aux, tensor_map, @ptrCast(akey.ptr)) == 0) {
+                l.aux_state = aux;
+            } else {
+                _ = mlx.mlx_array_free(aux);
+            }
+            const pkey = try std.fmt.allocPrint(self.allocator, "l{d}.pooled\x00", .{li});
+            defer self.allocator.free(pkey);
+            var pooled = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&pooled, tensor_map, @ptrCast(pkey.ptr)) == 0) {
+                l.qsa_pooled = pooled;
+            } else {
+                _ = mlx.mlx_array_free(pooled);
+            }
+        }
+        var ratio_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&ratio_c, meta_map, "qsa_ratio") == 0) {
+            const ratio = std.fmt.parseInt(c_int, std.mem.span(ratio_c), 10) catch return error.DiskCacheCorruptSsm;
+            for (layers) |*l| l.qsa_ratio = ratio;
+        }
+        var rows_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&rows_c, meta_map, "qsa_rows") == 0) {
+            const rows = std.fmt.parseInt(c_int, std.mem.span(rows_c), 10) catch return error.DiskCacheCorruptSsm;
+            for (layers) |*l| l.qsa_rows = rows;
+            cp.pos = @intCast(rows);
+        } else {
+            cp.pos = @intCast(DiskTier.qsaHistoryRowsOf(&cp));
+        }
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var count: usize = 0;
+            for (layers) |*l| {
+                inline for (.{ l.aux_state, l.qsa_pooled }) |arr| {
+                    if (arr.ctx != null) {
+                        _ = mlx.mlx_vector_array_append_value(vec, arr);
+                        count += 1;
+                    }
+                }
+            }
+            if (count > 0) try mlx.check(mlx.mlx_eval(vec));
+        }
+        if (cp.pos == 0) cp.pos = @intCast(DiskTier.qsaHistoryRowsOf(&cp));
+        // A v7 file holds the WHOLE raw history, and a mid-block checkpoint's leftover is
+        // interior to it: the ring truncation belongs to the live entry the restore seeds,
+        // not to the file it slices that ring out of.
+        for (layers) |*l| {
+            if (l.qsa_rows == 0) l.qsa_rows = @intCast(cp.pos);
+        }
+        if (!transformer_mod.checkpointHasQsaHistory(&cp)) return error.DiskCacheNoCheckpoint;
+        return cp;
+    }
+
+    fn persistQsaHistory(
+        self: *DiskTier,
+        dir_rel: []const u8,
+        cps_opt: ?[]const transformer_mod.SSMCheckpoint,
+        inherited: bool,
+        inherited_rows: u32,
+        held_bytes: u64,
+        prefix_rows: u32,
+        s: mlx.mlx_stream,
+    ) !QsaHistoryResult {
+        // No new checkpoint leaves the owned QSA file, and its bill, intact.
+        const kept: QsaHistoryResult = .{ .inherited = inherited, .rows = inherited_rows, .bytes = if (inherited) 0 else held_bytes };
+        const cps = cps_opt orelse return kept;
+        const src = DiskTier.newestQsaCheckpoint(cps) orelse return kept;
+        const rows: u32 = @intCast(DiskTier.qsaHistoryRowsOf(src));
+        // An owned bank already covering the newcomer stays: retained checkpoints may need its extra rows.
+        if (!inherited and held_bytes > 0 and rows <= inherited_rows) return kept;
+        if (inherited and rows > 0 and rows <= inherited_rows and rows <= prefix_rows) {
+            return .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 };
+        }
+        if (inherited) {
+            const qpath = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
+            defer self.allocator.free(qpath);
+            if (self.writer) |w| w.fence(qpath);
+            std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
+        }
+        const bytes = try self.writeQsaHistoryFile(dir_rel, src, s);
+        return .{ .bytes = bytes, .rows = rows, .inherited = false };
+    }
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
         const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
@@ -3471,7 +3755,7 @@ pub const DiskTier = struct {
         var lc_buf: [24]u8 = undefined;
         const lc = try std.fmt.bufPrint(&lc_buf, "{d}", .{src.entries.len});
         const path = try std.fmt.allocPrint(self.allocator, "{s}/r{d:0>7}.safetensors", .{ dir_rel, src.pos });
-        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, .ring, s);
+        return self.saveNamed(path, list.items, &.{.{ .key = "layers", .value = lc }}, s);
     }
 
     fn deleteRingFile(self: *DiskTier, id: u64, pos: u32) void {
@@ -3557,27 +3841,25 @@ pub const DiskTier = struct {
     }
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
-    /// same tool flag and kv-quant config, most whole chunks below the prefix whose rows are the
-    /// commit's (`commitShares`). Null on the synchronous legacy arm.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: CommitMedia) ?ChunkDonor {
+    /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
+    /// the synchronous legacy arm.
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const common: u32 = @min(@as(u32, @intCast(commonPrefixLen(e.tokens, tokens))), commitShares(e, media));
-            const shared = @min(common, kv_target, e.kv_len);
-            const whole: u32 = shared / self.chunk_tokens;
+            const shared: u64 = @min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len));
+            const whole: u32 = @intCast(shared / self.chunk_tokens);
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
-            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable, .shared = common };
+            if (best == null or usable > best.?.chunks) best = .{ .idx = i, .id = e.id, .chunks = usable };
         }
         return best;
     }
 
-    /// `shared`: the leading tokens whose rows the donor and the heir provably agree on.
-    pub const ChunkDonor = struct { idx: usize, id: u64, chunks: u32, shared: u32 };
+    const ChunkDonor = struct { idx: usize, id: u64, chunks: u32 };
 
     /// Hard-link the donor's leading landed chunk files into `e<id>/`; returns how many. Stops
     /// at the first chunk not landed and never touches the donor's queue (`Writer.fence` would
@@ -3612,8 +3894,28 @@ pub const DiskTier = struct {
         return linked;
     }
 
+    fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
+        const donor = &self.entries.items[d.idx];
+        if (donor.qsa_history_bytes == 0 or donor.qsa_history_rows == 0) return false;
+        const old_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, d.id }) catch return false;
+        defer self.allocator.free(old_abs);
+        if (!self.chunkLanded(old_abs, donor.qsa_history_bytes)) return false;
+        var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch return false;
+        defer root_dir.close(self.io);
+        const old_sub = std.fmt.allocPrint(self.allocator, "e{d}/qsa.safetensors", .{d.id}) catch return false;
+        defer self.allocator.free(old_sub);
+        const new_sub = std.fmt.allocPrint(self.allocator, "e{d}/qsa.safetensors", .{id}) catch return false;
+        defer self.allocator.free(new_sub);
+        std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
+            log.warn("  [disk-cache] chunk share: link e{d}/qsa -> e{d} failed: {s} — writing the history instead\n", .{ d.id, id, @errorName(err) });
+            return false;
+        };
+        log.info("  [disk-cache] chunk share: e{d} inherits qsa history from e{d} by hard link\n", .{ id, d.id });
+        return true;
+    }
+
     /// Has a chunk file landed: final name, recorded size, and no write to it queued or in flight?
-    pub fn chunkLanded(self: *DiskTier, abs_path: []const u8, want_size: u64) bool {
+    fn chunkLanded(self: *DiskTier, abs_path: []const u8, want_size: u64) bool {
         const st = statFile(self.io, abs_path) orelse return false;
         if (st.size != want_size) return false;
         if (self.writer) |w| {
@@ -3660,7 +3962,7 @@ pub const DiskTier = struct {
         }
     }
 
-    pub fn writeMeta(self: *DiskTier, e: IndexEntry) !void {
+    fn writeMeta(self: *DiskTier, e: IndexEntry) !void {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
         try self.renderMeta(&buf, e);
@@ -3674,13 +3976,12 @@ pub const DiskTier = struct {
             errdefer self.allocator.free(final_path);
             w.waitForRoom(buf.items.len);
             const bytes = try buf.toOwnedSlice(self.allocator);
-            w.submit(final_path, bytes, .meta);
+            w.submit(final_path, bytes);
             return;
         }
         defer self.allocator.free(final_path);
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.{d}.tmp", .{ self.root, e.id, std.c.getpid() });
         defer self.allocator.free(tmp_path);
-        errdefer self.stats.recordFailed(buf.items.len);
         {
             const f = try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
             defer f.close(self.io);
@@ -3690,13 +3991,12 @@ pub const DiskTier = struct {
             try fw.interface.flush();
         }
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
-        self.stats.recordWritten(.meta, buf.items.len);
     }
 
     /// The lowest manifest version that describes this entry. The version is a compatibility
     /// claim: an older reader accepts only 2..4, so stamping v6 unconditionally made a binary
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
-    pub fn metaVersionFor(e: IndexEntry) u8 {
+    fn metaVersionFor(e: IndexEntry) u8 {
         // v11: an older reader would look for rows in the point files, which keep only the ones past the segments.
         if (e.grown.len > 0) return 11;
         // v10: an older reader knows no media identity, so it would hand a text prompt rows that
@@ -3890,7 +4190,7 @@ pub const DiskTier = struct {
         e.bytes = billed;
     }
 
-    pub fn loadEntry(self: *DiskTier, id: u64) ?struct { e: IndexEntry, mtime: i128 } {
+    fn loadEntry(self: *DiskTier, id: u64) ?struct { e: IndexEntry, mtime: i128 } {
         const meta_path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, id }) catch return null;
         defer self.allocator.free(meta_path);
 
@@ -3965,8 +4265,7 @@ pub const DiskTier = struct {
             return null;
         };
         defer self.allocator.free(raw);
-        // Longer is an extend's append that died before its manifest landed: the first `n_tokens` are the record.
-        if (raw.len < n_tokens * 4) {
+        if (raw.len != n_tokens * 4) {
             self.allocator.free(chunk_bytes);
             return null;
         }
@@ -4224,15 +4523,348 @@ pub const DiskTier = struct {
             .mtime = stat.mtime.nanoseconds,
         };
     }
-    pub const linkInheritedQsa = disk_qsa.linkInheritedQsa;
-    pub const loadQsaHistoryFile = disk_qsa.loadQsaHistoryFile;
-    pub const newestQsaCheckpoint = disk_qsa.newestQsaCheckpoint;
-    pub const persistQsaHistory = disk_qsa.persistQsaHistory;
-    pub const qsaHistoryRowsOf = disk_qsa.qsaHistoryRowsOf;
-    pub const writeQsaHistoryFile = disk_qsa.writeQsaHistoryFile;
 };
 
 // ── Model fingerprint ──
+
+/// Identity of the weights the persisted KV was computed against: absolute
+/// model dir + config.json size/mtime. A re-downloaded or re-quantized
+/// checkpoint rewrites config.json, which rolls the fingerprint and orphans
+/// the stale KV (GC'd by the disk budget eventually; different fingerprint
+/// dirs never mix). 16 hex chars of XxHash64.
+/// Root-wide LRU sweep across sibling model fingerprints (never `keep_root`, which the tier's
+/// own `scan` owns), oldest first until they fit `sibling_budget`, plus index-less strays that
+/// are old enough to be crash leftovers. Best effort.
+pub fn sweepBase(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    base_dir: []const u8,
+    keep_root: []const u8,
+    sibling_budget: u64,
+) void {
+    var base = std.Io.Dir.openDirAbsolute(io, base_dir, .{ .iterate = true }) catch return;
+    defer base.close(io);
+
+    const Victim = struct { path: []u8, bytes: u64, mtime: i128 };
+    var victims = std.ArrayList(Victim).empty;
+    defer {
+        for (victims.items) |v| allocator.free(v.path);
+        victims.deinit(allocator);
+    }
+    var total: u64 = 0;
+    var strays: usize = 0;
+    var seen = InodeSet.init(allocator);
+    defer seen.deinit();
+    // Each swept root's lock is held to the end: a root a live tier owns is skipped, and no tier
+    // can take one while its entries are being deleted.
+    var held = std.ArrayList(std.Io.File).empty;
+    defer {
+        for (held.items) |f| f.close(io);
+        held.deinit(allocator);
+    }
+
+    var fps = base.iterate();
+    while (fps.next(io) catch null) |fp| {
+        if (fp.kind != .directory) continue;
+        const fp_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fp.name }) catch continue;
+        defer allocator.free(fp_abs);
+        if (std.mem.eql(u8, fp_abs, keep_root)) continue; // the live tier owns its own
+        const lock = (lockRoot(io, fp_abs) catch continue) orelse continue;
+        held.append(allocator, lock) catch {
+            lock.close(io);
+            continue;
+        };
+        reapPrivateRoots(allocator, io, fp_abs);
+
+        var fpd = std.Io.Dir.openDirAbsolute(io, fp_abs, .{ .iterate = true }) catch continue;
+        defer fpd.close(io);
+        var es = fpd.iterate();
+        while (es.next(io) catch null) |dent| {
+            if (dent.kind != .directory) continue;
+            if (dent.name.len < 2 or dent.name[0] != 'e') continue;
+            const e_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ fp_abs, dent.name }) catch continue;
+            const meta = std.fmt.allocPrint(allocator, "{s}/meta.json", .{e_abs}) catch {
+                allocator.free(e_abs);
+                continue;
+            };
+            defer allocator.free(meta);
+            const st = std.Io.Dir.cwd().statFile(io, meta, .{}) catch {
+                // No index: a crash leftover, OR another server's flush in progress (meta lands
+                // last). Age is the only signal.
+                if (dirYoungerThan(io, e_abs, STRAY_MIN_AGE_NS)) {
+                    allocator.free(e_abs);
+                    continue;
+                }
+                deleteTreeAbsolute(io, e_abs);
+                allocator.free(e_abs);
+                strays += 1;
+                continue;
+            };
+            // A `.tmp` older than the same bar is a crash leftover of the writer's tmp+rename.
+            reapStaleTmp(io, e_abs);
+            const bytes = dirBytes(io, e_abs, &seen);
+            total += bytes;
+            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
+                allocator.free(e_abs);
+            };
+        }
+    }
+
+    if (strays > 0) log.info("  [disk-cache] swept {d} stray entry directories under {s}\n", .{ strays, base_dir });
+    if (total <= sibling_budget) return;
+
+    std.mem.sort(Victim, victims.items, {}, struct {
+        fn lt(_: void, a: Victim, b: Victim) bool {
+            return a.mtime < b.mtime;
+        }
+    }.lt);
+    var freed: u64 = 0;
+    for (victims.items) |v| {
+        if (total -| freed <= sibling_budget) break;
+        deleteTreeAbsolute(io, v.path);
+        freed += v.bytes;
+    }
+    if (freed > 0) {
+        log.info("  [disk-cache] root-wide LRU freed {d} MB across other models ({d} MB held, {d} MB budget)\n", .{
+            freed >> 20,
+            total >> 20,
+            sibling_budget >> 20,
+        });
+    }
+}
+
+/// The flock that marks a tier root as owned by a live tier (`DiskTier.root_lock`).
+const ROOT_LOCK_NAME = ".lock";
+
+/// Distinguishes the private roots of several tiers in one process.
+var private_root_seq = std.atomic.Value(u32).init(0);
+
+/// Take `<root_abs>/.lock` without waiting; the returned file holds the lock until closed.
+/// Null when a live tier holds it. The lock file is never unlinked (a racing open would lock a
+/// second inode).
+fn lockRoot(io: std.Io, root_abs: []const u8) !?std.Io.File {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/" ++ ROOT_LOCK_NAME, .{root_abs});
+    return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = false, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
+        error.WouldBlock => null,
+        else => err,
+    };
+}
+
+/// Does a live tier own `root_abs`? A root without a lock file has none.
+pub fn rootIsLive(io: std.Io, root_abs: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&buf, "{s}/" ++ ROOT_LOCK_NAME, .{root_abs}) catch return true;
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{ .lock = .exclusive, .lock_nonblocking = true }) catch |err|
+        return err != error.FileNotFound;
+    f.close(io);
+    return false;
+}
+
+/// Create and lock a private root `<shared>/p<pid>-<n>` for a tier whose shared root is owned.
+fn ownPrivateRoot(allocator: std.mem.Allocator, io: std.Io, shared: []const u8) !struct { root: []u8, lock: std.Io.File } {
+    for (0..8) |_| {
+        const root = try std.fmt.allocPrint(allocator, "{s}/p{d}-{d}", .{ shared, std.c.getpid(), private_root_seq.fetchAdd(1, .monotonic) });
+        errdefer allocator.free(root);
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        if (try lockRoot(io, root)) |lock| return .{ .root = root, .lock = lock };
+        allocator.free(root);
+    }
+    return error.DiskCacheRootBusy;
+}
+
+/// Remove the private roots under `root_abs` whose tier is gone (a crash skips `deinit`). A young
+/// one may belong to a tier between its mkdir and its lock.
+fn reapPrivateRoots(allocator: std.mem.Allocator, io: std.Io, root_abs: []const u8) void {
+    var d = std.Io.Dir.openDirAbsolute(io, root_abs, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'p') continue;
+        const sub = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_abs, dent.name }) catch continue;
+        defer allocator.free(sub);
+        const lock = (lockRoot(io, sub) catch continue) orelse continue;
+        defer lock.close(io);
+        if (dirYoungerThan(io, sub, STRAY_MIN_AGE_NS)) continue;
+        log.info("  [disk-cache] removing {s}, the private SSD tier of a process that is gone\n", .{sub});
+        d.deleteTree(io, dent.name) catch {};
+    }
+}
+
+/// How old an index-less entry directory must be before a sweep may treat it as a crash leftover.
+const STRAY_MIN_AGE_NS: i128 = 10 * 60 * @as(i128, std.time.ns_per_s);
+
+/// True when any regular file directly inside `dir_abs` was modified within `age_ns`. Unreadable = young.
+fn dirYoungerThan(io: std.Io, dir_abs: []const u8, age_ns: i128) bool {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return true;
+    defer d.close(io);
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        const st = d.statFile(io, dent.name, .{}) catch return true;
+        if (now -| st.mtime.nanoseconds < age_ns) return true;
+    }
+    return false;
+}
+
+/// Delete `.tmp` files in `dir_abs` older than `STRAY_MIN_AGE_NS`.
+fn reapStaleTmp(io: std.Io, dir_abs: []const u8) void {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        if (!std.mem.endsWith(u8, dent.name, ".tmp")) continue;
+        const st = d.statFile(io, dent.name, .{}) catch continue;
+        if (now -| st.mtime.nanoseconds < STRAY_MIN_AGE_NS) continue;
+        d.deleteFile(io, dent.name) catch {};
+    }
+}
+
+/// Bytes the tier `<base>/<fingerprint>` already holds on the volume: the files of every `e<id>` directory.
+pub fn tierBytes(io: std.Io, base_dir: []const u8, fingerprint: []const u8) u64 {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = std.fmt.bufPrint(&root_buf, "{s}/{s}", .{ base_dir, fingerprint }) catch return 0;
+    // Another live tier's bytes: a tier loading beside it keeps a private root (`DiskTier.init`).
+    if (rootIsLive(io, root)) return 0;
+    var d = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var seen = InodeSet.init(std.heap.page_allocator);
+    defer seen.deinit();
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .directory or dent.name.len < 2 or dent.name[0] != 'e') continue;
+        var e_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const e_abs = std.fmt.bufPrint(&e_buf, "{s}/{s}", .{ root, dent.name }) catch continue;
+        total +|= dirBytes(io, e_abs, &seen);
+    }
+    return total;
+}
+
+/// Inodes already counted: chunk sharing hard-links one file into several entries.
+const InodeSet = std.AutoHashMap(std.Io.File.INode, void);
+
+/// Bytes of the regular files directly inside `dir_abs` whose inode `seen` has not counted yet.
+fn dirBytes(io: std.Io, dir_abs: []const u8, seen: *InodeSet) u64 {
+    var d = std.Io.Dir.openDirAbsolute(io, dir_abs, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    var total: u64 = 0;
+    var it = d.iterate();
+    while (it.next(io) catch null) |dent| {
+        if (dent.kind != .file) continue;
+        const st = d.statFile(io, dent.name, .{}) catch continue;
+        if (st.nlink > 1 and (seen.fetchPut(st.inode, {}) catch null) != null) continue;
+        total += st.size;
+    }
+    return total;
+}
+
+fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
+    const parent = std.fs.path.dirname(dir_abs) orelse return;
+    const name = std.fs.path.basename(dir_abs);
+    var pd = std.Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true }) catch return;
+    defer pd.close(io);
+    pd.deleteTree(io, name) catch {};
+}
+
+fn fingerprintFile(h: *std.hash.XxHash64, io: std.Io, dir: std.Io.Dir, name: []const u8) void {
+    h.update(name);
+    h.update(&[_]u8{0});
+    const st = dir.statFile(io, name, .{}) catch {
+        h.update(&[_]u8{0});
+        return;
+    };
+    h.update(&[_]u8{1});
+    h.update(std.mem.asBytes(&st.size));
+    const mt: i128 = st.mtime.nanoseconds;
+    h.update(std.mem.asBytes(&mt));
+}
+
+pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
+    return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+/// `layout` names a stored-state layout the model files do not tell apart; null keeps the historical fingerprint.
+pub fn modelFingerprintWithLayout(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, layout: ?[]const u8) ![]u8 {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return error.BadModelDir;
+    var h = std.hash.XxHash64.init(0x6b76_6361_6368_6531);
+    h.update(model_dir);
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
+    defer allocator.free(cfg_path);
+    if (statFile(io, cfg_path)) |st| {
+        h.update(std.mem.asBytes(&st.size));
+        const mt: i128 = st.mtime.nanoseconds;
+        h.update(std.mem.asBytes(&mt));
+    }
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+    var names = std.ArrayList([]const u8).empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    if (referenced) |r| {
+        var it = r.keyIterator();
+        while (it.next()) |name| {
+            const owned = try allocator.dupe(u8, name.*);
+            errdefer allocator.free(owned);
+            try names.append(allocator, owned);
+        }
+    } else {
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            const owned = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(owned);
+            try names.append(allocator, owned);
+        }
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.less);
+    for (names.items) |name| fingerprintFile(&h, io, dir, name);
+    fingerprintFile(&h, io, dir, "ngram_table.bin");
+    if (model.getConfigOverrides()) |raw| h.update(raw);
+    if (layout) |tag| h.update(tag);
+    return std.fmt.allocPrint(allocator, "{x:0>16}", .{h.final()});
+}
+
+/// Persistence root; an explicit directory also isolates live cache tests.
+pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
+    return cacheBaseDir(allocator,
+        if (std.c.getenv("HOME")) |h| std.mem.span(h) else null,
+        if (std.c.getenv("SUSHI_PREFIX_CACHE_DIR")) |p| std.mem.span(p) else null);
+}
+
+fn cacheBaseDir(allocator: std.mem.Allocator, home: ?[]const u8, override: ?[]const u8) ![]u8 {
+    if (override) |path| {
+        if (path.len > 0) {
+            if (!std.fs.path.isAbsolute(path)) return error.InvalidCacheDirectory;
+            return allocator.dupe(u8, path);
+        }
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.sushi/kv-cache", .{home orelse return error.NoHome});
+}
+
+test "prefix cache root: explicit absolute directory and default home path" {
+    const a = std.testing.allocator;
+    const explicit = try cacheBaseDir(a, null, "/tmp/sushi-cache-test");
+    defer a.free(explicit);
+    try std.testing.expectEqualStrings("/tmp/sushi-cache-test", explicit);
+    const fallback = try cacheBaseDir(a, "/tmp/sushi-test-user", "");
+    defer a.free(fallback);
+    try std.testing.expectEqualStrings("/tmp/sushi-test-user/.sushi/kv-cache", fallback);
+    try std.testing.expectError(error.InvalidCacheDirectory, cacheBaseDir(a, null, "relative"));
+    try std.testing.expectError(error.NoHome, cacheBaseDir(a, null, null));
+}
 
 // ── Small fs helpers ──
 
@@ -4266,19 +4898,19 @@ pub fn chunkShareEnabled() bool {
     return chunk_share_override orelse true;
 }
 
-pub fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {
+fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
     const f = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return null;
     defer f.close(io);
     return f.stat(io) catch null;
 }
 
-pub fn fileSize(io: std.Io, abs_path: []const u8) ?u64 {
+fn fileSize(io: std.Io, abs_path: []const u8) ?u64 {
     const st = statFile(io, abs_path) orelse return null;
     return st.size;
 }
 
-pub fn readFileAlloc(allocator: std.mem.Allocator, io: std.Io, abs_path: []const u8, limit: usize) ?[]u8 {
+fn readFileAlloc(allocator: std.mem.Allocator, io: std.Io, abs_path: []const u8, limit: usize) ?[]u8 {
     if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
     const f = std.Io.Dir.openFileAbsolute(io, abs_path, .{}) catch return null;
     defer f.close(io);
@@ -4380,7 +5012,7 @@ fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
 
 const testing = std.testing;
 
-pub fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32, head_dim: u32, seed: f64, dtype: mlx.mlx_dtype) !void {
+fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32, head_dim: u32, seed: f64, dtype: mlx.mlx_dtype) !void {
     // Drive the cache through its real update path with deterministic
     // arange-derived K/V so restored values are checkable. Dense tests use
     // float32 (every position stays exactly distinguishable); the affine test
@@ -4413,7 +5045,7 @@ pub fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32,
     }
 }
 
-pub fn cacheValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_stream) !f32 {
+fn cacheValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_stream) !f32 {
     return cacheBufValueAt(cache, layer, pos, d, s, false);
 }
 
@@ -4434,7 +5066,7 @@ fn cacheBufValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_str
     return ptr[0];
 }
 
-pub fn tmpRoot(tmp: *std.testing.TmpDir, io: std.Io, buf: []u8) ![]const u8 {
+fn tmpRoot(tmp: *std.testing.TmpDir, io: std.Io, buf: []u8) ![]const u8 {
     const n = try tmp.dir.realPath(io, buf);
     return buf[0..n];
 }
@@ -4746,6 +5378,32 @@ test "DiskTier: two live tiers on one root restore only their own entries" {
     }
 }
 
+test "DiskTier: the root-wide sweep never deletes a root a live tier owns" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var held = try DiskTier.init(testing.allocator, io, base, "fp-held", 0, 128);
+    defer held.deinit();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try held.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    const other = try std.fmt.allocPrint(testing.allocator, "{s}/fp-other", .{base});
+    defer testing.allocator.free(other);
+
+    sweepBase(testing.allocator, io, base, other, 0);
+    try testing.expect(tmp.dir.statFile(io, "fp-held/e1/meta.json", .{}) catch null != null);
+    try testing.expect(rootIsLive(io, held.root));
+    // A load beside the live tier keeps a private root: none of those bytes are its own.
+    try testing.expectEqual(@as(u64, 0), tierBytes(io, base, "fp-held"));
+}
+
 test "DiskTier: a token record that differs from the index poisons the entry and restores nothing" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -4809,6 +5467,31 @@ test "DiskTier: a restore that finds a chunk file missing or short drops the ent
         const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}) orelse return error.TestExpectedMatch;
         _ = try tier.restoreInto(&again, m.idx, s);
     }
+}
+
+test "DiskTier: hard-linked chunks are counted once by the root-wide sweep and tierBytes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    const chunk: [1000]u8 = @splat(0);
+    try tmp.dir.createDirPath(io, "fp-shared/e1");
+    try tmp.dir.createDirPath(io, "fp-shared/e2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e1/c000000.safetensors", .data = &chunk });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e1/meta.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shared/e2/meta.json", .data = "{}" });
+    try std.Io.Dir.hardLink(tmp.dir, "fp-shared/e1/c000000.safetensors", tmp.dir, "fp-shared/e2/c000000.safetensors", io, .{});
+
+    try testing.expectEqual(@as(u64, 1004), tierBytes(io, base, "fp-shared"));
+
+    // 1004 B held, so a 1500 B budget deletes nothing.
+    const other = try std.fmt.allocPrint(testing.allocator, "{s}/fp-other", .{base});
+    defer testing.allocator.free(other);
+    sweepBase(testing.allocator, io, base, other, 1500);
+    try testing.expect(tmp.dir.statFile(io, "fp-shared/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-shared/e2/meta.json", .{}) catch null != null);
 }
 
 test "DiskTier: a second tier in the same process sweeps around a live tier's root" {
@@ -5068,7 +5751,7 @@ const SSMCacheEntry = transformer_mod.SSMCacheEntry;
 const conv_shape = [_]c_int{ 1, 3, 8 }; // [B, kernel-1, conv_dim]
 const ssm_shape = [_]c_int{ 1, 2, 4, 4 }; // [B, Hv, Dv, Dk]
 
-pub fn makeArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
+fn makeArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
     var count: f64 = 1;
     for (shape) |d| count *= @floatFromInt(d);
     var flat = mlx.mlx_array_new();
@@ -5080,7 +5763,17 @@ pub fn makeArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_ar
     return out;
 }
 
-pub fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
+/// A test tensor of `shape` filled with `v` (f32). Owned by the caller.
+fn filledArray(shape: []const c_int, v: f32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const scalar = mlx.mlx_array_new_float(v);
+    defer _ = mlx.mlx_array_free(scalar);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_full(&out, shape.ptr, shape.len, scalar, .float32, s));
+    return out;
+}
+
+fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     _ = mlx.mlx_astype(&f, arr, .float32, s);
@@ -5089,12 +5782,12 @@ pub fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
 }
 
 /// Three-layer synthetic hybrid SSM state, covering the full null-state
-/// matrix: (0) a GatedDeltaNet layer with both conv+ssm, (1) a layer
-/// with conv only (null ssm_state), (2) a plain-attention
+/// matrix: (0) a GatedDeltaNet layer with both conv+ssm, (1) an LFM2
+/// gated-conv layer with conv only (null ssm_state), (2) a plain-attention
 /// layer in the hybrid (uninitialized, both null). `conv_base`/`ssm_base`
 /// make each capture position's values distinguishable, so a restore-side
 /// conv/ssm KEY SWAP fails the value checks (the K/V-swap lesson).
-pub fn buildHybridEntries(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
+fn buildHybridEntries(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
     return .{
         .{
             .conv_state = makeArange(s, &conv_shape, conv_base),
@@ -5114,13 +5807,913 @@ pub fn buildHybridEntries(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]S
     };
 }
 
-pub fn freeHybridEntries(e: *[3]SSMCacheEntry) void {
+fn freeHybridEntries(e: *[3]SSMCacheEntry) void {
     for (e) |*x| {
         _ = mlx.mlx_array_free(x.conv_state);
         _ = mlx.mlx_array_free(x.ssm_state);
         if (x.aux_state.ctx != null) _ = mlx.mlx_array_free(x.aux_state);
         if (x.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(x.qsa_pooled);
     }
+}
+
+test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
+    // qwen3_5/3_6 GatedDeltaNet + lfm2 gated-conv (null ssm_state) + plain
+    // attention (uninitialized) in one entry. No local hybrid checkpoint of
+    // lfm2/nemotron_h exists, so those archs are covered here purely by the
+    // null-state layer shapes (same SSMCacheEntrySnapshot contract).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32); // >= MIN_PERSIST_TOKENS
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Two checkpoints at 128 / 256 with distinguishable state (base 100/500
+    // vs 200/600), captured through the real production capture path.
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var src256 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src256);
+    // Layer 2 at 256 also carries qwen4_exp aux state: a QSA key history +
+    // pooled block keys, and layer 1 the PLE token history.
+    const aux_shape = [_]c_int{ 1, 256, 4 };
+    const pooled_shape = [_]c_int{ 1, 64, 4 };
+    src256[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src256[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src256[2].qsa_ratio = 4;
+    src256[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
+    src256[1].ple_prev_valid = true;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+
+    // Fresh tier (restart): both checkpoint positions survive the scan.
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(?u32, 256), tier2.highestSsmPosAtOrBelow(0, 300));
+    try testing.expectEqual(@as(?u32, 128), tier2.highestSsmPosAtOrBelow(0, 200));
+    try testing.expectEqual(@as(?u32, null), tier2.highestSsmPosAtOrBelow(0, 100));
+
+    // Restore at 256 into a fresh KVCache + ssm_entries.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    const restored = try tier2.restoreIntoHybrid(&cache2, &dst, 0, 256, s);
+    try testing.expectEqual(@as(u32, 256), restored);
+    try testing.expectEqual(@as(usize, 256), cache2.step);
+
+    // Layer 0: conv (base 200) + ssm (base 600) — a KEY SWAP would flip these.
+    try testing.expect(dst[0].initialized);
+    try testing.expectEqual(@as(f32, 200.0), ssmArrVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 200.0 + 23.0), ssmArrVal(dst[0].conv_state, 23, s));
+    try testing.expectEqual(@as(f32, 600.0), ssmArrVal(dst[0].ssm_state, 0, s));
+    try testing.expectEqual(@as(f32, 600.0 + 31.0), ssmArrVal(dst[0].ssm_state, 31, s));
+    // Layer 1: LFM2 gated-conv — conv present (base 10200), ssm stays null.
+    try testing.expect(dst[1].initialized);
+    try testing.expectEqual(@as(f32, 10_200.0), ssmArrVal(dst[1].conv_state, 0, s));
+    try testing.expect(dst[1].ssm_state.ctx == null);
+    // Layer 2: uninitialized plain-attention layer — both null, but the
+    // qwen4_exp aux state round-trips (key history 700.., pooled 800..).
+    try testing.expect(!dst[2].initialized);
+    try testing.expect(dst[2].conv_state.ctx == null);
+    try testing.expect(dst[2].ssm_state.ctx == null);
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
+    try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
+    try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
+    try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
+    try testing.expect(!dst[0].ple_prev_valid and dst[0].aux_state.ctx == null);
+
+    // KV rewound to 256 in lockstep, values byte-exact against the original.
+    for (cache2.entries) |*ce| {
+        try testing.expect(ce.initialized);
+        try testing.expectEqual(@as(usize, 256), ce.offset);
+    }
+    try testing.expectEqual(
+        try cacheValueAt(&cache, 1, 200, 3, s),
+        try cacheValueAt(&cache2, 1, 200, 3, s),
+    );
+
+    // Restore at the lower checkpoint installs THAT position's state.
+    var cache3 = try KVCache.init(testing.allocator, 3);
+    defer cache3.deinit();
+    var dst2: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst2);
+    const restored128 = try tier2.restoreIntoHybrid(&cache3, &dst2, 0, 128, s);
+    try testing.expectEqual(@as(u32, 128), restored128);
+    try testing.expectEqual(@as(usize, 128), cache3.step);
+    try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst2[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 500.0), ssmArrVal(dst2[0].ssm_state, 0, s));
+
+    // A position that was never checkpointed is rejected, not silently served.
+    try testing.expectError(error.DiskCacheNoCheckpoint, tier2.restoreIntoHybrid(&cache3, &dst2, 0, 200, s));
+}
+
+fn stAuxPooledBytes(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !struct { aux: u64, pooled: u64 } {
+    const raw = readFileAlloc(allocator, io, path, 4 * 1024 * 1024) orelse return error.TestUnexpectedResult;
+    defer allocator.free(raw);
+    if (raw.len < 8) return error.TestUnexpectedResult;
+    const hdr_len = std.mem.readInt(u64, raw[0..8], .little);
+    if (8 + hdr_len > raw.len) return error.TestUnexpectedResult;
+    const hdr = raw[8 .. 8 + hdr_len];
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, hdr, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestUnexpectedResult;
+    var aux: u64 = 0;
+    var pooled: u64 = 0;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, "__metadata__")) continue;
+        if (e.value_ptr.* != .object) continue;
+        const o = e.value_ptr.*.object;
+        const dtype = if (o.get("dtype")) |d| d.string else continue;
+        const shape_v = o.get("shape") orelse continue;
+        if (shape_v != .array) continue;
+        var el: u64 = 1;
+        for (shape_v.array.items) |x| {
+            if (x != .integer) continue;
+            el *= @intCast(x.integer);
+        }
+        const b: u64 = el * switch (dtype[0]) {
+            'F' => if (dtype.len > 1 and dtype[1] == '3') @as(u64, 4) else 2,
+            'B' => 2,
+            'U', 'I' => if (dtype.len > 1 and dtype[1] == '8') @as(u64, 1) else 4,
+            else => 1,
+        };
+        if (std.mem.indexOf(u8, e.key_ptr.*, ".aux") != null) aux += b;
+        if (std.mem.indexOf(u8, e.key_ptr.*, ".pooled") != null) pooled += b;
+    }
+    return .{ .aux = aux, .pooled = pooled };
+}
+
+test "DiskTier: QSA history bytes are O(rows), not O(checkpoints x rows)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-once", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    const s128 = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000128.safetensors", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(s128);
+    const s256 = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000256.safetensors", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(s256);
+    const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(qsa_path);
+    const a128 = try stAuxPooledBytes(testing.allocator, io, s128);
+    const a256 = try stAuxPooledBytes(testing.allocator, io, s256);
+    try testing.expectEqual(@as(u64, 0), a128.aux + a128.pooled);
+    try testing.expectEqual(@as(u64, 0), a256.aux + a256.pooled);
+    const hq = try stAuxPooledBytes(testing.allocator, io, qsa_path);
+    const one: u64 = 64 * 8 * 4;
+    try testing.expectEqual(one, hq.aux + hq.pooled);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-once", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
+    try testing.expectEqual(@as(c_int, 32), mlx.getShape(dst[2].qsa_pooled)[1]);
+}
+
+test "DiskTier: a shorter pooled bank never replaces the longer one an entry's checkpoints need" {
+    // An image turn persists only the text before its media: a short prefix of an existing entry.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 2048, 8, 0.0, .float32);
+    var tokens: [2048]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    var long = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&long);
+    long[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    long[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 500, 8 }, 800.0);
+    long[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &long, 1024, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &long, 2000, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &long, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    try testing.expectEqual(@as(u32, 2000), tier.entries.items[0].qsa_history_rows);
+
+    // The image turn: 600 text tokens, a checkpoint at 512, a bank of 512 rows.
+    var short = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&short);
+    short[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    short[2].qsa_pooled = makeArange(s, &[_]c_int{ 1, 128, 8 }, 800.0);
+    short[2].qsa_ratio = 4;
+    var cps2 = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &short, 512, s)};
+    defer for (&cps2) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps2, &short, s);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, &cps2, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(usize, 3), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(@as(u32, 2000), tier.entries.items[0].qsa_history_rows);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-keep", 0, 128);
+    defer tier2.deinit();
+    for ([_]u32{ 1024, 2000 }) |pos| {
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(pos, try tier2.restoreIntoHybrid(&cache2, &dst, 0, pos, s));
+        try testing.expectEqual(@as(c_int, @intCast(pos)), dst[2].qsa_hist_rows);
+        try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    }
+}
+
+test "DiskTier: a mid-block checkpoint restore overlays the pooled bank onto its own leftover" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    // 46 is not a multiple of the ratio, so this checkpoint carries a 2-row leftover — the
+    // shape `SSM_SNAPSHOT_BACKOFF` puts the always-on snapshot at.
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 46, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-mid", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 46), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 46, s));
+    try testing.expect(transformer_mod.entriesHaveQsaHistory(&dst));
+    try testing.expectEqual(@as(c_int, 46), dst[2].qsa_hist_rows);
+    // Pooled blocks 0..46/4 come from the history file; the leftover is the checkpoint's own.
+    try testing.expect(dst[2].qsa_pooled.ctx != null);
+    try testing.expectEqual(@as(c_int, 11), mlx.getShape(dst[2].qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    try testing.expectEqual(@as(f32, 880.0), ssmArrVal(dst[2].qsa_pooled, 80, s));
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(dst[2].aux_state)[1]);
+    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, 0, s));
+}
+
+test "DiskTier: a GDN-layer aux window is persisted in the checkpoint file" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ple-aux", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src);
+    const ple_shape = [_]c_int{ 1, 3, 8 };
+    src[0].aux_state = makeArange(s, &ple_shape, 900.0);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try testing.expect(cps[0].layers[0].aux_state.ctx != null);
+    try testing.expect(!transformer_mod.checkpointHasQsaHistory(&cps[0]));
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    const sp = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000128.safetensors", .{ tier.root, tier.entries.items[0].id });
+    defer testing.allocator.free(sp);
+    const fam = try stAuxPooledBytes(testing.allocator, io, sp);
+    try testing.expectEqual(@as(u64, 3 * 8 * 4), fam.aux);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expectEqual(@as(f32, 900.0), ssmArrVal(dst[0].aux_state, 0, s));
+    try testing.expectEqual(@as(f32, 900.0 + 23.0), ssmArrVal(dst[0].aux_state, 23, s));
+}
+
+test "DiskTier: a pre-v7 interior restore overlays QSA history from the latest s* file" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-prev7", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var src256 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src256);
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    src256[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src256[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src256[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    const id = tier.entries.items[0].id;
+    var latest = try tier.loadSsmFile(id, 256, 3);
+    defer latest.deinit(testing.allocator);
+    var qsa = try tier.loadQsaHistoryFile(id, 3);
+    defer qsa.deinit(testing.allocator);
+    for (latest.layers, qsa.layers) |*l, q| {
+        if (q.aux_state.ctx != null) {
+            if (l.aux_state.ctx != null) _ = mlx.mlx_array_free(l.aux_state);
+            l.aux_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&l.aux_state, q.aux_state));
+        }
+        if (q.qsa_pooled.ctx != null) {
+            if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+            l.qsa_pooled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&l.qsa_pooled, q.qsa_pooled));
+        }
+        l.qsa_ratio = q.qsa_ratio;
+    }
+    const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, id });
+    defer testing.allocator.free(dir_rel);
+    var interior = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s);
+    defer interior.deinit(testing.allocator);
+    _ = try tier.writeSsmFile(dir_rel, &interior, s);
+    test_ssm_write_qsa_aux = true;
+    defer test_ssm_write_qsa_aux = false;
+    _ = try tier.writeSsmFile(dir_rel, &latest, s);
+    const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
+    defer testing.allocator.free(qsa_path);
+    try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+    tier.entries.items[0].qsa_history_bytes = 0;
+    tier.entries.items[0].qsa_history_rows = 0;
+    tier.entries.items[0].inherited_qsa = false;
+    try tier.writeMeta(tier.entries.items[0]);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expect(transformer_mod.entriesHaveQsaHistory(&dst));
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
+}
+
+test "DiskTier: a pre-v7 interior restore misses when the latest s* file is gone" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-prev7-miss", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var src256 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src256);
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    src256[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src256[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src256[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src256, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    const id = tier.entries.items[0].id;
+    var latest = try tier.loadSsmFile(id, 256, 3);
+    defer latest.deinit(testing.allocator);
+    var qsa = try tier.loadQsaHistoryFile(id, 3);
+    defer qsa.deinit(testing.allocator);
+    for (latest.layers, qsa.layers) |*l, q| {
+        if (q.aux_state.ctx != null) {
+            if (l.aux_state.ctx != null) _ = mlx.mlx_array_free(l.aux_state);
+            l.aux_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&l.aux_state, q.aux_state));
+        }
+        if (q.qsa_pooled.ctx != null) {
+            if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
+            l.qsa_pooled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&l.qsa_pooled, q.qsa_pooled));
+        }
+        l.qsa_ratio = q.qsa_ratio;
+    }
+    const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, id });
+    defer testing.allocator.free(dir_rel);
+    var interior = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s);
+    defer interior.deinit(testing.allocator);
+    _ = try tier.writeSsmFile(dir_rel, &interior, s);
+    test_ssm_write_qsa_aux = true;
+    defer test_ssm_write_qsa_aux = false;
+    _ = try tier.writeSsmFile(dir_rel, &latest, s);
+    const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
+    defer testing.allocator.free(qsa_path);
+    try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+    const latest_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/s0000256.safetensors", .{ tier.root, id });
+    defer testing.allocator.free(latest_path);
+    try std.Io.Dir.deleteFileAbsolute(io, latest_path);
+    tier.entries.items[0].qsa_history_bytes = 0;
+    tier.entries.items[0].qsa_history_rows = 0;
+    tier.entries.items[0].inherited_qsa = false;
+    try tier.writeMeta(tier.entries.items[0]);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expectEqual(@as(usize, 0), cache2.step);
+    try testing.expect(dst[2].aux_state.ctx == null);
+}
+
+test "DiskTier: a v7 entry with missing or short qsa.safetensors misses before KV/SSM adopt" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-gap", 0, 128);
+        defer tier.deinit();
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        const id = tier.entries.items[0].id;
+        const qsa_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/qsa.safetensors", .{ tier.root, id });
+        defer testing.allocator.free(qsa_path);
+        try std.Io.Dir.deleteFileAbsolute(io, qsa_path);
+
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+        try testing.expectEqual(@as(usize, 0), cache2.step);
+        try testing.expect(dst[2].aux_state.ctx == null);
+    }
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-short", 0, 128);
+        defer tier.deinit();
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        const id = tier.entries.items[0].id;
+        var src64 = buildHybridEntries(s, 200.0, 600.0);
+        defer freeHybridEntries(&src64);
+        const aux64 = [_]c_int{ 1, 64, 8 };
+        const pooled64 = [_]c_int{ 1, 16, 8 };
+        src64[2].aux_state = makeArange(s, &aux64, 700.0);
+        src64[2].qsa_pooled = makeArange(s, &pooled64, 800.0);
+        src64[2].qsa_ratio = 4;
+        var cps64 = [_]transformer_mod.SSMCheckpoint{
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src64, 64, s),
+        };
+        defer for (&cps64) |*cp| cp.deinit(testing.allocator);
+        try transformer_mod.attachQsaHistoryToLatest(&cps64, &src64, s);
+        const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, id });
+        defer testing.allocator.free(dir_rel);
+        _ = try tier.writeQsaHistoryFile(dir_rel, &cps64[0], s);
+
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+        try testing.expectEqual(@as(usize, 0), cache2.step);
+        try testing.expect(dst[2].aux_state.ctx == null);
+    }
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-wt", 0, 128);
+        defer tier.deinit();
+        var wt_cps = [_]transformer_mod.SSMCheckpoint{
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        };
+        defer for (&wt_cps) |*cp| cp.deinit(testing.allocator);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &wt_cps, s);
+        try testing.expectEqual(@as(u32, 0), tier.entries.items[0].qsa_history_rows);
+
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+        try testing.expectEqual(@as(usize, 0), cache2.step);
+        try testing.expect(dst[2].aux_state.ctx == null);
+    }
+}
+
+test "DiskTier: a history tensor shorter than cp_pos is a miss, not a short hit" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-short-tensor", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 8, 8 };
+    const pooled_shape = [_]c_int{ 1, 2, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 16, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 64, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 16), cps[0].layers[2].qsa_rows);
+    try testing.expectEqual(@as(c_int, 64), cps[1].layers[2].qsa_rows);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    try testing.expect(cps[1].layers[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 64), cps[1].layers[2].qsa_rows);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectError(error.DiskCacheQsaHistoryGap, tier.restoreIntoHybrid(&cache2, &dst, 0, 16, s));
+    try testing.expectEqual(@as(usize, 0), cache2.step);
+    try testing.expect(dst[2].aux_state.ctx == null);
+}
+
+test "DiskTier: a QSA overlay error resets the half-built restore" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-ovl", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    test_qsa_overlay_mismatch = true;
+    defer test_qsa_overlay_mismatch = false;
+    try testing.expectError(error.SsmCheckpointLayerMismatch, tier.restoreIntoHybrid(&cache2, &dst, 0, 256, s));
+    try testing.expectEqual(@as(usize, 0), cache2.step);
+}
+
+test "DiskTier chunk share: a prefix-diverging entry hard-links qsa.safetensors" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    const donor_id = tier.entries.items[0].id;
+    try testing.expect(tier.entries.items[0].qsa_history_bytes > 0);
+    try testing.expectEqual(@as(u32, 256), tier.entries.items[0].qsa_history_rows);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &cps, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    try testing.expect(heir.inherited_qsa);
+    try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(heir.*));
+
+    var pbuf: [1024]u8 = undefined;
+    const dp = try std.fmt.bufPrint(&pbuf, "{s}/fp-qsa-share/e{d}/qsa.safetensors", .{ base, donor_id });
+    const dstat = statFile(io, dp).?;
+    var hbuf: [1024]u8 = undefined;
+    const hp = try std.fmt.bufPrint(&hbuf, "{s}/fp-qsa-share/e{d}/qsa.safetensors", .{ base, heir.id });
+    const hstat = statFile(io, hp).?;
+    try testing.expectEqual(dstat.inode, hstat.inode);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(hstat.nlink)));
+
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    try testing.expectEqual(@as(u32, 256), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 256, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 256), dst[2].qsa_hist_rows);
+}
+
+test "DiskTier: an inherited QSA history is dropped on extend past the common prefix" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-ext", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    var donor_src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&donor_src);
+    const donor_aux = [_]c_int{ 1, 600, 8 };
+    const donor_pooled = [_]c_int{ 1, 150, 8 };
+    donor_src[2].aux_state = makeArange(s, &donor_aux, 700.0);
+    donor_src[2].qsa_pooled = makeArange(s, &donor_pooled, 800.0);
+    donor_src[2].qsa_ratio = 4;
+    var donor_cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_src, 600, s),
+    };
+    defer for (&donor_cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&donor_cps, &donor_src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &donor_cps, s);
+
+    var heir_src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&heir_src);
+    const heir_aux1 = [_]c_int{ 1, 256, 8 };
+    const heir_pooled1 = [_]c_int{ 1, 64, 8 };
+    heir_src[2].aux_state = makeArange(s, &heir_aux1, 700.0);
+    heir_src[2].qsa_pooled = makeArange(s, &heir_pooled1, 800.0);
+    heir_src[2].qsa_ratio = 4;
+    var heir_cps1 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_src, 256, s),
+    };
+    defer for (&heir_cps1) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&heir_cps1, &heir_src, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &heir_cps1, s);
+    try testing.expect(tier.entries.items[1].inherited_qsa);
+
+    var heir_src2 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&heir_src2);
+    const heir_aux2 = [_]c_int{ 1, 560, 8 };
+    const heir_pooled2 = [_]c_int{ 1, 140, 8 };
+    heir_src2[2].aux_state = makeArange(s, &heir_aux2, 900.0);
+    heir_src2[2].qsa_pooled = makeArange(s, &heir_pooled2, 1000.0);
+    heir_src2[2].qsa_ratio = 4;
+    var heir_cps2 = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_src2, 256, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_src2, 560, s),
+    };
+    defer for (&heir_cps2) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&heir_cps2, &heir_src2, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &heir_cps2, s);
+
+    const heir = &tier.entries.items[1];
+    try testing.expect(!heir.inherited_qsa);
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    const m = tier.bestMatch(&toks.b, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    try testing.expectEqual(@as(u32, 560), try tier.restoreIntoHybrid(&cache2, &dst, m.idx, 560, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 560), dst[2].qsa_hist_rows);
 }
 
 test "DiskTier: SSM retention thins the interior, keeping both ends" {
@@ -5996,6 +7589,111 @@ test "DiskTier: a quantized MTP sidecar is rewritten to dense on the next commit
     try testing.expectEqual(@as(usize, 590), loaded.snap.step);
 }
 
+test "modelFingerprint: stable per path, rolls with config.json changes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+
+    const fp1 = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp1);
+    const fp2 = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp2);
+    try testing.expectEqualStrings(fp1, fp2);
+    try testing.expectEqual(@as(usize, 16), fp1.len);
+
+    // Rewriting config.json (re-download / re-quant) rolls the fingerprint.
+    std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"y\",\"pad\":1}" });
+    const fp3 = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp3);
+    try testing.expect(!std.mem.eql(u8, fp1, fp3));
+
+    try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, ""));
+    try testing.expectError(error.BadModelDir, modelFingerprint(testing.allocator, io, "rel/path"));
+}
+
+test "modelFingerprint: the f32 and the --qwen-gdn 16 GDN layouts each get their own SSD namespace" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" });
+    const dir = try std.fmt.allocPrint(testing.allocator, "{s}/m", .{base});
+    defer testing.allocator.free(dir);
+
+    const wide = model.ModelConfig{ .linear_num_value_heads = 48 };
+    var narrow = wide;
+    narrow.gdn_state_f32 = false;
+    var glm = wide;
+    glm.model_type = "glm5_next";
+    const mimo = model.ModelConfig{ .model_type = "mimo_v2" };
+
+    const today = try modelFingerprint(testing.allocator, io, dir);
+    defer testing.allocator.free(today);
+    // Entries written before the gate became f32 sit under `today`'s value and are never restored.
+    const fp_narrow = try modelFingerprintWithLayout(testing.allocator, io, dir, narrow.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_narrow);
+    try testing.expect(!std.mem.eql(u8, today, fp_narrow));
+    const fp_f32 = try modelFingerprintWithLayout(testing.allocator, io, dir, wide.cacheLayoutNamespace());
+    defer testing.allocator.free(fp_f32);
+    try testing.expect(!std.mem.eql(u8, today, fp_f32));
+    try testing.expect(!std.mem.eql(u8, fp_narrow, fp_f32));
+    // GLM (KDA state, f32 always) and MiMo (no GDN layers) keep the historical namespace.
+    for ([_]*const model.ModelConfig{ &glm, &mimo }) |c| {
+        const fp = try modelFingerprintWithLayout(testing.allocator, io, dir, c.cacheLayoutNamespace());
+        defer testing.allocator.free(fp);
+        try testing.expectEqualStrings(today, fp);
+    }
+}
+
+test "modelFingerprint: rolls with --config-overrides" {
+    defer model.setConfigOverrides(null);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    try tmp.dir.createDirPath(io, "model-a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-a/config.json", .data = "{\"model_type\":\"x\"}" });
+    const dir_a = try std.fmt.allocPrint(testing.allocator, "{s}/model-a", .{base});
+    defer testing.allocator.free(dir_a);
+
+    model.setConfigOverrides(null);
+    const fp_none = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_none);
+
+    const yarn = "{\"text_config\":{\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}}";
+    model.setConfigOverrides(yarn);
+    const fp_over = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_over);
+    try testing.expectEqual(@as(usize, 16), fp_over.len);
+    try testing.expect(!std.mem.eql(u8, fp_none, fp_over));
+
+    model.setConfigOverrides(yarn);
+    const fp_again = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_again);
+    try testing.expectEqualStrings(fp_over, fp_again);
+
+    // Raw-bytes pin: a whitespace-different spelling of the same JSON is a
+    // different fingerprint (canonicalizing would hide a YaRN boot restoring
+    // an unscaled SSD prefix if the override was re-spelled).
+    const yarn_ws = "{\"text_config\": {\"rope_parameters\": {\"rope_type\": \"yarn\", \"factor\": 4.0}}}";
+    model.setConfigOverrides(yarn_ws);
+    const fp_ws = try modelFingerprint(testing.allocator, io, dir_a);
+    defer testing.allocator.free(fp_ws);
+    try testing.expect(!std.mem.eql(u8, fp_over, fp_ws));
+}
+
 test "spec meta json: the v5 head half round-trips and a v4 record parses without one" {
     var w = std.ArrayList(u8).empty;
     defer w.deinit(testing.allocator);
@@ -6028,8 +7726,163 @@ test "spec meta json: the v5 head half round-trips and a v4 record parses withou
     try testing.expectEqual(@as(?SpecHeadMeta, null), old.head);
 }
 
+test "DiskTier: the qwen4 MTP head's QSA half round-trips exactly; a head-less sidecar declines the head only" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, 600, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    try testing.expectEqual(@as(c_int, 1), loaded.head_pos_base);
+    try testing.expectEqual(@as(c_int, 4), back.qsa_ratio);
+    try testing.expectEqual(@as(c_int, 600), mlx.getShape(back.aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 150), mlx.getShape(back.qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 4.25), ssmArrVal(back.aux_state, 0, s));
+    try testing.expectEqual(@as(f32, -1.75), ssmArrVal(back.qsa_pooled, 0, s));
+
+    // Second entry, MTP history but no head: KV half loads, head half absent (a pre-v5 sidecar).
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 700_000);
+    _ = try tier2.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens_b,
+        false,
+        null,
+        null,
+        .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 },
+        s,
+    );
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    var kv_only = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer kv_only.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), kv_only.snap.step);
+    try testing.expect(kv_only.head_aux == null);
+}
+
+test "DiskTier: a head snap with no raw-history tensor drops the head half and arms no MLX latch" {
+    // Bar: a pooled-only head (qsa_rows > 0, empty `aux_state`) writes no `h.aux` and leaves the latch clear.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 600, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 150, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 600;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+    try testing.expect(head_snap.aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 600), head_snap.qsa_rows);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 31);
+    try testing.expect(!mlx.errorPending());
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+    try testing.expect(!mlx.errorPending());
+
+    // A pooled bank without its raw history is not restorable: KV half only, head declined.
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-noraw", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    try testing.expectEqual(@as(usize, 600), loaded.snap.step);
+    try testing.expect(loaded.head_aux == null);
+}
+
 test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a foreign one" {
-    try mlx.requireGpu();
     // Bar: the appendCommit funnel's errdefer removes only the error THIS call raised.
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -6075,6 +7928,52 @@ test "DiskTier: a swallowed commit failure drops the latch it raised and keeps a
     try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
 }
 
+test "DiskTier: a raise anywhere in appendCommit frees its owned results exactly once" {
+    // Bar: the fault sweep reaches the QSA history write; a double free aborts under the testing allocator.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-exits", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const aux_shape = [_]c_int{ 1, 256, 8 };
+    const pooled_shape = [_]c_int{ 1, 64, 8 };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+
+    var k: u64 = 1;
+    while (true) : (k += 1) {
+        mlx.fault.arm(k);
+        const r = tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        mlx.fault.disarm();
+        if (!mlx.fault.didFire()) {
+            _ = try r;
+            break;
+        }
+        try testing.expectError(error.MlxError, r);
+        tier.invalidateAll();
+    }
+    try testing.expect(k > 1);
+}
+
 test "DiskTier: an entry's ring files thin as its RAM checkpoints do: the lowest and the newest stay" {
     var positions = [_]u32{ 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
     const kept = DiskTier.thinRingPositions(&positions);
@@ -6084,6 +7983,182 @@ test "DiskTier: an entry's ring files thin as its RAM checkpoints do: the lowest
     try std.testing.expectEqual(@as(u32, 1000), kept[kept.len - 1]);
     var few = [_]u32{ 100, 1000 };
     try std.testing.expectEqualSlices(u32, &.{ 100, 1000 }, DiskTier.thinRingPositions(&few));
+}
+
+test "DiskTier: MTP head QSA half round-trips a ring plus logical rows" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-ring", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 64, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, transformer_mod.QSA_RING_ROWS, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 64;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+    try testing.expectEqual(@as(c_int, 64), head_snap.qsa_rows);
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+
+    const m = tier.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    var loaded = tier.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    try testing.expectEqual(@as(c_int, 64), back.qsa_rows);
+    try testing.expectEqual(transformer_mod.QSA_RING_ROWS, mlx.getShape(back.aux_state)[1]);
+    try testing.expectEqual(@as(c_int, 16), mlx.getShape(back.qsa_pooled)[1]);
+}
+
+test "DiskTier: v8 persists the head's checkpoint leftovers; a sidecar without them loads blind" {
+    // The ring on disk is 32 rows and a warm clamp lands a whole generated tail below it, so
+    // the leftovers the trunk's checkpoints marked have to survive the round trip — including
+    // the meta.json parse a restart reads them back through.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 64, 8, 9.5, .float32);
+
+    var aux_src: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
+    defer {
+        _ = mlx.mlx_array_free(aux_src.conv_state);
+        _ = mlx.mlx_array_free(aux_src.ssm_state);
+        transformer_mod.ssmFreeQsaState(&aux_src);
+    }
+    aux_src.aux_state = try filledArray(&[_]c_int{ 1, transformer_mod.QSA_RING_ROWS, 8 }, 4.25, s);
+    aux_src.qsa_pooled = try filledArray(&[_]c_int{ 1, 16, 8 }, -1.75, s);
+    aux_src.qsa_ratio = 4;
+    aux_src.qsa_hist_rows = 64;
+    var head_snap = transformer_mod.ssmSnapshot(&aux_src);
+    defer transformer_mod.ssmSnapshotDeinit(&head_snap);
+
+    // Two trunk checkpoint positions, both mid-block.
+    var marks: transformer_mod.QsaHeadMarkSet = .{};
+    defer marks.deinit();
+    marks.put(26, try filledArray(&[_]c_int{ 1, 2, 8 }, 7.5, s));
+    marks.put(46, try filledArray(&[_]c_int{ 1, 2, 8 }, -3.25, s));
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 11);
+    _ = try tier.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+            .head_marks = marks.slice(),
+        },
+        s,
+    );
+
+    // A restart: the positions come back through meta.json, the rows through the sidecar.
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-head-marks", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    try testing.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(tier2.entries.items[m.idx]));
+    var loaded = tier2.loadSpecSnap(m.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer loaded.snap.deinit();
+    var back = loaded.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&back);
+    var back_marks = loaded.head_marks;
+    defer back_marks.deinit();
+    try testing.expectEqual(@as(usize, 2), back_marks.len);
+    const lv26 = back_marks.find(26) orelse return error.TestExpectedHeadMark;
+    const lv46 = back_marks.find(46) orelse return error.TestExpectedHeadMark;
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(lv26)[1]);
+    try testing.expectEqual(@as(f32, 7.5), ssmArrVal(lv26, 0, s));
+    try testing.expectEqual(@as(f32, -3.25), ssmArrVal(lv46, 0, s));
+
+    // A v5..v7 sidecar carries none: the head still restores, and clamps as it does today.
+    var tokens_b: [600]u32 = undefined;
+    for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 700_000);
+    _ = try tier2.appendCommitWithSpec(
+        cache.entries,
+        cache.step,
+        cache.config,
+        &tokens_b,
+        false,
+        null,
+        null,
+        .{
+            .entries = mtp.entries,
+            .step = mtp.step,
+            .config = mtp.config,
+            .base_pos = 0,
+            .head_aux = &head_snap,
+            .head_pos_base = 1,
+        },
+        s,
+    );
+    const mb = tier2.bestMatch(&tokens_b, false, kv_quant.KVQuantConfig.dense, .{}).?;
+    try testing.expectEqual(@as(u8, 5), DiskTier.metaVersionFor(tier2.entries.items[mb.idx]));
+    var no_marks = tier2.loadSpecSnap(mb.idx, .mtp, 1, kv_quant.KVQuantConfig.dense) orelse
+        return error.TestExpectedSpecSnap;
+    defer no_marks.snap.deinit();
+    var nb = no_marks.head_aux orelse return error.TestExpectedHeadSnap;
+    defer transformer_mod.ssmSnapshotDeinit(&nb);
+    try testing.expectEqual(@as(usize, 0), no_marks.head_marks.len);
 }
 
 test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
@@ -6148,6 +8223,109 @@ test "DiskTier: SSD-first writes a checkpoint beside the chunk that closes it" {
     }
 }
 
+test "DiskTier: an SSM checkpoint STAGES through the writer — no filesystem write on the inference thread" {
+    // The checkpoint file is staged through the writer, before the meta.json that indexes it,
+    // and the staged bytes are a real safetensors image (a fresh tier reads them back with
+    // their `__metadata__`).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32); // >= MIN_PERSIST_TOKENS
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // A checkpoint with every optional part qwen4_exp carries.
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    const aux_shape = [_]c_int{ 1, 128, 4 };
+    const pooled_shape = [_]c_int{ 1, 32, 4 };
+    src128[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src128[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src128[2].qsa_ratio = 4;
+    src128[1].ple_prev = .{ 42, 43, 0, 0, 0, 0, 0, 0 };
+    src128[1].ple_prev_valid = true;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src128, s);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+    tier.writer.?.setPaused(true);
+    defer if (tier.writer) |w| w.setPaused(false);
+
+    try testing.expectEqual(
+        PersistOutcome.persisted,
+        try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s),
+    );
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(@as(u32, 128), tier.entries.items[0].ssm_positions[0]);
+
+    // Bar 1: the checkpoint file is not on disk; the commit returned without writing it.
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{}),
+    );
+    try testing.expectEqual(@as(u64, 0), tier.writer.?.filesWritten());
+    try testing.expect(tier.entries.items[0].ssm_bytes[0] > 0);
+
+    // Bar 2: staged before meta.json.
+    var paths = std.ArrayList([]const u8).empty;
+    defer {
+        for (paths.items) |pp| testing.allocator.free(pp);
+        paths.deinit(testing.allocator);
+    }
+    try tier.writer.?.stagedPaths(&paths, testing.allocator);
+    const cp_at = for (paths.items, 0..) |pp, i| {
+        if (std.mem.endsWith(u8, pp, "/s0000128.safetensors")) break i;
+    } else return error.CheckpointNotStaged;
+    const meta_at = for (paths.items, 0..) |pp, i| {
+        if (std.mem.endsWith(u8, pp, "/meta.json")) break i;
+    } else return error.MetaNotStaged;
+    try testing.expect(cp_at < meta_at);
+
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    const st = try tmp.dir.statFile(io, "fp-ssd-cpstage/e1/s0000128.safetensors", .{});
+    try testing.expectEqual(tier.entries.items[0].ssm_bytes[0], st.size);
+
+    // Bar 3: a fresh tier reads the hand-rolled image back, `__metadata__` included.
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-cpstage", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+    try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 500.0), ssmArrVal(dst[0].ssm_state, 0, s));
+    try testing.expect(dst[2].aux_state.ctx == null);
+    try testing.expectEqual(@as(c_int, 128), dst[2].qsa_hist_rows);
+    try testing.expectEqual(@as(f32, 800.0 + 11.0), ssmArrVal(dst[2].qsa_pooled, 11, s));
+    try testing.expectEqual(@as(c_int, 4), dst[2].qsa_ratio);
+    try testing.expect(dst[1].ple_prev_valid and dst[1].ple_prev[0] == 42 and dst[1].ple_prev[1] == 43);
+    try testing.expectEqual(
+        try cacheValueAt(&cache, 0, 127, 3, s),
+        try cacheValueAt(&cache2, 0, 127, 3, s),
+    );
+}
+
 test "DiskTier: the staged encoder carries __metadata__, and refuses a value it cannot escape" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -6198,6 +8376,71 @@ test "DiskTier: the staged encoder carries __metadata__, and refuses a value it 
     // A value with a quote would produce a header mlx cannot parse.
     const bad = [_]DiskTier.MetaPair{.{ .key = "init", .value = "0\",\"x" }};
     try testing.expectError(error.DiskCacheBadMetadata, tier.encodeSafetensors(list.items, &bad));
+}
+
+test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
+    // The commit returns with the whole entry still staged, and meta.json is submitted after
+    // every chunk so the FIFO lands it last.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+    try testing.expectEqual(FLUSH_PIECE_BYTES, tier.max_flush_bytes);
+    tier.writer.?.setPaused(true);
+    defer if (tier.writer) |w| w.setPaused(false);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    try testing.expectEqual(PersistOutcome.persisted, complete);
+    try testing.expect(tier.writer.?.pendingBytes() > 0);
+    try testing.expectEqual(@as(u64, 0), tier.writer.?.filesWritten());
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-ssd-writer/e1/meta.json", .{}));
+
+    var paths = std.ArrayList([]const u8).empty;
+    defer {
+        for (paths.items) |p| testing.allocator.free(p);
+        paths.deinit(testing.allocator);
+    }
+    try tier.writer.?.stagedPaths(&paths, testing.allocator);
+    try testing.expectEqual(@as(usize, 6), paths.items.len); // 5 chunks + meta
+    for (paths.items[0 .. paths.items.len - 1]) |p| {
+        try testing.expect(std.mem.indexOf(u8, p, "/c0000") != null);
+    }
+    try testing.expect(std.mem.endsWith(u8, paths.items[paths.items.len - 1], "/meta.json"));
+
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expectEqual(@as(u64, 6), tier.writer.?.filesWritten());
+
+    // The staged bytes are a real safetensors image: a fresh tier restores it.
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    try testing.expectEqual(@as(u32, 640), try tier2.restoreInto(&cache2, 0, s));
+    for ([_]u32{ 0, 1, 2 }) |li| {
+        for ([_]u32{ 0, 127, 128, 511, 639 }) |pos| {
+            try testing.expectEqual(
+                try cacheValueAt(&cache, li, pos, 3, s),
+                try cacheValueAt(&cache2, li, pos, 3, s),
+            );
+        }
+    }
 }
 
 test "DiskTier: a writer-armed commit lands the whole entry in bounded pieces, in one call" {
@@ -6474,6 +8717,86 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
 }
 
+test "resolveDiskBudget: the formula, the 20 GB cap and free disk - 4 GB bind in turn; no room is null; a flag wins" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    // 2 entries x 1000 tokens x 1 MB + 2 GB: the formula binds.
+    const small = resolveDiskBudget(false, DEFAULT_DISK_CAP, 2, 1000, MB, 500 * GB, 0).?;
+    try testing.expectEqual(@as(u64, 2000 * MB + 2 * GB), small.bytes);
+    try testing.expectEqual(DiskBound.formula, small.bound);
+    // 32 entries x 262144 tokens x 18.4 kB is far past 20 GB.
+    const big = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 500 * GB, 0).?;
+    try testing.expectEqual(DEFAULT_DISK_CAP, big.bytes);
+    try testing.expectEqual(DiskBound.cap, big.bound);
+    // 10 GB free leaves 6.
+    const tight = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 10 * GB, 0).?;
+    try testing.expectEqual(6 * GB, tight.bytes);
+    try testing.expectEqual(DiskBound.free_disk, tight.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 4 * GB, 0));
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, 1 * GB, 0));
+    // Overflow saturates to the cap, never wraps.
+    try testing.expectEqual(DEFAULT_DISK_CAP, resolveDiskBudget(false, 0, std.math.maxInt(u32), std.math.maxInt(u64), 1 << 40, 500 * GB, 0).?.bytes);
+    // An explicit number is the budget, whatever the formula or the free space say; 0 is off.
+    const flag = resolveDiskBudget(true, 50 * GB, 32, 262144, 18_400, 10 * GB, 0).?;
+    try testing.expectEqual(@as(u64, 50 * GB), flag.bytes);
+    try testing.expectEqual(DiskBound.flag, flag.bound);
+    try testing.expectEqual(@as(?DefaultDiskBudget, null), resolveDiskBudget(true, 0, 32, 262144, 18_400, 500 * GB, 0));
+}
+
+test "diskUsageLine: used / budget in GB and the entry count" {
+    var buf: [128]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqualStrings("[disk-cache] usage 3.50 / 20.0 GB, 5 entries", diskUsageLine(&buf, 3 * GB + GB / 2, 20 * GB, 5));
+}
+
+test "allocatingDiskLine: starts with Allocating and names the terms, the bound and the directory" {
+    var buf: [256]u8 = undefined;
+    const GB: u64 = 1024 * 1024 * 1024;
+    const line = allocatingDiskLine(&buf, .{ .bytes = 20 * GB, .bound = .cap, .cap = 20 * GB }, 32, 262144, 18_400, "/c");
+    try testing.expectEqualStrings("Allocating 20.0 GB SSD for the prefix cache (32 entries x 262144 tokens x 18.0 KB + 2 GB; bound: 20 GB cap) at /c", line);
+    const flag = allocatingDiskLine(&buf, .{ .bytes = 12 * GB, .bound = .flag, .cap = 12 * GB }, 32, 0, 0, "/c");
+    try testing.expectEqualStrings("Allocating 12.0 GB SSD for the prefix cache (--prefix-cache-disk) at /c", flag);
+    try testing.expectEqualStrings("SSD prefix cache OFF: 3.0 GB free at /c leaves nothing after the 4 GB reserve", diskOffLine(&buf, 3 * GB, "/c"));
+}
+
+test "diskBudgetFromFreeSpace: the one reserve is 4 GiB, whatever the volume; nothing left stores nothing" {
+    const GB: u64 = 1 << 30;
+    try testing.expectEqual(@as(?u64, 1020 * GB), diskBudgetFromFreeSpace(0, 1024 * GB));
+    try testing.expectEqual(@as(?u64, 100 * GB), diskBudgetFromFreeSpace(100 * GB, 1024 * GB));
+    // A small budget is still a budget: free less 4 GiB, announced and stored alike.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(0, 10 * GB));
+    try testing.expectEqual(@as(?u64, GB / 2), diskBudgetFromFreeSpace(0, 4 * GB + GB / 2));
+    // The operator's cap is a cap, not a promise the volume must keep.
+    try testing.expectEqual(@as(?u64, 6 * GB), diskBudgetFromFreeSpace(500 * GB, 10 * GB));
+    // Refuse, never a silent 0.
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(0, 4 * GB));
+    try testing.expectEqual(@as(?u64, null), diskBudgetFromFreeSpace(500 * GB, 2 * GB));
+    // Load-time resolution and the store-time bound read the same free space the same way.
+    for ([_]u64{ 10 * GB, 5 * GB, 4 * GB + GB / 2, 3 * GB }) |free| {
+        const announced = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 1 << 20, 1 << 20, free, 0);
+        const stored = diskBudgetFromFreeSpace(if (announced) |a| a.cap else 0, free);
+        try testing.expectEqual(if (announced) |a| @as(?u64, a.bytes) else null, stored);
+    }
+}
+
+test "volumeSpace: the live probe is plausible or null (statfs ABI guard)" {
+    // On this machine the probe must succeed: a null means the struct layout broke.
+    const vs = volumeSpace("/") orelse return error.VolumeSpaceProbeFailed;
+    try testing.expect(vs.total > 0);
+    try testing.expect(vs.free <= vs.total);
+    try testing.expect(vs.total > 1024 * 1024 * 1024); // a macOS root volume
+}
+
+test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {
+    // The choice, not the live numbers: two samples of free disk space are never equal under a suite that writes.
+    const GB: u64 = 1024 * 1024 * 1024;
+    try testing.expectEqual(@as(u64, 117 * GB), freeForUse(117 * GB, 500 * GB, 36 * GB));
+    try testing.expectEqual(@as(u64, 36 * GB), freeForUse(0, 500 * GB, 36 * GB));
+    try testing.expectEqual(@as(u64, 36 * GB), freeForUse(500 * GB + 1, 500 * GB, 36 * GB));
+    // The grant probe is wired: absent it, every volume would fall back to f_bavail.
+    try testing.expect(sushi_volume_free_for_use("/") > 0);
+}
+
 test "DiskTier: SSD-first declines to store when the VOLUME is short, and says so" {
     // 3 GiB free against a 512 GiB volume leaves nothing after the reserve: the tier stores nothing.
     const io = std.testing.io;
@@ -6508,11 +8831,152 @@ test "DiskTier: SSD-first declines to store when the VOLUME is short, and says s
     try testing.expectEqual(@as(u32, 640), tier.entries.items[0].kv_len);
 }
 
-pub var test_evict_tier: ?*DiskTier = null;
-pub var test_evict_id: ?u64 = null;
+test "DiskTier: a budget the load line announced is a budget the store honours (10 GiB free on a 1 TiB volume)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    const free: u64 = 10 * 1024 * 1024 * 1024;
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, 0).?;
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-announced", plan.bytes, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(free, total);
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(!tier.store_declined);
+    try testing.expectEqual(plan.bytes, tier.max_bytes);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(u32, 640), tier.bestMatch(&tokens, false, cache.config, .{}).?.usable);
+}
+
+test "DiskTier: a restart on a nearly full volume keeps what the tier already holds" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1024 * 1024 * 1024 * 1024;
+
+    {
+        var first = try DiskTier.init(testing.allocator, io, base, "fp-restart", 0, 128);
+        defer first.deinit();
+        first.ssd_first = true;
+        first.armTestSpace(total / 2, total);
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+        for ([_]u32{ 7, 90_000 }) |off| {
+            var tokens: [640]u32 = undefined;
+            for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+            _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        }
+        first.drainWriter();
+        try testing.expectEqual(@as(usize, 2), first.entryCount());
+    }
+    const held = tierBytes(io, base, "fp-restart");
+    try testing.expect(held > 0);
+
+    // Free space is the reserve plus half of what the tier holds: the entries alone are not "free".
+    const free = DISK_FREE_RESERVE + held / 2;
+    const blind = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, 0).?;
+    try testing.expectEqual(held / 2, blind.bytes);
+    const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, held).?;
+    try testing.expectEqual(held + held / 2, plan.bytes);
+    try testing.expectEqual(DiskBound.free_disk, plan.bound);
+    try testing.expectEqual(DEFAULT_DISK_CAP, plan.cap);
+
+    var second = try DiskTier.init(testing.allocator, io, base, "fp-restart", plan.bytes, 128);
+    defer second.deinit();
+    second.operator_cap = plan.cap;
+    try testing.expectEqual(@as(usize, 2), second.entryCount());
+    // The live bound holds the entries it was given and follows the free space back up toward the cap.
+    second.armTestSpace(free, total);
+    second.refreshDiskBudget();
+    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes, second.max_bytes);
+    try testing.expectEqual(@as(usize, 2), second.entryCount());
+    second.armTestSpace(free + 8 * 1024 * 1024 * 1024, total);
+    second.refreshDiskBudget();
+    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes + 8 * 1024 * 1024 * 1024, second.max_bytes);
+
+    // An explicit flag is the budget as given, whatever the volume holds or leaves.
+    const flag = resolveDiskBudget(true, 3 * held, 32, 262144, 18_400, free, held).?;
+    try testing.expectEqual(3 * held, flag.bytes);
+    try testing.expectEqual(DiskBound.flag, flag.bound);
+    try testing.expectEqual(3 * held, flag.cap);
+}
+
+test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-probe", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    const roomy: u64 = 1024 * 1024 * 1024 * 1024;
+    tier.armTestSpace(roomy, 2 * roomy);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var p = test_space_probes;
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // Unchanged recommit: the tier already holds it.
+    p = test_space_probes;
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s));
+    try testing.expectEqual(p, test_space_probes);
+
+    // Pending spec work is a store.
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const snap: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    p = test_space_probes;
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, null, null, snap, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // An extension is a store.
+    p = test_space_probes;
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expect(test_space_probes > p);
+
+    // With nothing left after the reserve a copy already on disk still counts; a new entry declines.
+    tier.armTestSpace(3 * 1024 * 1024 * 1024, 512 * 1024 * 1024 * 1024);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s));
+    var other: [640]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(cache.entries, 640, cache.config, &other, false, null, s));
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+}
+
+var test_evict_tier: ?*DiskTier = null;
+var test_evict_id: ?u64 = null;
 
 // Stands in for the budget refresh evicting an entry while a store is in flight.
-pub fn evictingSpaceProbe(path: []const u8) ?disk_placement.VolumeSpace {
+fn evictingSpaceProbe(path: []const u8) ?VolumeSpace {
     if (test_evict_id) |id| {
         test_evict_id = null;
         const t = test_evict_tier.?;
@@ -6521,7 +8985,78 @@ pub fn evictingSpaceProbe(path: []const u8) ?disk_placement.VolumeSpace {
             break;
         };
     }
-    return disk_placement.testSpaceProbe(path);
+    return testSpaceProbe(path);
+}
+
+fn evictionDuringStoreRound(selected: usize, evicted: usize, ssm_only: bool) !void {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
+    tier.ssd_first = true;
+    const roomy: u64 = 1024 * 1024 * 1024 * 1024;
+    tier.armTestSpace(roomy, 2 * roomy);
+
+    const seeds = [3]f64{ 0.0, 100_000.0, 200_000.0 };
+    var toks: [3][640]u32 = undefined;
+    for (&toks, 0..) |*t, k| for (t, 0..) |*v, i| {
+        v.* = @intCast(i + 7 + k * 100_000);
+    };
+    for (0..3) |k| {
+        var c = try KVCache.init(testing.allocator, 2);
+        defer c.deinit();
+        try fillCache(&c, s, 2, 600, 8, seeds[k], .float32);
+        _ = try tier.appendCommit(c.entries, c.step, c.config, toks[k][0..600], false, null, s);
+        tier.drainWriter();
+    }
+    try testing.expectEqual(@as(usize, 3), tier.entryCount());
+    for (0..3) |k| try testing.expectEqualSlices(u32, toks[k][0..600], tier.entries.items[k].tokens);
+
+    // Commit entry `selected`, extended to 640 tokens or with a spec sidecar, while the probe evicts `evicted`.
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 640, 8, seeds[selected], .float32);
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    const snap: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
+    test_evict_tier = &tier;
+    test_evict_id = tier.entries.items[evicted].id;
+    tier.space_probe = evictingSpaceProbe;
+    const len: usize = if (ssm_only) 600 else 640;
+    _ = try tier.appendCommitWithSpec(cache.entries, len, cache.config, toks[selected][0..len], false, null, null, if (ssm_only) snap else null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(?u64, null), test_evict_id);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-evict", 0, 128);
+    defer tier2.deinit();
+    for (0..3) |k| {
+        if (k == evicted and k != selected) continue;
+        const m = tier2.bestMatch(&toks[k], false, kv_quant.KVQuantConfig.dense, .{}).?;
+        const want: u32 = if (k == selected and !ssm_only) 640 else 600;
+        try testing.expectEqual(want, m.usable);
+        var restored = try KVCache.init(testing.allocator, 2);
+        defer restored.deinit();
+        _ = try tier2.restoreInto(&restored, m.idx, s);
+        try testing.expectEqual(seeds[k], try cacheValueAt(&restored, 0, 0, 0, s));
+        try testing.expectEqual(seeds[k] + 8.0 * @as(f64, @floatFromInt(want - 1)), try cacheValueAt(&restored, 0, want - 1, 0, s));
+        // The sidecar belongs to the committed entry alone.
+        const sidecar = tier2.entries.items[m.idx].spec_bytes > 0;
+        try testing.expectEqual(ssm_only and k == selected, sidecar);
+    }
+}
+
+test "DiskTier: a budget refresh that evicts mid-commit cannot redirect the store to another entry" {
+    // swapRemove moves the LAST entry into the hole: a saved index then names another entry or none.
+    try evictionDuringStoreRound(0, 0, false);
+    try evictionDuringStoreRound(2, 0, false);
+    try evictionDuringStoreRound(0, 0, true);
+    try evictionDuringStoreRound(2, 1, true);
 }
 
 test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-first itself bumps no manifest)" {
@@ -6586,6 +9121,59 @@ test "DiskTier: entries cross the SSD-first boundary in BOTH directions (SSD-fir
         try testing.expect(std.mem.indexOf(u8, meta, "\"v\":4") != null);
         try testing.expect(std.mem.indexOf(u8, meta, "\"v\":6") == null);
     }
+}
+
+test "DiskTier: the root-wide sweep drops strays and never touches the live tier's own root" {
+    // A sibling's index-less entry is a crash leftover only once it is older than
+    // `STRAY_MIN_AGE_NS` (another server's flush writes meta.json last); the live tier's own
+    // root is skipped entirely.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    {
+        var sib = try DiskTier.init(testing.allocator, io, base, "fp-sibling", 0, 128);
+        defer sib.deinit();
+        var cache = try KVCache.init(testing.allocator, 1);
+        defer cache.deinit();
+        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        _ = try sib.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    }
+    try tmp.dir.createDirPath(io, "fp-stray/e9");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
+    const aged: std.Io.Timestamp = .{
+        .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)),
+    };
+    try tmp.dir.setTimestamps(io, "fp-stray/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
+    // Its young twin: index-less but written just now, so it must survive.
+    try tmp.dir.createDirPath(io, "fp-inflight/e3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-inflight/e3/c000000.safetensors", .data = "another server" });
+    var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
+    defer live.deinit();
+    live.ssd_first = true;
+    live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    // The live tier's own root, mid-write-through: chunks, no index yet. Staged after init
+    // (init's own `scan` rightly drops an index-less entry).
+    try tmp.dir.createDirPath(io, "fp-live/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
+    live.max_bytes = 1 << 40;
+    sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+
+    // With a budget of zero the siblings' real entries go too, and the live root is still untouched.
+    sweepBase(testing.allocator, io, base, live.root, 0);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }
 
 test "DiskTier: the per-entry cap holds the whole 8192 grid to 1M tokens, and past it thins keeping both ends" {
@@ -6723,11 +9311,46 @@ test "DiskTier: a failing synchronous writeMeta frees the final path exactly onc
     } else |_| {}
 }
 
+test "materializeContiguous: the fresh-handle errdefer never outlives the transfer" {
+    // The fresh handle's errdefer must not stay armed across `t.arr = cont`, or a later failure
+    // frees the same array twice. Transliterated onto a heap allocation so the testing
+    // allocator catches both a leak and a double free.
+    const t = testing;
+
+    const Item = struct { arr: *u32 };
+    const S = struct {
+        fn run(a: std.mem.Allocator, items: []Item, fail_at: usize) !void {
+            for (items, 0..) |*it, i| {
+                const cont = try a.create(u32);
+                {
+                    errdefer a.destroy(cont);
+                    cont.* = it.arr.* + 1;
+                }
+                a.destroy(it.arr);
+                it.arr = cont;
+                if (i == fail_at) return error.Injected;
+            }
+        }
+    };
+
+    var items: [4]Item = undefined;
+    for (&items, 0..) |*it, i| {
+        it.* = .{ .arr = try testing.allocator.create(u32) };
+        it.arr.* = @intCast(i);
+    }
+    // The caller's `defer freeNamed(&list)`: it owns every `arr`, on every outcome.
+    defer for (&items) |*it| testing.allocator.destroy(it.arr);
+    try t.expectError(error.Injected, S.run(testing.allocator, &items, 2));
+    try t.expectEqual(@as(u32, 1), items[0].arr.*);
+    try t.expectEqual(@as(u32, 3), items[2].arr.*);
+    try t.expectEqual(@as(u32, 3), items[3].arr.*);
+}
+
 // ── SSD-first chunk sharing ──
 
 /// Two 600-token sequences that agree for the first `shared` tokens and diverge after.
 const ShareToks = struct { a: [600]u32, b: [600]u32 };
-pub fn chunkShareTokens(shared: usize) ShareToks {
+fn chunkShareTokens(shared: usize) ShareToks {
     var out: ShareToks = undefined;
     for (&out.a, 0..) |*t, i| t.* = @intCast(i + 7);
     for (&out.b, 0..) |*t, i| t.* = if (i < shared) @intCast(i + 7) else @intCast(9000 + i);
@@ -6759,6 +9382,8 @@ test "DiskTier chunk share: a prefix-diverging entry hard-links the donor's whol
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
+    chunk_share_override = true;
+    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share", 0, 128);
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
@@ -6811,6 +9436,8 @@ test "DiskTier chunk share: total_bytes is bytes on disk whichever holder dies f
     // The filesystem is the refcount: donor-then-heir and heir-then-donor both land back on the pre-commit number.
     const io = std.testing.io;
     const s = mlx.gpuStream();
+    chunk_share_override = true;
+    defer chunk_share_override = null;
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
     try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
@@ -6868,6 +9495,8 @@ test "DiskTier chunk share: a writer-armed tier beside a RAM tier links like SSD
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-share-ram", 0, 128);
     defer tier.deinit();
     tier.enableBackgroundWriter();
@@ -6924,6 +9553,8 @@ test "DiskTier chunk share: meta v6 carries inherited_chunks; a v5 manifest load
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
     try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
@@ -6982,6 +9613,8 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
+    chunk_share_override = true;
+    defer chunk_share_override = null;
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-landed", 0, 128);
     tier.ssd_first = true;
@@ -7292,6 +9925,96 @@ test "DiskTier: the manifest stamps the LOWEST version that describes the entry"
     try t.expectEqual(@as(u8, 8), DiskTier.metaVersionFor(e));
 }
 
+test "DiskTier: a v7 full-aux QSA file serves a mid-block leftover inside a RING_ROWS ring; v>8 is refused" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    const hd: c_int = 8;
+    const aux_shape = [_]c_int{ 1, 256, hd };
+    const pooled_shape = [_]c_int{ 1, 64, hd };
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 46, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    // A v7 entry: its snaps carry recurrent state and `qsa_rows` only, and the whole raw
+    // indexer history — every checkpoint's leftover included — is the entry-level file.
+    for (&cps) |*cp| for (cp.layers) |*l| {
+        if (l.aux_state.ctx == null) continue;
+        _ = mlx.mlx_array_free(l.aux_state);
+        l.aux_state = .{ .ctx = null };
+    };
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    const id = tier.entries.items[0].id;
+    const dir_rel = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ tier.root, id });
+    defer testing.allocator.free(dir_rel);
+    const full_layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 3);
+    for (full_layers) |*l| l.* = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    };
+    full_layers[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    full_layers[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    full_layers[2].qsa_ratio = 4;
+    full_layers[2].qsa_rows = 256;
+    var full_cp: transformer_mod.SSMCheckpoint = .{ .pos = 256, .layers = full_layers };
+    defer full_cp.deinit(testing.allocator);
+    _ = try tier.writeQsaHistoryFile(dir_rel, &full_cp, s);
+
+    // The file keeps every row it was written with; the ring truncation is the live entry's.
+    var loaded = try tier.loadQsaHistoryFile(id, 3);
+    defer loaded.deinit(testing.allocator);
+    try testing.expectEqual(@as(c_int, 256), loaded.layers[2].qsa_rows);
+    try testing.expectEqual(@as(c_int, 256), mlx.getShape(loaded.layers[2].aux_state)[1]);
+
+    tier.deinit();
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-qsa-v8", 0, 128);
+    defer tier2.deinit();
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 46), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 46, s));
+    try testing.expectEqual(@as(c_int, 46), dst[2].qsa_hist_rows);
+    try testing.expectEqual(@as(c_int, 11), mlx.getShape(dst[2].qsa_pooled)[1]);
+    try testing.expectEqual(@as(f32, 800.0), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    // A restore at 46 (ratio 4) seeds exactly the 2 leftover rows 44 and 45, which are the checkpoint's
+    // own leftover — source rows 44 and 45.
+    const leftover = mlx.getShape(dst[2].aux_state)[1];
+    try testing.expectEqual(@as(c_int, 2), leftover);
+    try testing.expectEqual(@as(f32, 1052.0), ssmArrVal(dst[2].aux_state, 0, s));
+    try testing.expectEqual(@as(f32, 1060.0), ssmArrVal(dst[2].aux_state, hd, s));
+
+    try tmp.dir.createDirPath(io, "fp-qsa-v8/e9");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "fp-qsa-v8/e9/meta.json",
+        .data = "{\"v\":9,\"kv_len\":1,\"tokens\":0,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":0,\"chunk_tokens\":128,\"inherited_chunks\":0,\"bytes\":0,\"chunk_bytes\":[],\"ssm\":[]}",
+    });
+    try testing.expect(tier2.loadEntry(9) == null);
+}
+
 test "DiskTier: the per-entry checkpoint cap is gated; a legacy tier keeps 8" {
     const t = std.testing;
     const io = std.testing.io;
@@ -7572,10 +10295,8 @@ test "DiskTier hybrid lookup leaves a prompt token to compute logits" {
     var entry_list: std.ArrayList(IndexEntry) = .empty;
     defer entry_list.deinit(testing.allocator);
     try entry_list.appendSlice(testing.allocator, &entries);
-    var stats: write_stats.Stats = .{};
     const tier = DiskTier{
         .allocator = testing.allocator,
-        .stats = &stats,
         .io = testing.io,
         .root = &.{},
         .max_bytes = 0,
@@ -7591,6 +10312,53 @@ test "DiskTier hybrid lookup leaves a prompt token to compute logits" {
     try testing.expectEqual(@as(u32, 512), tier.bestHybridMatch(&tokens, false, quant, 512, .{}).?.cp);
     try testing.expect(tier.bestHybridMatch(tokens[0..256], false, quant, 256, .{}) == null);
     try testing.expect(tier.bestHybridMatch(&.{}, false, quant, 0, .{}) == null);
+}
+
+fn testFingerprintPayloadChange(indexed: bool, mtime_only: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const files: []const []const u8 = if (indexed) &.{ "trunk.safetensors", "experts.safetensors", "ngram_table.bin" } else &.{ "model.safetensors", "ngram_table.bin" };
+    if (indexed) try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"trunk.safetensors\",\"b\":\"experts.safetensors\",\"c\":\"trunk.safetensors\"}}" });
+    for (files) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "old" });
+    for (files) |name| {
+        const before = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(before);
+        const unchanged = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(unchanged);
+        try testing.expectEqualStrings(before, unchanged);
+        const f = try tmp.dir.openFile(io, name, .{ .mode = .read_write });
+        defer f.close(io);
+        const st = try f.stat(io);
+        if (mtime_only) {
+            try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = st.mtime.nanoseconds + 2_000_000_000 } } });
+        } else {
+            try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "replacement" });
+            try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = st.mtime } });
+        }
+        const changed = try modelFingerprint(testing.allocator, io, base);
+        defer testing.allocator.free(changed);
+        try testing.expect(!std.mem.eql(u8, before, changed));
+    }
+}
+
+test "fingerprint indexed shards and ngram size" {
+    try testFingerprintPayloadChange(true, false);
+}
+
+test "fingerprint indexed shards and ngram mtime" {
+    try testFingerprintPayloadChange(true, true);
+}
+
+test "fingerprint single shard and ngram size" {
+    try testFingerprintPayloadChange(false, false);
+}
+
+test "fingerprint single shard and ngram mtime" {
+    try testFingerprintPayloadChange(false, true);
 }
 
 test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" {
@@ -7634,7 +10402,6 @@ test "DiskTier: a restore wider than the fd limit closes each chunk as it goes" 
 }
 
 test "DiskTier: a failed restore drops the latch it raised and keeps a foreign one" {
-    try mlx.requireGpu();
     // The caller's cold-prefill fallback must not inherit this restore's MLX error.
     mlx.installErrorHandler();
     const io = std.testing.io;
@@ -7723,6 +10490,82 @@ test "DiskTier: a restore fills its buffers chunk by chunk, never holding every 
     }
 }
 
+test "upstream bugfix: DiskTier: in-place commits keep an entry's bytes equal to the files it owns" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-bill", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 900, 8, 0.0, .float32);
+    var tokens: [900]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    const aux_shape = [_]c_int{ 1, 600, 8 };
+    const pooled_shape = [_]c_int{ 1, 150, 8 };
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 384, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 600, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    // A fifth checkpoint with no QSA history: the append adds a file and leaves qsa.safetensors alone.
+    var more = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 64, s),
+    };
+    defer for (&more) |*cp| cp.deinit(testing.allocator);
+
+    const Owned = struct {
+        // Every file in a non-sharing entry's dir is its own; meta.json is the manifest, never billed.
+        fn bytes(t: *DiskTier, e: *const IndexEntry) !u64 {
+            const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ t.root, e.id });
+            defer testing.allocator.free(dir);
+            var d = try std.Io.Dir.openDirAbsolute(t.io, dir, .{});
+            defer d.close(t.io);
+            const meta = try d.statFile(t.io, "meta.json", .{});
+            var seen = InodeSet.init(testing.allocator);
+            defer seen.deinit();
+            return dirBytes(t.io, dir, &seen) - meta.size;
+        }
+    };
+
+    // Turn 1: 600 tokens land with four checkpoints and a QSA history file.
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, &cps, s);
+    try testing.expect(tier.entries.items[0].qsa_history_bytes > 0);
+    try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
+
+    // Turn 2: same tokens, an MTP snap and one more checkpoint -> the ssm/spec-only append.
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    try testing.expect(tier.entries.items[0].spec_bytes > 0);
+    try testing.expectEqual(@as(usize, 5), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
+    try testing.expectEqual(tier.entries.items[0].bytes, tier.total_bytes);
+
+    // Turn 3: the conversation grows to 900 tokens, again with no checkpoints -> extend in place.
+    _ = try tier.appendCommit(cache.entries, 900, cache.config, &tokens, false, null, s);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 900), e.kv_len);
+    try testing.expect(e.qsa_history_bytes > 0);
+    try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
+    try testing.expectEqual(e.bytes, tier.total_bytes);
+}
+
 test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoints" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -7786,418 +10629,4 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
         _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
         try testing.expectEqualSlices(u32, c.want, tier.entries.items[0].ssm_positions);
     }
-}
-
-fn wroteKind(tier: *const DiskTier, kind: write_stats.Kind) u64 {
-    return tier.stats.snapshot().written[@intFromEnum(kind)];
-}
-
-fn sumBytes(items: []const u64) u64 {
-    var n: u64 = 0;
-    for (items) |b| n += b;
-    return n;
-}
-
-test "DiskTier write counters: a cold persist counts its kinds, an exact reuse adds nothing, an extension counts the tail and the new chunks" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
-    var dfl = try KVCache.init(testing.allocator, 2);
-    defer dfl.deinit();
-    try fillCache(&dfl, s, 2, 600, 8, 3.5, .float32);
-    var tokens: [800]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    const dflash: SpecCommit = .{ .entries = dfl.entries, .step = dfl.step, .config = dfl.config, .base_pos = 0 };
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wcount", 0, 128);
-    defer tier.deinit();
-    tier.enableBackgroundWriter();
-    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
-    tier.drainWriter();
-
-    const meta_path = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/meta.json", .{ tier.root, tier.entries.items[0].id });
-    defer testing.allocator.free(meta_path);
-    const meta_json = fileSize(io, meta_path) orelse return error.TestUnexpectedResult;
-    const cold = tier.stats.snapshot();
-    const e = &tier.entries.items[0];
-    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
-    try testing.expect(e.spec_bytes > 0);
-    try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
-    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
-    for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
-    try testing.expectEqual(@as(u64, 0), cold.failed);
-
-    // The same commit again persists nothing.
-    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
-    tier.drainWriter();
-    try testing.expectEqual(cold, tier.stats.snapshot());
-
-    // 600 -> 800 tokens: chunks 0-3 are whole on disk; chunk 4 (the old partial tail) is written again with chunks 5 and 6.
-    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
-    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
-    tier.drainWriter();
-    const ext = tier.stats.snapshot();
-    const grown = &tier.entries.items[0];
-    try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
-    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
-    try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
-    try testing.expectEqual(@as(u64, 0), ext.failed);
-}
-
-test "DiskTier write counters: a spec sidecar replaced by an extension counts its full bytes again" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
-    var mtp = try KVCache.init(testing.allocator, 1);
-    defer mtp.deinit();
-    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
-    var tokens: [800]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wspec", 0, 128);
-    defer tier.deinit();
-    const first: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
-    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, null, first, s);
-    const spec_one = tier.entries.items[0].spec_bytes;
-    try testing.expect(spec_one > 0);
-    try testing.expectEqual(spec_one, wroteKind(&tier, .spec));
-
-    try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
-    try fillCache(&mtp, s, 1, 200, 8, 9.5 + 590 * 8, .float32);
-    const second: SpecCommit = .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 };
-    _ = try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, &tokens, false, null, null, second, s);
-    const spec_two = tier.entries.items[0].spec_bytes;
-    try testing.expect(spec_two > spec_one);
-    try testing.expectEqual(spec_one + spec_two, wroteKind(&tier, .spec));
-}
-
-test "DiskTier write counters: a failed background write lands in failed, never in written" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wfail", 0, 128);
-    defer tier.deinit();
-    tier.enableBackgroundWriter();
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-
-    tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
-    tier.writer.?.injectFailure("c000003", .write);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    const cb = tier.entries.items[0].chunk_bytes;
-    tier.writer.?.setPaused(false);
-    tier.drainWriter();
-    try testing.expectEqual(cb[3], tier.stats.snapshot().failed);
-    try testing.expectEqual(sumBytes(cb) - cb[3], wroteKind(&tier, .kv));
-}
-
-test "DiskTier write counters: the synchronous manifest write counts meta on success and failed on error" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wmeta", 0, 128);
-    defer tier.deinit();
-    try testing.expect(tier.writer == null);
-    var toks = [_]u32{ 1, 2, 3 };
-    var cb = [_]u64{64};
-    var no_pos = [_]u32{};
-    var no_sz = [_]u64{};
-    const e = IndexEntry{
-        .id = 5,
-        .tokens = &toks,
-        .kv_len = 3,
-        .has_tools = false,
-        .quant = kv_quant.KVQuantConfig.dense,
-        .bytes = 64,
-        .chunk_bytes = &cb,
-        .ssm_positions = &no_pos,
-        .ssm_bytes = &no_sz,
-        .last_used = 0,
-    };
-    try testing.expectError(error.FileNotFound, tier.writeMeta(e));
-    const missing_dir = tier.stats.snapshot();
-    try testing.expect(missing_dir.failed > 0);
-    try testing.expectEqual(@as(u64, 0), missing_dir.totalWritten());
-
-    try tmp.dir.createDirPath(io, "fp-wmeta/e5");
-    try tier.writeMeta(e);
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e5/meta.json", .{tier.root});
-    defer testing.allocator.free(path);
-    const landed = tier.stats.snapshot();
-    try testing.expectEqual(fileSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
-    try testing.expectEqual(missing_dir.failed, landed.failed);
-}
-
-fn mediaCommit(tier: *DiskTier, cache: *const KVCache, tokens: []const u32, key: u64, start: ?u32, s: mlx.mlx_stream) !PersistOutcome {
-    return tier.appendCommitWith(.{
-        .kv_entries = cache.entries,
-        .step = tokens.len,
-        .config = cache.config,
-        .tokens = tokens,
-        .has_tools = false,
-        .vision_key = key,
-        .media_start = start,
-    }, s, .{});
-}
-
-fn keyedKvLen(tier: *const DiskTier, key: u64) ?u32 {
-    for (tier.entries.items) |*e| {
-        if (e.vision_key == key) return e.kv_len;
-    }
-    return null;
-}
-
-test "DiskTier: a commit under other pixels gets its own record, never superseded by or extending another image's" {
-    // Two images of one size render the same placeholder ids, so the token record cannot tell their rows apart.
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-target", 0, 128);
-    defer tier.deinit();
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
-    var tokens: [1200]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
-    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
-    const kc: u64 = 0xC3C3_C3C3_C3C3_C3C3;
-
-    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
-    // B's longer commit would extend A's record.
-    _ = try mediaCommit(&tier, &cache, &tokens, kb, 100, s);
-    try testing.expectEqual(@as(usize, 2), tier.entryCount());
-    // A's own commit is still superseded by A's record.
-    _ = try mediaCommit(&tier, &cache, tokens[0..600], ka, 100, s);
-    try testing.expectEqual(@as(usize, 2), tier.entryCount());
-    // C's commit is covered by B's tokens, not by its rows.
-    _ = try mediaCommit(&tier, &cache, tokens[0..600], kc, 100, s);
-    try testing.expectEqual(@as(usize, 3), tier.entryCount());
-    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, ka));
-    try testing.expectEqual(@as(?u32, 1200), keyedKvLen(&tier, kb));
-    try testing.expectEqual(@as(?u32, 600), keyedKvLen(&tier, kc));
-}
-
-test "DiskTier: a text record extends into the image turn after it, and that image's record extends under its own key" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-extend", 0, 128);
-    defer tier.deinit();
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 1800, 8, 0.0, .float32);
-    var tokens: [1800]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
-
-    _ = try mediaCommit(&tier, &cache, tokens[0..600], 0, null, s);
-    const id = tier.entries.items[0].id;
-    _ = try mediaCommit(&tier, &cache, tokens[0..1200], ka, 700, s);
-    _ = try mediaCommit(&tier, &cache, &tokens, ka, 700, s);
-    try testing.expectEqual(@as(usize, 1), tier.entryCount());
-    try testing.expectEqual(id, tier.entries.items[0].id);
-    try testing.expectEqual(@as(u32, 1800), tier.entries.items[0].kv_len);
-    try testing.expectEqual(ka, tier.entries.items[0].vision_key);
-}
-
-test "DiskTier chunk share: a donor under other pixels lends only the chunks wholly below the first image row" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-media-share", 0, 128);
-    defer tier.deinit();
-    tier.ssd_first = true;
-    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
-    // The token records agree through 520 (4 whole chunks); the images start at 300.
-    const toks = chunkShareTokens(520);
-    _ = try mediaCommit(&tier, &cache, &toks.a, 0xA1A1_A1A1_A1A1_A1A1, 300, s);
-    _ = try mediaCommit(&tier, &cache, &toks.b, 0xB2B2_B2B2_B2B2_B2B2, 300, s);
-    try testing.expectEqual(@as(usize, 2), tier.entryCount());
-    try testing.expectEqual(@as(u32, 2), tier.entries.items[1].inherited_chunks);
-}
-
-test "DiskTier: an extend still staged behind the writer leaves an entry the scan reads at the manifest's count" {
-    // A kill before the staged manifest lands leaves the previous one, whose count is shorter than the record.
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
-    var tokens: [1200]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-torn-record", 0, 128);
-    defer tier.deinit();
-    tier.enableBackgroundWriter();
-    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
-    tier.drainWriter();
-    tier.writer.?.setPaused(true);
-    defer tier.writer.?.setPaused(false);
-    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
-
-    var loaded = tier.loadEntry(1) orelse return error.TestExpectedEntry;
-    defer tier.freeIndexEntryOwned(&loaded.e);
-    try testing.expectEqualSlices(u32, tokens[0..600], loaded.e.tokens);
-}
-
-test "DiskTier: a token record longer than the manifest's count restores at the count" {
-    // A torn append: whole tokens past the count, then a partial one.
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    {
-        var tier = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
-        defer tier.deinit();
-        var cache = try KVCache.init(testing.allocator, 1);
-        defer cache.deinit();
-        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    }
-    const record = try tmp.dir.readFileAlloc(io, "fp-longer/e1/tokens.bin", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(record);
-    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0 } });
-    defer testing.allocator.free(torn);
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-longer/e1/tokens.bin", .data = torn });
-
-    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-longer", 0, 128);
-    defer tier2.deinit();
-    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
-    try testing.expectEqualSlices(u32, &tokens, tier2.entries.items[0].tokens);
-    var out = try KVCache.init(testing.allocator, 1);
-    defer out.deinit();
-    try testing.expectEqual(@as(u32, 600), try tier2.restoreInto(&out, 0, s));
-}
-
-test "DiskTier: an extend shorter than a stale token tail leaves a record of exactly its tokens" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var cache = try KVCache.init(testing.allocator, 1);
-    defer cache.deinit();
-    try fillCache(&cache, s, 1, 601, 8, 0.0, .float32);
-    var tokens: [601]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    {
-        var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
-        defer tier.deinit();
-        _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
-    }
-    const record = try tmp.dir.readFileAlloc(io, "fp-stale/e1/tokens.bin", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(record);
-    const torn = try std.mem.concat(testing.allocator, u8, &.{ record, &[_]u8{ 9, 0, 0, 0, 10, 0, 0, 0, 11, 0, 0, 0, 12, 0 } });
-    defer testing.allocator.free(torn);
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stale/e1/tokens.bin", .data = torn });
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-stale", 0, 128);
-    defer tier.deinit();
-    _ = try tier.appendCommit(cache.entries, 601, cache.config, &tokens, false, null, s);
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e1/tokens.bin", .{tier.root});
-    defer testing.allocator.free(path);
-    try testing.expectEqual(@as(u64, tokens.len * 4), fileSize(io, path).?);
-}
-
-test "DiskTier: a token record shorter than the manifest's count drops the entry" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    {
-        var tier = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
-        defer tier.deinit();
-        var cache = try KVCache.init(testing.allocator, 1);
-        defer cache.deinit();
-        try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    }
-    const record = try tmp.dir.readFileAlloc(io, "fp-shorter/e1/tokens.bin", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(record);
-    try tmp.dir.writeFile(io, .{ .sub_path = "fp-shorter/e1/tokens.bin", .data = record[0 .. record.len - 2] });
-
-    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-shorter", 0, 128);
-    defer tier2.deinit();
-    try testing.expectEqual(@as(usize, 0), tier2.entryCount());
-}
-
-test "DiskTier: an extend writes the new tail of the token record, not the whole record" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try fillCache(&cache, s, 2, 1200, 8, 0.0, .float32);
-    var tokens: [1200]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-tail", 0, 128);
-    defer tier.deinit();
-    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
-    const kind = @intFromEnum(write_stats.Kind.meta);
-    const before = tier.stats.snapshot().written[kind];
-    _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
-    const grown = tier.stats.snapshot().written[kind] - before;
-
-    const manifest = try std.fmt.allocPrint(testing.allocator, "{s}/e1/meta.json", .{tier.root});
-    defer testing.allocator.free(manifest);
-    try testing.expectEqual(600 * 4 + fileSize(io, manifest).?, grown);
-
-    const record = try tmp.dir.readFileAlloc(io, "fp-tail/e1/tokens.bin", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(record);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&tokens), record);
 }

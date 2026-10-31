@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # Guard: POST /v1/models/rescan absorbs models downloaded AFTER boot.
 #

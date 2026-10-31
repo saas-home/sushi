@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=bench
 . "$(dirname "$0")/private_cache.sh"
 # Plan 01 — A8 24h concurrent soak test.
 #

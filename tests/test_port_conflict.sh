@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 set -euo pipefail
 

@@ -9,7 +9,6 @@
 const std = @import("std");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
-const write_stats = @import("disk_write_stats.zig");
 
 /// One staged file, or one part of a file larger than the permit; both buffers are owned by the
 /// queue once `submit` accepts them.
@@ -18,7 +17,6 @@ pub const Blob = struct {
     bytes: []u8,
     epoch: u64,
     part: Part = .whole,
-    kind: write_stats.Kind,
 };
 
 /// A file staged in parts: the first truncates its `tmp`, the rest append, the last renames.
@@ -70,8 +68,6 @@ pub const Writer = struct {
     /// Test-only: every blob whose path contains this substring fails like a full volume. Owned.
     fail_substr: ?[]u8 = null,
     fail_at: FailAt = .write,
-    /// Where written and failed bytes are reported, by kind. Null in a bare writer.
-    stats: ?*write_stats.Stats = null,
     /// Diagnostics / test bars. Written under the mutex.
     files_written: u64 = 0,
     bytes_written: u64 = 0,
@@ -139,14 +135,6 @@ pub const Writer = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize) void {
-        if (self.stats) |st| st.recordWritten(kind, n);
-    }
-
-    fn noteFailed(self: *Writer, n: usize) void {
-        if (self.stats) |st| st.recordFailed(n);
-    }
-
     fn freeBlob(self: *Writer, b: *Blob) void {
         self.allocator.free(b.path);
         self.allocator.free(b.bytes);
@@ -155,19 +143,18 @@ pub const Writer = struct {
     /// Stage one file. Takes ownership of both slices on every path, including errors.
     /// Blocks while the unwritten queue is over the permit (the only place the inference
     /// thread waits on the writer). Single producer: the inference thread.
-    pub fn submit(self: *Writer, path: []u8, bytes: []u8, kind: write_stats.Kind) void {
-        self.submitPart(path, bytes, .whole, kind);
+    pub fn submit(self: *Writer, path: []u8, bytes: []u8) void {
+        self.submitPart(path, bytes, .whole);
     }
 
     /// `submit` for one part of a file staged in parts (`Part`). A part that cannot be staged
     /// drops the rest of its file.
-    pub fn submitPart(self: *Writer, path: []u8, bytes: []u8, part: Part, kind: write_stats.Kind) void {
+    pub fn submitPart(self: *Writer, path: []u8, bytes: []u8, part: Part) void {
         std.debug.assert(!self.deinited);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.running) {
             // No writer: dropping is correct, the index file rides the same queue.
-            self.noteFailed(bytes.len);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -177,7 +164,6 @@ pub const Writer = struct {
             log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ "InjectedSubmitFailure", path });
             self.noteFailureLocked(path, "InjectedSubmitFailure");
             if (part != .whole) self.markBrokenLocked(path);
-            self.noteFailed(bytes.len);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -189,11 +175,9 @@ pub const Writer = struct {
             .bytes = bytes,
             .epoch = self.epoch,
             .part = part,
-            .kind = kind,
         }) catch |err| {
             self.noteFailureLocked(path, @errorName(err));
             if (part != .whole) self.markBrokenLocked(path);
-            self.noteFailed(bytes.len);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -333,7 +317,6 @@ pub const Writer = struct {
             var owned = self.queue.orderedRemove(i);
             if (owned.part != .whole and cut == null) cut = self.allocator.dupe(u8, owned.path) catch null;
             if (owned.part == .whole or owned.part == .last) self.clearBrokenLocked(owned.path);
-            self.noteFailed(owned.bytes.len);
             self.freeBlob(&owned);
             self.files_dropped += 1;
         }
@@ -489,11 +472,9 @@ pub const Writer = struct {
             } else self.clearBrokenLocked(blob.path);
             if (dropped) {
                 self.files_dropped += 1;
-                self.noteFailed(blob.bytes.len);
             } else {
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += blob.bytes.len;
-                self.noteWritten(blob.kind, blob.bytes.len);
             }
             self.inflight_bytes = 0;
             self.inflight_path = null;
@@ -575,7 +556,7 @@ test "kv_disk_writer: files land off-thread, in FIFO order, and atomically" {
         const path = try std.fmt.allocPrint(testing.allocator, "{s}/f{d}.bin", .{ root, i });
         const bytes = try testing.allocator.alloc(u8, 4096);
         @memset(bytes, @intCast(i));
-        w.submit(path, bytes, .kv);
+        w.submit(path, bytes);
     }
     w.drain();
     try testing.expectEqual(@as(u64, 10), w.filesWritten());
@@ -608,7 +589,7 @@ test "kv_disk_writer: the epoch fence drops staged bytes instead of writing them
     var w = Writer.init(testing.allocator, std.testing.io);
     const p0 = try std.fmt.allocPrint(testing.allocator, "{s}/never.bin", .{root});
     const b0 = try testing.allocator.alloc(u8, 16);
-    w.submit(p0, b0, .kv);
+    w.submit(p0, b0);
     try testing.expectEqual(@as(u64, 1), w.files_dropped);
 
     try w.start();
@@ -645,7 +626,7 @@ test "kv_disk_writer: the host-byte permit bounds staged bytes" {
         const path = try std.fmt.allocPrint(testing.allocator, "{s}/p{d}.bin", .{ root, i });
         const bytes = try testing.allocator.alloc(u8, 16 * 1024);
         @memset(bytes, 7);
-        w.submit(path, bytes, .kv);
+        w.submit(path, bytes);
         try testing.expect(w.pendingBytes() <= w.permit_bytes + 16 * 1024);
     }
     w.drain();
@@ -668,7 +649,7 @@ test "kv_disk_writer: room for a file is waited for before its bytes exist" {
         const path = try std.fmt.allocPrint(testing.allocator, "{s}/r{d}.bin", .{ root, i });
         const bytes = try testing.allocator.alloc(u8, 16 * 1024);
         @memset(bytes, 1);
-        w.submit(path, bytes, .kv);
+        w.submit(path, bytes);
     }
     const Waiter = struct {
         fn run(wr: *Writer, got: *std.atomic.Value(bool)) void {
@@ -685,6 +666,7 @@ test "kv_disk_writer: room for a file is waited for before its bytes exist" {
     t.join();
     try testing.expect(got.load(.acquire));
     try testing.expect(w.pendingBytes() + 16 * 1024 <= w.permit_bytes);
+    try testing.expect(w.waitedNs() > 0);
 }
 
 test "kv_disk_writer: a file staged in parts lands whole at its last part, and a failed part publishes nothing" {
@@ -703,7 +685,7 @@ test "kv_disk_writer: a file staged in parts lands whole at its last part, and a
         const path = try std.fmt.allocPrint(testing.allocator, "{s}/big.bin", .{root});
         const bytes = try testing.allocator.alloc(u8, 16 * 1024);
         @memset(bytes, @intCast(i + 1));
-        w.submitPart(path, bytes, part, .kv);
+        w.submitPart(path, bytes, part);
     }
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "big.bin", .{}));
     w.setPaused(false);
@@ -719,7 +701,7 @@ test "kv_disk_writer: a file staged in parts lands whole at its last part, and a
     w.injectFailure("broken.bin", .write);
     for (parts) |part| {
         const path = try std.fmt.allocPrint(testing.allocator, "{s}/broken.bin", .{root});
-        w.submitPart(path, try testing.allocator.alloc(u8, 1024), part, .kv);
+        w.submitPart(path, try testing.allocator.alloc(u8, 1024), part);
     }
     w.drain();
     try testing.expectEqual(@as(u64, 1), w.writeErrorCount());
@@ -730,7 +712,7 @@ test "kv_disk_writer: a file staged in parts lands whole at its last part, and a
     const again = try std.fmt.allocPrint(testing.allocator, "{s}/broken.bin", .{root});
     const bytes = try testing.allocator.alloc(u8, 8);
     @memset(bytes, 9);
-    w.submit(again, bytes, .kv);
+    w.submit(again, bytes);
     w.drain();
     try testing.expectEqual(@as(u64, 8), (try tmp.dir.statFile(std.testing.io, "broken.bin", .{})).size);
 }
@@ -748,7 +730,7 @@ test "kv_disk_writer: a PAUSED writer deinits without blocking" {
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/held.bin", .{root});
     const bytes = try testing.allocator.alloc(u8, 4096);
     @memset(bytes, 3);
-    w.submit(path, bytes, .kv);
+    w.submit(path, bytes);
     try testing.expect(w.pendingBytes() > 0);
 
     w.deinit();
@@ -777,120 +759,9 @@ test "kv_disk_writer: queue allocation failure invalidates persistence" {
     const path = try testing.allocator.dupe(u8, "e1/c000000.safetensors");
     const bytes = try testing.allocator.dupe(u8, "chunk bytes");
 
-    writer.submit(path, bytes, .kv);
+    writer.submit(path, bytes);
 
     try testing.expectEqual(@as(u64, 1), writer.writeErrorCount());
     try testing.expect(writer.takeUnattributed());
     try testing.expectEqual(@as(u64, 0), writer.pendingBytes());
-}
-
-const StatKind = write_stats.Kind;
-
-fn stagedBlob(root: []const u8, name: []const u8, len: usize) !struct { path: []u8, bytes: []u8 } {
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, name });
-    const bytes = try testing.allocator.alloc(u8, len);
-    @memset(bytes, 5);
-    return .{ .path = path, .bytes = bytes };
-}
-
-test "kv_disk_writer: landed bytes count under their kind, a rewrite counts its full bytes again" {
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
-    var stats: write_stats.Stats = .{};
-    var w = Writer.init(testing.allocator, std.testing.io);
-    w.stats = &stats;
-    try w.start();
-    defer w.deinit();
-
-    const plan = [_]struct { name: []const u8, len: usize, kind: StatKind }{
-        .{ .name = "c000000.safetensors", .len = 4000, .kind = .kv },
-        .{ .name = "s0000128.safetensors", .len = 300, .kind = .ssm },
-        .{ .name = "qsa.safetensors", .len = 200, .kind = .qsa },
-        .{ .name = "qsa.safetensors", .len = 260, .kind = .qsa },
-        .{ .name = "spec.safetensors", .len = 90, .kind = .spec },
-        .{ .name = "r0000128.safetensors", .len = 70, .kind = .ring },
-        .{ .name = "meta.json", .len = 11, .kind = .meta },
-    };
-    for (plan) |p| {
-        const b = try stagedBlob(root, p.name, p.len);
-        w.submit(b.path, b.bytes, p.kind);
-    }
-    w.drain();
-    const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 4000), s.written[@intFromEnum(StatKind.kv)]);
-    try testing.expectEqual(@as(u64, 300), s.written[@intFromEnum(StatKind.ssm)]);
-    try testing.expectEqual(@as(u64, 460), s.written[@intFromEnum(StatKind.qsa)]);
-    try testing.expectEqual(@as(u64, 90), s.written[@intFromEnum(StatKind.spec)]);
-    try testing.expectEqual(@as(u64, 70), s.written[@intFromEnum(StatKind.ring)]);
-    try testing.expectEqual(@as(u64, 11), s.written[@intFromEnum(StatKind.meta)]);
-    try testing.expectEqual(@as(u64, 0), s.failed);
-    try testing.expectEqual(w.bytes_written, s.totalWritten());
-}
-
-test "kv_disk_writer: a failed, dropped or fenced blob lands in failed, never in written" {
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
-    var stats: write_stats.Stats = .{};
-    var w = Writer.init(testing.allocator, std.testing.io);
-    w.stats = &stats;
-
-    const unarmed = try stagedBlob(root, "c000000.safetensors", 50);
-    w.submit(unarmed.path, unarmed.bytes, .kv);
-    try testing.expectEqual(@as(u64, 50), stats.snapshot().failed);
-
-    try w.start();
-    defer w.deinit();
-    w.injectFailure("c000001", .write);
-    const write_fail = try stagedBlob(root, "c000001.safetensors", 1000);
-    w.submit(write_fail.path, write_fail.bytes, .kv);
-    w.drain();
-    w.injectFailure("c000002", .submit);
-    const submit_fail = try stagedBlob(root, "c000002.safetensors", 700);
-    w.submit(submit_fail.path, submit_fail.bytes, .kv);
-    w.injectFailure(null, .write);
-
-    w.setPaused(true);
-    const fenced = try stagedBlob(root, "r0000128.safetensors", 400);
-    w.submit(fenced.path, fenced.bytes, .ring);
-    w.fence(root);
-    w.setPaused(false);
-    w.drain();
-
-    const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 50 + 1000 + 700 + 400), s.failed);
-    try testing.expectEqual(@as(u64, 0), s.totalWritten());
-}
-
-test "kv_disk_writer: a file staged in parts counts the parts that landed, a broken file's rest as failed" {
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
-    var stats: write_stats.Stats = .{};
-    var w = Writer.init(testing.allocator, std.testing.io);
-    w.stats = &stats;
-    try w.start();
-    defer w.deinit();
-
-    const parts = [_]Part{ .first, .middle, .last };
-    for (parts) |part| {
-        const b = try stagedBlob(root, "c000000.safetensors", 1024);
-        w.submitPart(b.path, b.bytes, part, .kv);
-    }
-    w.drain();
-    try testing.expectEqual(@as(u64, 3072), stats.snapshot().written[@intFromEnum(StatKind.kv)]);
-
-    w.injectFailure("c000001", .write);
-    for (parts) |part| {
-        const b = try stagedBlob(root, "c000001.safetensors", 512);
-        w.submitPart(b.path, b.bytes, part, .kv);
-    }
-    w.drain();
-    const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 3072), s.written[@intFromEnum(StatKind.kv)]);
-    try testing.expectEqual(@as(u64, 1536), s.failed);
 }

@@ -4,9 +4,6 @@ const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
-const tool_schema = @import("tool_schema.zig");
-const tool_calls_mod = @import("tool_calls.zig");
-const think_tags = @import("think_tags.zig");
 
 pub const ToolCall = struct {
     id: []const u8,
@@ -24,6 +21,15 @@ pub const ImageData = struct {
     // pixel_values and the encoder is QwenVision (see src/qwen_vision.zig).
     grid_h: u32 = 0,
     grid_w: u32 = 0,
+    /// LFM2-VL tiling: a source image past the single-tile budget is split into
+    /// a `tile_rows` x `tile_cols` grid plus a thumbnail, and EACH piece is its
+    /// own entry here — separate patch grid, separate encoder call. `tile_index`
+    /// runs row-major over the tiles, and `tile_index == rows*cols` is the
+    /// thumbnail. All three stay 0 for an untiled image, which is every other
+    /// tower we serve.
+    tile_rows: u16 = 0,
+    tile_cols: u16 = 0,
+    tile_index: u16 = 0,
     /// `pixels` is still the encoded file (JPEG/PNG/WebP) and `width`/`height`/`grid_*` are the plan the
     /// processor will reach; the tower's turn decodes it, so a request holds the compressed bytes only.
     undecoded: bool = false,
@@ -360,7 +366,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 }
 
 /// V4.1's image placeholder token, which the processor expands into the image's span.
-pub const dsv41_image_atom = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>";
+const dsv41_image_atom = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>";
 
 /// Format chat messages into token IDs using the model's Jinja chat template.
 /// `effort` is the client's raw `reasoning_effort` string (see
@@ -415,14 +421,13 @@ pub fn renderChatTemplate(
     continue_final: bool,
 ) ![]const u8 {
     // Split the partial reply off FIRST, so every transform below (tool
-    // fallback synthesis) sees exactly the message list
+    // fallback synthesis, muse's reasoning drop) sees exactly the message list
     // an ordinary turn would have. The template must open the assistant turn
     // once, which it only does when the trailing assistant is not in `messages`.
-    const prefill = think_tags.continuationPrefill(messages, continue_final);
+    const prefill = continuationPrefill(messages, continue_final);
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
 
     if (chat_config.chat_template.len == 0) {
-        if (!fallbackIsChatMl(chat_config)) return refuseTemplate("the model has no chat template and no fallback format");
         const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
         if (prefill) |partial| {
             defer allocator.free(base);
@@ -507,9 +512,30 @@ pub fn renderChatTemplate(
         }
     }
 
+    // Muse (harmony convention): reasoning belongs to the CURRENT turn only.
+    // The app round-trips `reasoning_content` on assistant history, and this
+    // template renders it as a to=self segment — so one bad chain (a loop-cut
+    // tail) would replay in the prompt on every later turn. Drop it on
+    // assistant messages before the last user message; tool rounds after it
+    // keep theirs. Families whose templates NEED history reasoning are
+    // untouched — same sniff `noThinkTailSuffix` uses.
+    if (std.mem.indexOf(u8, tpl, "reasoning_strength") != null) {
+        if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+        if (try dropPriorTurnReasoning(fallback_arena.?.allocator(), effective_messages)) |stripped| {
+            effective_messages = stripped;
+        }
+    }
+
     // Serialize messages to JSON — Gemma 4 templates handle role:"tool" natively
     // (producing <|turn>tool in the rendered output). No transformation needed.
-    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, chat_config);
+    // Harmony (gpt_oss) indexes into `message.content` after only checking that
+    // the KEY exists, so a null there breaks every tool round-trip. Sniffed off
+    // the template's own channel marker, like the reasoning drop above.
+    const empty_content: EmptyContent = if (std.mem.indexOf(u8, tpl, "<|channel|>") != null)
+        .empty_string
+    else
+        .null_literal;
+    const messages_json = try serializeMessagesJsonFor(allocator, effective_messages, empty_content, chat_config);
     defer allocator.free(messages_json);
 
     // Null-terminate strings for C
@@ -528,7 +554,7 @@ pub fn renderChatTemplate(
 
     if (prefill) |partial| {
         const turn = messages[messages.len - 1];
-        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, chat_config)) |cont| return cont;
+        if (try renderContinuation(allocator, tmpl_z, extra_z, tools_z, effective_messages, turn, partial, empty_content, chat_config)) |cont| return cont;
     }
 
     // Length-delimited: a message may carry a raw 0x00, and a C-string read would cut the prompt there.
@@ -552,24 +578,21 @@ pub fn renderChatTemplate(
         if (prefill) |partial| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{
-                collapsed, think_tags.contentChannelTail(collapsed), partial,
+                collapsed, contentChannelTail(tpl, collapsed, true), partial,
             });
         }
-        if (think_tags.noThinkTailSuffix(collapsed, enable_thinking)) |suffix| {
+        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
         }
         return collapsed;
     }
 
-    // WARN, not debug: a failed render silently swaps a ChatML model's prompt into
-    // fallbackFormatChat's format, so the downgrade must be visible at the default
-    // log level. Any other model has no fallback: its turn tokens are not ChatML's.
-    if (!fallbackIsChatMl(chat_config)) {
-        const reason = if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "the template failed to render";
-        log.warn("jinja render failed ({s}), and this model has no fallback chat format\n", .{reason});
-        return refuseTemplate(reason);
-    }
+    // WARN, not debug: a failed render silently swaps the prompt into
+    // fallbackFormatChat's generic format — for families whose stop/turn
+    // tokens differ (Gemma 4's <|turn> vs the fallback's <start_of_turn>)
+    // that means degenerate generation, so the downgrade must be visible
+    // at the default log level.
     _ = template_fallbacks.fetchAdd(1, .monotonic);
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
@@ -595,13 +618,14 @@ fn renderContinuation(
     history: []const Message,
     turn: Message,
     partial: []const u8,
+    empty_content: EmptyContent,
     chat_config: *const ChatConfig,
 ) !?[]const u8 {
     const turns = try allocator.alloc(Message, history.len + 1);
     defer allocator.free(turns);
     @memcpy(turns[0..history.len], history);
     turns[history.len] = .{ .role = "assistant", .content = partial, .reasoning_content = turn.reasoning_content };
-    const json = try serializeMessagesJsonFor(allocator, turns, chat_config);
+    const json = try serializeMessagesJsonFor(allocator, turns, empty_content, chat_config);
     defer allocator.free(json);
     const json_z = try allocator.dupeSentinel(u8, json, 0);
     defer allocator.free(json_z);
@@ -614,6 +638,32 @@ fn renderContinuation(
     const text = std.mem.trimStart(u8, partial, " \t\r\n");
     const at = std.mem.lastIndexOf(u8, rendered, text) orelse return null;
     return try allocator.dupe(u8, rendered[0 .. at + text.len]);
+}
+
+/// Null `reasoning_content` on assistant messages BEFORE the last user
+/// message (harmony convention: prior-turn analysis is dropped from the
+/// prompt; the current turn's tool rounds keep theirs). Returns null when
+/// nothing would change, so the common no-history-reasoning case allocates
+/// nothing.
+fn dropPriorTurnReasoning(arena: std.mem.Allocator, messages: []const Message) !?[]const Message {
+    var last_user: ?usize = null;
+    for (messages, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "user")) last_user = i;
+    }
+    const cut = last_user orelse return null;
+    var any = false;
+    for (messages[0..cut]) |m| {
+        if (std.mem.eql(u8, m.role, "assistant") and m.reasoning_content != null) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return null;
+    const out = try arena.dupe(Message, messages);
+    for (out[0..cut]) |*m| {
+        if (std.mem.eql(u8, m.role, "assistant")) m.reasoning_content = null;
+    }
+    return out;
 }
 
 /// DSV4's chat template emits `</think></think>` between every user→assistant
@@ -685,26 +735,32 @@ fn hasLateSystem(messages: []const Message) bool {
     return false;
 }
 
-/// The stock Flash-Next template raises on a system turn that is not first. Replace only that
-/// branch so the turn renders in place; any other revision keeps its native contract and the fold.
+/// The two stock Qwen3.8 revisions (the one the served Flash-Next ships, and the 2.4T one) raise on
+/// a system turn that is not first. Replace only that branch so the turn renders in place; any
+/// other revision keeps its native contract and the fold.
 fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
-    const source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
-    const content = "render_content(message.content, false, true)|trim";
+    const templates = [_]struct { source: []const u8, content: []const u8 }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .content = "render_content(message.content, false, true)|trim" },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .content = "content" },
+    };
     const branch =
         \\{%- if message.role == "system" %}
         \\        {%- if not loop.first %}
         \\            {{- raise_exception('System message must be at the beginning.') }}
         \\        {%- endif %}
     ;
-    if (!std.mem.eql(u8, tpl, source)) return null;
-    if (std.mem.count(u8, tpl, branch) != 1) return null;
-    const replacement = try std.mem.concat(allocator, u8, &.{
-        "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
-        content,
-        ") + '<|im_end|>\\n' }}{%- endif %}",
-    });
-    defer allocator.free(replacement);
-    return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
+    for (templates) |template| {
+        if (!std.mem.eql(u8, tpl, template.source)) continue;
+        if (std.mem.count(u8, tpl, branch) != 1) return null;
+        const replacement = try std.mem.concat(allocator, u8, &.{
+            "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
+            template.content,
+            ") + '<|im_end|>\\n' }}{%- endif %}",
+        });
+        defer allocator.free(replacement);
+        return try std.mem.replaceOwned(u8, allocator, tpl, branch, replacement);
+    }
+    return null;
 }
 
 /// False when the template raises on a system turn that is not first, or drops it.
@@ -805,8 +861,8 @@ const ProbeCall = struct { between: []const u8, head: []const u8, after: []const
 
 fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
-    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], think_tags.BARE_THINK_CLOSER) orelse return null;
-    const between = rendered[closer_at + think_tags.BARE_THINK_CLOSER.len .. name_at];
+    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], BARE_THINK_CLOSER) orelse return null;
+    const between = rendered[closer_at + BARE_THINK_CLOSER.len .. name_at];
     const head = std.mem.trimStart(u8, between, " \t\r\n");
     if (head.len == 0) return null;
     return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
@@ -880,7 +936,7 @@ fn messagesHaveToolContent(messages: []const Message) bool {
 /// - rewrite_tool_calls: rewrite assistant messages that carry tool_calls into plain
 ///   content emitting <tool_call>...</tool_call> blocks (matches what we instruct the
 ///   model to produce, so multi-turn context stays consistent).
-pub fn synthesizeToolFallbackMessages(
+fn synthesizeToolFallbackMessages(
     arena: std.mem.Allocator,
     messages: []const Message,
     tools_json: ?[]const u8,
@@ -894,7 +950,7 @@ pub fn synthesizeToolFallbackMessages(
     var tool_prompt: ?[]const u8 = null;
     if (inject_tool_prompt and tools_json != null) {
         var buf = std.ArrayList(u8).empty;
-        try tool_calls_mod.appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
+        try appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
         tool_prompt = try buf.toOwnedSlice(arena);
     }
 
@@ -962,6 +1018,24 @@ pub fn synthesizeToolFallbackMessages(
     return out.toOwnedSlice(arena);
 }
 
+/// How an assistant message with NO content should serialize.
+///
+/// Most templates read `message.content is none` / `if message.content`, and
+/// `null` is what they expect. Harmony (gpt_oss) does BOTH of these in
+/// sequence on every assistant message:
+///
+///     {%- if "content" in message %}
+///         {%- if "<|channel|>analysis<|message|>" in message.content ... %}
+///
+/// The first test asks whether the KEY exists, the second indexes into the
+/// VALUE — so `"content": null` passes the guard and then substring-searches
+/// None. A tool-calling assistant turn is exactly the message that carries no
+/// content, so every tool round-trip hit it (live 2026-08-12: the reply came
+/// back with reasoning and raw `<|channel|>final>` markers in the content).
+/// Serializing `""` satisfies both readings — the key exists, and it is falsy
+/// everywhere the template branches on it.
+pub const EmptyContent = enum { null_literal, empty_string };
+
 /// Deepest `{`/`[` nesting a JSON request may carry: the recursive consumers (echo, schema, template) have no cap of their own.
 pub const max_json_nesting: usize = 256;
 
@@ -990,11 +1064,22 @@ pub fn jsonNestingExceeds(body: []const u8, limit: usize) bool {
 }
 
 pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, null);
+    return serializeMessagesJsonOpts(allocator, messages, .null_literal);
 }
 
-pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, chat_config.image_placeholder);
+pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
+}
+
+/// K2-Horizon's template raises on an assistant turn with NO thinking field,
+/// so that family gets an empty `reasoning_content` where a client sent none
+/// (renders as the closed `<ifm|think>\n</ifm|think>` signature).
+fn templateRequiresReasoningField(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "'ifm|think'") != null;
+}
+
+pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.image_placeholder);
 }
 
 /// `content` as the typed part list vision templates render, each media part
@@ -1051,7 +1136,7 @@ fn appendJoined(allocator: std.mem.Allocator, text: *std.ArrayList(u8), piece: [
     try text.appendSlice(allocator, piece);
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, image_atom: ?[]const u8) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, image_atom: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1066,7 +1151,10 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
             if (image_atom) |atom| try appendContentText(allocator, &buf, msg.content, msg.media_parts.?, atom) else try appendContentParts(allocator, &buf, msg.content, msg.media_parts.?);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
-        } else try buf.appendSlice(allocator, "null");
+        } else switch (empty_content) {
+            .null_literal => try buf.appendSlice(allocator, "null"),
+            .empty_string => try buf.appendSlice(allocator, "\"\""),
+        }
 
         if (msg.tool_calls) |tcs| {
             try buf.appendSlice(allocator, ",\"tool_calls\":[");
@@ -1112,6 +1200,8 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
             // would still pass `is defined`-style checks.
             try buf.appendSlice(allocator, ",\"reasoning_content\":");
             try appendJsonString(allocator, &buf, rc);
+        } else if (reasoning_required and std.mem.eql(u8, msg.role, "assistant")) {
+            try buf.appendSlice(allocator, ",\"reasoning_content\":\"\"");
         }
 
         try buf.append(allocator, '}');
@@ -1125,7 +1215,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 ///
 /// `description` is optional in OpenAI's function schema and a no-arg tool
 /// needs no `parameters`, but a template that renders `fn.description | tojson`
-/// or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
+/// (muse) or `tool | tojson` wholesale hits `tojson` on Undefined, which is a
 /// jinja RAISE — i.e. a silent `fallbackFormatChat` with no tools preamble at
 /// all, for a request that was perfectly legal. Returns null when every
 /// function already carries both keys, so the common path re-emits nothing and
@@ -1179,7 +1269,8 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
 /// cap on purpose and still applies.
 ///
-/// Substring on the KEY, so a family reading a different one is untouched.
+/// Substring on the KEY, so a family reading a different one is untouched:
+/// muse's `reasoning_strength` is a near-miss the corpus pins.
 pub fn templateConsumesEffort(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
@@ -1194,8 +1285,11 @@ fn dsv41EffortFor(effort: ?[]const u8) []const u8 {
 
 /// OpenAI's effort vocabulary -> Qwen3.8's xhigh|medium|low. The template
 /// raise_exception's on any other string and its own default is xhigh, so an
-/// absent or unrecognized effort keeps the checkpoint default. The template
-/// never reads the key on its thinking-off arm, so the value is inert there.
+/// absent or unrecognized effort keeps the checkpoint default. Thinking-off
+/// maps to low for the variants that REFUSE it (2.4T-A95B): the request is
+/// served on the cheapest arm with the think block closed in the prompt by
+/// `noThinkTailSuffix`. On a variant that accepts thinking-off (27B) the
+/// template never reads the key on that arm, so the value is inert.
 fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (!enable_thinking) return "low";
     // An ABSENT effort takes OUR default, not the checkpoint's. The template
@@ -1213,6 +1307,15 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     if (std.mem.eql(u8, e, "medium")) return "medium";
     if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
     return "xhigh";
+}
+
+/// K2-Horizon reads `reasoning_effort` as high|medium|low (default high) and
+/// raises on anything else; each word picks a different think opener.
+fn k2EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "high";
+    if (std.mem.eql(u8, e, "medium")) return "medium";
+    if (std.mem.eql(u8, e, "low") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "none")) return "low";
+    return "high";
 }
 
 /// `effort` is the client's raw `reasoning_effort` string (null when the
@@ -1242,8 +1345,17 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // detection. EVERY 3.8 template raises on OpenAI's "high", so this keys the
     // mapping for the whole family.
     const qwen38_style = std.mem.indexOf(u8, chat_config.chat_template, "'xhigh'") != null;
+    // Whether the template REFUSES thinking-off is a SEPARATE question from the
+    // effort vocabulary, and the two split inside one family: 2.4T-A95B raises
+    // ("Disabling thinking is not supported"), the 27B answers that arm the 3.6
+    // way with a closed `<think>\n\n</think>` and NO reasoning preamble. Keying
+    // the override on the shared 'xhigh' literal forced the 27B's thinking-off
+    // requests onto the thinking-on arm, injecting a system line the checkpoint
+    // never renders there. Only a refusing template gets the flag withheld;
+    // thinking-off is then committed in the prompt by `noThinkTailSuffix`.
+    const refuses_nothink = std.mem.indexOf(u8, chat_config.chat_template, "Disabling thinking is not supported") != null;
     if (need_comma) try buf.append(allocator, ',');
-    if (enable_thinking) {
+    if (enable_thinking or refuses_nothink) {
         try buf.appendSlice(allocator, "\"enable_thinking\":true");
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
@@ -1256,7 +1368,11 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     const dsv41_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const glm5_style = std.mem.indexOf(u8, chat_config.chat_template, "effective_reasoning_effort") != null and
         std.mem.indexOf(u8, chat_config.chat_template, "[gMASK]<sop>") != null;
-    if (glm5_style) {
+    if (templateRequiresReasoningField(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, k2EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (glm5_style) {
         // Sushi defaults to high; depth is a prompt instruction, never a token cap.
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, effort orelse "high");
@@ -1289,6 +1405,23 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
         if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null) {
             try buf.appendSlice(allocator, if (keep) ",\"preserve_thinking\":true" else ",\"preserve_thinking\":false");
         }
+    }
+
+    // Muse-Glimmer reads `reasoning_strength` (its template default is
+    // 'high' and it has no thinking-off switch — the model always emits a
+    // to=self segment). Map the client's effort onto low|medium|high;
+    // thinking-off drops to 'low'. Only emitted when the template reads it.
+    if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_strength") != null) {
+        const strength: []const u8 = if (!enable_thinking)
+            "low"
+        else if (effort) |e| blk: {
+            if (std.mem.eql(u8, e, "none") or std.mem.eql(u8, e, "minimal") or std.mem.eql(u8, e, "low")) break :blk "low";
+            if (std.mem.eql(u8, e, "medium")) break :blk "medium";
+            break :blk "high";
+        } else "high";
+        try buf.appendSlice(allocator, ",\"reasoning_strength\":\"");
+        try buf.appendSlice(allocator, strength);
+        try buf.append(allocator, '"');
     }
 
     try buf.append(allocator, '}');
@@ -1348,27 +1481,7 @@ const SpecialEntry = struct {
     id: u32,
 };
 
-threadlocal var template_refusal_buf: [160]u8 = undefined;
-threadlocal var template_refusal_len: usize = 0;
-
-/// Why the last render on this thread was refused; the HTTP error names it.
-pub fn templateRefusal() []const u8 {
-    return template_refusal_buf[0..template_refusal_len];
-}
-
-fn refuseTemplate(reason: []const u8) error{ChatTemplateUnusable} {
-    template_refusal_len = @min(reason.len, template_refusal_buf.len);
-    @memcpy(template_refusal_buf[0..template_refusal_len], reason[0..template_refusal_len]);
-    return error.ChatTemplateUnusable;
-}
-
-/// The fallback format is ChatML, so only a model whose turns end with `<|im_end|>` may use it.
-fn fallbackIsChatMl(chat_config: *const ChatConfig) bool {
-    const eos = chat_config.eos_token orelse return false;
-    return std.mem.indexOf(u8, eos, "<|im_end|>") != null;
-}
-
-/// Fallback chat formatting (ChatML) for when Jinja rendering fails.
+/// Fallback chat formatting for when Jinja rendering fails.
 fn fallbackFormatChat(
     allocator: std.mem.Allocator,
     messages: []const Message,
@@ -1380,60 +1493,5619 @@ fn fallbackFormatChat(
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
+    const is_chatml = chat_config.eos_token != null and
+        std.mem.indexOf(u8, chat_config.eos_token.?, "<|im_end|>") != null;
+
     const has_system = messages.len > 0 and std.mem.eql(u8, messages[0].role, "system");
 
-    if (tools_json != null and !has_system) {
-        try result.appendSlice(allocator, "<|im_start|>system\n");
-        try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-        try result.appendSlice(allocator, "<|im_end|>\n");
-    }
-
-    for (messages) |msg| {
-        if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
+    if (is_chatml) {
+        // ChatML format (Qwen3, etc.)
+        if (tools_json != null and !has_system) {
             try result.appendSlice(allocator, "<|im_start|>system\n");
-            try result.appendSlice(allocator, msg.content);
-            try result.appendSlice(allocator, "\n\n");
-            try tool_calls_mod.appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
-            try result.appendSlice(allocator, "<|im_end|>\n");
-        } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
-            try result.appendSlice(allocator, "<|im_start|>assistant\n");
-            if (msg.content.len > 0) {
-                try result.appendSlice(allocator, msg.content);
-                try result.appendSlice(allocator, "\n");
-            }
-            for (msg.tool_calls.?) |tc| {
-                try result.appendSlice(allocator, "<tool_call>\n");
-                try result.appendSlice(allocator, "{\"name\": \"");
-                try result.appendSlice(allocator, tc.name);
-                try result.appendSlice(allocator, "\", \"arguments\": ");
-                try result.appendSlice(allocator, tc.arguments);
-                try result.appendSlice(allocator, "}\n</tool_call>");
-            }
-            try result.appendSlice(allocator, "<|im_end|>\n");
-        } else if (std.mem.eql(u8, msg.role, "tool")) {
-            try result.appendSlice(allocator, "<|im_start|>user\n");
-            try result.appendSlice(allocator, "<tool_response>\n");
-            try result.appendSlice(allocator, msg.content);
-            try result.appendSlice(allocator, "\n</tool_response>");
-            try result.appendSlice(allocator, "<|im_end|>\n");
-        } else {
-            try result.appendSlice(allocator, "<|im_start|>");
-            try result.appendSlice(allocator, msg.role);
-            try result.appendSlice(allocator, "\n");
-            try result.appendSlice(allocator, msg.content);
+            try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
             try result.appendSlice(allocator, "<|im_end|>\n");
         }
-    }
-    try result.appendSlice(allocator, "<|im_start|>assistant\n");
-    if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
-        if (enable_thinking) {
-            try result.appendSlice(allocator, "<think>\n");
+
+        for (messages) |msg| {
+            if (std.mem.eql(u8, msg.role, "system") and tools_json != null) {
+                try result.appendSlice(allocator, "<|im_start|>system\n");
+                try result.appendSlice(allocator, msg.content);
+                try result.appendSlice(allocator, "\n\n");
+                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+                try result.appendSlice(allocator, "<|im_end|>\n");
+            } else if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
+                try result.appendSlice(allocator, "<|im_start|>assistant\n");
+                if (msg.content.len > 0) {
+                    try result.appendSlice(allocator, msg.content);
+                    try result.appendSlice(allocator, "\n");
+                }
+                for (msg.tool_calls.?) |tc| {
+                    try result.appendSlice(allocator, "<tool_call>\n");
+                    try result.appendSlice(allocator, "{\"name\": \"");
+                    try result.appendSlice(allocator, tc.name);
+                    try result.appendSlice(allocator, "\", \"arguments\": ");
+                    try result.appendSlice(allocator, tc.arguments);
+                    try result.appendSlice(allocator, "}\n</tool_call>");
+                }
+                try result.appendSlice(allocator, "<|im_end|>\n");
+            } else if (std.mem.eql(u8, msg.role, "tool")) {
+                try result.appendSlice(allocator, "<|im_start|>user\n");
+                try result.appendSlice(allocator, "<tool_response>\n");
+                try result.appendSlice(allocator, msg.content);
+                try result.appendSlice(allocator, "\n</tool_response>");
+                try result.appendSlice(allocator, "<|im_end|>\n");
+            } else {
+                try result.appendSlice(allocator, "<|im_start|>");
+                try result.appendSlice(allocator, msg.role);
+                try result.appendSlice(allocator, "\n");
+                try result.appendSlice(allocator, msg.content);
+                try result.appendSlice(allocator, "<|im_end|>\n");
+            }
+        }
+        try result.appendSlice(allocator, "<|im_start|>assistant\n");
+        if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
+            if (enable_thinking) {
+                try result.appendSlice(allocator, "<think>\n");
+            } else {
+                try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            }
+        }
+    } else {
+        // Gemma/Llama-style format
+        if (chat_config.bos_token) |bos| {
+            try result.appendSlice(allocator, bos);
+        }
+
+        const is_llama = std.mem.indexOf(u8, chat_config.chat_template, "start_header_id") != null;
+
+        if (is_llama) {
+            // Llama 3 format with tool support
+            try result.appendSlice(allocator, "<|start_header_id|>system<|end_header_id|>\n\n");
+            if (tools_json != null) {
+                try result.appendSlice(allocator, "Environment: ipython\n");
+            }
+            if (has_system) {
+                try result.appendSlice(allocator, messages[0].content);
+            } else {
+                try result.appendSlice(allocator, "You are a helpful assistant.");
+            }
+            if (tools_json != null) {
+                try result.appendSlice(allocator, "\n\n");
+                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+            }
+            try result.appendSlice(allocator, "<|eot_id|>");
+
+            const start_idx: usize = if (has_system) 1 else 0;
+            for (messages[start_idx..]) |msg| {
+                if (std.mem.eql(u8, msg.role, "assistant") and msg.tool_calls != null) {
+                    try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+                    for (msg.tool_calls.?) |tc| {
+                        try result.appendSlice(allocator, "{\"name\": \"");
+                        try result.appendSlice(allocator, tc.name);
+                        try result.appendSlice(allocator, "\", \"parameters\": ");
+                        try result.appendSlice(allocator, tc.arguments);
+                        try result.appendSlice(allocator, "}");
+                    }
+                    try result.appendSlice(allocator, "<|eot_id|>");
+                } else if (std.mem.eql(u8, msg.role, "tool")) {
+                    try result.appendSlice(allocator, "<|start_header_id|>ipython<|end_header_id|>\n\n");
+                    try result.appendSlice(allocator, msg.content);
+                    try result.appendSlice(allocator, "<|eot_id|>");
+                } else {
+                    try result.appendSlice(allocator, "<|start_header_id|>");
+                    try result.appendSlice(allocator, msg.role);
+                    try result.appendSlice(allocator, "<|end_header_id|>\n\n");
+                    try result.appendSlice(allocator, msg.content);
+                    try result.appendSlice(allocator, "<|eot_id|>");
+                }
+            }
+            try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
         } else {
-            try result.appendSlice(allocator, "<think>\n\n</think>\n\n");
+            // Gemma-style format
+            if (tools_json != null and !has_system) {
+                try result.appendSlice(allocator, "<start_of_turn>user\n");
+                try appendToolSystemPrompt(allocator, &result, tools_json.?, tool_choice_instruction);
+                try result.appendSlice(allocator, "<end_of_turn>\n");
+            }
+            for (messages) |msg| {
+                if (std.mem.eql(u8, msg.role, "tool")) {
+                    try result.appendSlice(allocator, "<start_of_turn>user\n");
+                    try result.appendSlice(allocator, "Tool result: ");
+                    try result.appendSlice(allocator, msg.content);
+                    try result.appendSlice(allocator, "<end_of_turn>\n");
+                } else {
+                    try result.appendSlice(allocator, "<start_of_turn>");
+                    try result.appendSlice(allocator, msg.role);
+                    try result.appendSlice(allocator, "\n");
+                    try result.appendSlice(allocator, msg.content);
+                    try result.appendSlice(allocator, "<end_of_turn>\n");
+                }
+            }
+            try result.appendSlice(allocator, "<start_of_turn>model\n");
         }
     }
 
     return result.toOwnedSlice(allocator);
+}
+
+/// The FIRST unclosed think/thought opener: the earliest `<|channel>thought`
+/// or `<think>` in `text` with no matching close tag anywhere after it.
+/// Gemma 4 opens a NEW thought channel at the very end of a prose turn (its
+/// channel-thought tail behavior) — and sometimes SEVERAL in a row, none of
+/// them closed (seen live from the 26B GGUF via pi). Everything from the
+/// first such opener onward is dangling thought; cutting at the LAST opener
+/// instead leaks the earlier raw tags into visible content. A pos-0 opener is
+/// reported too: callers (the split arms / stripTrailingThinkOpen) strip
+/// their leading CLOSED block first, so an unclosed opener at the start of the
+/// remainder is a genuine dangling re-open (`…<channel|>\n<|channel>thought\n`,
+/// 2026-06-19 live) — excluding it leaked the bare opener into content.
+const TrailingThinkOpen = struct { pos: usize, after: usize };
+fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
+    var from: usize = 0;
+    while (nextThinkOpen(text, from)) |o| {
+        const close = if (o.is_think_style)
+            indexOfThinkCloseTag(text, o.after)
+        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |p|
+            TagAt{ .pos = p, .len = "<channel|>".len }
+        else
+            null;
+        if (close) |c| {
+            // This block IS closed — keep scanning past its close.
+            from = c.pos + c.len;
+            continue;
+        }
+        return .{ .pos = o.pos, .after = o.after };
+    }
+    return null;
+}
+
+// ── Think tag matching ──
+
+pub const TagAt = struct { pos: usize, len: usize };
+
+/// Length of the complete tag `base>` at the START of `text` (base "<think" matches "<think>").
+fn tagLenAt(text: []const u8, comptime base: []const u8) ?usize {
+    if (text.len <= base.len or !std.mem.startsWith(u8, text, base) or text[base.len] != '>') return null;
+    return base.len + 1;
+}
+
+/// True when `text` could still GROW into `full` with more streamed bytes
+/// (strict prefix: "<th", "<think").
+fn isPartialTag(text: []const u8, comptime full: []const u8) bool {
+    return text.len > 0 and text.len < full.len and std.mem.startsWith(u8, full, text);
+}
+
+pub fn thinkOpenTagLenAt(text: []const u8) ?usize {
+    return tagLenAt(text, "<think");
+}
+
+pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
+    return tagLenAt(text, "</think");
+}
+
+fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "<think")) |p| {
+        if (thinkOpenTagLenAt(text[p..])) |l| {
+            if (openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+        }
+        i = p + "<think".len;
+    }
+    return null;
+}
+
+pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
+        if (thinkCloseTagLenAt(text[p..])) |l| {
+            if (!thinkCloseIsToolCallPayload(text, p) and openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+        }
+        i = p + "</think".len;
+    }
+    return null;
+}
+
+/// Start of the inline code span still open at the end of `text`, or null. A model writing about its own
+/// format quotes the tag in backticks (`` `<think>plan</think>` ``): inside a span a close tag is text,
+/// not the end of the thought. Judged from the bytes before the tag alone, so a stream's verdict on a
+/// tag never changes as more arrive. A span ends with its line; three backticks are a fence, not a span.
+fn openCodeSpanStart(text: []const u8) ?usize {
+    var i = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0;
+    var open: ?usize = null;
+    while (i < text.len) {
+        if (text[i] != '`') {
+            i += 1;
+            continue;
+        }
+        var end = i;
+        while (end < text.len and text[end] == '`') end += 1;
+        if (end - i < 3) open = if (open == null) i else null;
+        i = end;
+    }
+    return open;
+}
+
+/// How much of `text` a stream may ship so the rest still carries every open code span's backtick: a
+/// trailing run of backticks (its length is not yet known) and an open span wait.
+fn spanSettledLen(text: []const u8) usize {
+    var n = text.len;
+    while (n > 0 and text[n - 1] == '`') n -= 1;
+    return openCodeSpanStart(text[0..n]) orelse n;
+}
+
+/// Whether a `</think>` at `pos` is an ARGUMENT VALUE rather than a block close.
+///
+/// The think split runs before tool parse, and this is the shared close-tag
+/// scan every surface uses — so a model writing about its own prompt format
+/// (`<arg_value>…closes a thought with </think>…</arg_value>`) had the split cut
+/// straight through the call, losing it entirely and leaking the fragments.
+/// Agent traffic writes files about prompts.
+///
+/// Payload ⟺ the nearest tool opener before `pos` is still OPEN there (no
+/// `</tool_call` between it and `pos`) AND the block does close afterwards.
+/// Both halves are load-bearing:
+///   • without the first, a call the model emitted and CLOSED inside its
+///     thought would make the real `</think>` after it look like payload;
+///   • without the second, an unclosed opener inside a thought (the leaked-
+///     markup case, which `trimLeakedToolMarkup` handles downstream) would
+///     swallow the answer that follows the close.
+fn thinkCloseIsToolCallPayload(text: []const u8, pos: usize) bool {
+    // `streamThinkGate2` calls the close scan once per TOKEN on a growing
+    // buffer, so the common case — text with no tool markup at all — must cost
+    // one substring scan, not a walk per opener spelling. Both spellings share
+    // this needle.
+    if (std.mem.indexOf(u8, text[0..pos], "tool_call") == null) return false;
+    // Nearest `<tool_call`-family opener before `pos`. Only this family is
+    // considered: it is the one whose bodies carry free-form argument text.
+    var open: ?usize = null;
+    for ([_][]const u8{ "<tool_call", "<|tool_call" }) |m| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, m)) |p| {
+            if (p >= pos) break;
+            if (open == null or p > open.?) open = p;
+            i = p + 1;
+        }
+    }
+    const o = open orelse return false;
+    var from = o;
+    while (std.mem.indexOfPos(u8, text, from, "</tool_call")) |c| {
+        if (c >= pos) return true;
+        // A close spelled inside the argument is not the call's own end.
+        if (valueStillOpen(text, o, c, "<arg_value", "</arg_value>") or
+            valueStillOpen(text, o, c, "<parameter", "</parameter>"))
+        {
+            from = c + "</tool_call".len;
+            continue;
+        }
+        return false; // that call already closed — a real block close
+    }
+    return false; // never closes — treat as leaked markup, not payload
+}
+
+fn valueStillOpen(text: []const u8, from: usize, at: usize, open_tag: []const u8, close_tag: []const u8) bool {
+    const rel = std.mem.lastIndexOf(u8, text[from..at], open_tag) orelse return false;
+    const open_at = from + rel;
+    if (std.mem.indexOfPos(u8, text, open_at + open_tag.len, close_tag)) |end| return end > at;
+    return true;
+}
+
+/// Length of the trailing bytes of `buf` that could still GROW into a think
+/// close tag with more streamed bytes — either family: `</think>` or
+/// Gemma's `<channel|>`. Streaming
+/// reasoning flushes must hold this suffix back: flushing half a close tag
+/// splits it across the flush boundary, so the retained remainder never
+/// matches and the stream stays "inside thinking" forever (tag bytes leak
+/// into reasoning_content). 0 = safe to flush everything.
+pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
+    // Any real close tag is well under 32 bytes; a longer '<'-run is prose.
+    const window_start = if (buf.len > 32) buf.len - 32 else 0;
+    var i = buf.len;
+    while (i > window_start) {
+        i -= 1;
+        if (buf[i] != '<') continue;
+        const tail = buf[i..];
+        if (isPartialTag(tail, "</think>")) return tail.len;
+        if (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail)) return tail.len;
+    }
+    return 0;
+}
+
+test "thinkOpenerPossible: a thought no opener can start is delivered without waiting for more bytes" {
+    try std.testing.expect(!thinkOpenerPossible("The"));
+    try std.testing.expect(!thinkOpenerPossible("Okay"));
+    try std.testing.expect(!thinkOpenerPossible("\nWe"));
+    try std.testing.expect(thinkOpenerPossible(""));
+    try std.testing.expect(thinkOpenerPossible(" \n"));
+    try std.testing.expect(thinkOpenerPossible("<"));
+    try std.testing.expect(thinkOpenerPossible("<thi"));
+    try std.testing.expect(thinkOpenerPossible("\n<|chan"));
+    // Muse headers open with bare text: the context word and the recipient.
+    try std.testing.expect(thinkOpenerPossible("assist"));
+    try std.testing.expect(thinkOpenerPossible("assistant to"));
+    try std.testing.expect(thinkOpenerPossible("to"));
+    try std.testing.expect(thinkOpenerPossible("to=self"));
+    try std.testing.expect(!thinkOpenerPossible("too"));
+}
+
+test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("plain reasoning text"));
+    try testing.expectEqual(@as(usize, 7), partialThinkCloseSuffixLen("thinking…</think"));
+    try testing.expectEqual(@as(usize, 5), partialThinkCloseSuffixLen("thinking…<chan"));
+    // A COMPLETE tag is not a partial — the scan-side indexOf owns it.
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("done</think>"));
+    // A '<' too far back is prose, not a growing tag.
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("a < b and then lots of ordinary words follow here"));
+}
+
+/// Tag length when `text` ENDS with a complete think-close tag.
+fn endsWithThinkCloseTag(text: []const u8) ?usize {
+    if (text.len == 0 or text[text.len - 1] != '>') return null;
+    const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
+    const l = thinkCloseTagLenAt(text[lt..]) orelse return null;
+    return if (lt + l == text.len) l else null;
+}
+
+/// Tag length when `text` ENDS with a complete think-open tag.
+fn endsWithThinkOpenTag(text: []const u8) ?usize {
+    if (text.len == 0 or text[text.len - 1] != '>') return null;
+    const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
+    const l = thinkOpenTagLenAt(text[lt..]) orelse return null;
+    return if (lt + l == text.len) l else null;
+}
+
+/// Tool-call WRAPPER openers that must never survive into text a client
+/// renders. Every entry is the opening marker of a call block, so whatever
+/// follows it is call payload, not prose — parseToolCalls has already run by
+/// the time these matter, so a marker still present means the block did not
+/// parse (a mangled opener, a bare marker with no call behind it, or a call
+/// the model emitted inside its think block, which the parser deliberately
+/// skips). The whole tail is cut rather than excised: a wrapper we could not
+/// parse has no reliable end, and shipping half of it is the same leak.
+const tool_markup_openers = [_][]const u8{
+    "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
+    "</｜DSML｜", // lone closers the model emits after prose with no opener
+    "<|tool_call", // Gemma 4
+    "<tool_call", // Hermes XML + the plural variants
+    "<atem:", // Muse-Glimmer ATEM (covers function_calls/invoke/parameter)
+};
+
+/// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
+/// the opener alone is prose ("wrap it in <invoke name=…>"): a `<parameter ` or `</invoke>` must be there too.
+fn bareInvokeMarkupCut(text: []const u8) ?usize {
+    if (std.mem.indexOf(u8, text, "<parameter ") == null and
+        std.mem.indexOf(u8, text, BARE_INVOKE.invoke_close) == null) return null;
+    var cut = std.mem.indexOf(u8, text, FUNCTION_CALLS_TAG);
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, text, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= text.len or std.ascii.isWhitespace(text[after])) {
+            if (cut == null or p < cut.?) cut = p;
+            break;
+        }
+        scan = after;
+    }
+    return cut;
+}
+
+/// True while `buf` holds, or ends in a growing prefix of, a `<function_calls>` / `<invoke …` opener.
+fn invokeOpenerHoldsForTools(buf: []const u8) bool {
+    if (std.mem.indexOf(u8, buf, FUNCTION_CALLS_TAG) != null) return true;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, buf, scan, BARE_INVOKE.invoke)) |p| {
+        const after = p + BARE_INVOKE.invoke.len;
+        if (after >= buf.len or std.ascii.isWhitespace(buf[after])) return true;
+        scan = after;
+    }
+    inline for (.{ FUNCTION_CALLS_TAG, BARE_INVOKE.invoke }) |marker| {
+        var k: usize = 2;
+        while (k < marker.len) : (k += 1) if (std.mem.endsWith(u8, buf, marker[0..k])) return true;
+    }
+    return false;
+}
+
+/// Earliest index of MiniCPM5 attribute-form tool markup, or null.
+/// Discriminated exactly as the streaming gate does it — `<function` followed
+/// by WHITESPACE, with a `name=` inside the opener region — so `<functional`,
+/// `<function-like>` and `<function>` prose are never cut. A malformed opener
+/// (dropped quote) still matches, which is the point: `parseToolCalls` has
+/// already run by the time this matters, so markup still present is markup that
+/// did NOT parse, and shipping it renders raw XML to the user.
+fn miniCpm5MarkupCut(text: []const u8) ?usize {
+    // The opener ALONE is not evidence of leaked markup. Prose names functions
+    // ("Document the syntax as <function name=\"shell\"> before …") and cutting
+    // there deletes the rest of the answer — the exact contradiction that let a
+    // green parser test and a green scrubber test disagree about one string.
+    // Require the same structural evidence the parser requires: a `<param`
+    // element or a `</function>` close somewhere in the text.
+    if (std.mem.indexOf(u8, text, "<param") == null and
+        std.mem.indexOf(u8, text, "</function>") == null) return null;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, text, scan, "<function")) |p| {
+        const after = p + "<function".len;
+        if (after >= text.len) return p; // truncated mid-opener
+        if (!std.ascii.isWhitespace(text[after])) {
+            scan = after;
+            continue;
+        }
+        const gt_rel = std.mem.indexOfScalar(u8, text[after..], '>');
+        const region_end = if (gt_rel) |g| after + g else text.len;
+        if (std.mem.indexOf(u8, text[after..region_end], "name=") != null) return p;
+        scan = region_end;
+    }
+    return null;
+}
+
+/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
+/// slice (no alloc); text with no marker is returned untouched.
+pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+    var cut: usize = text.len;
+    for (tool_markup_openers) |m| {
+        if (std.mem.indexOf(u8, text, m)) |p| {
+            if (p < cut) cut = p;
+        }
+    }
+    // MiniCPM5 attribute form. Same reasoning, different discriminator: the
+    // dialect is `<function` + whitespace + a `name=` attribute, so prose words
+    // beginning `<function…` are left alone.
+    if (miniCpm5MarkupCut(text)) |p| {
+        if (p < cut) cut = p;
+    }
+    if (bareInvokeMarkupCut(text)) |p| {
+        if (p < cut) cut = p;
+    }
+    if (cut == text.len) return text;
+    return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
+}
+
+// NOTE: there is deliberately NO strip-think helper anymore. Reasoning the
+// model generated is ALWAYS delivered (reasoning_content / thinking blocks) —
+// thinking-off is enforced on the PROMPT side (`noThinkTailSuffix`), so every
+// delivery site takes `splitThinkBlock(text, true, …)` and ships both halves.
+
+/// Trim trailing think/channel/tool CLOSE markers (and surrounding whitespace)
+/// from visible content. A close marker is never valid at the tail of content —
+/// but a degenerate model can spam them (live: a Gemma variant emitted 16 bare
+/// `<channel|>` after its answer; the leading strip cuts the FIRST close, the
+/// trailing-OPEN strip ignores closes, so they leaked). The Gemma tool CLOSE
+/// `<tool_call|>` is here too: a degenerate 1-token bare close with no
+/// `<|tool_call>` opener leaked as the entire content (live 2026-07-16 soak,
+/// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
+/// call, so any residual `<tool_call|>` reaching here is orphan by construction.
+/// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
+pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
+    var s = content;
+    while (true) {
+        const t = std.mem.trimEnd(u8, s, "\n \t\r");
+        if (std.mem.endsWith(u8, t, "<channel|>")) {
+            s = t[0 .. t.len - "<channel|>".len];
+        } else if (std.mem.endsWith(u8, t, "<tool_call|>")) {
+            s = t[0 .. t.len - "<tool_call|>".len];
+        } else if (endsWithThinkCloseTag(t)) |l| {
+            s = t[0 .. t.len - l];
+        } else {
+            return t;
+        }
+    }
+}
+
+/// Truncate a trailing unclosed thought opener (and its dangling thought)
+/// out of visible content. Used by the split arms after the leading block has
+/// been handled.
+fn stripTrailingThinkOpen(content: []const u8) []const u8 {
+    if (lastUnclosedThinkOpen(content)) |o| {
+        return std.mem.trimEnd(u8, content[0..o.pos], "\n ");
+    }
+    return content;
+}
+
+pub const ThinkSplit = struct {
+    reasoning_content: ?[]const u8,
+    content: []const u8,
+};
+
+/// True when a rendered generation prompt ends inside a think block the
+/// A think block the MODEL opens when the template did not: a bare `<think>` token, or
+/// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
+/// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
+/// has been emitted. Returns the opener to seed `think_buf` with.
+pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+    if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
+    return null;
+}
+
+/// Control-channel marker TOKENS that must never appear in a visible stream
+/// delta. Every entry is a single special token in its family's vocab, so
+/// exact-match filtering at the delta level is complete — a marker can't be
+/// split across deltas. Shared by every streaming surface's flush path.
+pub fn isChannelMarkerToken(tt: []const u8) bool {
+    return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>") or
+        std.mem.eql(u8, tt, MUSE_START_TAG) or std.mem.eql(u8, tt, MUSE_MSG_TAG) or
+        std.mem.eql(u8, tt, MUSE_EOM_TAG) or std.mem.eql(u8, tt, MUSE_EOT_TAG);
+}
+
+// ── Muse-Glimmer (muse_glimmer) channel format ──────────────────────────
+//
+// The model emits harmony-style SEGMENTS after the prompt's bare
+// `<|start|>assistant`:
+//   ` to=self<|message|>REASONING<|eom|>` then
+//   `<|start|>assistant to=user<|message|>ANSWER<|eot|>` — or a tool segment
+//   `<|start|>assistant to=<fn><|message|><atem:function_calls>…<|eot|>`.
+// <|start|>/<|message|>/<|eom|>/<|eot|> are single special tokens (ids
+// 200022/200023/200007/200008); the `assistant to=<recipient>` header BETWEEN
+// them is ORDINARY text, which is what makes an unresolved header something
+// every streaming path must hold rather than flush.
+const MUSE_START_TAG = "<|start|>";
+const MUSE_MSG_TAG = "<|message|>";
+const MUSE_EOM_TAG = "<|eom|>";
+const MUSE_EOT_TAG = "<|eot|>";
+
+pub const BARE_THINK_OPENER = "<think>";
+pub const BARE_THINK_CLOSER = "</think>";
+
+// ── gpt_oss / harmony channels ──
+//
+// After the generation prompt's bare `<|start|>assistant`, the model emits
+// channel segments:
+//   `<|channel|>analysis<|message|>REASONING<|end|>`
+//   `<|start|>assistant<|channel|>final<|message|>ANSWER<|return|>`
+//   `<|start|>assistant to=functions.NAME<|channel|>commentary <|constrain|>json`
+//       `<|message|>{args}<|call|>`
+//
+// Muse is this format's descendant and shares `<|start|>`/`<|message|>`, so
+// `<|message|>` alone CANNOT discriminate the two families. `<|channel|>` is
+// harmony's and only harmony's — both routers key on it, one to claim and one
+// to decline.
+const HARMONY_START_TAG = "<|start|>";
+const HARMONY_CHANNEL_TAG = "<|channel|>";
+const HARMONY_MSG_TAG = "<|message|>";
+const HARMONY_END_TAG = "<|end|>";
+const HARMONY_RETURN_TAG = "<|return|>";
+const HARMONY_CALL_TAG = "<|call|>";
+
+const HarmonySegment = struct { channel: []const u8, recipient: []const u8, body: []const u8 };
+
+/// Channel, recipient and body of the segment in text[seg_start..seg_end].
+/// null when the header never resolved — a header still streaming in is never
+/// content.
+///
+/// The recipient is searched for across the WHOLE header because harmony
+/// permits it on either side of the channel name (`assistant to=functions.x
+/// <|channel|>commentary` and `<|channel|>commentary to=functions.x` are the
+/// same call).
+fn harmonySegmentAt(text: []const u8, seg_start: usize, seg_end: usize) ?HarmonySegment {
+    const seg = text[seg_start..seg_end];
+    const msg_rel = std.mem.indexOf(u8, seg, HARMONY_MSG_TAG) orelse return null;
+    const header = seg[0..msg_rel];
+    const chan_rel = std.mem.indexOf(u8, header, HARMONY_CHANNEL_TAG) orelse return null;
+
+    // Channel name = the identifier run right after the marker.
+    const after = header[chan_rel + HARMONY_CHANNEL_TAG.len ..];
+    var n: usize = 0;
+    while (n < after.len and museIsRecipientChar(after[n])) n += 1;
+    const channel = after[0..n];
+
+    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t| blk: {
+        const r = header[t + 3 ..];
+        var m: usize = 0;
+        while (m < r.len and museIsRecipientChar(r[m])) m += 1;
+        break :blk r[0..m];
+    } else "";
+
+    var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
+    for ([_][]const u8{ HARMONY_END_TAG, HARMONY_RETURN_TAG, HARMONY_CALL_TAG }) |tag| {
+        if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
+    }
+    return .{ .channel = channel, .recipient = recipient, .body = body };
+}
+
+/// gpt_oss channel split. Claims the text only when `<|channel|>` is present.
+/// First segment of each destination wins. A tool segment's body rides out as
+/// content ONLY when there is no final segment, so the KeepingMarkup callers
+/// can still see the call and the trim wrapper cuts it from display — the same
+/// contract muse's splitter honours.
+fn splitHarmonyChannels(text: []const u8) ?ThinkSplit {
+    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return null;
+    var reasoning: ?[]const u8 = null;
+    var content: ?[]const u8 = null;
+    var tool_body: ?[]const u8 = null;
+    var routed = false;
+
+    var seg_start: usize = 0;
+    while (true) {
+        const next = std.mem.indexOfPos(u8, text, seg_start + 1, HARMONY_START_TAG);
+        const seg_end = next orelse text.len;
+        if (harmonySegmentAt(text, seg_start, seg_end)) |s| {
+            routed = true;
+            if (std.mem.startsWith(u8, s.recipient, "functions.")) {
+                // A tool call, whatever channel it rode in on.
+                if (tool_body == null) tool_body = s.body;
+            } else if (std.mem.eql(u8, s.channel, "analysis")) {
+                if (reasoning == null) {
+                    const r = std.mem.trim(u8, s.body, "\n ");
+                    if (r.len > 0) reasoning = r;
+                }
+            } else {
+                // `final`, and a bare `commentary` preamble addressed to no
+                // tool — both are user-visible.
+                if (content == null) content = std.mem.trim(u8, s.body, "\n ");
+            }
+        }
+        seg_start = next orelse break;
+    }
+    if (!routed) return null;
+    return .{
+        .reasoning_content = reasoning,
+        .content = content orelse (tool_body orelse ""),
+    };
+}
+
+/// What a harmony segment header at the START of a streaming buffer means.
+/// Mirrors `museThinkOpenerAt`: the streaming loop consumes the header bytes
+/// and latches a close tag, so the close matcher's pos/len model then works on
+/// reasoning that really does begin at byte 0.
+pub const HarmonyOpener = union(enum) {
+    /// `<|channel|>analysis<|message|>` — reasoning follows, closes at <|end|>.
+    /// Payload is the header length to strip.
+    analysis: usize,
+    /// A resolved header for any OTHER channel (`final`, bare `commentary`):
+    /// the answer starts immediately, with no reasoning at all.
+    direct: usize,
+    /// A header still arriving token by token — decide nothing yet, or its
+    /// text leaks as reasoning.
+    growing,
+    not_harmony,
+};
+
+pub fn harmonyThinkOpenerAt(buf: []const u8) HarmonyOpener {
+    var i: usize = 0;
+    if (std.mem.startsWith(u8, buf, HARMONY_START_TAG)) {
+        i = HARMONY_START_TAG.len;
+        while (i < buf.len and museIsRecipientChar(buf[i])) i += 1;
+    } else if (HARMONY_START_TAG.len > buf.len and std.mem.startsWith(u8, HARMONY_START_TAG, buf)) {
+        // A strict prefix of `<|start|>` — could still become one.
+        return if (buf.len == 0) .not_harmony else .growing;
+    }
+    const rest = buf[i..];
+    if (!std.mem.startsWith(u8, rest, HARMONY_CHANNEL_TAG)) {
+        // Partial `<|channel|>` still arriving.
+        if (rest.len < HARMONY_CHANNEL_TAG.len and rest.len > 0 and
+            std.mem.startsWith(u8, HARMONY_CHANNEL_TAG, rest)) return .growing;
+        return .not_harmony;
+    }
+    const after_chan = i + HARMONY_CHANNEL_TAG.len;
+    const msg = std.mem.indexOfPos(u8, buf, after_chan, HARMONY_MSG_TAG) orelse return .growing;
+    const hdr_len = msg + HARMONY_MSG_TAG.len;
+    if (std.mem.startsWith(u8, buf[after_chan..], "analysis")) return .{ .analysis = hdr_len };
+    return .{ .direct = hdr_len };
+}
+
+/// Byte length of a leading harmony ANALYSIS header
+/// (`[<|start|>assistant]<|channel|>analysis<|message|>`), or null when `buf`
+/// does not open with one.
+///
+/// The streaming split identifies a reasoning block by a close tag and emits
+/// everything before it, which assumes the reasoning starts at byte 0. Harmony
+/// puts a header there instead, and every byte of it is ordinary text — so
+/// without this the first reasoning delta opens with a literal
+/// `<|channel|>analysis<|message|>` (live 2026-08-12).
+pub fn harmonyAnalysisHeaderLen(buf: []const u8) ?usize {
+    var i: usize = 0;
+    if (std.mem.startsWith(u8, buf, HARMONY_START_TAG)) {
+        // Skip `<|start|>` + the role that follows it.
+        i = HARMONY_START_TAG.len;
+        while (i < buf.len and museIsRecipientChar(buf[i])) i += 1;
+    }
+    if (!std.mem.startsWith(u8, buf[i..], HARMONY_CHANNEL_TAG)) return null;
+    const after_chan = i + HARMONY_CHANNEL_TAG.len;
+    if (!std.mem.startsWith(u8, buf[after_chan..], "analysis")) return null;
+    const msg = std.mem.indexOfPos(u8, buf, after_chan, HARMONY_MSG_TAG) orelse return null;
+    return msg + HARMONY_MSG_TAG.len;
+}
+
+/// Drop a leading harmony segment header of ANY channel — the answer arrives
+/// as its own `<|start|>assistant<|channel|>final<|message|>` segment once the
+/// analysis channel closes, and that header is ordinary text that would
+/// otherwise ride out as the first bytes of content.
+pub fn stripHarmonySegmentHeader(text: []const u8) []const u8 {
+    var i: usize = 0;
+    if (std.mem.startsWith(u8, text, HARMONY_START_TAG)) {
+        i = HARMONY_START_TAG.len;
+        while (i < text.len and museIsRecipientChar(text[i])) i += 1;
+    }
+    if (!std.mem.startsWith(u8, text[i..], HARMONY_CHANNEL_TAG)) return text;
+    const msg = std.mem.indexOfPos(u8, text, i, HARMONY_MSG_TAG) orelse return text;
+    return text[msg + HARMONY_MSG_TAG.len ..];
+}
+
+/// gpt_oss streaming verdict, decided from the channel markers alone.
+/// null = not harmony traffic (fall through to the generic think gate).
+///
+/// The header between `<|channel|>` and `<|message|>` is ORDINARY text —
+/// only the delimiters are single special tokens — so an unresolved header
+/// always HOLDS. Flushing it leaks `analysis` / `commentary to=functions.…`
+/// fragments into the user's stream, which is the muse ` to=user` bug in a
+/// different alphabet.
+fn harmonyStreamVerdict(buf: []const u8) ?StreamThinkGate {
+    if (std.mem.indexOf(u8, buf, HARMONY_CHANNEL_TAG) == null) return null;
+    const seg_start = std.mem.lastIndexOf(u8, buf, HARMONY_START_TAG) orelse 0;
+    const seg = buf[seg_start..];
+    const chan_rel = std.mem.indexOf(u8, seg, HARMONY_CHANNEL_TAG) orelse return .hold_thinking;
+    const msg_rel = std.mem.indexOfPos(u8, seg, chan_rel, HARMONY_MSG_TAG) orelse return .hold_thinking;
+    const header = seg[0..msg_rel];
+
+    const after = header[chan_rel + HARMONY_CHANNEL_TAG.len ..];
+    var n: usize = 0;
+    while (n < after.len and museIsRecipientChar(after[n])) n += 1;
+    const channel = after[0..n];
+
+    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t| blk: {
+        const r = header[t + 3 ..];
+        var m: usize = 0;
+        while (m < r.len and museIsRecipientChar(r[m])) m += 1;
+        break :blk r[0..m];
+    } else "";
+
+    // Tool payload: the tools path buffers before this gate is consulted;
+    // hold defensively on a no-tools request rather than leak raw arguments.
+    if (std.mem.startsWith(u8, recipient, "functions.")) return .hold_thinking;
+    if (std.mem.eql(u8, channel, "analysis")) {
+        const closed = std.mem.indexOf(u8, seg, HARMONY_END_TAG) != null or
+            std.mem.indexOf(u8, seg, HARMONY_RETURN_TAG) != null;
+        return if (closed) .split_think else .hold_thinking;
+    }
+    return .split_think;
+}
+
+/// gpt_oss streaming tool hold: true while a segment header is unresolved
+/// (the next token decides whether it names a tool) or already resolved to a
+/// `functions.` recipient (the body is call arguments — parsed on the end
+/// flush, never streamed).
+fn harmonyHeaderHoldsForTools(buf: []const u8) bool {
+    const chan = std.mem.lastIndexOf(u8, buf, HARMONY_CHANNEL_TAG) orelse return false;
+    // Header runs from the segment's `<|start|>` (the `to=` may sit on either
+    // side of the channel marker) to `<|message|>`. No `<|message|>` yet means
+    // the header is still growing — hold, the next token may name a tool.
+    const msg_rel = std.mem.indexOfPos(u8, buf, chan, HARMONY_MSG_TAG) orelse return true;
+    const seg_start = std.mem.lastIndexOf(u8, buf, HARMONY_START_TAG) orelse 0;
+    return std.mem.indexOf(u8, buf[seg_start..msg_rel], "to=functions.") != null;
+}
+
+fn museIsRecipientChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.';
+}
+
+const MuseSegment = struct { recipient: []const u8, body: []const u8 };
+
+/// Recipient + body of the segment in text[seg_start..seg_end] (seg_start
+/// sits on a `<|start|>` marker, or 0 for the headerless first segment).
+/// null when the header never resolved — a growing or truncated header is
+/// never content.
+fn museSegmentAt(text: []const u8, seg_start: usize, seg_end: usize) ?MuseSegment {
+    const seg = text[seg_start..seg_end];
+    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return null;
+    const header = seg[0..msg_rel];
+    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
+        std.mem.trim(u8, header[t + 3 ..], " \n")
+    else
+        "";
+    var body = seg[msg_rel + MUSE_MSG_TAG.len ..];
+    if (std.mem.indexOf(u8, body, MUSE_EOM_TAG)) |e| body = body[0..e];
+    if (std.mem.indexOf(u8, body, MUSE_EOT_TAG)) |e| body = body[0..e];
+    return .{ .recipient = recipient, .body = body };
+}
+
+/// Muse channel split. Claims the text only when `<|message|>` is present —
+/// no other family emits it. First segment of each channel wins (the template
+/// renders one per turn). A tool segment's body (ATEM markup) rides out as
+/// content ONLY when no user segment exists, so the KeepingMarkup callers can
+/// still see it and the trim wrapper cuts it from display.
+fn splitMuseChannels(text: []const u8) ?ThinkSplit {
+    if (std.mem.indexOf(u8, text, MUSE_MSG_TAG) == null) return null;
+    // `<|message|>` is NOT unique to muse: harmony (gpt_oss), muse's own
+    // format ancestor, emits the same marker. Decline harmony traffic here —
+    // its `analysis` header carries no `to=`, so muse's recipient rules would
+    // route the model's private reasoning into user-visible content.
+    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) != null) return null;
+    var reasoning: ?[]const u8 = null;
+    var content: ?[]const u8 = null;
+    var tool_body: ?[]const u8 = null;
+    var routed = false;
+
+    var seg_start: usize = 0;
+    while (true) {
+        const next = std.mem.indexOfPos(u8, text, seg_start + 1, MUSE_START_TAG);
+        const seg_end = next orelse text.len;
+        if (museSegmentAt(text, seg_start, seg_end)) |s| {
+            routed = true;
+            if (std.mem.eql(u8, s.recipient, "self")) {
+                if (reasoning == null) {
+                    const r = std.mem.trim(u8, s.body, "\n ");
+                    if (r.len > 0) reasoning = r;
+                }
+            } else if (s.recipient.len == 0 or std.mem.eql(u8, s.recipient, "user")) {
+                if (content == null) content = std.mem.trim(u8, s.body, "\n ");
+            } else {
+                if (tool_body == null) tool_body = s.body;
+            }
+        } else if (seg_start == 0) {
+            // Headerless first segment: a prompt-committed `to=user<|message|>`
+            // header puts the model's first bytes straight into BODY. Claim it
+            // as content — but never text that still reads as a (truncated)
+            // recipient header.
+            var body = text[0..seg_end];
+            if (std.mem.indexOf(u8, body, MUSE_EOM_TAG)) |e| body = body[0..e];
+            if (std.mem.indexOf(u8, body, MUSE_EOT_TAG)) |e| body = body[0..e];
+            const c = std.mem.trim(u8, body, "\n ");
+            if (c.len > 0 and museThinkOpenerAt(body) == .not_muse) {
+                routed = true;
+                content = c;
+            }
+        }
+        seg_start = next orelse break;
+    }
+    if (!routed) return null;
+    return .{
+        .reasoning_content = reasoning,
+        .content = content orelse (tool_body orelse ""),
+    };
+}
+
+/// Muse-Glimmer streaming verdict, decided from the channel markers alone.
+/// null = not muse traffic (fall through to the generic think gate). The
+/// recipient header between <|start|> and <|message|> is ORDINARY text, so an
+/// unresolved header always HOLDS — flushing it leaks ` to=user` fragments.
+fn museStreamVerdict(buf: []const u8) ?StreamThinkGate {
+    const has_marker = std.mem.indexOf(u8, buf, MUSE_MSG_TAG) != null or
+        std.mem.indexOf(u8, buf, MUSE_START_TAG) != null or
+        std.mem.indexOf(u8, buf, MUSE_EOM_TAG) != null;
+    if (!has_marker) {
+        // A growing bare header (` to=sel`) carries no marker yet: claim it
+        // only while every byte fits the recipient grammar, so prose that
+        // merely starts with "to=" is released to the generic gate. The
+        // first tokens can be SHORTER than "to=" (" to" leaked live
+        // 2026-08-10) — a strict prefix of it still holds.
+        const t = std.mem.trimStart(u8, buf, " \n");
+        if (t.len < "to=".len) {
+            return if (t.len > 0 and std.mem.startsWith(u8, "to=", t)) .hold_thinking else null;
+        }
+        if (!std.mem.startsWith(u8, t, "to=")) return null;
+        for (t["to=".len..]) |c| {
+            if (!museIsRecipientChar(c)) return null;
+        }
+        return .hold_thinking;
+    }
+    const seg_start = std.mem.lastIndexOf(u8, buf, MUSE_START_TAG) orelse 0;
+    const seg = buf[seg_start..];
+    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return .hold_thinking;
+    const header = seg[0..msg_rel];
+    const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
+        std.mem.trim(u8, header[t + 3 ..], " \n")
+    else
+        "";
+    if (std.mem.eql(u8, recipient, "self")) {
+        const closed = std.mem.indexOf(u8, seg, MUSE_EOM_TAG) != null or
+            std.mem.indexOf(u8, seg, MUSE_EOT_TAG) != null;
+        return if (closed) .split_think else .hold_thinking;
+    }
+    if (recipient.len == 0 or std.mem.eql(u8, recipient, "user")) return .split_think;
+    // Tool recipient: the tools path buffers before this gate is consulted;
+    // hold defensively on a no-tools request rather than leak ATEM markup.
+    return .hold_thinking;
+}
+
+/// Muse streaming tool hold: true while a segment header is unresolved (the
+/// next token decides whether it names a tool) or resolved to a TOOL
+/// recipient (the body is ATEM payload — parse runs on the end flush).
+fn museHeaderHoldsForTools(buf: []const u8) bool {
+    var header_from: usize = 0;
+    if (std.mem.lastIndexOf(u8, buf, MUSE_START_TAG)) |p| {
+        header_from = p + MUSE_START_TAG.len;
+    } else {
+        const lead = std.mem.trimStart(u8, buf, " \n");
+        // A strict prefix of "to=" could still become a header (" to" leaked
+        // as a text delta live 2026-08-10) — hold it.
+        if (lead.len < "to=".len) return lead.len > 0 and std.mem.startsWith(u8, "to=", lead);
+        if (!std.mem.startsWith(u8, lead, "to=")) return false;
+        header_from = buf.len - lead.len;
+    }
+    const seg = buf[header_from..];
+    if (std.mem.indexOf(u8, seg, MUSE_MSG_TAG)) |msg_rel| {
+        const header = seg[0..msg_rel];
+        const recipient: []const u8 = if (std.mem.indexOf(u8, header, "to=")) |t|
+            std.mem.trim(u8, header[t + 3 ..], " \n")
+        else
+            "";
+        if (recipient.len == 0) return false;
+        if (std.mem.eql(u8, recipient, "self") or std.mem.eql(u8, recipient, "user")) return false;
+        return true;
+    }
+    // Unresolved: hold only while the bytes still fit `assistant to=<r>`.
+    var rest = std.mem.trimStart(u8, seg, " \n");
+    if (std.mem.startsWith(u8, rest, "assistant")) rest = rest["assistant".len..];
+    rest = std.mem.trimStart(u8, rest, " \n");
+    if (rest.len == 0) return true;
+    if (rest.len < "to=".len) return std.mem.startsWith(u8, "to=", rest);
+    if (!std.mem.startsWith(u8, rest, "to=")) return false;
+    for (rest["to=".len..]) |c| {
+        if (!museIsRecipientChar(c)) return false;
+    }
+    return true;
+}
+
+/// Muse-Glimmer opener classification for the no-tools streaming think arm.
+/// The model's first bytes after the prompt's `<|start|>assistant` are a
+/// recipient header in ORDINARY text: ` to=self<|message|>` opens reasoning
+/// (closes at <|eom|>), any other resolved header means the model went
+/// straight to content. Payload sizes are the byte offset just past the
+/// header's `<|message|>`.
+pub const MuseThinkOpener = union(enum) { not_muse, growing, self_opened: usize, direct: usize };
+
+pub fn museThinkOpenerAt(buf: []const u8) MuseThinkOpener {
+    var rest = std.mem.trimStart(u8, buf, " \n");
+    var saw_ctx = false;
+    if (std.mem.startsWith(u8, rest, MUSE_START_TAG)) {
+        rest = rest[MUSE_START_TAG.len..];
+        saw_ctx = true;
+    }
+    if (std.mem.startsWith(u8, rest, "assistant")) {
+        rest = rest["assistant".len..];
+        rest = std.mem.trimStart(u8, rest, " \n");
+        saw_ctx = true;
+    } else if (saw_ctx) {
+        return if (std.mem.startsWith(u8, "assistant", rest)) .growing else .not_muse;
+    }
+    if (std.mem.startsWith(u8, rest, MUSE_MSG_TAG)) {
+        return .{ .direct = buf.len - rest.len + MUSE_MSG_TAG.len };
+    }
+    if (!std.mem.startsWith(u8, rest, "to=")) {
+        if (rest.len < "to=".len and std.mem.startsWith(u8, "to=", rest)) return .growing;
+        return .not_muse;
+    }
+    const after_to = rest["to=".len..];
+    if (std.mem.indexOf(u8, after_to, MUSE_MSG_TAG)) |msg_rel| {
+        const recipient = std.mem.trim(u8, after_to[0..msg_rel], " \n");
+        const consumed = (buf.len - after_to.len) + msg_rel + MUSE_MSG_TAG.len;
+        if (std.mem.eql(u8, recipient, "self")) return .{ .self_opened = consumed };
+        return .{ .direct = consumed };
+    }
+    for (after_to) |c| {
+        if (!museIsRecipientChar(c)) return .not_muse;
+    }
+    return .growing;
+}
+
+/// A muse prompt that ends at `<|start|>assistant` leaves the model to write its own
+/// header, so the plain stream arm must start skipping as if `<|start|>` had just arrived.
+pub fn promptTailOpensMuseHeader(tail: []const u8) bool {
+    return std.mem.endsWith(u8, std.mem.trimEnd(u8, tail, "\n "), MUSE_START_TAG ++ "assistant");
+}
+
+/// The held header bytes between `<|start|>` and `<|message|>` name `self`: the segment is reasoning.
+pub fn museHeaderOpensReasoning(head: []const u8) bool {
+    var rest = std.mem.trimStart(u8, head, " \n");
+    if (std.mem.startsWith(u8, rest, "assistant")) rest = std.mem.trimStart(u8, rest["assistant".len..], " \n");
+    if (!std.mem.startsWith(u8, rest, "to=")) return false;
+    return std.mem.eql(u8, std.mem.trim(u8, rest["to=".len..], " \n"), "self");
+}
+
+/// Length of a COMPLETE next-segment header at the start of `text`
+/// (`<|start|>assistant to=<r><|message|>`), or null when text doesn't start
+/// with one or the header hasn't fully arrived yet.
+pub fn museContentHeaderSkip(text: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, text, MUSE_START_TAG)) return null;
+    const seg = text[MUSE_START_TAG.len..];
+    const msg_rel = std.mem.indexOf(u8, seg, MUSE_MSG_TAG) orelse return null;
+    return MUSE_START_TAG.len + msg_rel + MUSE_MSG_TAG.len;
+}
+
+/// Plain-arm segment-header skip for muse streams: the `<|start|>` marker
+/// token arms it, `<|message|>` disarms — everything between is the
+/// role+recipient header, never content. Both markers are single special
+/// tokens, so exact-match at the delta level is complete.
+pub fn museHeaderSkipNext(skipping: bool, token_text: []const u8) bool {
+    if (std.mem.eql(u8, token_text, MUSE_START_TAG)) return true;
+    if (std.mem.eql(u8, token_text, MUSE_MSG_TAG)) return false;
+    return skipping;
+}
+
+/// template opened (Qwen 3.5/3.6 style: `…assistant\n<think>\n`). Callers
+/// decode the last few prompt tokens and pass the tail here. A thinking-off
+/// render ends with a CLOSED `</think>` block and must not match.
+pub fn promptTailOpensThink(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return endsWithThinkOpenTag(trimmed) != null or k2ThinkOpenerAt(trimmed) != null;
+}
+
+/// K2-Horizon's three RENDERED think openers (one per effort). The tokenizer
+/// decodes them all to `<think>`, so generated text never carries them; only
+/// the rendered prompt bytes do, and the closer must spell the same variant.
+const k2_think_openers = [_][]const u8{ "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>" };
+
+fn k2ThinkOpenerAt(trimmed_tail: []const u8) ?[]const u8 {
+    for (k2_think_openers) |opener| {
+        if (std.mem.endsWith(u8, trimmed_tail, opener)) return opener;
+    }
+    return null;
+}
+
+/// Narrow form used by generation-side phase switches: armed against the bare
+/// `</think>` boundary only.
+pub fn promptTailOpensBareThink(tail: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return std.mem.endsWith(u8, trimmed, "<think>");
+}
+
+/// Which reasoning opener a rendered generation prompt ENDS with (trailing
+/// whitespace ignored): a bare `<think>`, or nothing. Generation-side protocol
+/// resolution consumes this.
+pub const ThinkTailClass = enum { bare, none };
+
+pub fn promptThinkTailClass(tail: []const u8) ThinkTailClass {
+    const trimmed_tail = std.mem.trimEnd(u8, tail, "\n\r\t ");
+    return if (std.mem.endsWith(u8, trimmed_tail, BARE_THINK_OPENER)) .bare else .none;
+}
+
+/// Suffix that COMMITS the no-think channel in the rendered prompt, or null.
+/// Thinking-off on an always-thinking template otherwise means generating the
+/// whole reasoning pass and discarding it — the prompt-side commit is what
+/// makes thinking-off a real skip.
+///   • Muse: the generation prompt ends bare `<|start|>assistant`; spending
+///     the header (` to=user<|message|>`, byte-exactly what the template
+///     renders for history content turns) makes `to=self` unreachable. Never
+///     with tools — a tool call is a `to=<fn>` header.
+///   • Unconditional think opener (LFM2.5 class): close the block the
+///     template opened. Thinking-off Qwen-style renders end CLOSED and never
+///     match; no tools gate — tool calls ride outside the think block.
+fn noThinkTailSuffix(tpl: []const u8, rendered: []const u8, enable_thinking: bool, has_tools: bool) ?[]const u8 {
+    if (enable_thinking) return null;
+    const tail = contentChannelTail(tpl, rendered, !has_tools);
+    return if (tail.len > 0) tail else null;
+}
+
+/// What must be appended to a rendered prompt so generation resumes in the
+/// assistant's VISIBLE CONTENT channel rather than inside a reasoning block.
+///
+/// Two callers, one rule, deliberately: thinking-off enforces the content
+/// channel so no reasoning pass runs, and a CONTINUATION needs the same thing
+/// for a different reason — the partial text is prose the user has already
+/// read, so a prompt that lands inside a think block would return the rest of
+/// their answer as reasoning. Written twice, the muse and LFM2.5 cases would
+/// drift apart the first time a third family joined.
+///
+/// `allow_channel_commit` is thinking-off's extra gate: with tools present it
+/// declines to commit muse's `to=user`, since that would forbid the tool call
+/// the model may be about to make. A continuation always passes true — it is
+/// resuming prose by construction.
+fn contentChannelTail(tpl: []const u8, rendered: []const u8, allow_channel_commit: bool) []const u8 {
+    if (allow_channel_commit and std.mem.indexOf(u8, tpl, "reasoning_strength") != null and
+        std.mem.endsWith(u8, rendered, "<|start|>assistant"))
+    {
+        return " to=user<|message|>";
+    }
+    const tail = std.mem.trimEnd(u8, rendered[rendered.len -| 64 ..], "\n\r\t ");
+    if (k2ThinkOpenerAt(tail)) |opener| {
+        inline for (k2_think_openers) |o| {
+            if (std.mem.eql(u8, opener, o)) return "</" ++ o[1..];
+        }
+    }
+    if (promptTailOpensThink(tail)) return "</think>";
+    return "";
+}
+
+/// Whether this conversation SHAPE is a continuation: it ends with an
+/// assistant message carrying prose. The one predicate every surface asks, so
+/// "what counts as continuable" cannot differ between the endpoint that
+/// implies it and the endpoint that takes a flag — and so the answer matches
+/// what `continuationPrefill` will actually do with it.
+pub fn continuationRequested(messages: []const Message) bool {
+    return continuationPrefill(messages, true) != null;
+}
+
+/// The partial assistant reply a continuation request is asking to extend, or
+/// null when this is an ordinary turn.
+///
+/// The flag describes the SHAPE of the request, so a client that sets it on a
+/// conversation not ending in an assistant message gets an ordinary turn —
+/// never the user's own words committed into the assistant's mouth.
+///
+/// The prefill is trimmed of trailing whitespace: a tokenizer merges a trailing
+/// space into the word that follows, so a prompt ending in one tokenizes
+/// differently than the same text does mid-reply. (Anthropic's API rejects such
+/// a prefill outright; trimming keeps the request serviceable, and only the
+/// PROMPT is trimmed — the stored reply keeps its whitespace.)
+fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]const u8 {
+    if (!continue_final or messages.len == 0) return null;
+    const last = messages[messages.len - 1];
+    if (!std.mem.eql(u8, last.role, "assistant")) return null;
+    // A reply that ended in a tool call has no prose to resume — splicing a
+    // continuation onto it would re-run the parse chain over half a call.
+    if (last.tool_calls != null) return null;
+    const trimmed = std.mem.trimEnd(u8, last.content, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+/// Split model output into reasoning_content and content.
+/// Handles both `<think>...</think>` and Gemma 4's `<|channel>thought\n...<channel|>`.
+/// `opened_by_template`: the generation prompt ended with a template-injected
+/// think opener (see `promptTailOpensThink`), so output with no literal opener
+/// and no close tag is still reasoning — generation started inside the block.
+pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    const split = splitThinkBlockKeepingMarkup(text, thinking, opened_by_template);
+    const reasoning: ?[]const u8 = if (split.reasoning_content) |r| blk: {
+        const t = trimLeakedToolMarkup(r);
+        break :blk if (t.len > 0) t else null;
+    } else null;
+    return .{ .reasoning_content = reasoning, .content = trimLeakedToolMarkup(split.content) };
+}
+
+/// The split WITHOUT the leaked-markup cut — for the one caller that feeds the
+/// content back to `parseToolCalls` (the /v1/messages non-streaming path).
+/// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
+/// above so a new arm cannot forget it.
+pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    // gpt_oss / harmony channel segments (`analysis` / `final` /
+    // `commentary to=functions.X`). Keyed on `<|channel|>`; must run BEFORE
+    // the muse arm, which shares the `<|message|>` marker.
+    if (splitHarmonyChannels(text)) |split| return split;
+    // Muse-Glimmer channel segments (`to=self` / `to=user` / tool). Keyed on
+    // the `<|message|>` marker, minus harmony's `<|channel|>`; runs regardless
+    // of the `thinking` flag because the headers need stripping either way.
+    if (splitMuseChannels(text)) |split| return split;
+    // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        const think_tag = "<|channel>thought\n";
+        const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
+        const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
+        var content = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
+        // Strip the content channel tag: <|channel>\n or <|channel>. A
+        // re-opened THOUGHT channel (`<|channel>thought…`) is NOT a content
+        // opener — stripping its `<|channel>` prefix here left a bare "thought"
+        // in visible content (2026-06-19 live); leave it for stripTrailingThinkOpen.
+        if (std.mem.startsWith(u8, content, "<|channel>\n")) {
+            content = content[11..];
+        } else if (std.mem.startsWith(u8, content, "<|channel>") and !std.mem.startsWith(u8, content, "<|channel>thought")) {
+            content = content[10..];
+        }
+        content = std.mem.trimStart(u8, content, "\n ");
+        return .{
+            .reasoning_content = if (reasoning.len > 0) reasoning else null,
+            .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
+        };
+    }
+    // Standard style: <think>...</think>
+    if (indexOfThinkCloseTag(text, 0)) |close| {
+        const reasoning_start: usize = thinkOpenTagLenAt(text) orelse 0;
+        const reasoning = std.mem.trim(u8, text[reasoning_start..close.pos], "\n ");
+        const content = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
+        return .{
+            .reasoning_content = if (reasoning.len > 0) reasoning else null,
+            .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
+        };
+    }
+    if (thinking) {
+        // Unclosed think block: split policy depends on whether the model's
+        // output begins with a literal opener.
+        //   • Literal opener present → model definitely entered thinking but
+        //     ran out of tokens / didn't close. Treat as reasoning.
+        //   • No literal opener + template-injected opener → generation began
+        //     INSIDE the block (Qwen 3.5/3.6 render `…assistant\n<think>\n`);
+        //     an unclosed tail is truncated reasoning, never content.
+        //   • No literal opener + no template opener → the model answered
+        //     directly (Gemma style); keep the answer visible as content.
+        if (thinkOpenTagLenAt(text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
+            const start: usize = if (thinkOpenTagLenAt(text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
+            const reasoning = std.mem.trimStart(u8, text[start..], "\n ");
+            return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+        }
+        if (opened_by_template) {
+            const reasoning = std.mem.trimStart(u8, text, "\n ");
+            return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+        }
+        // Prose answer that ENDS by opening a new, unclosed thought block
+        // (Gemma 12B tail behavior): the text before the opener is the
+        // answer; the dangling thought is reasoning. The raw opener tag must
+        // never leak into visible content.
+        if (lastUnclosedThinkOpen(text)) |o| {
+            const content = std.mem.trimEnd(u8, std.mem.trimStart(u8, text[0..o.pos], "\n "), "\n ");
+            const reasoning = std.mem.trim(u8, text[o.after..], "\n ");
+            return .{
+                .reasoning_content = if (reasoning.len > 0) reasoning else null,
+                .content = content,
+            };
+        }
+        // No thought block, but the model may have emitted (or been truncated
+        // right after) a dangling Gemma 4 *content* channel opener `<|channel>`
+        // / `<|channel>\n`. Strip it so a cut-off reply never leaks the raw
+        // control tag into visible content; whatever follows is the answer.
+        var content = std.mem.trimStart(u8, text, "\n ");
+        if (std.mem.startsWith(u8, content, "<|channel>\n")) {
+            content = content[11..];
+        } else if (std.mem.startsWith(u8, content, "<|channel>")) {
+            content = content[10..];
+        }
+        return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, content, "\n ") };
+    }
+    return .{ .reasoning_content = null, .content = text };
+}
+
+const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
+
+/// Earliest think/thought opener at or after `from` (either tag family).
+fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
+    const chan = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
+    const think = indexOfThinkOpenTag(text, from);
+    if (chan == null and think == null) return null;
+    if (think == null or (chan != null and chan.? < think.?.pos)) {
+        return .{ .pos = chan.?, .after = chan.? + "<|channel>thought".len, .is_think_style = false };
+    }
+    return .{ .pos = think.?.pos, .after = think.?.pos + think.?.len, .is_think_style = true };
+}
+
+/// Earliest close tag at or after `from` (either tag family).
+fn nextThinkClose(text: []const u8, from: usize) ?ThinkOpen {
+    const chan = std.mem.indexOfPos(u8, text, from, "<channel|>");
+    const think = indexOfThinkCloseTag(text, from);
+    if (chan == null and think == null) return null;
+    if (think == null or (chan != null and chan.? < think.?.pos)) {
+        return .{ .pos = chan.?, .after = chan.? + "<channel|>".len, .is_think_style = false };
+    }
+    return .{ .pos = think.?.pos, .after = think.?.pos + think.?.len, .is_think_style = true };
+}
+
+/// Skip an optional Gemma 4 CONTENT channel opener (`<|channel>` not followed
+/// by `thought`) plus surrounding newlines, right after a thought close.
+fn skipContentChannelTag(text: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < text.len and (text[pos] == '\n' or text[pos] == ' ')) pos += 1;
+    const tag = "<|channel>";
+    if (pos + tag.len <= text.len and std.mem.eql(u8, text[pos .. pos + tag.len], tag)) {
+        const rest = text[pos + tag.len ..];
+        if (!std.mem.startsWith(u8, rest, "thought")) {
+            pos += tag.len;
+            while (pos < text.len and (text[pos] == '\n' or text[pos] == ' ')) pos += 1;
+        }
+    }
+    return pos;
+}
+
+/// Merge ALL closed think/thought blocks in `text` into one leading block.
+///
+/// The split/strip layer understands exactly one leading block plus an
+/// optional UNCLOSED trailing opener. Gemma 4 12B, however, re-opens a thought
+/// channel mid-turn and closes it again (`…content<|channel>thought\n…
+/// <channel|>more content`) — observed live via Claude Code on /v1/messages,
+/// where the raw pair leaked verbatim into the visible text block. This pass
+/// rewrites such output to `<|channel>thought\n{all thought text}<channel|>
+/// {all content}` so every downstream consumer (splitThinkBlock,
+/// parseToolCalls) handles it unchanged.
+///
+/// Returns null when no rewrite is needed (zero or one LEADING closed block —
+/// the overwhelmingly common case, zero-cost). An unclosed trailing opener is
+/// left in place for the existing trailing-strip logic.
+pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    var reasoning_parts = std.ArrayList([]const u8).empty;
+    defer reasoning_parts.deinit(allocator);
+    var content_parts = std.ArrayList([]const u8).empty;
+    defer content_parts.deinit(allocator);
+
+    var style_think = false;
+    var style_set = false;
+    var closed_blocks: usize = 0;
+    var first_block_leading = false;
+    var pos: usize = 0;
+
+    // Template-opened leading block: a close tag BEFORE any opener (Qwen
+    // renders `…assistant\n<think>\n` into the prompt, so output starts
+    // mid-thought and contains only the close).
+    if (nextThinkClose(text, 0)) |lc| {
+        const open_pos = if (nextThinkOpen(text, 0)) |o| o.pos else text.len;
+        if (lc.pos < open_pos) {
+            try reasoning_parts.append(allocator, std.mem.trim(u8, text[0..lc.pos], "\n "));
+            style_think = lc.is_think_style;
+            style_set = true;
+            closed_blocks += 1;
+            first_block_leading = true;
+            pos = skipContentChannelTag(text, lc.after);
+        }
+    }
+
+    while (true) {
+        const o = nextThinkOpen(text, pos) orelse {
+            try content_parts.append(allocator, text[pos..]);
+            break;
+        };
+        const found: ?TagAt = if (o.is_think_style)
+            indexOfThinkCloseTag(text, o.after)
+        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |cp|
+            TagAt{ .pos = cp, .len = "<channel|>".len }
+        else
+            null;
+        const close = found orelse {
+            // Unclosed trailing opener — leave verbatim for the trailing-strip
+            // logic in splitThinkBlock.
+            try content_parts.append(allocator, text[pos..]);
+            break;
+        };
+        try content_parts.append(allocator, text[pos..o.pos]);
+        try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close.pos], "\n "));
+        if (!style_set) {
+            style_think = o.is_think_style;
+            style_set = true;
+        }
+        closed_blocks += 1;
+        if (o.pos == 0) first_block_leading = true;
+        pos = skipContentChannelTag(text, close.pos + close.len);
+    }
+
+    // Rewrite only when a closed block exists beyond the single leading one.
+    if (closed_blocks == 0) return null;
+    if (closed_blocks == 1 and first_block_leading) return null;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, if (style_think) "<think>\n" else "<|channel>thought\n");
+    var first = true;
+    for (reasoning_parts.items) |r| {
+        if (r.len == 0) continue;
+        if (!first) try out.appendSlice(allocator, "\n\n");
+        try out.appendSlice(allocator, r);
+        first = false;
+    }
+    try out.appendSlice(allocator, if (style_think) "</think>\n" else "<channel|>\n");
+    first = true;
+    for (content_parts.items) |c| {
+        const trimmed = std.mem.trim(u8, c, "\n ");
+        if (trimmed.len == 0) continue;
+        if (!first) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, trimmed);
+        first = false;
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// Streaming-only: true when the buffer TAIL is a partial prefix of a think
+/// opener (`<think>` / `<|channel>thought`). The buffered-stream flush must
+/// hold these bytes back until the tag completes or diverges — flushing them
+/// leaks tag fragments as visible content (a pi session showed prose ending
+/// in a glued "thought" because `<|channel>` flushed before "thought"
+/// arrived and completed the opener).
+/// Can a thought that begins with `buf` still grow into an opener the streaming gates strip?
+/// Every opener starts with `<` or is a Muse header (`assistant`, `to=`), so any other first
+/// byte is decided at once instead of waiting for the gates' 7 bytes.
+pub fn thinkOpenerPossible(buf: []const u8) bool {
+    const rest = std.mem.trimStart(u8, buf, " \n");
+    if (rest.len == 0 or rest[0] == '<') return true;
+    for ([_][]const u8{ "assistant", "to=" }) |word| {
+        const n = @min(rest.len, word.len);
+        if (std.mem.eql(u8, rest[0..n], word[0..n])) return true;
+    }
+    return false;
+}
+
+pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
+    const tags = [_][]const u8{ "<|channel>thought", "<think>" };
+    for (tags) |tag| {
+        // Strictly-partial prefixes only — a COMPLETE opener in the buffer is
+        // the caller's contains-check's job; ours is the growing tail.
+        var l = @min(buf.len, tag.len - 1);
+        while (l > 0) : (l -= 1) {
+            if (std.mem.endsWith(u8, buf, tag[0..l])) return true;
+        }
+    }
+    return false;
+}
+
+/// Streaming-only: should the chat-completion SSE path defer flushing
+/// because `buf` is on track to become a tool call?
+///
+/// True when:
+///   * `buf` contains `<tool` followed by a valid tag terminator
+///     (`>`, ` `, `\t`, `\n`, `_`, `|`) somewhere — that's any of the
+///     accepted families: `<tool>`, `<tool …>`, `<tool_call…>`, `<tool_calls…>`,
+///     `<tool_request…>`, `<tool_requests…>` (mirrors `parseToolCalls`).
+///   * `buf` contains the Gemma 4 `<|tool_call` substring.
+///   * `functionOpenerHoldsForTools(buf)` — a MiniCPM5 `<function name="…">`
+///     opener still unresolved, or resolved into a real call. `<functional`,
+///     `<function>` and `<function foo>` are not this dialect and keep flowing.
+///     NOTE the bare equals-sign Hermes `<function=NAME>` form is deliberately
+///     NOT held here: `parseToolCalls` accepts it wrapper-less, so the gate is
+///     narrower than the parser for THAT dialect. Pre-existing on main, tracked
+///     separately — two attempts at closing it inside this change were both
+///     wrong, and real captures show non-adjacent `<parameter=` openers.
+///   * `buf[0] == '{'` and `buf` contains `"name"` (raw JSON tool-call shape).
+///   * `buf` ends with a partial prefix that could grow into one of the above
+///     in the next token (`<`, `<t`, `<to`, `<too`, `<tool`, or any prefix
+///     of `<|tool_call`).
+///
+/// Conservatively false on `<toolkit>`, `<toolbar>`, etc. — anything where
+/// the char after `<tool` isn't a valid tag terminator. That keeps prose
+/// that happens to mention HTML-ish tags flowing through normally.
+pub fn streamShouldBufferForTools(buf: []const u8) bool {
+    if (buf.len == 0) return false;
+
+    // Raw JSON tool-call shape: starts with `{` and has `"name"` somewhere.
+    if (buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) return true;
+
+    // Gemma 4 fully-formed canonical open.
+    if (std.mem.indexOf(u8, buf, "<|tool_call") != null) return true;
+
+    // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
+    if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
+    if (std.mem.indexOf(u8, buf, "</｜DSML｜") != null) return true;
+
+    // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
+    if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
+    // Muse segment-header hold: between <|start|> and <|message|> only the
+    // role+recipient text flows, and a non-self/user recipient names a TOOL.
+    if (museHeaderHoldsForTools(buf)) return true;
+    // gpt_oss/harmony segment-header hold: same shape, `<|channel|>`-keyed.
+    if (harmonyHeaderHoldsForTools(buf)) return true;
+
+    // `<tool…` family: walk every `<tool` occurrence, accept the first one
+    // whose terminator is valid (mirrors parseToolCalls' acceptance rule).
+    var scan: usize = 0;
+    while (std.mem.indexOf(u8, buf[scan..], "<tool")) |rel| {
+        const after = scan + rel + "<tool".len;
+        if (after >= buf.len) return true; // truncated mid-prefix → in progress
+        const c = buf[after];
+        if (c == '>' or c == ' ' or c == '\t' or c == '\n' or c == '_' or c == '|') return true;
+        scan = after;
+    }
+
+    // `<function…` family: MiniCPM5's `<function name="…">`.
+    if (functionOpenerHoldsForTools(buf)) return true;
+    // Claude-style `<function_calls>` / `<invoke name="…">`.
+    if (invokeOpenerHoldsForTools(buf)) return true;
+
+    // Trailing partial prefixes — the next streamed token could complete any
+    // of these into a real tool open. Order doesn't matter; first endsWith
+    // hit wins. Listed shortest-first for legibility.
+    const tail_prefixes = [_][]const u8{
+        "<",     "<t",     "<to",     "<too",     "<tool",
+        "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
+        "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        // MiniCPM5 V3 `<function name="…">` — COMPLETE ladder. `<funct` is a
+        // real decomposition in this vocabulary (`<f` id 54303 + `unct` id
+        // 14185 decode to exactly `<funct`); omitting that one rung flushed the
+        // fragment and leaked the rest of the tag. The rungs are DERIVED in the
+        // test, so a future gap fails there instead of shipping.
+        "<f", "<fu", "<fun", "<func", "<funct", "<functi", "<functio", "<function",
+        // Muse ATEM (a fused multi-char BPE fragment can end mid-marker)
+        "<a", "<at", "<ate", "<atem", "<atem:",
+        // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
+        // splits too in case the tokenizer spells the marker in pieces)
+        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
+        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
+        "</", "</\xef", "</\xef\xbd", "</｜", "</｜D", "</｜DS", "</｜DSM",
+        "</｜DSML", "</｜DSML\xef", "</｜DSML\xef\xbd",
+    };
+    for (tail_prefixes) |p| {
+        if (std.mem.endsWith(u8, buf, p)) return true;
+    }
+    return false;
+}
+
+/// Streaming-only: does a `<function …` opener anywhere in `buf` still hold?
+/// Three arrival states, mirroring `museHeaderHoldsForTools` above:
+///
+///   unresolved (no `>` yet)        → HOLD; the next token may complete a call
+///   resolved WITH a quoted name=   → HOLD; it is a MiniCPM5 V3 call
+///   resolved WITHOUT one          → RELEASE and keep scanning; the parser
+///                                    (parseMiniCpm5ToolCalls) will decline it
+///
+/// The `name=` test delegates to `miniCpm5AttrValue`, so the gate's acceptance
+/// is DERIVED from the parser's instead of hand-mirrored. That direction
+/// matters: the gate must stay a strict SUPERSET of the parser. A stricter gate
+/// (e.g. one demanding `name=` immediately after the whitespace) would flush a
+/// real call's opener as content — `<function foo name="x">` does parse — and
+/// the end-of-stream parse would then emit the call anyway: leak AND duplicate.
+///
+/// Releasing the resolved-non-call case is what keeps prose usable. The hold is
+/// monotonic over a buffer that never shrinks, so treating any `<function foo>`
+/// as a call silences every remaining token of a tool-enabled turn.
+fn functionOpenerHoldsForTools(buf: []const u8) bool {
+    var scan: usize = 0;
+    while (std.mem.indexOf(u8, buf[scan..], "<function")) |rel| {
+        const after = scan + rel + "<function".len;
+        // Truncated mid-marker — the next token decides what this is.
+        if (after >= buf.len) return true;
+        // `<functional`, `<function=NAME>` (the equals-sign Hermes form) and
+        // `<function>` are not this dialect; skip and keep scanning so ordinary
+        // prose keeps flowing. Gating the bare `<function=` dialect is a
+        // SEPARATE problem with its own evidence — see the follow-up issue.
+        if (!std.ascii.isWhitespace(buf[after])) {
+            scan = after;
+            continue;
+        }
+        const tag_rel = std.mem.indexOfScalar(u8, buf[after..], '>') orelse return true;
+        const tag_end = after + tag_rel;
+        // Empty `name=""` is rejected by the parser too, so it releases here.
+        if (miniCpm5AttrValue(buf[after..tag_end], "name")) |v| {
+            if (v.len > 0) return true;
+        }
+        scan = tag_end + 1;
+    }
+    return false;
+}
+
+/// Streaming-only: what should a tools-enabled SSE path do with the buffered
+/// text so far, with respect to thinking? Shared by the chat-completions and
+/// Anthropic /v1/messages stream handlers — the two paths drifted apart once
+/// already: /v1/messages only recognized think OPENERS present in the output,
+/// so Qwen-family template-opened thinking (opener injected into the PROMPT)
+/// streamed as visible text and a raw `</think>` leaked into Claude Code
+/// transcripts (2026-06-10 live).
+///
+///   .hold_thinking — inside an unclosed think block; buffer, emit nothing
+///   .split_think   — close tag arrived; splitThinkBlock once, emit
+///                    reasoning + visible remainder, clear the buffer, and
+///                    set think_closed for the rest of the turn
+///   .flush_text    — plain visible prose; stream it
+///
+/// `think_closed` releases the enable_thinking hold after the one split —
+/// without it the visible answer sits in the buffer until end-of-stream and
+/// gets misfiled as reasoning (the pi hidden-answer bug).
+pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
+
+/// The gate WITHOUT a prompt-opened think block — every family whose template
+/// gates its `<think>` on `enable_thinking` renders the closed `<think></think>`
+/// signature (or no tag at all) when thinking is off, so the flag is false for
+/// them and this stays their exact behavior.
+pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    return streamThinkGate2(buf, enable_thinking, think_closed, false);
+}
+
+/// `prompt_opened_think`: the rendered generation prompt ended with an OPEN
+/// think tag (`server.promptOpensThink`). That is a fact about the prompt
+/// BYTES, not about our request flag — LFM2.5's template pre-opens `<think>`
+/// unconditionally, so with thinking off the model's reasoning arrives as
+/// tag-free prose and the 3-arg gate flushed the whole chain-of-thought as the
+/// visible answer (live 2026-08-04). It can only ever ADD a hold: when
+/// thinking is on `enable_thinking` already held, and once `think_closed` the
+/// term is dropped so the answer after the block still flushes.
+/// Memoized marker scan for the streaming think gate, owned BESIDE the stream
+/// buffer and reset with it.
+///
+/// Without it `streamThinkGate2` re-scans the whole accumulated buffer on every
+/// token for as long as thinking markup is present and no close has arrived —
+/// O(buffer) per token, O(n²) over a reasoning block. Measured on a hermetic
+/// 4000-token stream growing to 113 KB: 47.99 µs/token with no close in the
+/// buffer (every scan runs to the end), 16.98 µs/token with a close near the
+/// front (the close scan stops early). ~0.3% of a 15 ms/token model, ~1% at
+/// 5 ms/token, and it GROWS with the thought.
+///
+/// Exactness rests on one property of the marker grammar: every recognized
+/// marker contains exactly ONE `<`, at its start. A marker straddling the scanned/unscanned boundary must therefore
+/// begin at the LAST `<` in the buffer — and if that `<` cannot still grow into
+/// a marker, nothing straddles the boundary at all. So the resume point is
+/// exact and bounded, with no overlap constant to get wrong.
+pub const ThinkScan = struct {
+    /// Bytes already examined. Never trusted when the buffer is SHORTER than
+    /// this (the loop reset the buffer without resetting the scan).
+    checked_upto: usize = 0,
+    /// Index of the last `<` seen, or null. The only position a marker can
+    /// straddle the boundary from.
+    last_lt: ?usize = null,
+    saw_channel_thought: bool = false,
+    saw_open: bool = false,
+    saw_channel_close: bool = false,
+    /// Tool markup anywhere in the buffer. This is what makes a found close
+    /// UNSTABLE and therefore un-latchable: `thinkCloseIsToolCallPayload`
+    /// reclassifies a close as an argument value once a `</tool_call` arrives
+    /// AFTER it, so a close that was real at token N is payload at token N+k.
+    /// With no tool markup the close is stable and latching is exact.
+    saw_tool_marker: bool = false,
+    /// First real close tag, once found and stable.
+    close: ?TagAt = null,
+    /// Bytes examined by the last call, INCLUDING the exact full re-scan the
+    /// tool-markup case falls back to. Test-visible: the invariant is that this
+    /// stays FLAT as the buffer grows for traffic with no tool markup — which
+    /// is the arm the 47.99 µs/token bench measured.
+    last_scan_span: usize = 0,
+
+    /// Longest plain substring needle minus one — the overlap a windowed
+    /// substring search needs so a needle split across two arrivals is caught.
+    /// `<|channel>thought` is the longest at 17.
+    const substr_overlap: usize = 16;
+
+    pub fn reset(self: *ThinkScan) void {
+        self.* = .{};
+    }
+
+    /// Where the next scan must start so no marker spanning the boundary is
+    /// missed: the last `<` if it can still grow into a tag (see the type's
+    /// doc comment for why no earlier `<` can), and far enough back for the
+    /// plain substring needles either way.
+    fn resumeFrom(self: *const ThinkScan, buf: []const u8) usize {
+        const upto = @min(self.checked_upto, buf.len);
+        const substr_from = upto -| substr_overlap;
+        const lt = self.last_lt orelse return substr_from;
+        if (lt >= upto) return substr_from;
+        const tail = buf[lt..upto];
+        const growing = isPartialTag(tail, "<think>") or
+            isPartialTag(tail, "</think>") or
+            (tail.len < "<|channel>thought".len and std.mem.startsWith(u8, "<|channel>thought", tail)) or
+            (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail));
+        return if (growing) @min(lt, substr_from) else substr_from;
+    }
+
+    fn advance(self: *ThinkScan, buf: []const u8) void {
+        if (buf.len < self.checked_upto) self.reset(); // buffer was cleared under us
+        if (buf.len == self.checked_upto and self.checked_upto != 0) {
+            self.last_scan_span = 0;
+        } else {
+            const from = self.resumeFrom(buf);
+            self.last_scan_span = buf.len - from;
+            const win = buf[from..];
+            if (std.mem.lastIndexOfScalar(u8, win, '<')) |rel| self.last_lt = from + rel;
+            if (!self.saw_channel_thought and std.mem.indexOf(u8, win, "<|channel>thought") != null)
+                self.saw_channel_thought = true;
+            if (!self.saw_channel_close and std.mem.indexOf(u8, win, "<channel|>") != null)
+                self.saw_channel_close = true;
+            if (!self.saw_tool_marker and std.mem.indexOf(u8, win, "tool_call") != null)
+                self.saw_tool_marker = true;
+            // The open scan takes the FULL buffer with a start offset: it
+            // consults nothing before the match, but a windowed slice would
+            // shift the reported position. Monotone — a complete opener stays
+            // one — so latching is exact.
+            if (!self.saw_open and indexOfThinkOpenTag(buf, from) != null) self.saw_open = true;
+            if (self.close == null and !self.saw_tool_marker)
+                self.close = indexOfThinkCloseTag(buf, from);
+            self.checked_upto = buf.len;
+        }
+        if (self.saw_tool_marker) {
+            // Exact, and only here: the payload classification looks FORWARD
+            // past the close for a `</tool_call`, so it must be recomputed on
+            // the whole buffer. The caller latches `think_closed` right after a
+            // split, so this runs for a handful of tokens, not a whole block.
+            self.close = indexOfThinkCloseTag(buf, 0);
+            self.last_scan_span = buf.len;
+        }
+    }
+};
+
+/// `streamThinkGate2` with the per-token rescan memoized. Byte-identical
+/// verdicts — pinned prefix-by-prefix against the fresh gate over a corpus that
+/// includes every marker family, a close buried in a tool argument, and a
+/// suffix longer than the partial-scan's tail window.
+pub fn streamThinkGateScan(
+    buf: []const u8,
+    enable_thinking: bool,
+    think_closed: bool,
+    prompt_opened_think: bool,
+    scan: *ThinkScan,
+) StreamThinkGate {
+    // Harmony (gpt_oss) decides before muse — both emit <|message|>, and only
+    // the <|channel|> marker tells them apart.
+    if (harmonyStreamVerdict(buf)) |v| return v;
+    if (museStreamVerdict(buf)) |v| return v;
+    scan.advance(buf);
+    const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
+        scan.saw_channel_thought or
+        scan.saw_open or
+        (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+        (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+        endsWithPartialThinkOpen(buf);
+    if (!has_thinking) return .flush_text;
+    return if (scan.saw_channel_close or scan.close != null) .split_think else .hold_thinking;
+}
+
+pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
+    // Harmony (gpt_oss) channels decide first — the muse arm below shares the
+    // <|message|> marker and would otherwise claim this traffic.
+    if (harmonyStreamVerdict(buf)) |v| return v;
+    // Muse channels decide early — the recipient header is ordinary text and
+    // must never flush unresolved.
+    if (museStreamVerdict(buf)) |v| return v;
+    const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
+        std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+        indexOfThinkOpenTag(buf, 0) != null or
+        (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+        (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+        // A partial opener at the buffer TAIL (mid-text re-opened channel
+        // arriving token by token) must hold the flush — flushing leaks tag
+        // fragments like a glued "thought".
+        endsWithPartialThinkOpen(buf);
+    if (!has_thinking) return .flush_text;
+    const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
+        indexOfThinkCloseTag(buf, 0) != null;
+    return if (has_close) .split_think else .hold_thinking;
+}
+
+/// End-of-stream classification for a think buffer that never saw a close tag:
+/// is it reasoning, or was it content all along?
+///
+/// The streaming loop starts `in_think_block` from `enable_thinking`, i.e. it
+/// ASSUMES the model begins inside a think block whenever thinking was
+/// requested. That holds only for templates that pre-inject the opener. Gemma 4
+/// renders a bare `<|turn>model\n` and lets the MODEL decide, so a turn it
+/// answers directly ("391") carries no think markup at all — and the whole
+/// answer was flushed as `reasoning_content` with EMPTY content, while the
+/// non-streaming path (`splitThinkBlock`, no opener + no close + not
+/// template-opened ⇒ content) returned it correctly (live 2026-08-04).
+///
+/// So require POSITIVE evidence a block was open: the PROMPT opened one, or the
+/// model emitted a literal opener. This is what makes the two paths agree.
+pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, saw_think_open: bool) bool {
+    return in_think_block and (prompt_opened_think or saw_think_open);
+}
+
+/// The reasoning bytes not yet streamed, or null when there is nothing new.
+///
+/// The tools streaming path emits reasoning INCREMENTALLY (see the
+/// `.hold_thinking` arm), so every later site that emits reasoning for the same
+/// Streaming counterpart to the leading `trimStart(content, "\n ")` every
+/// non-streaming split already applies.
+///
+/// The two surfaces disagreed on the BYTES of the same answer: LFM2.5's template
+/// opens `<think>` unconditionally, so its first generated token is the newline
+/// pair that follows the closer, and `splitThinkBlock` drops it while a stream
+/// flushing tokens verbatim shipped it — `'One, two…'` non-streaming,
+/// `'\n\nOne, two…'` streaming (live 2026-08-13). Any model whose first visible
+/// token is whitespace is in this class, not just LFM2.5.
+///
+/// Leading whitespace is the ONE thing a stream can still withhold: nothing
+/// visible has been sent yet, so this is a suppression, never a retraction.
+///
+/// It suppresses a chunk that is ENTIRELY whitespace, never a prefix of one. A
+/// partial trim would ship a logprobs entry whose `token` no longer appears in
+/// `content` — the collector describes whole tokens and cannot split one — so
+/// the two contracts are kept consistent by never cutting inside a token. A
+/// single token mixing leading whitespace with visible text is the residual
+/// case, and it keeps its whitespace on both surfaces' terms: the stream ships
+/// it, and the caller flips `content_started` so nothing later is touched.
+///
+/// `content_started` must flip on the first NON-EMPTY emission, so a suppressed
+/// whitespace token leaves the next one still eligible.
+pub fn streamContentLead(chunk: []const u8, content_started: bool) []const u8 {
+    if (content_started) return chunk;
+    if (std.mem.trimStart(u8, chunk, "\n ").len == 0) return "";
+    return chunk;
+}
+
+/// turn must send only the remainder or the client sees the thought twice.
+///
+/// `already >= reasoning.len` returns null rather than underflowing: the split
+/// can SHRINK when a tool marker appears mid-thought and `trimLeakedToolMarkup`
+/// cuts the tail. An SSE delta cannot be retracted, so the honest behavior is to
+/// send nothing further — never to resend from the top.
+/// The part of a still-open thought's split a stream may ship. A closed thought
+/// is delivered as `trim(thought, "\n ")`, so a trailing run of those bytes, and
+/// a close tag still arriving, wait for what follows.
+pub fn settledReasoning(open: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, open[0 .. open.len - partialThinkCloseSuffixLen(open)], "\n ");
+}
+
+pub const OpenThoughtFlush = struct { skip: usize, ship: usize };
+
+/// How a stream flushes an open thought's raw bytes (everything since its last
+/// delta) so the deltas add up to the closed thought's `trim(thought, "\n ")`:
+/// `skip` leading bytes drop before the first delta, `ship` bytes go out, and the
+/// rest (a trailing "\n " run, a partial close tag, a split code point) waits.
+pub fn openThoughtFlush(buf: []const u8, shipped: bool) OpenThoughtFlush {
+    const skip = if (shipped) 0 else buf.len - std.mem.trimStart(u8, buf, "\n ").len;
+    const whole = @max(buf.len - partialThinkCloseSuffixLen(buf), skip);
+    var end = skip + std.mem.trimEnd(u8, buf[skip..whole], "\n ").len;
+    // An open code span stays in the buffer: `indexOfThinkCloseTag` reads its backtick to know a tag inside is quoted.
+    end = @max(@min(end, spanSettledLen(buf[0..whole])), skip);
+    while (end > skip and end < buf.len and (buf[end] & 0xC0) == 0x80) end -= 1;
+    return .{ .skip = skip, .ship = end - skip };
+}
+
+/// The last delta of a thought whose remaining raw bytes are `body`.
+pub fn closedThoughtDelta(body: []const u8, shipped: bool) []const u8 {
+    return if (shipped) std.mem.trimEnd(u8, body, "\n ") else std.mem.trim(u8, body, "\n ");
+}
+
+/// The last delta of a thought the generation cut while still open, from the
+/// bytes the stream still holds: an opener not yet consumed is structure, and a
+/// thought that shipped nothing drops its leading "\n " as the split does.
+pub fn cutThoughtDelta(held: []const u8, opener_consumed: bool, shipped: bool) []const u8 {
+    var body = held;
+    if (!opener_consumed) {
+        if (thinkOpenTagLenAt(body)) |l| {
+            body = body[l..];
+        } else if (std.mem.startsWith(u8, body, "<|channel>thought")) {
+            body = body["<|channel>thought".len..];
+        }
+    }
+    return if (shipped) body else std.mem.trimStart(u8, body, "\n ");
+}
+
+pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
+    if (already >= reasoning.len) return null;
+    return reasoning[already..];
+}
+
+/// `<tool_call>` followed by a special token spelled where `<` belongs
+/// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.
+fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const wrapper = "<tool_call>";
+    var out: ?std.ArrayList(u8) = null;
+    errdefer if (out) |*o| o.deinit(allocator);
+    var copied: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, wrapper)) |at| {
+        var p = at + wrapper.len;
+        from = p;
+        while (p < text.len and std.ascii.isWhitespace(text[p])) p += 1;
+        if (!std.mem.startsWith(u8, text[p..], "<|")) continue;
+        const close = std.mem.indexOfPos(u8, text, p + 2, "|>") orelse continue;
+        if (close - p > 32 or std.mem.indexOfAny(u8, text[p + 2 .. close], "<>\n ") != null) continue;
+        if (!std.mem.startsWith(u8, text[close + 2 ..], "function=")) continue;
+        if (out == null) out = .empty;
+        try out.?.appendSlice(allocator, text[copied..p]);
+        try out.?.append(allocator, '<');
+        copied = close + 2;
+        from = copied;
+    }
+    var o = out orelse return null;
+    try o.appendSlice(allocator, text[copied..]);
+    return try o.toOwnedSlice(allocator);
+}
+
+/// Parse tool calls from model output text.
+pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
+    // Strip thinking blocks if present
+    var effective_text = text;
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
+    } else if (indexOfThinkCloseTag(text, 0)) |close| {
+        effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
+    }
+
+    const special_fixed = try hermesSpecialOpenerRepair(allocator, effective_text);
+    defer if (special_fixed) |r| allocator.free(r);
+    if (special_fixed) |r| effective_text = r;
+
+    var calls = std.ArrayList(ParsedToolCall).empty;
+    errdefer {
+        for (calls.items) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        calls.deinit(allocator);
+    }
+
+    // Look for `<tool…>…</tool…>` patterns. DSV4-Flash hallucinates the
+    // spec aggressively; we accept the entire training-bias family:
+    //   • `<tool_call>JSON</tool_call>`                      (canonical Hermes)
+    //   • `<tool_call name="X">JSON</tool_call>`             (attribute style)
+    //   • `<tool_call …>JSON</tool_request>`                 (mismatched close)
+    //   • `<tool_calls>JSON</tool_calls>`                    (plural form)
+    //   • `<tool_calls name="X">{args}</tool_calls>`         (plural + attr)
+    //   • `<tool name="X">{args}</tool_calls>`               (bare-tool open, plural close — nested wrappers)
+    //   • `<tool>{json}</tool>`                              (bare tag, body has name+args)
+    //   • `<tool name="X" arguments="{...}"/>`               (SELF-CLOSING — DSV4 emits this routinely;
+    //                                                          parseSelfClosingToolTag handles broken-quote
+    //                                                          variants like `…"}'/>` too)
+    // Approach: search for the prefix `<tool` (5 chars). Skip the Gemma 4
+    // close marker `<tool_call|>`. Try the self-closing form first (cheap
+    // attribute scan + balanced-JSON extraction; tolerates the model's
+    // mismatched quotes). If that doesn't match, fall through to the
+    // open/close-marker path: scan to the next `>`, optionally capturing
+    // `name="X"` / `name='X'`, then locate the earliest of `</tool>`,
+    // `</tool_call>`, `</tool_calls>`, `</tool_request>`, `</tool_requests>`.
+    // When the body fails to parse, advance only past the OPENING `>` so any
+    // inner `<tool…>` blocks get a chance — this is what makes the outer
+    // `<tool_calls>` wrapper case work.
+    //
+    // Muse-Glimmer ATEM (`<atem:invoke name="X">`): distinctive namespace
+    // prefix no other family emits; the generic `<tool` scan never sees it
+    // (the bytes after `<` are `atem`, not `tool`). Runs on the FULL text —
+    // tool segments arrive wrapped in channel headers the think-strip above
+    // would misjudge.
+    try parseInvokeToolCalls(allocator, text, &calls, ATEM_INVOKE);
+    // gpt_oss / harmony (`to=functions.NAME<|channel|>commentary…<|message|>`):
+    // the name lives in the header, not the payload, so no generic scan can
+    // recover it. Runs on the FULL text for the same reason ATEM does — the
+    // call arrives wrapped in channel headers the think-strip would misjudge.
+    try parseHarmonyToolCalls(allocator, text, &calls);
+    // DeepSeek-V4 native DSML (`<｜DSML｜invoke …>`): distinctive fullwidth-bar
+    // marker no other family emits, and the generic `<tool` scan never sees
+    // it (the byte before "tool_calls" is `｜`, not `<`).
+    try parseDsmlToolCalls(allocator, effective_text, &calls);
+    // LFM2.5 pythonic (`<|tool_call_start|>[fn(a='x')]<|tool_call_end|>`):
+    // distinctive marker no other family emits, and the generic `<tool` scan
+    // never sees it (the opener is `<|tool_call_start|>`, not `<|tool_call>`).
+    try parsePythonicToolCalls(allocator, effective_text, &calls);
+    // GLM's bare `<tool_call>NAME<arg_key>…` format is tried FIRST among the
+    // tag families: the generic `<tool` scan below would misread its non-JSON
+    // arg_key/arg_value body. When it matched, the generic scans are skipped
+    // but the shared safety net at the bottom still runs.
+    try parseArgKeyToolCalls(allocator, effective_text, &calls);
+    var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
+    while (search_pos < effective_text.len) {
+        const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
+        const after_tool = search_pos + rel + "<tool".len;
+        if (after_tool >= effective_text.len) break;
+
+        // Reject anything that isn't actually a tool open tag — the char
+        // right after `<tool` must be `>`, whitespace, `_` (suffix coming),
+        // or `|` (Gemma 4 close marker). Anything else is text like
+        // `<toolkit>` or `<toolbar>`; advance past `<tool` and keep scanning.
+        const next = effective_text[after_tool];
+        if (next != '>' and next != ' ' and next != '\t' and next != '\n' and next != '_' and next != '|') {
+            search_pos = after_tool;
+            continue;
+        }
+        // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
+        // we see `_call|`. Let the Gemma 4 branch below pick this up.
+        if (next == '_'
+            and after_tool + 6 <= effective_text.len
+            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
+        {
+            search_pos = after_tool + 6;
+            continue;
+        }
+        // If suffix is `_`, the only accepted continuations are
+        // `_call`, `_calls`, `_request`, `_requests`. Any OTHER suffix gets
+        // one more chance as the XML-element-TAG form before being rejected:
+        // DSV4 embeds the tool name in the tag itself —
+        //   `<tool_read>\n<path>mlx.html</path>\n</tool_read>`
+        // (2026-06-10 pi html-ds4 capture; both calls leaked as text and pi
+        // scored 0/4). Conditions kept tight: tag must close with `>` right
+        // after the name (no attributes), an EXACT `</tool_NAME>` close must
+        // exist, the name must not be a result-ish marker (`<tool_output>`
+        // is DSV4 hallucinating a result, not calling a tool named
+        // "output"), and the body must be entirely `<key>value</key>` args.
+        if (next == '_') {
+            const accepted = [_][]const u8{ "_call", "_calls", "_request", "_requests" };
+            var matched = false;
+            for (accepted) |suf| {
+                if (after_tool + suf.len > effective_text.len) continue;
+                if (!std.mem.eql(u8, effective_text[after_tool .. after_tool + suf.len], suf)) continue;
+                // Char right after the suffix must be tag-terminating; otherwise
+                // `_call` could swallow `<tool_called_X>`.
+                const post = after_tool + suf.len;
+                if (post >= effective_text.len) break;
+                const c = effective_text[post];
+                if (c == '>' or c == ' ' or c == '\t' or c == '\n' or c == '/' or c == '|') {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                const origin = after_tool - "<tool".len;
+                if (try parseXmlElementTagToolCall(allocator, effective_text[origin..])) |etc| {
+                    try calls.append(allocator, .{ .name = etc.call.name, .arguments = etc.call.arguments });
+                    search_pos = origin + etc.consumed;
+                    continue;
+                }
+                search_pos = after_tool;
+                continue;
+            }
+        }
+
+        // Self-closing `<tool …/>` form first — DSV4 emits this routinely
+        // and the open/close scan below won't find a `</tool*>` close, so
+        // without this branch the call gets dropped silently.
+        const tag_origin = after_tool - "<tool".len;
+        if (parseSelfClosingToolTag(effective_text[tag_origin..])) |sc| {
+            const name_owned = try allocator.dupe(u8, sc.name);
+            errdefer allocator.free(name_owned);
+            const args_owned = try allocator.dupe(u8, sc.arguments);
+            try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+            search_pos = tag_origin + sc.consumed;
+            continue;
+        }
+
+        // Scan the opening tag to its `>`, capturing optional name attr.
+        var attr_name: ?[]const u8 = null;
+        var content_start: usize = 0;
+        {
+            var i: usize = after_tool;
+            // Bound the scan so a malformed input can't run wild.
+            const limit = @min(effective_text.len, after_tool + 256);
+            while (i < limit and effective_text[i] != '>') : (i += 1) {
+                if (effective_text[i] != 'n') continue;
+                if (i + 5 > effective_text.len) continue;
+                if (!std.mem.eql(u8, effective_text[i .. i + 5], "name=")) continue;
+                const q_pos = i + 5;
+                if (q_pos >= effective_text.len) break;
+                const quote = effective_text[q_pos];
+                if (quote != '"' and quote != '\'') continue;
+                const val_start = q_pos + 1;
+                const val_end_rel = std.mem.indexOfScalar(u8, effective_text[val_start..], quote) orelse break;
+                attr_name = effective_text[val_start .. val_start + val_end_rel];
+                i = val_start + val_end_rel;
+            }
+            if (i >= limit or effective_text[i] != '>') {
+                // Unclosed opening tag — skip past `<tool` and keep going.
+                search_pos = after_tool;
+                continue;
+            }
+            content_start = i + 1;
+        }
+        // Find the close marker. Prefer the close matching the OPENING tag's
+        // name (`<tool_calls>` closes at `</tool_calls>`, never at a
+        // `</tool_name>` child element inside the body — the XML-element
+        // form puts `</tool…>`-shaped children first). When no exact match
+        // exists, fall back to the earliest `</tool…>` with ANY suffix of
+        // word characters: DSV4 hallucinates closes freely (`</tool_action>`
+        // was captured live closing a `<tool_call>` open), and pinning an
+        // exact-name list drops the whole call and leaks it as visible text.
+        var close_rel: ?usize = null;
+        var close_len: usize = 0;
+        {
+            const hay = effective_text[content_start..];
+            // Opening tag name: "tool" + suffix up to the attr/`>` delimiter.
+            var name_end = after_tool;
+            while (name_end < effective_text.len and
+                (std.ascii.isAlphanumeric(effective_text[name_end]) or effective_text[name_end] == '_')) : (name_end += 1)
+            {}
+            const open_name = effective_text[tag_origin + 1 .. name_end];
+            var exact_buf: [40]u8 = undefined;
+            if (open_name.len + 3 <= exact_buf.len) {
+                const exact = std.fmt.bufPrint(&exact_buf, "</{s}>", .{open_name}) catch unreachable;
+                var from: usize = 0;
+                while (std.mem.indexOfPos(u8, hay, from, exact)) |found| {
+                    // A `<parameter=…>` value may spell the wrapper's own close.
+                    if (hermesParamSpanEnclosing(hay, found)) |past| {
+                        from = past;
+                        continue;
+                    }
+                    close_rel = found;
+                    close_len = exact.len;
+                    break;
+                }
+            }
+            if (close_rel == null) {
+                var cpos: usize = 0;
+                while (std.mem.indexOf(u8, hay[cpos..], "</tool")) |found| {
+                    const open_at = cpos + found;
+                    var j = open_at + "</tool".len;
+                    const jlimit = @min(hay.len, j + 24);
+                    var word_only = true;
+                    while (j < jlimit and hay[j] != '>') : (j += 1) {
+                        const c = hay[j];
+                        if (!std.ascii.isAlphanumeric(c) and c != '_') {
+                            word_only = false;
+                            break;
+                        }
+                    }
+                    if (word_only and j < jlimit and hay[j] == '>') {
+                        if (hermesParamSpanEnclosing(hay, open_at)) |past| {
+                            cpos = past;
+                            continue;
+                        }
+                        close_rel = open_at;
+                        close_len = j + 1 - open_at;
+                        break;
+                    }
+                    cpos = open_at + "</tool".len;
+                }
+            }
+        }
+        if (close_rel == null) {
+            // No `</tool…>` close in sight. Two ways this happens in the
+            // wild: (1) the model emitted EOS mid-tool-call (`<tool_call>\n{
+            // …well-formed args…}` then nothing); (2) max_tokens truncated.
+            // The args object itself is usually intact — snap a balanced
+            // JSON object from right after the open tag and try to parse it.
+            // Function-tag form first: a parameter VALUE is arbitrary bytes and never names the tool.
+            const truncated_fn_tag = std.mem.indexOf(u8, effective_text[content_start..], "<function=") != null;
+            const truncated_json: ?[]const u8 = if (truncated_fn_tag) null else balancedJsonObject(effective_text[content_start..]);
+            if (truncated_json) |json_body| {
+                const json_off = @intFromPtr(json_body.ptr) - @intFromPtr(effective_text[content_start..].ptr);
+                const advance_to = content_start + json_off + json_body.len;
+                // Hermes shape (top-level "name" + "arguments"): use as-is.
+                if (tryParseJsonToolCall(allocator, json_body)) |tc| {
+                    try calls.append(allocator, tc);
+                    search_pos = advance_to;
+                    continue;
+                }
+                // Attribute shape — body is JUST the args, take name from attr.
+                if (attr_name) |an| {
+                    const name_owned = try allocator.dupe(u8, an);
+                    errdefer allocator.free(name_owned);
+                    const args_owned = try allocator.dupe(u8, json_body);
+                    try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+                    search_pos = advance_to;
+                    continue;
+                }
+            }
+            // Truncated Hermes/XML tool call: the model emitted
+            // `<tool_call><function=NAME><parameter=KEY>…` (Hermes function-tag)
+            // or the XML-element `<tool_name>NAME</tool_name>…` shape and ran
+            // out of tokens before ANY closing tag — so there's no balanced
+            // JSON to snap. The OPENING tags still carry the tool NAME; recover
+            // that (parseHermesToolCall breaks out of its parameter loop on a
+            // missing `</parameter>`, yielding name + `{}` args) so the call is
+            // recognized as a truncated writeFile instead of being DROPPED and
+            // leaked into visible content (live JFK-novel capture, 2026-06-20:
+            // a 19k-char writeFile cut off mid-content was silently lost and
+            // the app fired the wrong "malformed tag" ghost nudge). Recovering
+            // the name is enough for the client to fire the right chunk/append
+            // nudge; we do NOT salvage the partial content (a half-written file
+            // is worse than a re-issued chunked write). The text is truncated
+            // to its end here, so advance past it to terminate the scan.
+            if (parseHermesToolCall(allocator, effective_text[content_start..])) |tc| {
+                try calls.append(allocator, tc);
+                search_pos = effective_text.len;
+                continue;
+            }
+            if (parseXmlElementToolCall(allocator, effective_text[content_start..])) |tc| {
+                try calls.append(allocator, tc);
+                search_pos = effective_text.len;
+                continue;
+            }
+            // JSON dialect cut off INSIDE the object (EOS mid-string on a
+            // large edit): nothing balances, but a top-level `"name"` key is
+            // still the tool. NAME + `{}`, never a fragment.
+            if (truncatedJsonCallName(effective_text[content_start..])) |name| {
+                const name_owned = try allocator.dupe(u8, name);
+                errdefer allocator.free(name_owned);
+                const args_owned = try allocator.dupe(u8, "{}");
+                try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+                search_pos = effective_text.len;
+                continue;
+            }
+            break;
+        }
+        const content = std.mem.trim(u8, effective_text[content_start .. content_start + close_rel.?], " \t\n\r");
+
+        // Pre-clean the body before the parse attempts. Two DSV4 quirks:
+        //   • The args object may be wrapped in `<parameters>…</parameters>`.
+        //   • The model sometimes emits an extra trailing `}` after the
+        //     proper JSON close. Find the first balanced JSON object via
+        //     depth tracking and use just that.
+        const unwrapped = stripParametersWrapper(content);
+        // Some models (often when echoing a Jinja `{{ }}` example) wrap the args
+        // object in an extra brace layer: `<tool_call>{{"name":…}}</tool_call>`.
+        // Strip one layer so the body parses as JSON. Only fires on the `{{…}}`
+        // shape (which otherwise fails to parse), so valid single-brace bodies are
+        // untouched. Mirrors the unwrap in `parseGemma4ToolCall`.
+        const balanced: []const u8 = unwrapDoubleBraces(balancedJsonObject(unwrapped) orelse unwrapped);
+
+        // Try to extract a tool call from the body. Three shapes, tried in
+        // priority order:
+        //   1. Attribute form (`name="X"` captured, body is JUST args).
+        //   2. Canonical Hermes JSON ({"name":"X","arguments":{...}}).
+        //   3. Hermes function-tag format (parseHermesToolCall).
+        var parsed_ok = false;
+        // 0. Function-tag form FIRST when the body actually carries a
+        // `<function=` opener. The dialect qwen 3.5/3.6's own template
+        // mandates rides inside the SAME `<tool_call>` wrapper the JSON form
+        // uses, and a `<parameter=…>` VALUE is arbitrary bytes — a written
+        // package.json made `balancedJsonObject` snap the FILE CONTENT, whose
+        // "name" key then became the tool name (live 2026-08-12: pi answered
+        // "Tool voxel-pagoda-garden not found" and the model looped on it).
+        // The JSON shapes below can never contain that opener, so this only
+        // reorders the case that was being read wrong.
+        if (std.mem.indexOf(u8, content, "<function=") != null) {
+            if (parseHermesToolCall(allocator, content)) |tc| {
+                try calls.append(allocator, tc);
+                parsed_ok = true;
+            }
+        }
+        if (!parsed_ok) {
+            if (attr_name) |an| {
+                if (std.json.parseFromSlice(std.json.Value, allocator, balanced, .{})) |parsed| {
+                    defer parsed.deinit();
+                    if (parsed.value == .object) {
+                        const name_owned = try allocator.dupe(u8, an);
+                        errdefer allocator.free(name_owned);
+                        const args_owned = try allocator.dupe(u8, balanced);
+                        try calls.append(allocator, .{ .name = name_owned, .arguments = args_owned });
+                        parsed_ok = true;
+                    }
+                } else |_| {}
+            }
+        }
+        if (!parsed_ok) {
+            if (tryParseJsonToolCall(allocator, balanced)) |tc| {
+                try calls.append(allocator, tc);
+                parsed_ok = true;
+            }
+        }
+        if (!parsed_ok) {
+            if (parseHermesToolCall(allocator, content)) |tc| {
+                try calls.append(allocator, tc);
+                parsed_ok = true;
+            }
+        }
+        if (!parsed_ok) {
+            if (parseXmlElementToolCall(allocator, content)) |tc| {
+                try calls.append(allocator, tc);
+                parsed_ok = true;
+            }
+        }
+
+        if (parsed_ok) {
+            // Body consumed cleanly — advance past the close marker.
+            search_pos = content_start + close_rel.? + close_len;
+        } else {
+            // Body wasn't a tool call. Advance only past the opening `>`
+            // so inner `<tool…>` blocks (if any) still get parsed. This is
+            // what makes the outer-wrapper case work: the outer
+            // `<tool_calls>` has no JSON body, but its content contains
+            // real `<tool name="X">` inner calls.
+            search_pos = content_start;
+        }
+    }
+
+    // Gemma 4 format: <|tool_call>call:name{args}<tool_call|>
+    if (calls.items.len == 0) {
+        search_pos = 0;
+        while (search_pos < effective_text.len) {
+            const tag_start = std.mem.indexOf(u8, effective_text[search_pos..], "<|tool_call>") orelse break;
+            const content_start = search_pos + tag_start + "<|tool_call>".len;
+            const tag_end_opt = std.mem.indexOf(u8, effective_text[content_start..], "<tool_call|>");
+            const content = if (tag_end_opt) |tag_end|
+                std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r")
+            else
+                // Incomplete tool call (model hit EOS before closing tag) — use rest of text
+                std.mem.trim(u8, effective_text[content_start..], " \t\n\r");
+
+            search_pos = if (tag_end_opt) |tag_end|
+                content_start + tag_end + "<tool_call|>".len
+            else
+                effective_text.len;
+
+            // No <tool_call|> close = the generation was CUT mid-call (EOS,
+            // max_tokens, or the degenerate-tail-loop guard) — fragment values
+            // are dropped inside the parse, only completed args ship.
+            if (parseGemma4ToolCall(allocator, content, tag_end_opt == null)) |tc| {
+                try calls.append(allocator, tc);
+            } else {
+                log.info("  [tool-parse] Gemma4 parse FAILED for: {s}\n", .{content[0..@min(content.len, 200)]});
+            }
+        }
+    }
+
+    // Bare Hermes function tag with NO <tool_call> wrapper. The outer scan
+    // triggers on the substring `<tool`, which a lone `<function=…></function>`
+    // (even with a trailing `</tool_call>`, since that is `</too…`, not `<tool`)
+    // never provides — so a model that drops the OPENING <tool_call> would leak
+    // the whole call as visible text. Only fire when a `<function=` opener AND a
+    // `<parameter=` are both present, so prose that merely mentions the tag can't
+    // false-fire (parseHermesToolCall needs a real parameter to recover args).
+    if (calls.items.len == 0) {
+        if (std.mem.indexOf(u8, effective_text, "<function=") != null and
+            std.mem.indexOf(u8, effective_text, "<parameter=") != null)
+        {
+            if (parseHermesToolCall(allocator, effective_text)) |tc| {
+                try calls.append(allocator, tc);
+            }
+        }
+    }
+
+    // MiniCPM5 V3 XML: `<function name="X"><param name="K">V</param>…</function>`,
+    // zero or more consecutive calls, no outer wrapper. Tried only after every
+    // other explicit tag format above has had its shot, and before the
+    // raw-JSON guessing fallback below — an explicit recognized tag always
+    // wins over heuristic inference.
+    if (calls.items.len == 0) {
+        // Never scan a gpt-oss/harmony transcript for this dialect. Harmony owns
+        // its own format and its arm has already run; what is left is its
+        // ANALYSIS channel — reasoning the user never sees as an answer. A
+        // harmony model explaining `<function name="get_time"></function>` was
+        // being turned into a real `get_time({})` call by this fallback, an
+        // invocation nobody requested. A MiniCPM5 checkpoint never emits
+        // `<|channel|>`, so this costs the dialect nothing.
+        const harmony_owned = std.mem.indexOf(u8, effective_text, HARMONY_CHANNEL_TAG) != null;
+        if (!harmony_owned and std.mem.indexOf(u8, effective_text, "<function") != null) {
+            try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
+        }
+    }
+
+    // Inferred `<invoke>` runs last among the tag families: a native call can carry
+    // invoke-shaped text inside a value.
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
+
+    // If no <tool_call> tags, try to find raw JSON tool call(s).
+    if (calls.items.len == 0) {
+        var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
+        if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
+            trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
+        }
+        // JSON ARRAY of {name, arguments} objects — parallel tool calls from
+        // models without a trained tool format. Gemma 3 emits a ```json fence
+        // around the array; skip one leading fence line before the check so
+        // the array (not the first object inside it) is what we parse —
+        // otherwise only the first call survives and the rest silently drop.
+        var array_probe = trimmed;
+        if (std.mem.startsWith(u8, array_probe, "```")) {
+            if (std.mem.indexOfScalar(u8, array_probe, '\n')) |nl| {
+                array_probe = std.mem.trim(u8, array_probe[nl + 1 ..], " \t\n\r");
+            }
+        }
+        if (array_probe.len > 0 and array_probe[0] == '[') {
+            if (balancedJsonArray(array_probe)) |arr_body| {
+                try appendJsonToolCallArray(allocator, arr_body, &calls);
+            }
+        }
+        if (calls.items.len == 0) {
+            if (std.mem.indexOf(u8, trimmed, "{")) |brace_pos| {
+                const json_start = trimmed[brace_pos..];
+                // Snap the first balanced object so trailing garbage can't poison
+                // the parse — models without a trained tool format (Gemma 3) emit
+                // the call inside a ```json fence, leaving "\n```" after the `}`.
+                const json_body = balancedJsonObject(json_start) orelse json_start;
+                if (tryParseJsonToolCall(allocator, json_body)) |tc| {
+                    try calls.append(allocator, tc);
+                }
+            }
+        }
+        // Everything appended in this block was inferred from BARE JSON — no
+        // tag syntax anywhere. Mark provenance so the request chokepoint
+        // (server.parseToolCallsForRequest → filterInferredBySchema) can
+        // validate the name against the declared tools: the first balanced
+        // {"name": …} object in truncated prose/code is routinely a DATA
+        // record, not a call (the George Washington class).
+        for (calls.items) |*tc| tc.inferred = true;
+    }
+
+    // A nameless placeholder cannot be executed or repaired by a client.
+    var named: usize = 0;
+    for (calls.items) |tc| {
+        if (std.mem.trim(u8, tc.name, " \t\r\n").len == 0) {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+            continue;
+        }
+        calls.items[named] = tc;
+        named += 1;
+    }
+    calls.items.len = named;
+    if (calls.items.len == 0) {
+        calls.deinit(allocator);
+        return null;
+    }
+
+    // Final safety net: EVERY emitted call carries valid-JSON arguments, whatever
+    // converter built them. The direct-construction converters (Gemma custom
+    // format, Hermes) can still emit invalid JSON on a pathological value — e.g. a
+    // JSON-style string with a bad escape (`\q`) copied verbatim. std.json is the
+    // arbiter: if the args don't parse, try the tolerant re-serialize (which
+    // re-escapes lone backslashes / control bytes / inner quotes), and if THAT
+    // still fails, fall back to `{}` — a client can retry a named call with empty
+    // args, but invalid JSON it cannot parse at all. This makes the "args are
+    // always valid JSON" invariant structural, not per-converter.
+    for (calls.items) |*tc| {
+        if (jsonIsValidObject(allocator, tc.arguments)) continue;
+        if (looseRepairToolCallJson(allocator, tc.arguments)) |repaired| {
+            if (jsonIsValidObject(allocator, repaired)) {
+                allocator.free(tc.arguments);
+                tc.arguments = repaired;
+                continue;
+            }
+            allocator.free(repaired);
+        }
+        log.info("  [tool-parse] unrepairable args for '{s}' → empty object (never ship invalid JSON)\n", .{tc.name});
+        const empty = try allocator.dupe(u8, "{}");
+        allocator.free(tc.arguments);
+        tc.arguments = empty;
+    }
+
+    return try calls.toOwnedSlice(allocator);
+}
+
+/// True when `s` strict-parses as a JSON object. Cheap arbiter for the
+/// parseToolCalls safety net.
+fn jsonIsValidObject(allocator: std.mem.Allocator, s: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, s, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
+pub const ParsedToolCall = struct {
+    name: []const u8,
+    arguments: []const u8, // JSON string
+    /// True when the call was HEURISTICALLY inferred from bare JSON in the
+    /// output (no tag syntax — the model never said "this is a tool call").
+    /// The request chokepoint validates inferred names against the declared
+    /// tools schema: a truncated DATA object like {"name": "George
+    /// Washington", "num": 1, …} must never become a tool call (live pi
+    /// capture 2026-07-13). Explicit tag-format calls keep flowing even with
+    /// unknown names — "tool not found" is feedback the model corrects from.
+    inferred: bool = false,
+};
+
+/// Locate a tool's `properties` map in an OpenAI-shaped tools array. Accepts
+/// both the wrapped (`{"type":"function","function":{…}}`) and flat forms.
+/// The tool's JSON-Schema `parameters` object (Anthropic `input_schema` too).
+/// Callers that need only the property map use `toolPropertiesFor`; the hoist
+/// also needs `required`, which lives beside `properties` here.
+fn toolParametersFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
+    if (tools != .array) return null;
+    for (tools.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func = blk: {
+            if (tool_val.object.get("function")) |f| {
+                if (f == .object) break :blk f.object;
+            }
+            break :blk tool_val.object;
+        };
+        const nv = func.get("name") orelse continue;
+        if (nv != .string or !std.mem.eql(u8, nv.string, name)) continue;
+        const params = func.get("parameters") orelse func.get("input_schema") orelse return null;
+        if (params != .object) return null;
+        return params.object;
+    }
+    return null;
+}
+
+fn propertiesOf(params: std.json.ObjectMap) ?std.json.ObjectMap {
+    const props = params.get("properties") orelse return null;
+    if (props != .object) return null;
+    return props.object;
+}
+
+fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
+    return propertiesOf(toolParametersFor(tools, name) orelse return null);
+}
+
+/// The types a misplaced value may be hoisted on. A required OBJECT/ARRAY param
+/// found inside another container is too speculative to move — only scalars.
+fn isScalarJsonType(want: []const u8) bool {
+    return std.mem.eql(u8, want, "string") or std.mem.eql(u8, want, "integer") or
+        std.mem.eql(u8, want, "number") or std.mem.eql(u8, want, "boolean");
+}
+
+const SchemaTypes = struct {
+    items: [4][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *SchemaTypes, t: []const u8) void {
+        if (std.mem.eql(u8, t, "null") or self.len == self.items.len) return;
+        for (self.items[0..self.len]) |have| if (std.mem.eql(u8, have, t)) return;
+        self.items[self.len] = t;
+        self.len += 1;
+    }
+
+    fn slice(self: *const SchemaTypes) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+const schema_ref_depth = 8;
+
+/// The non-null JSON types a property declares, in declaration order. `"type"` may be a union
+/// array; without one, `anyOf`/`oneOf` contribute every branch, `allOf` its first typed branch,
+/// and a local `$ref` into `$defs`/`definitions` of `root` its target. Odd/absent → empty,
+/// which means "leave the value alone".
+fn collectJsonTypes(prop: std.json.Value, root: std.json.ObjectMap, out: *SchemaTypes, depth: u8) void {
+    if (prop != .object or depth > schema_ref_depth) return;
+    if (prop.object.get("type")) |t| {
+        switch (t) {
+            .string => |s| out.add(s),
+            .array => |arr| for (arr.items) |item| if (item == .string) out.add(item.string),
+            else => {},
+        }
+        return;
+    }
+    if (prop.object.get("$ref")) |r| {
+        if (r != .string) return;
+        inline for (.{ "#/$defs/", "#/definitions/" }) |prefix| {
+            if (std.mem.startsWith(u8, r.string, prefix)) {
+                const defs = root.get(prefix[2 .. prefix.len - 1]) orelse return;
+                if (defs != .object) return;
+                if (defs.object.get(r.string[prefix.len..])) |target| collectJsonTypes(target, root, out, depth + 1);
+                return;
+            }
+        }
+        return;
+    }
+    inline for (.{ "anyOf", "oneOf" }) |key| {
+        if (prop.object.get(key)) |branches| {
+            if (branches == .array) for (branches.array.items) |b| collectJsonTypes(b, root, out, depth + 1);
+            return;
+        }
+    }
+    if (prop.object.get("allOf")) |branches| {
+        if (branches == .array) for (branches.array.items) |b| {
+            collectJsonTypes(b, root, out, depth + 1);
+            if (out.len > 0) return;
+        };
+    }
+}
+
+/// The first type a property declares (see `collectJsonTypes`), or null.
+fn declaredJsonType(prop: std.json.Value, root: std.json.ObjectMap) ?[]const u8 {
+    var types = SchemaTypes{};
+    collectJsonTypes(prop, root, &types, 0);
+    return if (types.len > 0) types.items[0] else null;
+}
+
+/// Tolerant boolean spelling — the union of what weak models actually emit:
+/// Python's `False`, shell's `0`/`1`, prose `yes`/`no`, plus the trailing-comma
+/// weld the app's `appendFlagIsTrue` already tolerates. Anything else → null
+/// (never guess; an honest client validation error beats a wrong value).
+fn looseBoolSpelling(raw: []const u8) ?bool {
+    const s = std.mem.trim(u8, raw, " \t\r\n,");
+    if (s.len == 0 or s.len > 5) return null;
+    var buf: [5]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..s.len], s);
+    if (std.mem.eql(u8, lower, "true") or std.mem.eql(u8, lower, "yes") or
+        std.mem.eql(u8, lower, "on") or std.mem.eql(u8, lower, "1")) return true;
+    if (std.mem.eql(u8, lower, "false") or std.mem.eql(u8, lower, "no") or
+        std.mem.eql(u8, lower, "off") or std.mem.eql(u8, lower, "0")) return false;
+    return null;
+}
+
+/// Strict parse of a container string that admits a key repeated with the SAME
+/// value (issue #402: a model spelling `header` twice per item) and refuses a
+/// key repeated with different values: the two are told apart by parsing
+/// first-wins and last-wins and comparing the documents.
+fn parseContainerAllowingRepeats(allocator: std.mem.Allocator, text: []const u8) ?std.json.Parsed(std.json.Value) {
+    var first = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_first }) catch return null;
+    var last = std.json.parseFromSlice(std.json.Value, allocator, text, .{ .duplicate_field_behavior = .use_last }) catch {
+        first.deinit();
+        return null;
+    };
+    defer last.deinit();
+    const a = std.json.Stringify.valueAlloc(allocator, first.value, .{}) catch {
+        first.deinit();
+        return null;
+    };
+    defer allocator.free(a);
+    const b = std.json.Stringify.valueAlloc(allocator, last.value, .{}) catch {
+        first.deinit();
+        return null;
+    };
+    defer allocator.free(b);
+    if (!std.mem.eql(u8, a, b)) {
+        first.deinit();
+        return null;
+    }
+    return first;
+}
+
+/// Coerce ONE value to the declared type. Returns null when the value already
+/// matches or the spelling is undecidable. Allocated replacements are appended
+/// to `owned`; parsed sub-documents to `docs` — both are freed by the caller
+/// AFTER the object is re-serialized, because the returned Value borrows them.
+fn coerceValueToType(
+    allocator: std.mem.Allocator,
+    v: std.json.Value,
+    want: []const u8,
+    owned: *std.ArrayList([]const u8),
+    docs: *std.ArrayList(std.json.Parsed(std.json.Value)),
+) !?std.json.Value {
+    // A CONTAINER param carried through a tag format arrives as a STRING — no tag
+    // format types its values. Live (15 hits in one session): pi's `edit.edits`,
+    // an array of {oldText,newText}, shipped as `"[{\"oldText\":…}]"` on every
+    // call. Strict parse only: a value that isn't well-formed JSON of the
+    // DECLARED kind is left alone rather than guessed at.
+    if (std.mem.eql(u8, want, "array") or std.mem.eql(u8, want, "object")) {
+        if (v != .string) return null;
+        const t = std.mem.trim(u8, v.string, " \t\r\n");
+        const want_array = want[0] == 'a';
+        if (t.len == 0 or t[0] != (if (want_array) @as(u8, '[') else @as(u8, '{'))) return null;
+
+        // Strict first; a well-formed container is the common case.
+        if (parseContainerAllowingRepeats(allocator, t)) |doc| {
+            const kind_ok = if (want_array) doc.value == .array else doc.value == .object;
+            if (kind_ok) {
+                try docs.append(allocator, doc);
+                return doc.value;
+            }
+            var d = doc;
+            d.deinit();
+            return null;
+        }
+
+        // The container string is itself MANGLED (live: pi's `edits` array with a
+        // missing comma between two object values). Same big-file escaping class
+        // as looseRepairToolCallJson — re-serialize tolerantly, then STRICT-parse
+        // the result so a mis-repair that yields invalid JSON is discarded.
+        const repaired = looseRepairContainer(allocator, t) orelse return null;
+        defer allocator.free(repaired);
+        var rdoc = parseContainerAllowingRepeats(allocator, repaired) orelse {
+            log.debug("[tool-autocorrect] {s} param left as a string: not well-formed JSON of that kind\n", .{want});
+            return null;
+        };
+        const rkind_ok = if (want_array) rdoc.value == .array else rdoc.value == .object;
+        if (!rkind_ok) {
+            rdoc.deinit();
+            return null;
+        }
+        try docs.append(allocator, rdoc); // ownership transfers; never deinit here
+        return rdoc.value;
+    }
+    if (std.mem.eql(u8, want, "boolean")) {
+        return switch (v) {
+            .bool => null,
+            .string => |s| if (looseBoolSpelling(s)) |b| std.json.Value{ .bool = b } else null,
+            .integer => |i| if (i == 0 or i == 1) std.json.Value{ .bool = i == 1 } else null,
+            else => null,
+        };
+    }
+    if (std.mem.eql(u8, want, "integer")) {
+        return switch (v) {
+            .string => |s| blk: {
+                const n = std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\r\n"), 10) catch break :blk null;
+                break :blk std.json.Value{ .integer = n };
+            },
+            else => null,
+        };
+    }
+    if (std.mem.eql(u8, want, "number")) {
+        return switch (v) {
+            .string => |s| blk: {
+                const t = std.mem.trim(u8, s, " \t\r\n");
+                if (std.fmt.parseInt(i64, t, 10)) |n| break :blk std.json.Value{ .integer = n } else |_| {}
+                const f = std.fmt.parseFloat(f64, t) catch break :blk null;
+                if (std.math.isNan(f) or std.math.isInf(f)) break :blk null; // not representable in JSON
+                break :blk std.json.Value{ .float = f };
+            },
+            else => null,
+        };
+    }
+    if (std.mem.eql(u8, want, "string")) {
+        // The inverse repair: the tag/custom formats infer type from the value's
+        // SPELLING (isJsonLiteral), so a string param whose content happens to
+        // read as `false`/`42` was shipped as a bool/number. The schema is the
+        // only thing that can tell those apart.
+        return switch (v) {
+            .bool => |b| std.json.Value{ .string = if (b) "true" else "false" },
+            .integer => |i| blk: {
+                const s = try std.fmt.allocPrint(allocator, "{d}", .{i});
+                try owned.append(allocator, s);
+                break :blk std.json.Value{ .string = s };
+            },
+            .float => |f| blk: {
+                const s = try std.fmt.allocPrint(allocator, "{d}", .{f});
+                try owned.append(allocator, s);
+                break :blk std.json.Value{ .string = s };
+            },
+            .number_string => |s| std.json.Value{ .string = s },
+            else => null,
+        };
+    }
+    return null; // a type we don't model — never guessed
+}
+
+fn jsonTypeMatches(v: std.json.Value, want: []const u8) bool {
+    if (v == .null) return true; // an explicit null satisfies any optional field
+    if (std.mem.eql(u8, want, "boolean")) return v == .bool;
+    if (std.mem.eql(u8, want, "integer")) return v == .integer or v == .number_string;
+    if (std.mem.eql(u8, want, "number")) return v == .integer or v == .float or v == .number_string;
+    if (std.mem.eql(u8, want, "string")) return v == .string;
+    if (std.mem.eql(u8, want, "array")) return v == .array;
+    if (std.mem.eql(u8, want, "object")) return v == .object;
+    return true; // a type we don't model constrains nothing
+}
+
+/// True when every argument whose type the tool DECLARES actually carries that
+/// JSON type. This is the invariant strict clients (Claude Code, pi, opencode)
+/// enforce and reject on; the format corpus asserts it universally so a new
+/// entry in any family is covered without a bespoke assertion. Undeclared keys
+/// and unmodelled types constrain nothing.
+pub fn toolCallConformsToSchema(
+    allocator: std.mem.Allocator,
+    call: ParsedToolCall,
+    tools_json: []const u8,
+) bool {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return true;
+    defer tools.deinit();
+    const params = toolParametersFor(tools.value, call.name) orelse return true;
+    const props = propertiesOf(params) orelse return true;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .object) return true;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        const prop = props.get(entry.key_ptr.*) orelse continue;
+        var types = SchemaTypes{};
+        collectJsonTypes(prop, params, &types, 0);
+        if (types.len == 0) continue;
+        for (types.slice()) |want| {
+            if (jsonTypeMatches(entry.value_ptr.*, want)) break;
+        } else return false;
+    }
+    return true;
+}
+
+/// True when a REQUIRED scalar param is MISSING at the top level while sitting
+/// buried inside one of the tool's declared container args — exactly the shape
+/// `hoistMisplacedRequiredParams` exists to repair, and exactly what a strict
+/// client rejects with "must have required properties X". The format corpus
+/// asserts this is FALSE for every entry that declares tools, so a future family
+/// that produces the buried shape is covered without a bespoke assertion.
+pub fn requiredParamIsBuried(
+    allocator: std.mem.Allocator,
+    call: ParsedToolCall,
+    tools_json: []const u8,
+) bool {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return false;
+    defer tools.deinit();
+    const params = toolParametersFor(tools.value, call.name) orelse return false;
+    const props_v = params.get("properties") orelse return false;
+    const required_v = params.get("required") orelse return false;
+    if (props_v != .object or required_v != .array) return false;
+    const props = props_v.object;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    for (required_v.array.items) |req_v| {
+        if (req_v != .string) continue;
+        const name = req_v.string;
+        if (parsed.value.object.get(name) != null) continue;
+        const want = declaredJsonType(props.get(name) orelse continue, params) orelse continue;
+        if (!isScalarJsonType(want)) continue;
+
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            const prop = props.get(e.key_ptr.*) orelse continue;
+            if (containerItemDeclares(prop, name)) continue;
+            if (buriedParamIn(e.value_ptr, name, want, false) != null) return true;
+        }
+    }
+    return false;
+}
+
+/// Coerce every parsed call's `arguments` to the types its tool DECLARES.
+///
+/// Class: **type inference from value spelling.** Neither the tag formats
+/// (`<parameter=x>False</parameter>`, Gemma's `key:false`) nor a model writing
+/// JSON by hand carries type information a parser can trust — `isJsonLiteral`
+/// has to guess from the bytes, and it guesses wrong in both directions:
+///   • `False` / `"false"` on a boolean param → shipped as the STRING "false";
+///   • `false` / `42` as a string param's CONTENT → shipped as a bool/number.
+/// Strict clients (Claude Code, pi, opencode) reject both and the model, which
+/// cannot see its own serialized request, loops forever "fixing" a value that
+/// was already correct. The tool schema is the only disambiguator, and it is
+/// already threaded to every parse site as `tools_json`.
+///
+/// Contract: only where the schema declares a type, and only when the spelling
+/// is unambiguous. An undecidable value is left alone so the client's
+/// validation error stays honest. Correct calls from strong models are
+/// byte-unchanged (nothing re-serializes unless a coercion actually fired).
+///
+/// Scalars AND containers: a tag format types nothing, so a declared
+/// `array`/`object` arrives as a string of JSON and `coerceValueToType` parses
+/// it back (strict, then one tolerant repair re-validated strictly). This
+/// comment used to say "only SCALARS are touched" — it was two weeks stale by
+/// the time it was read as a spec and filed as issue #94. A contract comment is
+/// load-bearing documentation: pin it with a test (`issue #94: a container
+/// param carried as literal TEXT…`), don't let it drift.
+pub fn coerceToolArgsToSchema(
+    allocator: std.mem.Allocator,
+    calls: []ParsedToolCall,
+    tools_json: []const u8,
+) !void {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return;
+    defer tools.deinit();
+    if (tools.value != .array) return;
+
+    for (calls) |*call| {
+        const params = toolParametersFor(tools.value, call.name) orelse continue;
+        const props = propertiesOf(params) orelse continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        var owned = std.ArrayList([]const u8).empty;
+        defer {
+            for (owned.items) |s| allocator.free(s);
+            owned.deinit(allocator);
+        }
+        // Parsed container sub-documents: the rewritten object BORROWS from these,
+        // so they must outlive the Stringify below.
+        var docs = std.ArrayList(std.json.Parsed(std.json.Value)).empty;
+        defer {
+            for (docs.items) |*d| d.deinit();
+            docs.deinit(allocator);
+        }
+
+        var changed = false;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            const prop = props.get(entry.key_ptr.*) orelse continue;
+            var types = SchemaTypes{};
+            collectJsonTypes(prop, params, &types, 0);
+            if (types.len == 0) continue;
+            // Among several candidates a value that already fits one is kept.
+            if (types.len > 1) {
+                const fits = for (types.slice()) |want| {
+                    if (jsonTypeMatches(entry.value_ptr.*, want)) break true;
+                } else false;
+                if (fits) continue;
+            }
+            const new_val = for (types.slice()) |want| {
+                if (try coerceValueToType(allocator, entry.value_ptr.*, want, &owned, &docs)) |nv| break nv;
+            } else continue;
+            entry.value_ptr.* = new_val;
+            changed = true;
+        }
+        if (!changed) continue;
+
+        const rewritten = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch continue;
+        log.info("  [tool-parse] coerced {s} arguments to the declared schema types\n", .{call.name});
+        allocator.free(call.arguments);
+        call.arguments = rewritten;
+    }
+}
+
+/// Does this container's ITEM schema declare `name` as one of its own
+/// properties? If it does, a `name` sitting inside it BELONGS there and must
+/// never be lifted out — a multi-file edit tool would lose its per-item paths.
+/// This is the whole safety argument for the hoist below, so it is deliberately
+/// conservative: no declared item `properties` map ⇒ nothing is proven ⇒ false.
+fn containerItemDeclares(prop: std.json.Value, name: []const u8) bool {
+    if (prop != .object) return false;
+    // Array property → the item schema. Object property → the schema itself.
+    const inner = if (prop.object.get("items")) |items| items else prop;
+    if (inner != .object) return false;
+    const props = inner.object.get("properties") orelse return false;
+    if (props != .object) return false;
+    return props.object.get(name) != null;
+}
+
+/// Scalar equality — the only shapes we ever hoist on. A container value is
+/// never a candidate, so a structural compare is not needed.
+fn jsonScalarEql(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .string => |s| b == .string and std.mem.eql(u8, s, b.string),
+        .integer => |i| b == .integer and i == b.integer,
+        .bool => |x| b == .bool and x == b.bool,
+        else => false,
+    };
+}
+
+/// Find `name` buried one level down inside `container`, requiring UNANIMITY:
+/// every object in the container carries `name`, all with the same scalar value,
+/// and that value matches the type the schema declares for the top-level param.
+/// Anything less is ambiguous → null. With `remove`, also deletes it from each
+/// object (the returned value keeps pointing into the parse arena, which
+/// outlives the removal).
+fn buriedParamIn(
+    container: *std.json.Value,
+    name: []const u8,
+    want: []const u8,
+    remove: bool,
+) ?std.json.Value {
+    switch (container.*) {
+        .array => |*arr| {
+            if (arr.items.len == 0) return null;
+            var found: ?std.json.Value = null;
+            for (arr.items) |*item| {
+                if (item.* != .object) return null;
+                const v = item.object.get(name) orelse return null; // must be in EVERY item
+                if (v == .null or !jsonTypeMatches(v, want)) return null;
+                if (found) |f| {
+                    if (!jsonScalarEql(f, v)) return null; // items disagree → ambiguous
+                } else found = v;
+            }
+            if (remove) for (arr.items) |*item| {
+                _ = item.object.orderedRemove(name);
+            };
+            return found;
+        },
+        .object => |*obj| {
+            const v = obj.get(name) orelse return null;
+            if (v == .null or !jsonTypeMatches(v, want)) return null;
+            if (remove) _ = obj.orderedRemove(name);
+            return v;
+        },
+        else => return null,
+    }
+}
+
+/// Lift a REQUIRED top-level parameter the model BURIED inside a container arg.
+///
+/// Class: **misplaced required param.** A weak model that has internalized "the
+/// edit object holds everything about the edit" writes the file path INSIDE each
+/// `edits[]` item and never emits it at the top level:
+///
+///     {"edits":[{"newText":"…","oldText":"…","path":"us_presidents/generate_site.sh"}]}
+///
+/// The call is valid JSON and correctly escaped, so no repair path fires and no
+/// type is wrong — it is purely in the wrong PLACE, which only the schema can
+/// know. Strict clients reject it ("path: must have required properties path"),
+/// and the model, which cannot see its own serialized request, re-emits the same
+/// call until it gives up and falls back to rewriting the whole file with
+/// `write` — three dead multi-thousand-token rounds in the live 2026-07-13 pi
+/// session (gemma-4-26B-A4B). Same shape as the Claude Code replace_all loop.
+///
+/// Contract — every condition is read off the SCHEMA, never guessed:
+///   • the param is declared REQUIRED at the top level and is ABSENT there;
+///   • it is declared a SCALAR (hoisting a container is too speculative);
+///   • it sits inside a DECLARED container arg whose item schema does NOT
+///     declare it (`containerItemDeclares` — otherwise it belongs where it is);
+///   • every object in that container carries it with the SAME value and the
+///     declared type.
+/// Ambiguity of any kind (items disagreeing, two containers offering different
+/// values, a wrong-typed value) leaves the call untouched so the client's
+/// validation error stays honest. A compliant call never re-serializes.
+pub fn hoistMisplacedRequiredParams(
+    allocator: std.mem.Allocator,
+    calls: []ParsedToolCall,
+    tools_json: []const u8,
+) !void {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return;
+    defer tools.deinit();
+    if (tools.value != .array) return;
+
+    for (calls) |*call| {
+        const params = toolParametersFor(tools.value, call.name) orelse continue;
+        const props_v = params.get("properties") orelse continue;
+        const required_v = params.get("required") orelse continue;
+        if (props_v != .object or required_v != .array) continue;
+        const props = props_v.object;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        var changed = false;
+        for (required_v.array.items) |req_v| {
+            if (req_v != .string) continue;
+            const name = req_v.string; // borrows from `tools`, which outlives the Stringify
+            if (parsed.value.object.get(name) != null) continue; // present — nothing misplaced
+
+            const want = declaredJsonType(props.get(name) orelse continue, params) orelse continue;
+            if (!isScalarJsonType(want)) continue;
+
+            // Probe every declared container WITHOUT mutating: a value found in
+            // two containers that disagree is ambiguous, and we must not have
+            // already gutted the first one by then.
+            var found: ?std.json.Value = null;
+            var ambiguous = false;
+            var it = parsed.value.object.iterator();
+            while (it.next()) |e| {
+                const prop = props.get(e.key_ptr.*) orelse continue;
+                if (containerItemDeclares(prop, name)) continue;
+                const v = buriedParamIn(e.value_ptr, name, want, false) orelse continue;
+                if (found) |f| {
+                    if (!jsonScalarEql(f, v)) {
+                        ambiguous = true;
+                        break;
+                    }
+                } else found = v;
+            }
+            if (ambiguous or found == null) continue;
+
+            // Commit: strip it from the containers, install it at the top level.
+            it = parsed.value.object.iterator();
+            while (it.next()) |e| {
+                const prop = props.get(e.key_ptr.*) orelse continue;
+                if (containerItemDeclares(prop, name)) continue;
+                _ = buriedParamIn(e.value_ptr, name, want, true);
+            }
+            try parsed.value.object.put(parsed.arena.allocator(), name, found.?);
+            log.info("  [tool-parse] hoisted misplaced required arg '{s}' to the top level for {s}\n", .{ name, call.name });
+            changed = true;
+        }
+        if (!changed) continue;
+
+        const rewritten = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch continue;
+        allocator.free(call.arguments);
+        call.arguments = rewritten;
+    }
+}
+
+/// Does the OpenAI-shaped tools array declare a function with this name?
+/// Accepts both the wrapped ({"type":"function","function":{…}}) and flat
+/// forms, mirroring `toolPropertiesFor`. An unparseable/odd `tools_json`
+/// returns TRUE — never drop a call because OUR schema parse failed.
+pub fn toolNameIsDeclared(allocator: std.mem.Allocator, tools_json: []const u8, name: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .array) return true;
+    for (parsed.value.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func = blk: {
+            if (tool_val.object.get("function")) |f| {
+                if (f == .object) break :blk f.object;
+            }
+            break :blk tool_val.object;
+        };
+        const nv = func.get("name") orelse continue;
+        if (nv == .string and std.mem.eql(u8, nv.string, name)) return true;
+    }
+    return false;
+}
+
+/// Drop HEURISTICALLY-inferred raw-JSON calls (`ParsedToolCall.inferred`)
+/// whose name the request never declared. The George Washington class: a
+/// generation truncated mid-data-script leaves `{"name": "George Washington",
+/// "num": 1, …}` as the first balanced object, and the flat-shape synthesis
+/// promoted it to a tool call the client can only answer with "tool not
+/// found" — burning the turn. Explicit tag-format calls are NEVER dropped
+/// here (undeclared name → honest client feedback the model corrects from).
+///
+/// Returns the retained slice (shrunk in place), or null when every call was
+/// dropped — the caller treats that exactly like "no tool calls", so the text
+/// stays visible content and finish_reason (e.g. "length") is preserved.
+pub fn filterInferredBySchema(
+    allocator: std.mem.Allocator,
+    calls: []ParsedToolCall,
+    tools_json: []const u8,
+) !?[]ParsedToolCall {
+    var kept: usize = 0;
+    for (calls) |tc| {
+        if (!tc.inferred or toolNameIsDeclared(allocator, tools_json, tc.name)) {
+            calls[kept] = tc;
+            kept += 1;
+        } else {
+            log.warn("  [tool-parse] dropped inferred raw-JSON call '{s}' — name not among the request's tools (data object, not a call)\n", .{tc.name});
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    if (kept == calls.len) return calls;
+    if (kept == 0) {
+        allocator.free(calls);
+        return null;
+    }
+    return try allocator.realloc(calls, kept);
+}
+
+/// Last-resort tool-call inference for models that emit JUST the arguments
+/// object — no tool name, no wrapper syntax. Observed live from Gemma 4 12B
+/// via Claude Code: ```` ```json\n{"file_path": …, "content": …}\n``` ````
+/// with the Write tool defined; parseToolCalls finds nothing (no "name" key)
+/// and the un-executed JSON leaked into the visible text.
+///
+/// Conservative contract — fires ONLY when parseToolCalls returned null:
+///   • the visible content (after a leading think block) must START with the
+///     JSON object, optionally wrapped in a markdown fence;
+///   • the object's keys must satisfy exactly ONE tool in `tools_json`
+///     (OpenAI shape): required ⊆ keys AND keys ⊆ properties;
+///   • zero or multiple matching tools → null (ambiguity never guesses).
+pub fn inferBareJsonToolCalls(allocator: std.mem.Allocator, text: []const u8, tools_json: []const u8) !?[]ParsedToolCall {
+    // Strip a leading think block, mirroring parseToolCalls.
+    var effective_text = text;
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
+    } else if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
+        effective_text = std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
+    }
+    var trimmed = std.mem.trimStart(u8, effective_text, "\n \t");
+    // Skip one opening markdown fence line (``` or ```json etc.).
+    if (std.mem.startsWith(u8, trimmed, "```")) {
+        const nl = std.mem.indexOfScalar(u8, trimmed, '\n') orelse return null;
+        trimmed = std.mem.trimStart(u8, trimmed[nl + 1 ..], "\n \t");
+    }
+    // The object must LEAD the visible content — a JSON example mid-prose is
+    // never promoted to a call.
+    if (!std.mem.startsWith(u8, trimmed, "{")) return null;
+    const obj_slice = balancedJsonObject(trimmed) orelse return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, obj_slice, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    if (obj.count() == 0) return null;
+
+    const tools_parsed = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return null;
+    defer tools_parsed.deinit();
+    if (tools_parsed.value != .array) return null;
+
+    var match_name: ?[]const u8 = null;
+    for (tools_parsed.value.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func_val = tool_val.object.get("function") orelse continue;
+        if (func_val != .object) continue;
+        const name_val = func_val.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        const params_val = func_val.object.get("parameters") orelse continue;
+        if (params_val != .object) continue;
+        const props_val = params_val.object.get("properties") orelse continue;
+        if (props_val != .object) continue;
+        const props = props_val.object;
+        if (props.count() == 0) continue;
+
+        // keys ⊆ properties
+        var keys_ok = true;
+        var it = obj.iterator();
+        while (it.next()) |kv| {
+            if (props.get(kv.key_ptr.*) == null) {
+                keys_ok = false;
+                break;
+            }
+        }
+        if (!keys_ok) continue;
+
+        // required ⊆ keys
+        if (params_val.object.get("required")) |req_val| {
+            if (req_val == .array) {
+                var req_ok = true;
+                for (req_val.array.items) |r| {
+                    if (r != .string) continue;
+                    if (obj.get(r.string) == null) {
+                        req_ok = false;
+                        break;
+                    }
+                }
+                if (!req_ok) continue;
+            }
+        }
+
+        if (match_name != null) return null; // ambiguous — never guess
+        match_name = name_val.string;
+    }
+
+    const name = match_name orelse return null;
+    const calls = try allocator.alloc(ParsedToolCall, 1);
+    errdefer allocator.free(calls);
+    const name_owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_owned);
+    calls[0] = .{ .name = name_owned, .arguments = try allocator.dupe(u8, obj_slice) };
+    log.info("  [tool-parse] inferred bare-args call to '{s}' via unique schema match\n", .{name});
+    return calls;
+}
+
+/// Strip a leading `<parameters>` / trailing `</parameters>` pair if both
+/// are present. DSV4 occasionally wraps the args object in this XML
+/// container — leaving it in place would defeat the JSON parser. Trims
+/// surrounding whitespace.
+fn stripParametersWrapper(content: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\n\r");
+    const open = "<parameters>";
+    const close = "</parameters>";
+    if (trimmed.len < open.len + close.len) return trimmed;
+    if (!std.mem.startsWith(u8, trimmed, open)) return trimmed;
+    if (!std.mem.endsWith(u8, trimmed, close)) return trimmed;
+    const inner = trimmed[open.len .. trimmed.len - close.len];
+    return std.mem.trim(u8, inner, " \t\n\r");
+}
+
+/// Return the substring of `content` covering the first brace-balanced JSON
+/// object, or null if no balanced object is present. Handles quoted strings
+/// (so `}` inside a string doesn't close the object) and escape sequences.
+/// Used to tolerate the DSV4 `{"…"}}` extra-trailing-`}` artifact.
+/// Try to parse a tool tag whose body lives entirely in XML-ish
+/// attributes. Two terminator shapes are accepted:
+///
+///   Self-closing /> :
+///     <tool name="shell" arguments="{...}"/>
+///     <tool name="X" arguments='{...}' />
+///     <tool name="X" arguments="{...}'/>             (broken quote — DSV4)
+///
+///   Empty-body explicit close ></tool*> :
+///     <tool_call name="cwd" arguments="{...}"></tool_call>
+///     <tool name="X" arguments="{...}"></tool_calls>  (mismatched close OK)
+///
+/// `slice` MUST start with `<tool` (the caller has already validated the
+/// terminator char after that prefix). Returns name + arguments slices into
+/// `slice` plus the number of bytes consumed (up to and including the final
+/// `>` or `</tool*>` close), or null if this isn't a shape we can parse.
+///
+/// We never trust the XML quoting around `arguments=` — the model frequently
+/// uses `"` to open and `'` to close, or doesn't escape inner `"` at all.
+/// Instead we expect a `{` immediately (optionally after a single opening
+/// quote) and snap a balanced JSON object via `balancedJsonObject`. That
+/// strategy is what makes the DSV4 fragment parse cleanly even though the
+/// surrounding XML is malformed.
+fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, arguments: []const u8, consumed: usize } {
+    if (slice.len < "<tool".len) return null;
+    if (!std.mem.startsWith(u8, slice, "<tool")) return null;
+    // Bound the scan window so a runaway tag can't pin us forever.
+    const limit = @min(slice.len, 8192);
+
+    // 1. Locate `name="X"` (or `'X'`) attribute. We don't enforce ordering
+    //    against `arguments=` — DSV4 sometimes interleaves them.
+    var name: ?[]const u8 = null;
+    var name_end: usize = "<tool".len;
+    {
+        var i: usize = "<tool".len;
+        while (i + "name=".len < limit) : (i += 1) {
+            if (slice[i] != 'n') continue;
+            if (!std.mem.eql(u8, slice[i .. i + "name=".len], "name=")) continue;
+            const q_pos = i + "name=".len;
+            if (q_pos >= limit) break;
+            const quote = slice[q_pos];
+            if (quote != '"' and quote != '\'') continue;
+            const val_start = q_pos + 1;
+            const val_end_rel = std.mem.indexOfScalar(u8, slice[val_start..limit], quote) orelse break;
+            name = slice[val_start .. val_start + val_end_rel];
+            name_end = val_start + val_end_rel + 1;
+            break;
+        }
+    }
+
+    // 2. Locate `arguments=` and snap the next balanced JSON object as
+    //    the value. We deliberately don't parse the XML quote — see
+    //    function docs.
+    var args: ?[]const u8 = null;
+    var args_end: usize = 0;
+    {
+        var i: usize = "<tool".len;
+        while (i + "arguments=".len < limit) : (i += 1) {
+            if (slice[i] != 'a') continue;
+            if (!std.mem.eql(u8, slice[i .. i + "arguments=".len], "arguments=")) continue;
+            var j: usize = i + "arguments=".len;
+            // Skip an opening quote if present.
+            if (j < limit and (slice[j] == '"' or slice[j] == '\'')) j += 1;
+            // Skip whitespace between the quote and the JSON object.
+            while (j < limit and (slice[j] == ' ' or slice[j] == '\t')) j += 1;
+            if (j >= limit or slice[j] != '{') break;
+            const sub = slice[j..limit];
+            const json = balancedJsonObject(sub) orelse break;
+            args = json;
+            const json_off = @intFromPtr(json.ptr) - @intFromPtr(sub.ptr);
+            args_end = j + json_off + json.len;
+            break;
+        }
+    }
+
+    if (name == null or args == null) return null;
+
+    // 3. Scan forward from the end of whichever attribute landed last to
+    //    the terminator. Tolerate a stray closing quote (model often closes
+    //    args with `'` even though the opener was `"`) and any intervening
+    //    whitespace. We accept either:
+    //      a) `/>` — self-closing.
+    //      b) `>` followed (possibly across whitespace) by `</tool*>` —
+    //         empty body, explicit close marker.
+    var k: usize = @max(name_end, args_end);
+    while (k < limit and (slice[k] == ' ' or slice[k] == '\t' or slice[k] == '\n' or slice[k] == '\r' or slice[k] == '"' or slice[k] == '\'')) k += 1;
+    if (k >= limit) return null;
+
+    if (slice[k] == '/') {
+        k += 1;
+        if (k >= limit or slice[k] != '>') return null;
+        return .{ .name = name.?, .arguments = args.?, .consumed = k + 1 };
+    }
+    if (slice[k] == '>') {
+        var w: usize = k + 1;
+        while (w < slice.len and (slice[w] == ' ' or slice[w] == '\t' or slice[w] == '\n' or slice[w] == '\r')) w += 1;
+        const close_markers = [_][]const u8{
+            "</tool_call>",   "</tool_calls>",
+            "</tool_request>", "</tool_requests>",
+            "</tool>",
+        };
+        for (close_markers) |m| {
+            if (w + m.len <= slice.len and std.mem.eql(u8, slice[w .. w + m.len], m)) {
+                return .{ .name = name.?, .arguments = args.?, .consumed = w + m.len };
+            }
+        }
+    }
+    return null;
+}
+
+/// The value of a depth-1 `"name"` key in an UNBALANCED JSON object (a tool
+/// call truncated mid-body). String-aware, so a `"name"` inside a nested
+/// value or a string never counts. Null when the text is not an object or
+/// carries no complete top-level name.
+fn truncatedJsonCallName(content: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, content, " \t\n\r");
+    if (!std.mem.startsWith(u8, t, "{")) return null;
+    var depth: usize = 0;
+    var i: usize = 0;
+    var last_str: ?[]const u8 = null; // most recent complete string at depth 1
+    var after_name_colon = false;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c == '"') {
+            const start = i + 1;
+            var j = start;
+            while (j < t.len and t[j] != '"') : (j += 1) {
+                if (t[j] == '\\') j += 1;
+            }
+            if (j >= t.len) return null; // unterminated string = the cut
+            const str = t[start..j];
+            if (depth == 1) {
+                if (after_name_colon) return if (str.len > 0) str else null;
+                last_str = str;
+            }
+            i = j;
+            continue;
+        }
+        switch (c) {
+            '{', '[' => {
+                depth += 1;
+                after_name_colon = false;
+            },
+            '}', ']' => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            ':' => if (depth == 1) {
+                if (last_str) |k| after_name_colon = std.mem.eql(u8, k, "name");
+            },
+            ',' => {
+                after_name_colon = false;
+                if (depth == 1) last_str = null;
+            },
+            ' ', '\t', '\n', '\r' => {},
+            else => after_name_colon = false,
+        }
+    }
+    return null;
+}
+
+fn balancedJsonObject(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\n\r");
+    const start = std.mem.indexOfScalar(u8, trimmed, '{') orelse return null;
+    var depth: i32 = 0;
+    var in_string: bool = false;
+    var escape: bool = false;
+    var i: usize = start;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return trimmed[start .. i + 1];
+            if (depth < 0) return null; // mismatched — give up
+        }
+    }
+    return null;
+}
+
+/// DSV4-Flash XML-element tool form: the body of a `<tool_calls>`-style
+/// wrapper carries the tool name and each argument as plain child elements —
+/// no JSON anywhere (captured live, 2026-06-10):
+///     <tool_name>shell</tool_name>
+///     <command>df -h / | grep -v "Filesystem"</command>
+/// The name comes from a <tool_name>, <name>, or <tool> element; every other
+/// simple `<key>text</key>` pair becomes a string argument. Strict on shape:
+/// non-whitespace between elements, an unclosed element, a duplicate name
+/// element, or a missing name returns null so prose-ish markup can't
+/// half-execute.
+/// Tag suffixes after `tool_` that mark tool RESULTS or metadata, never tool
+/// names. `<tool_output>…</tool_output>` is DSV4 hallucinating the result of
+/// a call it never made — mapping it onto a tool named "output" would
+/// fabricate a call out of thin air. `name` guards the bare XML-element-form
+/// child (`<tool_name>shell</tool_name>`) appearing outside its wrapper.
+const xml_tag_reserved_names = [_][]const u8{
+    "output", "outputs", "result", "results", "response", "responses", "error", "errors", "name",
+};
+
+/// XML-element-TAG tool form: `<tool_NAME><key>value</key>…</tool_NAME>`,
+/// the tool name embedded in the tag itself (DSV4 training-bias family;
+/// captured live 2026-06-10: `<tool_read>` / `<tool_edit>`). `slice` starts
+/// at `<tool`. Returns the parsed call plus bytes consumed through the close
+/// tag, or null when the shape doesn't hold (no attributes allowed, exact
+/// close required, reserved names rejected, body must be all elements).
+fn parseXmlElementTagToolCall(
+    allocator: std.mem.Allocator,
+    slice: []const u8,
+) !?struct { call: ParsedToolCall, consumed: usize } {
+    std.debug.assert(std.mem.startsWith(u8, slice, "<tool"));
+    const name_start = "<tool_".len;
+    if (slice.len <= name_start) return null;
+    var name_end = name_start;
+    while (name_end < slice.len and
+        (std.ascii.isAlphanumeric(slice[name_end]) or slice[name_end] == '_')) : (name_end += 1)
+    {}
+    if (name_end == name_start) return null; // bare `<tool_>`
+    if (name_end >= slice.len or slice[name_end] != '>') return null; // attributes → not this form
+    const tool_name = slice[name_start..name_end];
+    for (xml_tag_reserved_names) |reserved| {
+        if (std.ascii.eqlIgnoreCase(tool_name, reserved)) return null;
+    }
+    var close_buf: [72]u8 = undefined;
+    if (tool_name.len + "</tool_>".len > close_buf.len) return null;
+    const close_tag = std.fmt.bufPrint(&close_buf, "</tool_{s}>", .{tool_name}) catch return null;
+    const body_start = name_end + 1;
+    const close_rel = std.mem.indexOf(u8, slice[body_start..], close_tag) orelse return null;
+    const body = slice[body_start .. body_start + close_rel];
+    const args = parseXmlElementArgsJson(allocator, body) orelse blk: {
+        // JSON-args body variant of the same form, also captured live:
+        // `<tool_write>\n{"path": …, "content": …}\n</tool_write>`. The whole
+        // object IS the args. The trimmed body must START with `{` so prose
+        // that merely contains braces never produces arguments.
+        const trimmed = std.mem.trim(u8, body, " \t\n\r");
+        if (trimmed.len == 0 or trimmed[0] != '{') return null;
+        const json_body = balancedJsonObject(trimmed) orelse return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        break :blk allocator.dupe(u8, json_body) catch return null;
+    };
+    const name_owned = allocator.dupe(u8, tool_name) catch {
+        allocator.free(args);
+        return null;
+    };
+    return .{
+        .call = .{ .name = name_owned, .arguments = args },
+        .consumed = body_start + close_rel + close_tag.len,
+    };
+}
+
+/// Parse a body consisting ENTIRELY of `<key>value</key>` child elements into
+/// a JSON args string. Values are kept verbatim, so nested markup (DSV4's
+/// `<edits><oldText>…</oldText>…</edits>`) survives as the arg's string
+/// value. Returns null unless every non-whitespace byte belongs to an element
+/// and at least one element is present — a plain-text body must never
+/// produce arguments.
+fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var args_map: std.json.ObjectMap = .empty;
+    defer args_map.deinit(allocator);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < body.len) {
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        if (i >= body.len) break;
+        if (body[i] != '<') return null;
+        const key_start = i + 1;
+        var j = key_start;
+        while (j < body.len and (std.ascii.isAlphanumeric(body[j]) or body[j] == '_')) j += 1;
+        if (j == key_start or j >= body.len or body[j] != '>') return null;
+        const key = body[key_start..j];
+        const val_start = j + 1;
+        var close_buf: [64]u8 = undefined;
+        if (key.len + 3 > close_buf.len) return null;
+        const close_tag = std.fmt.bufPrint(&close_buf, "</{s}>", .{key}) catch return null;
+        const rel = std.mem.indexOf(u8, body[val_start..], close_tag) orelse return null;
+        args_map.put(allocator, key, .{ .string = body[val_start .. val_start + rel] }) catch return null;
+        count += 1;
+        i = val_start + rel + close_tag.len;
+    }
+    if (count == 0) return null;
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch null;
+}
+
+/// Earliest position at/after `from` where any of `needles` occurs, or null.
+fn isBareToolName(body: []const u8) bool {
+    const name = std.mem.trim(u8, body, " \t\n\r");
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.')) return false;
+    }
+    return true;
+}
+
+fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8) ?usize {
+    var best: ?usize = null;
+    for (needles) |n| {
+        if (std.mem.indexOfPos(u8, text, from, n)) |q| {
+            if (best == null or q < best.?) best = q;
+        }
+    }
+    return best;
+}
+
+/// A tool-name character per the identifier alphabet every template family's
+/// names draw from. Anything outside this set (a channel marker's `>`, a
+/// payload's `}`, prose punctuation) terminates a name run.
+fn toolNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+/// The trailing identifier run ending at `end` (exclusive): a name that
+/// echoed a channel marker (`<|content_text|>bash`) resolves to the bare NAME.
+fn trailingNameRun(text: []const u8, end: usize) []const u8 {
+    var start = end;
+    while (start > 0 and toolNameChar(text[start - 1])) start -= 1;
+    return text[start..end];
+}
+
+// DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
+// (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
+// V4.1 puts a space before every tag name (`<｜DSML｜ invoke`); both spellings parse.
+const DsmlTag = struct { open: []const u8, name: []const u8 };
+const DSML_INVOKE_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "invoke" };
+const DSML_INVOKE_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "invoke>" };
+const DSML_PARAM_TAG: DsmlTag = .{ .open = "<｜DSML｜", .name = "parameter" };
+const DSML_PARAM_CLOSE: DsmlTag = .{ .open = "</｜DSML｜", .name = "parameter>" };
+
+const DsmlHit = struct { at: usize, end: usize };
+
+fn dsmlFind(text: []const u8, from: usize, comptime tag: DsmlTag) ?DsmlHit {
+    var p = from;
+    while (std.mem.indexOfPos(u8, text, p, tag.open)) |at| {
+        var q = at + tag.open.len;
+        if (q < text.len and text[q] == ' ') q += 1;
+        if (std.mem.startsWith(u8, text[q..], tag.name)) return .{ .at = at, .end = q + tag.name.len };
+        p = at + 1;
+    }
+    return null;
+}
+
+/// Tolerant quoted-attribute extraction from a tag-attribute segment:
+/// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
+fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
+    const pat = key ++ "=";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, seg, start, pat)) |at| {
+        if (at > 0 and (std.ascii.isAlphanumeric(seg[at - 1]) or seg[at - 1] == '_')) {
+            start = at + pat.len;
+            continue;
+        }
+        var v = at + pat.len;
+        if (v >= seg.len) return null;
+        const q = seg[v];
+        if (q == '"' or q == '\'') {
+            v += 1;
+            const end = std.mem.indexOfScalarPos(u8, seg, v, q) orelse seg.len;
+            return seg[v..end];
+        }
+        const end = std.mem.indexOfAnyPos(u8, seg, v, " \t\n>") orelse seg.len;
+        return seg[v..end];
+    }
+    return null;
+}
+
+/// DeepSeek-V4 DSML tool calls:
+///   `<｜DSML｜tool_calls>` wrapping
+///   `<｜DSML｜invoke name="X">` +
+///   `<｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>`.
+/// string="true" values are raw text (JSON-escaped here); string="false"
+/// values are already JSON (validated; invalid degrades to an honest string).
+/// House conventions: the parser keys on the INVOKE marker (a dropped
+/// wrapper or invoke-close still parses — delimiter-drop class), values run
+/// to the CONFIRMED closing tag (rich values with `<`/newlines survive),
+/// truncation salvages NAME + completed pairs (fragments dropped), keys are
+/// escaped + deduped (last wins) so emitted arguments are ALWAYS valid JSON.
+fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    const Param = struct { key: []const u8, value: []const u8, is_string: bool };
+    var pos: usize = 0;
+    while (dsmlFind(text, pos, DSML_INVOKE_TAG)) |inv| {
+        var p = inv.end;
+        const tag_end = std.mem.indexOfScalarPos(u8, text, p, '>') orelse break;
+        const name = dsmlAttr(text[p..tag_end], "name") orelse {
+            pos = tag_end + 1;
+            continue;
+        };
+        p = tag_end + 1;
+
+        var params = std.ArrayList(Param).empty;
+        defer params.deinit(allocator);
+        while (true) {
+            const next_param = dsmlFind(text, p, DSML_PARAM_TAG);
+            const next_close = dsmlFind(text, p, DSML_INVOKE_CLOSE);
+            const next_invoke = dsmlFind(text, p, DSML_INVOKE_TAG);
+            const np = if (next_param) |h| h.at else std.math.maxInt(usize);
+            const nc = if (next_close) |h| h.at else std.math.maxInt(usize);
+            const ni = if (next_invoke) |h| h.at else std.math.maxInt(usize);
+            if (np == std.math.maxInt(usize) and nc == std.math.maxInt(usize) and ni == std.math.maxInt(usize)) {
+                // truncated invoke: ship NAME + completed pairs
+                p = text.len;
+                break;
+            }
+            if (nc <= np and nc <= ni) {
+                p = next_close.?.end;
+                break;
+            }
+            if (ni < np) {
+                // dropped invoke-close — the next call starts here; the outer
+                // loop picks it up from `p`.
+                p = ni;
+                break;
+            }
+            // parameter
+            var q = next_param.?.end;
+            const ptag_end = std.mem.indexOfScalarPos(u8, text, q, '>') orelse {
+                p = text.len;
+                break;
+            };
+            const attrs = text[q..ptag_end];
+            const pkey = dsmlAttr(attrs, "name");
+            const pstring = dsmlAttr(attrs, "string");
+            const vstart = ptag_end + 1;
+            const vclose = dsmlFind(text, vstart, DSML_PARAM_CLOSE) orelse {
+                // unterminated value = server-cut fragment; drop it, end scan
+                p = text.len;
+                break;
+            };
+            q = vclose.end;
+            if (pkey) |k| {
+                const value = text[vstart..vclose.at];
+                // string attr absent (mangled opener): treat JSON-parseable
+                // values as JSON, everything else as a string.
+                const is_string = if (pstring) |sf|
+                    !std.mem.eql(u8, sf, "false")
+                else
+                    !dsmlValueIsJson(allocator, value);
+                // dedup: last wins
+                var replaced = false;
+                for (params.items) |*prm| {
+                    if (std.mem.eql(u8, prm.key, k)) {
+                        prm.value = value;
+                        prm.is_string = is_string;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) try params.append(allocator, .{ .key = k, .value = value, .is_string = is_string });
+            }
+            p = q;
+        }
+
+        // Build the arguments object: escaped keys, escaped string values,
+        // raw (validated) JSON values.
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '{');
+        for (params.items, 0..) |prm, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try appendJsonString(allocator, &out, prm.key);
+            try out.append(allocator, ':');
+            if (!prm.is_string and dsmlValueIsJson(allocator, prm.value)) {
+                try out.appendSlice(allocator, std.mem.trim(u8, prm.value, " \t\n\r"));
+            } else {
+                try appendJsonString(allocator, &out, prm.value);
+            }
+        }
+        try out.append(allocator, '}');
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = try out.toOwnedSlice(allocator) });
+        pos = p;
+    }
+}
+
+fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\n\r");
+    if (trimmed.len == 0) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
+
+// ── ATEM tool calls (Muse-Glimmer / `muse_glimmer`) ────────────────────
+//
+//   <atem:function_calls>
+//   <atem:invoke name="weather.get">
+//   <atem:parameter name="city">Paris</atem:parameter>
+//   <atem:parameter name="detailed">false</atem:parameter>
+//   </atem:invoke>
+//   </atem:function_calls>
+//
+// String parameters are RAW bytes (the reference explicitly does not strip
+// spaces — the Hermes trim gap stays Hermes'); lists/objects/bools/null/
+// numbers are spelled as JSON and keep their spelled type (the schema
+// coercion chokepoint still gets the final word). The parser keys on the
+// INVOKE tag so a dropped wrapper still parses (delimiter-drop class), and
+// truncation salvages NAME + completed parameters — never fragment values.
+const InvokeDialect = struct {
+    invoke: []const u8,
+    param: []const u8,
+    param_close: []const u8,
+    invoke_close: []const u8,
+    /// Not the model's own dialect: kept only when it names a declared tool (`filterInferredBySchema`).
+    inferred: bool,
+};
+const ATEM_INVOKE: InvokeDialect = .{ .invoke = "<atem:invoke", .param = "<atem:parameter", .param_close = "</atem:parameter>", .invoke_close = "</atem:invoke>", .inferred = false };
+/// Claude's spelling of the same grammar (`<function_calls><invoke name="X"><parameter name="k">`),
+/// which models trained on Claude transcripts emit in place of their own (qwen4_exp).
+const BARE_INVOKE: InvokeDialect = .{ .invoke = "<invoke", .param = "<parameter", .param_close = "</parameter>", .invoke_close = "</invoke>", .inferred = true };
+const FUNCTION_CALLS_TAG = "<function_calls>";
+
+/// gpt_oss / harmony tool calls. Structurally unlike every other family here:
+/// the function NAME is not in the payload at all, it is the segment header's
+/// recipient (`to=functions.NAME`), and the body is already a JSON arguments
+/// object rather than a markup block to assemble.
+///
+///     <|start|>assistant to=functions.get_weather<|channel|>commentary
+///     <|constrain|>json<|message|>{"location":"SF"}<|call|>
+///
+/// Keyed on `to=functions.` sitting in a resolved channel header, a shape no
+/// other family emits. A body that is not a COMPLETE balanced JSON object is
+/// a truncated call: ship the name with `{}` rather than a fragment, per the
+/// same rule the ATEM and DSML parsers follow.
+fn parseHarmonyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    if (std.mem.indexOf(u8, text, HARMONY_CHANNEL_TAG) == null) return;
+    var seg_start: usize = 0;
+    while (true) {
+        const next = std.mem.indexOfPos(u8, text, seg_start + 1, HARMONY_START_TAG);
+        const seg_end = next orelse text.len;
+        defer seg_start = next orelse text.len;
+
+        const seg = text[seg_start..seg_end];
+        // Only a RESOLVED header can name a call — an unterminated one is
+        // still arriving and its recipient may yet change.
+        const msg_rel = std.mem.indexOf(u8, seg, HARMONY_MSG_TAG) orelse {
+            if (next == null) break;
+            continue;
+        };
+        const header = seg[0..msg_rel];
+        const fn_at = std.mem.indexOf(u8, header, "to=functions.") orelse {
+            if (next == null) break;
+            continue;
+        };
+        const raw_name = header[fn_at + "to=functions.".len ..];
+        var n: usize = 0;
+        while (n < raw_name.len and museIsRecipientChar(raw_name[n])) n += 1;
+        // A tool name never carries a channel marker (corpus invariant).
+        const name_slice = raw_name[0..n];
+        if (name_slice.len == 0) {
+            if (next == null) break;
+            continue;
+        }
+
+        var body = seg[msg_rel + HARMONY_MSG_TAG.len ..];
+        for ([_][]const u8{ HARMONY_CALL_TAG, HARMONY_END_TAG, HARMONY_RETURN_TAG }) |tag| {
+            if (std.mem.indexOf(u8, body, tag)) |e| body = body[0..e];
+        }
+        const args_src = balancedJsonObject(std.mem.trim(u8, body, " \n\t\r")) orelse "{}";
+
+        const name = try allocator.dupe(u8, name_slice);
+        errdefer allocator.free(name);
+        const arguments = try allocator.dupe(u8, args_src);
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+
+        if (next == null) break;
+    }
+}
+
+fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
+    // An inferred dialect's opener alone is prose ("wrap it in <invoke name=\"bash\">", even naming a declared
+    // tool): a call also carries a parameter or its close, as `bareInvokeMarkupCut` demands.
+    if (d.inferred and std.mem.indexOf(u8, text, d.param ++ " ") == null and std.mem.indexOf(u8, text, d.invoke_close) == null) return;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, d.invoke)) |inv| {
+        const after_tag = inv + d.invoke.len;
+        const seg = text[after_tag..];
+        // `<invoked>` is a word, not the tag.
+        if (seg.len > 0 and !std.ascii.isWhitespace(seg[0])) {
+            pos = after_tag;
+            continue;
+        }
+        // Attribute scan bounded so a runaway unclosed quote can't eat the
+        // rest of the output.
+        const raw_name = dsmlAttr(seg[0..@min(seg.len, 512)], "name") orelse {
+            pos = after_tag;
+            continue;
+        };
+        // No real tool name carries a channel marker (corpus invariant —
+        // the marker-echo class).
+        var name_slice = raw_name;
+        if (std.mem.indexOf(u8, name_slice, "<|") != null) {
+            name_slice = trailingNameRun(name_slice, name_slice.len);
+        }
+        if (name_slice.len == 0) {
+            pos = after_tag;
+            continue;
+        }
+
+        var args_json: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
+            const body_all = seg[te + 1 ..];
+            // An inferred opener must own a parameter or close before the next opener,
+            // else it is prose and would borrow the next call's body.
+            if (d.inferred) {
+                const own = body_all[0 .. std.mem.indexOf(u8, body_all, d.invoke) orelse body_all.len];
+                if (std.mem.indexOf(u8, own, d.param ++ " ") == null and std.mem.indexOf(u8, own, d.invoke_close) == null) {
+                    pos = after_tag;
+                    continue;
+                }
+            }
+            const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
+            args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
+            pos = if (body_end < body_all.len)
+                after_tag + te + 1 + body_end + d.invoke_close.len
+            else
+                text.len; // truncated body — completed params already salvaged
+        } else {
+            pos = text.len; // truncated inside the opening tag: NAME + {}
+        }
+
+        const name = try allocator.dupe(u8, name_slice);
+        errdefer allocator.free(name);
+        const arguments = args_json orelse try allocator.dupe(u8, "{}");
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = d.inferred });
+    }
+}
+
+/// Assemble `<parameter name="k">v</parameter>` runs (ATEM's namespaced or Claude's bare) into a JSON
+/// object string. A value that parses as COMPLETE JSON keeps its spelled type;
+/// everything else is a raw string, exact bytes. Keys are escaped + deduped
+/// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
+/// JSON. Returns null when no complete parameter was found.
+fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d: InvokeDialect) !?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    var pos: usize = 0;
+    var found = false;
+    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
+        const after = p + d.param.len;
+        const seg = body[after..];
+        const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
+        const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
+            pos = after;
+            continue;
+        };
+        const vstart = after + te + 1;
+        // The value runs to the CONFIRMED closing tag — rich values with
+        // newlines/quotes/`<` survive; no close by end of text = fragment,
+        // dropped.
+        const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
+        const raw = body[vstart .. vstart + vend_rel];
+        const v: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, raw, .{}) catch
+            std.json.Value{ .string = raw };
+        try map.put(aa, pname, v);
+        found = true;
+        pos = vstart + vend_rel + d.param_close.len;
+    }
+    if (!found) return null;
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
+}
+
+// ── Pythonic tool calls (LFM2.5 / `lfm2`) ──────────────────────────────
+//
+//   <|tool_call_start|>[get_weather(city='Paris', days=3, metric=True,
+//                                   tags=['trip', 'eu'])]<|tool_call_end|>
+//
+// A CALL-EXPRESSION grammar, not a JSON one: values are Python literals. The
+// model emits full repr — `True`, single-quoted lists — even though its own
+// template renders history containers via `tojson`, so a JSON-only value
+// reader mis-reads the two most common non-string types. Parsing the literals
+// here (rather than shipping them as text for `coerceToolArgsToSchema` to
+// rescue) is what keeps a declared `array`/`boolean` parameter from arriving
+// as a string — the value types are knowable from the SPELLING in this
+// grammar, so the schema never has to be consulted.
+//
+// Marker-gated: `<|tool_call_start|>` is emitted by no other family, and the
+// generic `<tool` scan never sees it, so this arm cannot touch existing
+// traffic. The Gemma 4 arm keys on the exact `<|tool_call>` (with `>`), which
+// this never matches.
+const PYTHONIC_CALL_START = "<|tool_call_start|>";
+const PYTHONIC_CALL_END = "<|tool_call_end|>";
+
+fn pythonicIsNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+/// Index of the first byte in `s` at nesting depth 0 that satisfies `pred`,
+/// skipping anything inside a quoted string or a nested ()/[]/{} group.
+/// One scanner for every structural search in this grammar — the arg
+/// separator, the `=`, the dict `:`, and the closing paren all need the same
+/// blindness to separators that live inside a value.
+fn pythonicScan(s: []const u8, start: usize, pred: *const fn (u8, i32) bool) ?usize {
+    var depth: i32 = 0;
+    var quote: u8 = 0;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == quote) {
+                quote = 0;
+            }
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            continue;
+        }
+        if (c == '(' or c == '[' or c == '{') {
+            depth += 1;
+        } else if (c == ')' or c == ']' or c == '}') {
+            if (pred(c, depth)) return i;
+            depth -= 1;
+            continue;
+        }
+        if (pred(c, depth)) return i;
+    }
+    return null;
+}
+
+fn pythonicIsCloser(c: u8, depth: i32) bool {
+    return c == ')' and depth == 0;
+}
+fn pythonicIsComma(c: u8, depth: i32) bool {
+    return c == ',' and depth == 0;
+}
+fn pythonicIsEquals(c: u8, depth: i32) bool {
+    return c == '=' and depth == 0;
+}
+fn pythonicIsColon(c: u8, depth: i32) bool {
+    return c == ':' and depth == 0;
+}
+
+/// Unescape a Python string literal body. Unknown escapes keep the backslash,
+/// which is Python's own behavior (`'\d' == '\\d'`) and the forgiving reading
+/// of a model that under-escaped a path.
+fn pythonicUnescape(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        if (body[i] != '\\' or i + 1 >= body.len) {
+            try out.append(arena, body[i]);
+            continue;
+        }
+        i += 1;
+        switch (body[i]) {
+            'n' => try out.append(arena, '\n'),
+            'r' => try out.append(arena, '\r'),
+            't' => try out.append(arena, '\t'),
+            '\\', '\'', '"' => try out.append(arena, body[i]),
+            else => {
+                try out.append(arena, '\\');
+                try out.append(arena, body[i]);
+            },
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// A Python literal → its JSON value. Anything undecidable stays a string
+/// VERBATIM rather than being guessed at, so a client's own validation error
+/// stays honest (the `coerceToolArgsToSchema` contract, one layer down).
+fn pythonicLiteral(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const s = std.mem.trim(u8, raw, " \t\n\r");
+    if (s.len == 0) return .{ .string = "" };
+
+    if ((s[0] == '\'' or s[0] == '"') and s.len >= 2 and s[s.len - 1] == s[0]) {
+        return .{ .string = try pythonicUnescape(arena, s[1 .. s.len - 1]) };
+    }
+    if (std.mem.eql(u8, s, "True")) return .{ .bool = true };
+    if (std.mem.eql(u8, s, "False")) return .{ .bool = false };
+    if (std.mem.eql(u8, s, "None")) return .null;
+
+    if (s[0] == '[' and s[s.len - 1] == ']') {
+        var arr = std.json.Array.init(arena);
+        var it = PythonicParts{ .s = s[1 .. s.len - 1] };
+        while (it.next()) |part| {
+            if (std.mem.trim(u8, part, " \t\n\r").len == 0) continue;
+            try arr.append(try pythonicLiteral(arena, part));
+        }
+        return .{ .array = arr };
+    }
+    if (s[0] == '{' and s[s.len - 1] == '}') {
+        var obj: std.json.ObjectMap = .empty;
+        var it = PythonicParts{ .s = s[1 .. s.len - 1] };
+        while (it.next()) |part| {
+            const colon = pythonicScan(part, 0, pythonicIsColon) orelse continue;
+            const key_v = try pythonicLiteral(arena, part[0..colon]);
+            const key = switch (key_v) {
+                .string => |k| k,
+                else => continue,
+            };
+            if (key.len == 0 or obj.getEntry(key) != null) continue;
+            try obj.put(arena, key, try pythonicLiteral(arena, part[colon + 1 ..]));
+        }
+        return .{ .object = obj };
+    }
+
+    if (std.fmt.parseInt(i64, s, 10)) |n| return .{ .integer = n } else |_| {}
+    if (std.fmt.parseFloat(f64, s)) |f| return .{ .float = f } else |_| {}
+    return .{ .string = s };
+}
+
+/// Iterator over top-level comma-separated parts.
+const PythonicParts = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn next(self: *PythonicParts) ?[]const u8 {
+        if (self.i > self.s.len) return null;
+        if (self.i == self.s.len) {
+            self.i += 1;
+            return self.s[self.s.len..];
+        }
+        const start = self.i;
+        if (pythonicScan(self.s, start, pythonicIsComma)) |c| {
+            self.i = c + 1;
+            return self.s[start..c];
+        }
+        self.i = self.s.len + 1;
+        return self.s[start..];
+    }
+};
+
+fn parsePythonicToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, PYTHONIC_CALL_START)) |p| {
+        const body_start = p + PYTHONIC_CALL_START.len;
+        const close = std.mem.indexOfPos(u8, text, body_start, PYTHONIC_CALL_END);
+        pos = if (close) |c| c + PYTHONIC_CALL_END.len else text.len;
+
+        // A dropped end marker (truncation, or the weak-model delimiter-drop
+        // class) must not cost the call — the body simply runs to the end.
+        var body = std.mem.trim(u8, text[body_start .. close orelse text.len], " \t\n\r");
+        if (body.len > 0 and body[0] == '[') body = body[1..];
+        if (body.len > 0 and body[body.len - 1] == ']') body = body[0 .. body.len - 1];
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var i: usize = 0;
+        while (i < body.len) {
+            while (i < body.len and (std.ascii.isWhitespace(body[i]) or body[i] == ',')) i += 1;
+            const name_start = i;
+            while (i < body.len and pythonicIsNameChar(body[i])) i += 1;
+            const name = body[name_start..i];
+            if (name.len == 0) break;
+
+            while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+            // No `(`, or no matching `)`: the cut landed inside the call. Ship
+            // the NAME with EMPTY args — never a partial value (a half-written
+            // file body is worse than a re-issued call).
+            const args = blk: {
+                if (i >= body.len or body[i] != '(') break :blk null;
+                const arg_start = i + 1;
+                const arg_end = pythonicScan(body, arg_start, pythonicIsCloser) orelse break :blk null;
+                i = arg_end + 1;
+                break :blk body[arg_start..arg_end];
+            };
+
+            var args_map: std.json.ObjectMap = .empty;
+            if (args) |a| {
+                var parts = PythonicParts{ .s = a };
+                while (parts.next()) |part| {
+                    const eq = pythonicScan(part, 0, pythonicIsEquals) orelse continue;
+                    const key = std.mem.trim(u8, part[0..eq], " \t\n\r");
+                    if (key.len == 0 or args_map.getEntry(key) != null) continue;
+                    try args_map.put(arena, key, try pythonicLiteral(arena, part[eq + 1 ..]));
+                }
+            }
+
+            const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+            errdefer allocator.free(args_str);
+            const name_owned = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_owned);
+            try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+            if (args == null) break;
+        }
+    }
+}
+
+/// GLM's tag-format tool calls: a BARE `<tool_call>` opener, the NAME, then
+/// `<arg_key>K</arg_key><arg_value>V</arg_value>` pairs:
+///   <tool_call>NAME
+///   <arg_key>KEY</arg_key>
+///   <arg_value>VALUE</arg_value> …
+///   </tool_call> …
+/// Values are kept as RAW STRINGS: the template `tojson`s non-string values on
+/// the way in, and the schema-driven coercion at the server chokepoint types
+/// them on the way back (types come from the SCHEMA, never the value's
+/// spelling). Args build through ObjectMap + Stringify — keys escaped,
+/// duplicates first-wins — per the tag-format-converter class rule. Truncation
+/// (max_tokens mid-call, the big-file-write class) recovers with the CLOSED
+/// key/value pairs only; partial values are never salvaged.
+fn parseArgKeyToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "<tool_call>")) |p| {
+        const after_base = p + "<tool_call".len;
+        // Bare `<tool_call>` has two sub-formats sharing this opener:
+        //   • Hermes JSON `<tool_call>{…}` / function-tag `<tool_call><function=…>`
+        //     → the generic scan reads those; fall through.
+        //   • GLM: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
+        //     — bare opener, NAME, then arg_key/arg_value pairs. Route HERE only
+        //     when an `<arg_key` precedes this call's close (the unambiguous GLM
+        //     signal a JSON/function body never has), so the Hermes path is
+        //     untouched.
+        const body = after_base + 1;
+        const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
+        const ak_probe = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
+        // A parameterless GLM call has no <arg_key>: its whole body is
+        // the bare NAME, a shape neither the JSON nor `<function=` arms read.
+        if (!(ak_probe < this_close or isBareToolName(text[body..this_close]))) {
+            pos = after_base;
+            continue;
+        }
+        const name_start = body;
+
+        // NAME runs to the first structural marker after the opener. A mangled
+        // call (weak model) closes the name with </arg_value> instead of
+        // newline/<arg_key>, so accept any of them. No marker at all → the cut
+        // happened inside the name; nothing to recover.
+        const name_end = earliestIndexOfAny(text, name_start, &.{
+            "<arg_key", "<arg_value", "</tool_call", "</arg_key", "</arg_value",
+        }) orelse {
+            pos = name_start;
+            continue;
+        };
+        const name = std.mem.trim(u8, text[name_start..name_end], " \t\n\r");
+        if (name.len == 0) {
+            pos = name_start;
+            continue;
+        }
+
+        var args_map: std.json.ObjectMap = .empty;
+        defer args_map.deinit(allocator);
+
+        // Parse <arg_key>/<arg_value> pairs, bounded by this call's </tool_call>.
+        // SCAN to the next <arg_key> (rather than requiring it right here) so a
+        // stray name-close tag between the name and the first key is skipped, and
+        // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>), as
+        // a weak model closes it with </arg_value>. The well-formed path is
+        // unchanged: </arg_key> is the earliest close.
+        var i: usize = name_end;
+        const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
+        while (true) {
+            const ak_at = std.mem.indexOfPos(u8, text, i, "<arg_key") orelse break;
+            if (ak_at >= call_end) break;
+            const ak_len = tagLenAt(text[ak_at..], "<arg_key") orelse {
+                i = ak_at + "<arg_key".len;
+                continue;
+            };
+            const key_start = ak_at + ak_len;
+            const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
+            const ak_close_len = tagLenAt(text[ak_close..], "</arg_key") orelse
+                tagLenAt(text[ak_close..], "</arg_value") orelse break;
+            // A doubled opener (`<arg_key><arg_key>K`) keys on the last one.
+            var real_start = key_start;
+            while (std.mem.indexOfPos(u8, text, real_start, "<arg_key")) |n| {
+                if (n >= ak_close) break;
+                real_start = n + (tagLenAt(text[n..], "<arg_key") orelse break);
+            }
+            const key = std.mem.trim(u8, text[real_start..ak_close], " \t\n\r");
+            i = ak_close + ak_close_len;
+            while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+            const av_len = tagLenAt(text[i..], "<arg_value") orelse break;
+            const val_start = i + av_len;
+            const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
+            const av_close_len = tagLenAt(text[av_close..], "</arg_value") orelse break;
+            const value = text[val_start..av_close];
+            i = av_close + av_close_len;
+            if (key.len > 0 and args_map.getEntry(key) == null) {
+                try args_map.put(allocator, key, .{ .string = value });
+            }
+        }
+
+        const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+        errdefer allocator.free(args_str);
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+        if (std.mem.indexOfPos(u8, text, i, "</tool_call")) |cl| {
+            const cl_len = tagLenAt(text[cl..], "</tool_call") orelse 0;
+            pos = if (cl_len > 0) cl + cl_len else cl + "</tool_call".len;
+        } else {
+            pos = i;
+        }
+    }
+}
+
+fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?ParsedToolCall {
+    var name: ?[]const u8 = null;
+    var args_map: std.json.ObjectMap = .empty;
+    defer args_map.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < body.len) {
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        if (i >= body.len) break;
+        if (body[i] != '<') return null;
+        const key_start = i + 1;
+        var j = key_start;
+        while (j < body.len and (std.ascii.isAlphanumeric(body[j]) or body[j] == '_')) j += 1;
+        if (j == key_start or j >= body.len or body[j] != '>') return null;
+        const key = body[key_start..j];
+        const val_start = j + 1;
+        var close_buf: [64]u8 = undefined;
+        if (key.len + 3 > close_buf.len) return null;
+        const close_tag = std.fmt.bufPrint(&close_buf, "</{s}>", .{key}) catch return null;
+        const rel = std.mem.indexOf(u8, body[val_start..], close_tag) orelse return null;
+        const value = body[val_start .. val_start + rel];
+        i = val_start + rel + close_tag.len;
+
+        if (std.mem.eql(u8, key, "tool_name") or std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "tool")) {
+            if (name != null) return null;
+            const trimmed_name = std.mem.trim(u8, value, " \t\n\r");
+            if (trimmed_name.len == 0) return null;
+            name = trimmed_name;
+        } else {
+            args_map.put(allocator, key, .{ .string = value }) catch return null;
+        }
+    }
+
+    const n = name orelse return null;
+    const args_str = std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch return null;
+    const name_owned = allocator.dupe(u8, n) catch {
+        allocator.free(args_str);
+        return null;
+    };
+    return .{ .name = name_owned, .arguments = args_str };
+}
+
+/// Repair a JSON object whose trailing closer(s) were dropped — e.g. the
+/// model wrote `{"name":"edit","arguments":{…,"edits":[{…}]}` and went
+/// straight to its close tag, one `}` short. String/escape-aware bracket
+/// stack; appends exactly the missing closers in nesting order. Returns null
+/// when the text doesn't start with `{`, is already balanced (trailing
+/// garbage is someone else's problem), ends mid-string, or nests deeper
+/// than the stack (not worth guessing).
+fn completeUnbalancedJsonObject(allocator: std.mem.Allocator, content: []const u8) ?[]u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\n\r");
+    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+    var stack: [16]u8 = undefined;
+    var depth: usize = 0;
+    var in_string = false;
+    var escape = false;
+    for (trimmed) |c| {
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{' => {
+                if (depth == stack.len) return null;
+                stack[depth] = '}';
+                depth += 1;
+            },
+            '[' => {
+                if (depth == stack.len) return null;
+                stack[depth] = ']';
+                depth += 1;
+            },
+            '}', ']' => {
+                if (depth == 0 or stack[depth - 1] != c) return null;
+                depth -= 1;
+                // Balanced before the end → trailing garbage, not a
+                // truncated tail. balancedJsonObject owns that case.
+                if (depth == 0) return null;
+            },
+            else => {},
+        }
+    }
+    if (in_string or depth == 0) return null;
+    var out = allocator.alloc(u8, trimmed.len + depth) catch return null;
+    @memcpy(out[0..trimmed.len], trimmed);
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        out[trimmed.len + i] = stack[depth - 1 - i];
+    }
+    return out;
+}
+
+/// Snap a balanced JSON array starting at the first `[`. Mirrors
+/// balancedJsonObject: string/escape aware, tracks BOTH bracket kinds so
+/// objects nested in the array can't fool the depth count.
+fn balancedJsonArray(content: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, content, " \t\n\r");
+    const start = std.mem.indexOfScalar(u8, trimmed, '[') orelse return null;
+    var depth: i32 = 0;
+    var in_string: bool = false;
+    var escape: bool = false;
+    var i: usize = start;
+    while (i < trimmed.len) : (i += 1) {
+        const c = trimmed[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                escape = true;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '[', '{' => depth += 1,
+            ']', '}' => {
+                depth -= 1;
+                if (depth == 0) return trimmed[start .. i + 1];
+                if (depth < 0) return null; // mismatched — give up
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Parse a JSON array of tool-call objects (`[{"name":…,"arguments":…}, …]`)
+/// and append EVERY call. All-or-nothing: if any element fails to parse as a
+/// tool call, nothing is appended — a prose-ish array must pass through as
+/// text rather than half-execute.
+fn appendJsonToolCallArray(
+    allocator: std.mem.Allocator,
+    arr_text: []const u8,
+    calls: *std.ArrayList(ParsedToolCall),
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arr_text, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .array) return;
+    const items = parsed.value.array.items;
+    if (items.len == 0) return;
+
+    var pending = std.ArrayList(ParsedToolCall).empty;
+    var ok = true;
+    defer {
+        for (pending.items) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        pending.deinit(allocator);
+    }
+    for (items) |item| {
+        if (item != .object) {
+            ok = false;
+            break;
+        }
+        // Reuse tryParseJsonToolCall (leaf-name walk, flat-shape synthesis)
+        // by round-tripping the element through its text form.
+        const item_text = std.json.Stringify.valueAlloc(allocator, item, .{}) catch {
+            ok = false;
+            break;
+        };
+        defer allocator.free(item_text);
+        const tc = tryParseJsonToolCall(allocator, item_text) orelse {
+            ok = false;
+            break;
+        };
+        try pending.append(allocator, tc);
+    }
+    if (!ok) return;
+    try calls.appendSlice(allocator, pending.items);
+    pending.clearRetainingCapacity();
+}
+
+/// Lenient recovery for tool-call argument JSON that small models mangle when
+/// emitting large string values (file contents). Two failure modes, both of
+/// which make strict std.json reject the WHOLE blob so the call would be dropped
+/// and leak as visible text:
+///   • raw control bytes (literal newlines/tabs) inside a string instead of
+///     `\n`/`\t` — the dominant big-file failure;
+///   • unescaped inner double-quotes (`<meta charset="UTF-8">`) and invalid
+///     backslash escapes (Windows paths, regex) inside a string.
+/// Re-serializes a CLEAN object by walking the input with a position-aware
+/// tolerant parser (key vs value context): control bytes are re-escaped, lone/
+/// invalid backslashes are escaped, and a `"` closes a string only at a
+/// structural delimiter (`:` after a key; `,`/`}`/`]`/end after a value) — any
+/// other `"` is an inner content quote and gets escaped. The CALLER strict-parses
+/// the result, so a mis-recovery that yields invalid JSON is discarded; the only
+/// residual risk is a value string closed early on pathological content (a
+/// literal `"}` / `",` byte-sequence inside the file), which still beats dropping
+/// the call. Does NOT tolerate truncation (no auto-close of open containers) —
+/// that stays with completeUnbalancedJsonObject. Returns an allocator-owned
+/// normalized JSON string, or null when no well-formed leading object recovers.
+fn looseRepairToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const obj_start = std.mem.indexOfScalar(u8, trimmed, '{') orelse return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    _ = looseEmitObject(allocator, &out, trimmed, obj_start, 0) catch {
+        out.deinit(allocator);
+        return null;
+    };
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+/// Tolerant re-serialize of a top-level JSON CONTAINER (`[…]` or `{…}`) — the
+/// array-aware sibling of looseRepairToolCallJson. Used by the schema coercion to
+/// salvage a container-typed argument the model mangled (e.g. a missing comma
+/// inside an `edits` array). Same discipline: the caller strict-parses the
+/// result, so a mis-repair yielding invalid JSON is discarded. Returns null when
+/// the text doesn't start with `[`/`{` or can't be re-serialized.
+fn looseRepairContainer(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or (trimmed[0] != '[' and trimmed[0] != '{')) return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    _ = looseEmitValue(allocator, &out, trimmed, 0, 0, .object_value) catch {
+        out.deinit(allocator);
+        return null;
+    };
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+const LooseStringCtx = enum { key, object_value, array_value };
+const LooseError = error{ Malformed, OutOfMemory };
+const loose_max_depth = 32;
+
+fn looseSkipWs(body: []const u8, start: usize) usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+fn looseSkipWsCommas(body: []const u8, start: usize) usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ' ', '\t', '\n', '\r', ',' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+fn looseIsHex4(s: []const u8) bool {
+    if (s.len != 4) return false;
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn looseEmitObject(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) LooseError!usize {
+    if (depth > loose_max_depth) return error.Malformed;
+    var i = looseSkipWs(body, start);
+    if (i >= body.len or body[i] != '{') return error.Malformed;
+    i += 1;
+    try out.append(allocator, '{');
+    var first = true;
+    while (true) {
+        i = looseSkipWsCommas(body, i);
+        if (i >= body.len) return error.Malformed; // unterminated (not truncation-tolerant)
+        if (body[i] == '}') {
+            try out.append(allocator, '}');
+            return i + 1;
+        }
+        if (body[i] != '"') return error.Malformed; // key must be a string
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        i = try looseEmitString(allocator, out, body, i, .key);
+        i = looseSkipWs(body, i);
+        if (i >= body.len or body[i] != ':') return error.Malformed;
+        i += 1;
+        try out.append(allocator, ':');
+        i = try looseEmitValue(allocator, out, body, i, depth, .object_value);
+    }
+}
+
+fn looseEmitArray(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) LooseError!usize {
+    if (depth > loose_max_depth) return error.Malformed;
+    var i = looseSkipWs(body, start);
+    if (i >= body.len or body[i] != '[') return error.Malformed;
+    i += 1;
+    try out.append(allocator, '[');
+    var first = true;
+    while (true) {
+        i = looseSkipWsCommas(body, i);
+        if (i >= body.len) return error.Malformed;
+        if (body[i] == ']') {
+            try out.append(allocator, ']');
+            return i + 1;
+        }
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        i = try looseEmitValue(allocator, out, body, i, depth, .array_value);
+    }
+}
+
+fn looseEmitValue(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+    str_ctx: LooseStringCtx,
+) LooseError!usize {
+    const i = looseSkipWs(body, start);
+    if (i >= body.len) return error.Malformed;
+    return switch (body[i]) {
+        '"' => try looseEmitString(allocator, out, body, i, str_ctx),
+        '{' => try looseEmitObject(allocator, out, body, i, depth + 1),
+        '[' => try looseEmitArray(allocator, out, body, i, depth + 1),
+        else => try looseEmitScalar(allocator, out, body, i),
+    };
+}
+
+fn looseEmitScalar(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+) LooseError!usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ',', '}', ']', ' ', '\t', '\n', '\r' => break,
+            else => try out.append(allocator, body[i]),
+        }
+    }
+    if (i == start) return error.Malformed;
+    return i; // strict re-parse validates the token was a real number/bool/null
+}
+
+fn looseEmitString(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    ctx: LooseStringCtx,
+) LooseError!usize {
+    // body[start] == '"'
+    try out.append(allocator, '"');
+    var i = start + 1;
+    while (i < body.len) {
+        const c = body[i];
+        if (c == '\\') {
+            if (i + 1 >= body.len) {
+                try out.appendSlice(allocator, "\\\\"); // trailing backslash → literal
+                i += 1;
+                continue;
+            }
+            const n = body[i + 1];
+            switch (n) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {
+                    try out.append(allocator, '\\');
+                    try out.append(allocator, n);
+                    i += 2;
+                },
+                'u' => {
+                    if (i + 6 <= body.len and looseIsHex4(body[i + 2 .. i + 6])) {
+                        try out.appendSlice(allocator, body[i .. i + 6]);
+                        i += 6;
+                    } else {
+                        try out.appendSlice(allocator, "\\\\"); // invalid \u → literal backslash
+                        i += 1;
+                    }
+                },
+                else => {
+                    try out.appendSlice(allocator, "\\\\"); // invalid escape → literal backslash
+                    i += 1;
+                },
+            }
+            continue;
+        }
+        if (c == '"') {
+            const j = looseSkipWs(body, i + 1);
+            const is_close = switch (ctx) {
+                .key => j < body.len and body[j] == ':',
+                .object_value => j >= body.len or body[j] == ',' or body[j] == '}',
+                .array_value => j >= body.len or body[j] == ',' or body[j] == ']',
+            };
+            if (is_close) {
+                try out.append(allocator, '"');
+                return i + 1;
+            }
+            try out.appendSlice(allocator, "\\\""); // inner content quote → escape
+            i += 1;
+            continue;
+        }
+        if (c < 0x20) {
+            switch (c) {
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                0x08 => try out.appendSlice(allocator, "\\b"),
+                0x0c => try out.appendSlice(allocator, "\\f"),
+                else => {
+                    var buf: [6]u8 = undefined;
+                    const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try out.appendSlice(allocator, esc);
+                },
+            }
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, c);
+        i += 1;
+    }
+    // Ran off the end with no structural close — unterminated. The enclosing
+    // container won't find its close either → looseEmitObject returns Malformed
+    // and the whole recovery is discarded (truncation handled elsewhere). Emit
+    // a closing quote so the discarded buffer stays well-formed.
+    try out.append(allocator, '"');
+    return i;
+}
+
+fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedToolCall {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch blk: {
+        // Strict parse failed. Try a chain of repairs for known shapes:
+        //   1. {"name":"shell", {"command":"ls"}}           — missing `"arguments":` key entirely (Qwen MoE)
+        //   2. {"name":"shell", arguments":{"command":..}}   — missing OPENING quote on `arguments` (Qwen MoE)
+        //   3. {"name":"edit", "arguments": {…}]}            — truncated tail, final closer(s) dropped
+        //      before the close tag (DSV4-Flash, captured live)
+        // Repairs are cheap and run only on the parse-failure path.
+        if (repairBrokenToolCallJson(allocator, text)) |repaired| {
+            defer allocator.free(repaired);
+            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+                break :blk reparsed;
+            } else |_| {}
+        }
+        //   4. Mangled big-file content: raw control bytes (literal newlines/
+        //      tabs) and unescaped inner quotes inside a string value — what
+        //      small models emit when writing a large file in one shot. The
+        //      re-escaped copy is re-validated by the strict parse below, so a
+        //      mis-recovery that yields invalid JSON is silently discarded.
+        if (looseRepairToolCallJson(allocator, text)) |repaired| {
+            defer allocator.free(repaired);
+            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+                log.info("  [tool-parse] loose-repair recovered mangled tool-call JSON (raw control bytes / unescaped quotes)\n", .{});
+                break :blk reparsed;
+            } else |_| {}
+        }
+        const completed = completeUnbalancedJsonObject(allocator, text) orelse return null;
+        defer allocator.free(completed);
+        const reparsed = std.json.parseFromSlice(std.json.Value, allocator, completed, .{}) catch return null;
+        break :blk reparsed;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    var obj = parsed.value.object;
+
+    // Qwen 3.5/3.6 MoE sometimes emits nested-name garbage like
+    //   {"name":{"name":{"name":"write","arguments":{...}}}}
+    // Walk down through up to a few levels of nested "name" objects to find the
+    // leaf object that has a string name + arguments/parameters. Observed in the
+    // wild with pi + Qwen3.6-35B in non-thinking mode.
+    {
+        var depth: u8 = 0;
+        while (depth < 4) : (depth += 1) {
+            const nv = obj.get("name") orelse return null;
+            switch (nv) {
+                .string => break,
+                .object => |inner| obj = inner,
+                else => return null,
+            }
+        }
+    }
+
+    const name_val = obj.get("name") orelse return null;
+    if (name_val != .string) return null;
+
+    const args_str: []const u8 = blk: {
+        if (obj.get("arguments") orelse obj.get("parameters")) |args_val| {
+            break :blk switch (args_val) {
+                .object => std.json.Stringify.valueAlloc(allocator, args_val, .{}) catch return null,
+                .string => |s| allocator.dupe(u8, s) catch return null,
+                else => return null,
+            };
+        }
+        // Flat shape (e.g. Qwen MoE): {"name":"shell","command":"ls"} —
+        // parameters live at top level. Synthesize an arguments object from
+        // every non-metadata key.
+        var flat_map: std.json.ObjectMap = .empty;
+        defer flat_map.deinit(allocator);
+        var it = obj.iterator();
+        while (it.next()) |entry| {
+            const k = entry.key_ptr.*;
+            if (std.mem.eql(u8, k, "name") or
+                std.mem.eql(u8, k, "id") or
+                std.mem.eql(u8, k, "type"))
+            {
+                continue;
+            }
+            flat_map.put(allocator, k, entry.value_ptr.*) catch return null;
+        }
+        if (flat_map.count() == 0) return null;
+        const flat_value = std.json.Value{ .object = flat_map };
+        break :blk std.json.Stringify.valueAlloc(allocator, flat_value, .{}) catch return null;
+    };
+
+    return .{
+        .name = allocator.dupe(u8, name_val.string) catch {
+            allocator.free(args_str);
+            return null;
+        },
+        .arguments = args_str,
+    };
+}
+
+/// Run known Qwen-MoE-broken-JSON repairs in sequence; return the first
+/// successfully-repaired string (allocator-owned), or null if none match.
+fn repairBrokenToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    if (repairFlatBraceToolCallJson(allocator, text)) |s| return s;
+    if (repairUnquotedArgsKey(allocator, text)) |s| return s;
+    return null;
+}
+
+/// Repair `{"name":"x", arguments":{...}}` (missing OPENING quote on
+/// `arguments`/`parameters`) by injecting the quote.
+fn repairUnquotedArgsKey(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    // Look for the unquoted-key pattern. Both `arguments` and `parameters`
+    // have been observed; both are short fixed strings, so direct search is fine.
+    const candidates = [_][]const u8{ ", arguments\":", ",arguments\":", ", parameters\":", ",parameters\":" };
+    for (candidates) |needle| {
+        if (std.mem.indexOf(u8, trimmed, needle)) |at| {
+            const insert_at = at + 1; // right after the comma
+            // Skip leading whitespace after the comma so the injected `"` lands on the identifier.
+            var p = insert_at;
+            while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+            return std.fmt.allocPrint(allocator, "{s}\"{s}", .{ trimmed[0..p], trimmed[p..] }) catch null;
+        }
+    }
+    return null;
+}
+
+/// Repair the Qwen-MoE-broken shape `{"name":"x", {"k":"v"}}` by injecting
+/// the missing `"arguments":` key between the comma and the inner object.
+/// Returns an allocator-owned repaired JSON string, or null if the pattern
+/// doesn't match.
+fn repairFlatBraceToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\n\r");
+    if (trimmed.len < 4 or trimmed[0] != '{') return null;
+
+    // Locate `"name"` key.
+    const name_at = std.mem.indexOf(u8, trimmed, "\"name\"") orelse return null;
+    var p = name_at + 6;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != ':') return null;
+    p += 1;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != '"') return null;
+
+    // Skip the string value.
+    p += 1;
+    while (p < trimmed.len and trimmed[p] != '"') {
+        if (trimmed[p] == '\\' and p + 1 < trimmed.len) p += 2 else p += 1;
+    }
+    if (p >= trimmed.len) return null;
+    p += 1;
+
+    // Expect `, {` (any whitespace).
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t' or trimmed[p] == '\n')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != ',') return null;
+    p += 1;
+    while (p < trimmed.len and (trimmed[p] == ' ' or trimmed[p] == '\t' or trimmed[p] == '\n')) p += 1;
+    if (p >= trimmed.len or trimmed[p] != '{') return null;
+
+    return std.fmt.allocPrint(allocator, "{s}\"arguments\":{s}", .{ trimmed[0..p], trimmed[p..] }) catch null;
+}
+
+/// Strip one layer of outer braces from a `{{…}}`-wrapped JSON object. Models
+/// sometimes emit args with a doubled brace layer (a literal-brace artifact from
+/// Jinja `{{ }}` templates). Only touches strings that start with `{{` and end
+/// with `}}`, so well-formed single-brace JSON passes through unchanged.
+fn unwrapDoubleBraces(s: []const u8) []const u8 {
+    if (s.len >= 4 and std.mem.startsWith(u8, s, "{{") and std.mem.endsWith(u8, s, "}}")) {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
+/// Strip artifacts models sometimes append to a tool name — surrounding
+/// whitespace and a trailing ':' (Gemma 4 12B leaks one via its `call:NAME:`
+/// format). A valid OpenAI tool name matches `^[A-Za-z0-9_-]{1,64}$`, so a
+/// trailing colon is never legitimate and is always safe to drop.
+fn sanitizeToolName(raw: []const u8) []const u8 {
+    var name = std.mem.trim(u8, raw, " \t\n\r");
+    while (name.len > 0 and name[name.len - 1] == ':') {
+        name = std.mem.trim(u8, name[0 .. name.len - 1], " \t\n\r");
+    }
+    return name;
+}
+
+/// Parse Gemma 4 tool call format: "call:function_name{json_args}"
+/// `input_truncated`: the call had NO `<tool_call|>` close tag — the
+/// generation was cut (EOS mid-call, max_tokens, or the scheduler's
+/// degenerate-tail-loop guard). Under truncation, a value whose scan runs to
+/// end-of-body without its terminator is a FRAGMENT and is dropped (the
+/// Hermes-truncation rule: a half-written file is worse than a re-issued
+/// write); with the close tag present, behavior is byte-identical to before.
+fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8, input_truncated: bool) ?ParsedToolCall {
+    const prefix = "call:";
+    if (!std.mem.startsWith(u8, content, prefix)) return null;
+    const after_prefix = content[prefix.len..];
+
+    // Find the opening brace
+    const brace_pos = std.mem.indexOf(u8, after_prefix, "{") orelse return null;
+    const name = sanitizeToolName(after_prefix[0..brace_pos]);
+    if (name.len == 0) return null;
+
+    var args_str = after_prefix[brace_pos..];
+
+    // Gemma 4 uses {{ }} (double braces) for literal braces in Jinja templates.
+    // The model often generates {{"key":"value"}} — unwrap the outer braces.
+    args_str = unwrapDoubleBraces(args_str);
+
+    // Try JSON first (model sometimes outputs valid JSON arguments)
+    if (std.json.parseFromSlice(std.json.Value, allocator, args_str, .{})) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            return .{
+                .name = allocator.dupe(u8, name) catch return null,
+                .arguments = allocator.dupe(u8, args_str) catch return null,
+            };
+        }
+    } else |_| {}
+
+    // Strict JSON failed — but the model may have emitted standard JSON with
+    // mangled escaping (raw newlines / unescaped quotes in big content) rather
+    // than the custom <|"|> format. Recover that BEFORE the custom-format
+    // converter, which would garble standard JSON. looseRepair returns null for
+    // the bare-key `{key:<|"|>v<|"|>}` form, so the custom path still runs.
+    if (looseRepairToolCallJson(allocator, args_str)) |repaired| {
+        var keep = false;
+        defer if (!keep) allocator.free(repaired);
+        if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+            defer reparsed.deinit();
+            if (reparsed.value == .object) {
+                const name_owned = allocator.dupe(u8, name) catch return null;
+                keep = true;
+                log.info("  [tool-parse] loose-repair recovered mangled Gemma 4 tool-call JSON\n", .{});
+                return .{ .name = name_owned, .arguments = repaired };
+            }
+        } else |_| {}
+    }
+
+    // Convert Gemma 4 custom format to JSON:
+    // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
+    const json = convertGemma4ArgsToJson(allocator, args_str, input_truncated) orelse {
+        log.info("  [tool-parse] convertGemma4ArgsToJson FAILED for: {s}\n", .{args_str[0..@min(args_str.len, 200)]});
+        return null;
+    };
+    return .{
+        .name = allocator.dupe(u8, name) catch return null,
+        .arguments = json,
+    };
+}
+
+/// Convert Gemma 4's custom key-value format to JSON.
+/// Input:  {key:<|"|>value<|"|>,nested:{k:<|"|>v<|"|>},arr:[<|"|>a<|"|>]}
+/// Output: {"key":"value","nested":{"k":"v"},"arr":["a"]}
+///
+/// Gemma 4 emits its own object/array/string syntax (bare keys, `<|"|>…<|"|>`
+/// string delimiters) that can nest arbitrarily, so every value is converted
+/// recursively — see `convertGemma4Value`. Nested structures that already use
+/// valid JSON (regular `"…"` strings, numbers, bools, null) pass through
+/// unchanged. The args are always an object, with or without a literal `{…}`.
+fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8, input_truncated: bool) ?[]const u8 {
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    // `cut` = the truncation landed INSIDE a value somewhere below; the pair
+    // holding it has already been rolled back (fragment values never ship).
+    var cut = false;
+    _ = convertGemma4Object(allocator, &result, input, 0, 0, input_truncated, &cut) orelse return null;
+    return result.toOwnedSlice(allocator) catch return null;
+}
+
+const gemma4_str_delim = "<|\"|>";
+/// Recursion-depth guard against adversarial deeply-nested model output.
+const gemma4_max_depth = 64;
+
+fn gemma4SkipWs(body: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => break,
+        }
+    }
+    return pos;
+}
+
+fn gemma4SkipWsCommas(body: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            ' ', '\t', '\n', '\r', ',' => {},
+            else => break,
+        }
+    }
+    return pos;
+}
+
+/// Parse a Gemma 4 object beginning at `start` (an optional leading `{` is
+/// consumed; absent braces are tolerated so a brace-less body still parses).
+/// Appends the JSON object to `result`; returns the index just past it.
+fn convertGemma4Object(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+    input_truncated: bool,
+    cut: *bool,
+) ?usize {
+    if (depth >= gemma4_max_depth) return null;
+    var pos = gemma4SkipWs(body, start);
+    if (pos < body.len and body[pos] == '{') pos += 1;
+    result.append(allocator, '{') catch return null;
+
+    // Dedup keys within this object (a repeated key would make std.json reject
+    // the args with error.DuplicateField — same class as parseHermesToolCall's
+    // dup-param bug). Keys are slices into the stable input `body`.
+    var seen = std.ArrayList([]const u8).empty;
+    defer seen.deinit(allocator);
+
+    var closed = false;
+    var first = true;
+    while (pos < body.len) {
+        pos = gemma4SkipWsCommas(body, pos);
+        if (pos >= body.len) break;
+        if (body[pos] == '}') {
+            pos += 1;
+            closed = true;
+            break;
+        }
+
+        // Key: everything up to the first ':'.
+        const colon = std.mem.indexOfScalar(u8, body[pos..], ':') orelse break;
+        const key_raw = std.mem.trim(u8, body[pos .. pos + colon], " \t\n\r");
+        // Strip surrounding quotes if present (model sometimes quotes keys).
+        const key = if (key_raw.len >= 2 and key_raw[0] == '"' and key_raw[key_raw.len - 1] == '"')
+            key_raw[1 .. key_raw.len - 1]
+        else
+            key_raw;
+        pos = pos + colon + 1;
+
+        // Tentatively emit comma+key+value; roll back if this key is a dup. The
+        // value is still consumed (pos advances) so the dup's payload is skipped.
+        const mark = result.items.len;
+        if (!first) result.append(allocator, ',') catch return null;
+        // Escape the KEY — a raw `"`/control byte in the key would emit invalid
+        // JSON (the Gemma converter's output is not strict-re-validated).
+        appendJsonString(allocator, result, key) catch return null;
+        result.append(allocator, ':') catch return null;
+
+        pos = convertGemma4Value(allocator, result, body, pos, depth, input_truncated, cut) orelse return null;
+
+        // The truncation landed INSIDE this value — it is a fragment (partial
+        // file content, partial url) and must never ship as a real argument
+        // (the Hermes-truncation rule, extended to the Gemma arm 2026-07-14:
+        // php.html loop-stop capture). Roll the whole pair back; the scan
+        // consumed to end-of-body, so this object is done.
+        if (cut.*) {
+            result.shrinkRetainingCapacity(mark); // undo comma+key+value; keep `first`
+            break;
+        }
+
+        var is_dup = false;
+        for (seen.items) |s| {
+            if (std.mem.eql(u8, s, key)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) {
+            result.shrinkRetainingCapacity(mark); // undo comma+key+value; keep `first`
+            continue;
+        }
+        seen.append(allocator, key) catch return null;
+        first = false;
+    }
+
+    // A NESTED object the cut landed inside (it never saw its `}`) is itself a
+    // fragment — even when every pair inside completed, more were coming; the
+    // parent rolls the whole container back. The ROOT object (depth 0) is
+    // exempt: pairs completed before the cut are intact values and survive —
+    // only the value holding the cut drops.
+    if (input_truncated and depth > 0 and !closed) cut.* = true;
+
+    result.append(allocator, '}') catch return null;
+    return pos;
+}
+
+/// Parse a Gemma 4 array beginning at `start` (`body[start] == '['`). Appends
+/// the JSON array to `result`; returns the index just past it.
+fn convertGemma4Array(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+    input_truncated: bool,
+    cut: *bool,
+) ?usize {
+    if (depth >= gemma4_max_depth) return null;
+    var pos = start + 1; // consume '['
+    result.append(allocator, '[') catch return null;
+
+    var closed = false;
+    var first = true;
+    while (pos < body.len) {
+        pos = gemma4SkipWsCommas(body, pos);
+        if (pos >= body.len) break;
+        if (body[pos] == ']') {
+            pos += 1;
+            closed = true;
+            break;
+        }
+        if (!first) result.append(allocator, ',') catch return null;
+        first = false;
+        pos = convertGemma4Value(allocator, result, body, pos, depth, input_truncated, cut) orelse return null;
+        // Fragment below: stop consuming; the parent object rolls the whole
+        // container pair back, so no local cleanup is needed.
+        if (cut.*) break;
+    }
+
+    // Same fragment rule as nested objects: an unclosed array under truncation
+    // is a partial LIST — more elements were coming (a partial edits[] applies
+    // fragmentary work, the same hazard as partial file content).
+    if (input_truncated and !closed) cut.* = true;
+
+    result.append(allocator, ']') catch return null;
+    return pos;
+}
+
+/// Convert one Gemma 4 value (custom string / JSON string / object / array /
+/// bare literal) beginning at `start`. String branches are checked first so
+/// braces inside a string stay string content. Returns the index past it.
+fn convertGemma4Value(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+    input_truncated: bool,
+    cut: *bool,
+) ?usize {
+    var pos = gemma4SkipWs(body, start);
+    if (pos >= body.len) {
+        // `key:` then end-of-body. Under truncation the value is a fragment
+        // that never arrived — drop the pair (pre-fix this shipped
+        // {"path":""} and a client would act on the bogus empty value).
+        if (input_truncated) {
+            cut.* = true;
+            return pos;
+        }
+        result.appendSlice(allocator, "\"\"") catch return null;
+        return pos;
+    }
+
+    // Gemma custom string: <|"|>…<|"|> (closing delimiter may be missing if
+    // the model output was truncated).
+    if (pos + gemma4_str_delim.len <= body.len and
+        std.mem.eql(u8, body[pos .. pos + gemma4_str_delim.len], gemma4_str_delim))
+    {
+        pos += gemma4_str_delim.len;
+        const end_idx = std.mem.indexOf(u8, body[pos..], gemma4_str_delim);
+        const value = if (end_idx) |e| body[pos .. pos + e] else blk: {
+            // Closing <|"|> missing.
+            if (input_truncated) {
+                // The call itself was cut (no <tool_call|>): the truncation
+                // landed INSIDE this string — a fragment (partial file
+                // content, partial url) that must never ship as a real
+                // argument (live 2026-07-14 php.html: the loop-stop guard cut
+                // a write call mid-`content` and the 1.1 KB fragment shipped).
+                cut.* = true;
+                return body.len;
+            }
+            // Complete call (close tag present), delimiter just dropped: a
+            // plain to-end-of-body scan swallows the args object's own `}`
+            // and any stray fence garbage the model tacked on — a real write
+            // call reached disk as "mlx_pi1.html`}". Trim one trailing `}`
+            // (the enclosing object's closer) plus backtick/whitespace junk.
+            var v = std.mem.trimEnd(u8, body[pos..], " \t\n\r");
+            if (std.mem.endsWith(u8, v, "}")) v = v[0 .. v.len - 1];
+            v = std.mem.trimEnd(u8, v, "` \t\n\r");
+            break :blk v;
+        };
+        pos = if (end_idx) |e|
+            pos + e + gemma4_str_delim.len
+        else
+            body.len;
+        appendJsonString(allocator, result, value) catch return null;
+        return pos;
+    }
+
+    // Regular JSON string: already valid, copy verbatim (respecting \" escapes).
+    if (body[pos] == '"') {
+        var end = pos + 1;
+        var closed_quote = false;
+        while (end < body.len) : (end += 1) {
+            if (body[end] == '\\' and end + 1 < body.len) {
+                end += 1;
+                continue;
+            }
+            if (body[end] == '"') {
+                closed_quote = true;
+                end += 1;
+                break;
+            }
+        }
+        // Unclosed JSON string at end-of-body under truncation: same fragment
+        // rule — and copying it verbatim would emit an UNCLOSED string, i.e.
+        // invalid JSON that only the {}-fallback safety net could catch.
+        if (!closed_quote and input_truncated) {
+            cut.* = true;
+            return body.len;
+        }
+        result.appendSlice(allocator, body[pos..end]) catch return null;
+        return end;
+    }
+
+    if (body[pos] == '{') return convertGemma4Object(allocator, result, body, pos, depth + 1, input_truncated, cut);
+    if (body[pos] == '[') return convertGemma4Array(allocator, result, body, pos, depth + 1, input_truncated, cut);
+
+    // Bare value — a JSON literal (number/bool/null) terminates at the
+    // enclosing separator and is emitted verbatim.
+    const sep_rel = std.mem.indexOfAny(u8, body[pos..], ",}]");
+    const first_sep = sep_rel orelse (body.len - pos);
+    const head = std.mem.trim(u8, body[pos .. pos + first_sep], " \t\n\r");
+    if (isJsonLiteral(head)) {
+        // A literal that ran to end-of-body under truncation has no
+        // terminator either — uniform fragment rule (a cut `5` may have been
+        // `50`; the client re-asks and gets the real value).
+        if (sep_rel == null and input_truncated) {
+            cut.* = true;
+            return body.len;
+        }
+        result.appendSlice(allocator, head) catch return null;
+        return pos + first_sep;
+    }
+
+    // Unquoted STRING. The bare scan above stops at the first `,`/`}`/`]`, which
+    // truncates rich content (HTML/markdown) that legitimately contains those
+    // bytes. Observed live on gemma-4-e4b-it writing a full page: it dropped the
+    // OPENING <|"|> on `content` but kept the CLOSING one
+    // (`content:<!DOCTYPE…>…</html><|"|>,path:…`), so content got cut at the
+    // viewport meta's comma and the rest became bogus keys → invalid args. Only
+    // rich content (multi-line or markup) gets the wider scan; a plain short
+    // bare token keeps the first-separator behavior so it can't swallow a
+    // sibling field (e.g. `command:ls -la`).
+    const rich = std.mem.indexOfScalar(u8, head, '\n') != null or
+        std.mem.indexOfScalar(u8, head, '<') != null;
+    if (rich) {
+        // Prefer a CLOSING <|"|> as the boundary (dropped-opener case). Confirm
+        // it's a closer — the byte after it (past whitespace) must be a
+        // separator/closer — so a LATER field's OPENING delimiter isn't grabbed.
+        if (std.mem.indexOf(u8, body[pos..], gemma4_str_delim)) |close_rel| {
+            const after = gemma4SkipWs(body, pos + close_rel + gemma4_str_delim.len);
+            const is_closer = after >= body.len or body[after] == ',' or body[after] == '}' or body[after] == ']';
+            if (is_closer) {
+                const value = std.mem.trim(u8, body[pos .. pos + close_rel], " \t\n\r");
+                appendJsonString(allocator, result, value) catch return null;
+                return pos + close_rel + gemma4_str_delim.len;
+            }
+        }
+        // No usable closing delimiter at all. Under truncation the rest of the
+        // body IS the fragment: consuming to the first comma would ship a
+        // partial value AND shred the remainder into bogus keys, and the
+        // last-`}` heuristic below would cut a truncated page at some interior
+        // CSS brace — drop the whole value instead.
+        if (input_truncated) {
+            cut.* = true;
+            return body.len;
+        }
+        // Complete call, both delimiters dropped. At the TOP level the value
+        // runs to the object's closing `}` (the last one); nested values keep
+        // the narrow scan since the outer `}` isn't theirs.
+        if (depth == 0) {
+            if (std.mem.lastIndexOfScalar(u8, body, '}')) |last_brace| {
+                if (last_brace > pos) {
+                    const value = std.mem.trim(u8, body[pos..last_brace], " \t\n\r");
+                    appendJsonString(allocator, result, value) catch return null;
+                    return last_brace;
+                }
+            }
+        }
+    }
+
+    // A short bare string that ran to end-of-body under truncation is a
+    // fragment too (`command:ls -la` cut mid-flags) — uniform rule.
+    if (sep_rel == null and input_truncated) {
+        cut.* = true;
+        return body.len;
+    }
+
+    // Plain short bare string — terminate at the first separator (unchanged).
+    appendJsonString(allocator, result, head) catch return null;
+    return pos + first_sep;
+}
+
+/// End of a `<parameter=…>` value: the LAST `</parameter>` before the next opener (a value may
+/// spell its own close tag); an unclosed parameter falls back to the first close.
+fn hermesValueEnd(body: []const u8, val_start: usize) ?usize {
+    const bound = std.mem.indexOfPos(u8, body, val_start, "<parameter=") orelse body.len;
+    var best: ?usize = null;
+    var i = val_start;
+    while (std.mem.indexOfPos(u8, body, i, "</parameter>")) |at| {
+        if (at >= bound) break;
+        best = at;
+        i = at + 1;
+    }
+    return best orelse std.mem.indexOfPos(u8, body, val_start, "</parameter>");
+}
+
+/// If `at` falls inside a `<parameter=…>` value, the position just past that value's close; else null.
+fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
+    const open = std.mem.lastIndexOf(u8, body[0..at], "<parameter=") orelse return null;
+    const gt = std.mem.indexOfScalarPos(u8, body, open, '>') orelse return null;
+    if (gt >= at) return null;
+    const end = hermesValueEnd(body, gt + 1) orelse return null;
+    if (end <= at) return null;
+    return end + "</parameter>".len;
+}
+
+fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
+    const fn_start_tag = "<function=";
+    const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
+    var name_start = fn_start + fn_start_tag.len;
+    while (name_start < block.len and std.ascii.isWhitespace(block[name_start])) name_start += 1;
+    // A name never spans a line or a tag: a newline or `<` before the `>` means the model
+    // dropped the `>`, so the name ends there and the body starts there.
+    const name_end = std.mem.indexOfAnyPos(u8, block, name_start, ">\n\r<") orelse return null;
+    const fn_name = std.mem.trim(u8, block[name_start..name_end], " \t");
+    if (!isPlausibleParamName(fn_name)) return null;
+
+    var args_map = std.ArrayList(u8).empty;
+    defer args_map.deinit(allocator);
+    args_map.append(allocator, '{') catch return null;
+
+    const fn_body_start = if (block[name_end] == '>') name_end + 1 else name_end;
+    const fn_end = blk: {
+        var from = fn_body_start;
+        while (std.mem.indexOfPos(u8, block, from, "</function>")) |found| {
+            if (hermesParamSpanEnclosing(block, found)) |past| {
+                from = past;
+                continue;
+            }
+            break :blk found - fn_body_start;
+        }
+        break :blk block.len - fn_body_start;
+    };
+    const fn_body = block[fn_body_start .. fn_body_start + fn_end];
+    // Qwen3.8 frames the body and every value with newlines; MiMo writes both bare,
+    // so there a value's edge newlines are its own bytes.
+    const framed = std.mem.startsWith(u8, fn_body, "\n") or std.mem.startsWith(u8, fn_body, "\r\n");
+
+    // Track emitted parameter names so a repeated `<parameter=NAME>` can't
+    // produce a duplicate JSON key (std.json rejects those with DuplicateField —
+    // invalid JSON to the client; live soak record 443, a 0.8B model emitting two
+    // `<parameter=edits>` blocks). First occurrence wins.
+    var seen_names = std.ArrayList([]const u8).empty;
+    defer seen_names.deinit(allocator);
+
+    var param_search: usize = 0;
+    var first_param = true;
+    while (std.mem.indexOf(u8, fn_body[param_search..], "<parameter=")) |ps| {
+        const p_name_start = param_search + ps + "<parameter=".len;
+        const p_name_end = std.mem.indexOf(u8, fn_body[p_name_start..], ">") orelse break;
+        const p_name = std.mem.trim(u8, fn_body[p_name_start .. p_name_start + p_name_end], " \n");
+
+        // A well-formed `<parameter=NAME>` name is a clean token. When the model
+        // malforms the tag — e.g. `<parameter=limit=1` with no closing `>` — the
+        // `>`-scan spills across a newline into `</parameter`, and interpolating
+        // that raw would emit INVALID JSON (live soak record 317). Detect the
+        // malformed name and skip just this opener, so the well-formed sibling
+        // parameter after it is still recovered. Advancing to p_name_start (past
+        // the `<parameter=` we matched) guarantees forward progress.
+        if (!isPlausibleParamName(p_name)) {
+            param_search = p_name_start;
+            continue;
+        }
+
+        const p_val_start = p_name_start + p_name_end + 1;
+        const p_val_end = (hermesValueEnd(fn_body, p_val_start) orelse break) - p_val_start;
+        const raw_val = fn_body[p_val_start .. p_val_start + p_val_end];
+        const p_val = if (framed) stripHermesValueFraming(raw_val) else raw_val;
+
+        // Skip a duplicate name (first wins); still advance past its block.
+        var dup = false;
+        for (seen_names.items) |seen| {
+            if (std.mem.eql(u8, seen, p_name)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            param_search = p_val_start + p_val_end + "</parameter>".len;
+            continue;
+        }
+        seen_names.append(allocator, p_name) catch return null;
+
+        if (!first_param) args_map.append(allocator, ',') catch return null;
+        first_param = false;
+
+        // Escape the NAME too — belt-and-braces so no parameter name can ever
+        // produce invalid JSON, even if a future malformed shape slips the guard.
+        appendJsonString(allocator, &args_map, p_name) catch return null;
+        args_map.append(allocator, ':') catch return null;
+
+        // Whitespace around a NUMBER/BOOLEAN/null carries no meaning, so a
+        // padded scalar is still typed from its spelling. A STRING's own
+        // whitespace is PAYLOAD and ships verbatim: an `old_string` must match
+        // the file "exactly, including indentation", and trimming it either
+        // failed the edit or — worse — matched a different, un-indented
+        // occurrence mid-line. Only the template framing is removed.
+        const literal_val = std.mem.trim(u8, p_val, " \t\r\n");
+        if (isJsonLiteral(literal_val)) {
+            args_map.appendSlice(allocator, literal_val) catch return null;
+        } else {
+            appendJsonString(allocator, &args_map, p_val) catch return null;
+        }
+
+        param_search = p_val_start + p_val_end + "</parameter>".len;
+    }
+
+    args_map.append(allocator, '}') catch return null;
+
+    return .{
+        .name = allocator.dupe(u8, fn_name) catch return null,
+        .arguments = allocator.dupe(u8, args_map.items) catch return null,
+    };
+}
+
+/// The Hermes/Qwen XML tool-call template frames a parameter value with EXACTLY
+/// one newline on each side (`<parameter=NAME>\nVALUE\n</parameter>` — pinned by the
+/// Qwen3.8 render test in this file), so exactly that framing is what the parser
+/// may remove. Everything else between the tags is the value's own bytes: eating
+/// a run of newlines, or the spaces an `old_string` needs to match a file
+/// "exactly, including indentation", silently mis-edits.
+fn stripHermesValueFraming(raw: []const u8) []const u8 {
+    var v = raw;
+    if (std.mem.startsWith(u8, v, "\r\n")) {
+        v = v[2..];
+    } else if (std.mem.startsWith(u8, v, "\n")) {
+        v = v[1..];
+    }
+    if (std.mem.endsWith(u8, v, "\r\n")) {
+        v = v[0 .. v.len - 2];
+    } else if (std.mem.endsWith(u8, v, "\n")) {
+        v = v[0 .. v.len - 1];
+    }
+    return v;
+}
+
+/// MiniCPM5 V3 XML tool calls — attribute-quoted, one call per `<function>`
+/// tag, no outer wrapper:
+///   <function name="shell">
+///     <param name="command">pwd</param>
+///   </function>
+/// Multiple calls appear as consecutive `<function name="…">…</function>`
+/// blocks. A `<param>` value may be CDATA-wrapped
+/// (`<param name="x"><![CDATA[ … ]]></param>`) — the payload is used
+/// verbatim. This is its own scan, not part of the generic `<tool` family or
+/// the equals-sign Hermes function-tag scan just above (`<function=NAME>`):
+/// the marker is `<function` followed by WHITESPACE (the attribute form),
+/// which the equals-sign form never produces (its char right after
+/// `<function` is always `=`), so the two can never false-fire on each
+/// other. Duplicate `<param name="K">` — first occurrence wins, mirroring
+/// `parseHermesToolCall`'s `<parameter=>` dedup and `parseArgKeyToolCalls`'s
+/// `<arg_key>` dedup (both exist because std.json rejects duplicate object
+/// keys). An unrecognized function name or an undeclared parameter is never
+/// rejected here — schema validation is centralized downstream
+/// (`toolCallConformsToSchema` et al., `src/server.zig`'s
+/// `parseToolCallsForRequest`), exactly as for every other tag-format
+/// dialect. Truncation (EOS or max_tokens mid-call): when no `</function>`
+/// close is found, the param scan is bounded by end-of-text instead — any
+/// COMPLETE `<param>…</param>` pairs before the cut still recover (mirrors
+/// `parseArgKeyToolCalls`'s `call_end` fallback); a partial trailing value is
+/// never salvaged.
+fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "<function")) |p| {
+        const after = p + "<function".len;
+        // The attribute form requires whitespace right after `<function` —
+        // anything else is the equals-sign Hermes form or unrelated text
+        // (e.g. `<functional>`), left for that scan / plain content.
+        if (after >= text.len or !std.ascii.isWhitespace(text[after])) {
+            pos = after;
+            continue;
+        }
+        const tag_end = std.mem.indexOfScalarPos(u8, text, after, '>') orelse {
+            pos = text.len; // Unterminated opening tag — nothing left to recover.
+            break;
+        };
+        const open_tag = text[after..tag_end];
+        const fn_name = miniCpm5AttrValue(open_tag, "name") orelse {
+            // No `name="…"` attribute — not a recognizable MiniCPM5 call.
+            pos = tag_end + 1;
+            continue;
+        };
+        if (fn_name.len == 0) {
+            pos = tag_end + 1;
+            continue;
+        }
+
+        const body_start = tag_end + 1;
+        const close_pos = miniCpm5FindCloseTag(text, body_start, "</function>");
+        const body_end = if (close_pos) |cp| cp else text.len;
+        const body = text[body_start..body_end];
+
+        var args_map: std.json.ObjectMap = .empty;
+        defer args_map.deinit(allocator);
+
+        var pscan: usize = 0;
+        while (std.mem.indexOfPos(u8, body, pscan, "<param")) |pp| {
+            const p_after = pp + "<param".len;
+            if (p_after >= body.len or !std.ascii.isWhitespace(body[p_after])) {
+                pscan = p_after;
+                continue;
+            }
+            const p_tag_end = std.mem.indexOfScalarPos(u8, body, p_after, '>') orelse break;
+            const p_open_tag = body[p_after..p_tag_end];
+            const p_name = miniCpm5AttrValue(p_open_tag, "name") orelse {
+                pscan = p_tag_end + 1;
+                continue;
+            };
+            const p_val_start = p_tag_end + 1;
+            const p_close_pos = miniCpm5FindCloseTag(body, p_val_start, "</param>") orelse break;
+            const value = miniCpm5ParamValue(body[p_val_start..p_close_pos]);
+
+            if (p_name.len > 0 and args_map.getEntry(p_name) == null) {
+                try args_map.put(allocator, p_name, .{ .string = value });
+            }
+            pscan = p_close_pos + "</param>".len;
+        }
+
+        // An UNCLOSED function is salvaged only with EVIDENCE that a call was
+        // really under way: a completed `<param>…</param>`, or at minimum a
+        // `<param` opener. Without that, a model merely WRITING ABOUT the
+        // syntax ("you write <function name=\"shell\"> to open a call") is
+        // promoted into an executable `shell({})` — an unintended invocation
+        // for a zero-arg tool, a bogus call replacing the answer otherwise.
+        //
+        // The `<param` opener half is NOT belt-and-braces; it is required by a
+        // real capture. MiniCPM5-1B-OptiQ-4bit at max_tokens=12 emits exactly:
+        //     <function name="shell"><param name="command">git status
+        // — a genuine truncated call with ZERO completed params. Demanding a
+        // COMPLETE pair discarded it. Prose naming a function carries no
+        // `<param` at all, so the two stay separable.
+        //
+        // A properly CLOSED call is untouched either way, including the
+        // zero-argument form `<function name="get_time"></function>`, which the
+        // same model emits verbatim: its `</function>` is the model's own
+        // commitment that the call is complete.
+        if (close_pos == null and args_map.count() == 0 and
+            std.mem.indexOf(u8, body, "<param") == null)
+        {
+            pos = text.len;
+            continue;
+        }
+
+        const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+        errdefer allocator.free(args_str);
+        const name_owned = try allocator.dupe(u8, fn_name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+        pos = if (close_pos) |cp| cp + "</function>".len else text.len;
+    }
+}
+
+/// Find `close_tag` (`</param>` or `</function>`) starting at `from`,
+/// skipping over the payload of any `<![CDATA[ … ]]>` span encountered along
+/// the way. A CDATA payload may legitimately contain the literal closing-tag
+/// text — e.g. a `write_file` call whose content documents this very XML
+/// format, or writes an unrelated `</param>`-shaped snippet — and CDATA's
+/// whole purpose is to carry such content safely; a naive substring search
+/// would truncate the value/call at that inner occurrence. An unterminated
+/// CDATA open (no matching `]]>`) has no knowable end, so the search gives
+/// up (null) rather than guess — the caller's existing truncation path
+/// already treats "no close found" as EOS/max_tokens truncation.
+fn miniCpm5FindCloseTag(haystack: []const u8, from: usize, close_tag: []const u8) ?usize {
+    var i = from;
+    while (true) {
+        const cdata_at = std.mem.indexOfPos(u8, haystack, i, "<![CDATA[");
+        const close_at = std.mem.indexOfPos(u8, haystack, i, close_tag);
+        if (cdata_at) |cd| {
+            if (close_at == null or cd < close_at.?) {
+                const payload_start = cd + "<![CDATA[".len;
+                const end_pos = std.mem.indexOfPos(u8, haystack, payload_start, "]]>") orelse return null;
+                i = end_pos + "]]>".len;
+                continue;
+            }
+        }
+        return close_at;
+    }
+}
+
+/// Extract `key="value"` or `key='value'` from an opening tag's attribute
+/// span (the text strictly between the tag name and its closing `>`).
+/// Requires a word boundary before `key` so `data-name=` can't match `name=`.
+/// An unquoted `key=value` is malformed (MiniCPM5 always quotes) and yields
+/// null, same as a missing key.
+fn miniCpm5AttrValue(tag_attrs: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [40]u8 = undefined;
+    if (key.len + 1 > buf.len) return null;
+    const needle = std.fmt.bufPrint(&buf, "{s}=", .{key}) catch return null;
+    var search_from: usize = 0;
+    while (std.mem.indexOf(u8, tag_attrs[search_from..], needle)) |rel| {
+        const at = search_from + rel;
+        if (at > 0) {
+            const before = tag_attrs[at - 1];
+            if (std.ascii.isAlphanumeric(before) or before == '_' or before == '-') {
+                search_from = at + needle.len;
+                continue;
+            }
+        }
+        const q_pos = at + needle.len;
+        if (q_pos >= tag_attrs.len) return null;
+        const quote = tag_attrs[q_pos];
+        if (quote != '"' and quote != '\'') {
+            search_from = q_pos;
+            continue;
+        }
+        const val_start = q_pos + 1;
+        const val_end_rel = std.mem.indexOfScalar(u8, tag_attrs[val_start..], quote) orelse return null;
+        return tag_attrs[val_start .. val_start + val_end_rel];
+    }
+    return null;
+}
+
+/// Resolve a `<param>` body to its final value. CDATA form
+/// (`<![CDATA[ … ]]>`, detected after trimming incidental surrounding
+/// whitespace) yields its payload byte-exact and unfiltered — CDATA's whole
+/// purpose is to carry content verbatim. Otherwise it reuses
+/// `stripHermesValueFraming`, removing at most ONE newline per side.
+/// This is a deliberately CONSERVATIVE choice. Captured MiniCPM5-1B-OptiQ-4bit
+/// output is VALUE-ADJACENT — `<param name="command">git status</param>`, no
+/// framing newlines at all — so on real emissions this strip is a no-op and the
+/// question is moot. It exists for the newline-framed layout, which the fixtures
+/// use but which no capture has yet shown; removing at most one newline per side
+/// is the least-lossy reading if that layout is ever emitted. Trimming a RUN, which is what
+/// this did first, eats blank lines the value itself carries - the
+/// indentation-destroying class fixed upstream for `<parameter=>`. Interior and
+/// space-only padding (shell flags, indentation) are kept either way.
+fn miniCpm5ParamValue(raw: []const u8) []const u8 {
+    const probe = std.mem.trim(u8, raw, " \t\n\r");
+    const cdata_open = "<![CDATA[";
+    const cdata_close = "]]>";
+    if (std.mem.startsWith(u8, probe, cdata_open) and std.mem.endsWith(u8, probe, cdata_close)) {
+        // The close must END the probe. Keying on the LAST `]]>` anywhere let
+        // `<![CDATA[x]]>tail` return just `x` — silently discarding character
+        // data the model sent. A section that does not end the value is not a
+        // CDATA-wrapped value; fall through and treat the whole thing as text.
+        const inner = probe[cdata_open.len .. probe.len - cdata_close.len];
+        return inner;
+    }
+    return stripHermesValueFraming(raw);
+}
+
+/// A parameter name from a well-formed `<parameter=NAME>` tag is a short token
+/// with no whitespace or markup. Reject names carrying a newline, angle bracket,
+/// quote, or whitespace — those signal the `>`-scan spilled past a malformed tag.
+fn isPlausibleParamName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    for (name) |c| {
+        switch (c) {
+            '\n', '\r', '\t', ' ', '<', '>', '"' => return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+fn isJsonLiteral(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
+    // Objects/arrays are handled by brace-matching in the caller, not here
+    return isJsonNumber(s);
+}
+
+/// JSON's number grammar; `parseFloat` is wider (`Infinity`, `0755`, `.5`) and the literal is spliced UNQUOTED.
+fn isJsonNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+    if (s[i] == '0') {
+        i += 1;
+    } else {
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i >= s.len or !std.ascii.isDigit(s[i])) return false;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    }
+    return i == s.len;
 }
 
 /// One UTF-8 sequence starting at `i`: `valid` = well-formed, else `end` is the maximal
@@ -1500,13 +7172,163 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     try buf.append(allocator, '"');
 }
 
+/// A request's `tool_choice`, read from any surface's wire shape: chat nests the
+/// name under `function`, Responses and Anthropic carry it flat, Anthropic
+/// spells required `any`. Anything unrecognised is `auto`.
+pub const ToolChoice = union(enum) {
+    auto,
+    none,
+    required,
+    named: []const u8,
+
+    /// The prompt-side instruction of a forced choice; null for auto and none.
+    pub fn instruction(self: ToolChoice, allocator: std.mem.Allocator) !?[]u8 {
+        return switch (self) {
+            .auto, .none => null,
+            .required => try allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text."),
+            .named => |name| try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name}),
+        };
+    }
+};
+
+pub fn parseToolChoice(value: ?std.json.Value) ToolChoice {
+    const v = value orelse return .auto;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "none")) return .none;
+            if (std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any")) return .required;
+            return .auto;
+        },
+        .object => |obj| {
+            const kind = if (obj.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (std.mem.eql(u8, kind, "none")) return .none;
+            if (std.mem.eql(u8, kind, "any") or std.mem.eql(u8, kind, "required")) return .required;
+            const holder = if (obj.get("function")) |f| (if (f == .object) f.object else obj) else obj;
+            const name = holder.get("name") orelse return .auto;
+            if (name != .string or name.string.len == 0) return .auto;
+            return .{ .named = name.string };
+        },
+        else => return .auto,
+    }
+}
+
+/// Every function name the OpenAI-shaped tools array declares, in order; empty
+/// when it does not parse. Strings live in `arena`.
+pub fn declaredToolNames(arena: std.mem.Allocator, tools_json: []const u8) ![]const []const u8 {
+    const tools = std.json.parseFromSliceLeaky(std.json.Value, arena, tools_json, .{}) catch return &.{};
+    if (tools != .array) return &.{};
+    var names = std.ArrayList([]const u8).empty;
+    for (tools.array.items) |tool| {
+        if (tool != .object) continue;
+        const holder = if (tool.object.get("function")) |f| (if (f == .object) f.object else tool.object) else tool.object;
+        const name = holder.get("name") orelse continue;
+        if (name == .string and name.string.len > 0) try names.append(arena, name.string);
+    }
+    return names.toOwnedSlice(arena);
+}
+
+/// A named choice for a function the request never declared cannot be honoured.
+pub fn toolChoiceNamesUndeclared(allocator: std.mem.Allocator, choice: ToolChoice, tools_json: ?[]const u8) bool {
+    const name = switch (choice) {
+        .named => |n| n,
+        else => return false,
+    };
+    return !toolNameIsDeclared(allocator, tools_json orelse "[]", name);
+}
+
+/// Append tool definitions as a system prompt section.
+fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
+    try result_buf.appendSlice(allocator,
+        \\You are a helpful assistant with access to the following functions. To call a function, respond with a JSON object in the following format:
+        \\<tool_call>
+        \\{"name": "function_name", "arguments": {"arg1": "value1"}}
+        \\</tool_call>
+        \\
+        \\Available functions:
+        \\
+    );
+    try result_buf.appendSlice(allocator, tools_json);
+    if (tool_choice_instruction) |instr| {
+        try result_buf.appendSlice(allocator, instr);
+    }
+}
+
 // ── Tests ──
 
 const testing = std.testing;
 
+test "parseToolChoice reads every surface's wire shape" {
+    const Case = struct { json: []const u8, want: ToolChoice };
+    const cases = [_]Case{
+        // OpenAI chat completions
+        .{ .json = "\"auto\"", .want = .auto },
+        .{ .json = "\"none\"", .want = .none },
+        .{ .json = "\"required\"", .want = .required },
+        .{ .json = "{\"type\":\"function\",\"function\":{\"name\":\"get_time\"}}", .want = .{ .named = "get_time" } },
+        // OpenAI Responses
+        .{ .json = "{\"type\":\"function\",\"name\":\"get_time\"}", .want = .{ .named = "get_time" } },
+        .{ .json = "{\"type\":\"allowed_tools\",\"mode\":\"auto\"}", .want = .auto },
+        // Anthropic messages
+        .{ .json = "{\"type\":\"auto\"}", .want = .auto },
+        .{ .json = "{\"type\":\"none\"}", .want = .none },
+        .{ .json = "{\"type\":\"any\",\"disable_parallel_tool_use\":true}", .want = .required },
+        .{ .json = "{\"type\":\"tool\",\"name\":\"get_time\"}", .want = .{ .named = "get_time" } },
+        // A named choice with no usable name forces nothing.
+        .{ .json = "{\"type\":\"tool\"}", .want = .auto },
+        .{ .json = "{\"type\":\"function\",\"function\":{\"name\":\"\"}}", .want = .auto },
+        .{ .json = "7", .want = .auto },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.json, .{});
+        defer parsed.deinit();
+        try testing.expectEqualDeep(c.want, parseToolChoice(parsed.value));
+    }
+    try testing.expectEqualDeep(ToolChoice.auto, parseToolChoice(null));
+}
+
+test "a named tool_choice must name a declared tool" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","parameters":{}}}]
+    ;
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .{ .named = "get_time" }, tools));
+    try testing.expect(toolChoiceNamesUndeclared(allocator, .{ .named = "rm_rf" }, tools));
+    try testing.expect(toolChoiceNamesUndeclared(allocator, .{ .named = "get_time" }, null));
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .required, tools));
+    try testing.expect(!toolChoiceNamesUndeclared(allocator, .auto, null));
+}
+
+test "declaredToolNames lists every function a tools array declares, in order" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const names = try declaredToolNames(allocator,
+        \\[{"type":"function","function":{"name":"get_time"}},{"name":"flat_tool"},{"type":"function","function":{}},{"type":"function","function":{"name":"get_weather"}}]
+    );
+    try testing.expectEqual(@as(usize, 3), names.len);
+    try testing.expectEqualStrings("get_time", names[0]);
+    try testing.expectEqualStrings("flat_tool", names[1]);
+    try testing.expectEqualStrings("get_weather", names[2]);
+    try testing.expectEqual(@as(usize, 0), (try declaredToolNames(allocator, "not json")).len);
+}
+
+test "only a forced tool_choice carries a prompt instruction" {
+    const allocator = testing.allocator;
+    try testing.expect(try (ToolChoice{ .auto = {} }).instruction(allocator) == null);
+    try testing.expect(try (ToolChoice{ .none = {} }).instruction(allocator) == null);
+
+    const any = (try (ToolChoice{ .required = {} }).instruction(allocator)).?;
+    defer allocator.free(any);
+    try testing.expectEqualStrings("\nYou MUST call one of the available functions. Do not respond with text.", any);
+
+    const one = (try (ToolChoice{ .named = "get_time" }).instruction(allocator)).?;
+    defer allocator.free(one);
+    try testing.expectEqualStrings("\nYou MUST call the function \"get_time\". Do not respond with text.", one);
+}
+
 /// src/fixtures/mimo_v26_chat_template.jinja is the `chat_template` of
 /// XiaomiMiMo/MiMo-V2.6-Flash-RL's tokenizer_config.json, verbatim.
-pub fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
+fn mimoTemplateConfig(allocator: std.mem.Allocator) ChatConfig {
     return .{
         .chat_template = @embedFile("fixtures/mimo_v26_chat_template.jinja"),
         .bos_token = null,
@@ -1521,6 +7343,30 @@ test "real mimo_v2 template is the committed fixture" {
     var config = try loadChatConfig(testing.io, testing.allocator, std.mem.span(raw));
     defer config.deinit();
     try testing.expectEqualStrings(@embedFile("fixtures/mimo_v26_chat_template.jinja"), config.chat_template);
+}
+
+test "mimo_v2 template preserves reasoning and XML tool history" {
+    const a = testing.allocator;
+    var config = mimoTemplateConfig(a);
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "sum", .arguments = "{\"x\":2}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Compute." },
+        .{ .role = "assistant", .content = "", .reasoning_content = "Use sum.", .tool_calls = &calls },
+        .{ .role = "tool", .content = "2" },
+        .{ .role = "user", .content = "Continue." },
+    };
+    const expected = "<|im_start|>user\nCompute.<|im_end|>" ++
+        "<|im_start|>assistant\n<think>Use sum.</think>" ++
+        "<tool_call><function=sum><parameter=x>2</parameter></function></tool_call><|im_end|>" ++
+        "<|im_start|>tool\n2<|im_end|>" ++
+        "<|im_start|>user\nContinue.<|im_end|><|im_start|>assistant\n";
+    const thinking = try renderChatTemplate(a, &messages, &config, null, null, true, null, false);
+    defer a.free(thinking);
+    try testing.expectEqualStrings(expected, thinking);
+    try testing.expect(!promptTailOpensThink(thinking));
+    const plain = try renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+    defer a.free(plain);
+    try testing.expectEqualStrings(expected ++ "<think></think>", plain);
 }
 
 test "mimo_v2 template renders a late system turn in place" {
@@ -1594,6 +7440,2231 @@ test "collapseDoubledThinkTags handles multiple separated doublings" {
     try testing.expectEqualStrings("A</think>B</think>C", out);
 }
 
+test "split content: think tags never reach content" {
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\nHello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\n\nHello", true, false).content);
+}
+
+test "split content: empty for open think tag (truncated thought is never content)" {
+    try testing.expectEqualStrings("", splitThinkBlock("<think>still thinking...", true, false).content);
+}
+
+test "indexOfThinkCloseTag: a literal tool close inside the argument does not end the call" {
+    const literal_close = "<tool_call>write<arg_value>see </tool_call> and </think> here</arg_value></tool_call>";
+    try testing.expect(indexOfThinkCloseTag(literal_close, 0) == null);
+    const hermes = "<tool_call><function=write><parameter=content>see </tool_call> and </think> here</parameter></function></tool_call>";
+    try testing.expect(indexOfThinkCloseTag(hermes, 0) == null);
+}
+
+test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload, not a block close" {
+    // Agent traffic writes files about prompts, and the think split runs
+    // BEFORE the tool parse — so this cut used to destroy the whole call.
+    const payload = "<tool_call>write\n<arg_key>content</arg_key>\n" ++
+        "<arg_value>a thought ends with </think> here</arg_value>\n</tool_call>";
+    try testing.expect(indexOfThinkCloseTag(payload, 0) == null);
+
+    // A call the model emitted and CLOSED inside its thought: the `</think>`
+    // after it is a REAL close and the answer stays content.
+    const in_thought = "<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.";
+    const c = indexOfThinkCloseTag(in_thought, 0) orelse return error.MissingClose;
+    try testing.expectEqualStrings("The answer is 4.", in_thought[c.pos + c.len ..]);
+    try testing.expectEqualStrings("The answer is 4.", splitThinkBlock(in_thought, true, false).content);
+
+    // An opener that NEVER closes is leaked markup, not a payload container:
+    // the close still ends the block, and trimLeakedToolMarkup takes the tail.
+    const unclosed = "<think>starting <tool_call>partial</think>Answer.";
+    try testing.expect(indexOfThinkCloseTag(unclosed, 0) != null);
+
+    // Ordinary shapes are untouched.
+    try testing.expect(indexOfThinkCloseTag("<think>r</think>a", 0).?.pos == 8);
+    try testing.expect(indexOfThinkCloseTag("<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
+}
+
+test "indexOfThinkCloseTag: a close quoted in a code span does not end the thought" {
+    // The model's reasoning quoting the raw string it was asked about.
+    const quoted = "The user wants `<think>plan A</think>Done` parsed.\n</think>\n\nOPEN plan A CLOSE";
+    const split = splitThinkBlock(quoted, true, true);
+    try testing.expectEqualStrings("The user wants `<think>plan A</think>Done` parsed.", split.reasoning_content.?);
+    try testing.expectEqualStrings("OPEN plan A CLOSE", split.content);
+    // Double backticks are a span too; a span ends with its line.
+    try testing.expect(indexOfThinkCloseTag("see ``</think>`` here", 0) == null);
+    try testing.expect(indexOfThinkCloseTag("a stray ` tick\n</think>x", 0) != null);
+    // A fence is not a span, so the close after it is the real one.
+    try testing.expect(indexOfThinkCloseTag("```\ncode\n```</think>x", 0) != null);
+    // A closed span is behind the tag.
+    try testing.expect(indexOfThinkCloseTag("the `tag` is done</think>x", 0) != null);
+    // Nothing after the span changes the verdict on a tag inside it.
+    try testing.expect(indexOfThinkCloseTag("a `</think>", 0) == null);
+    try testing.expect(indexOfThinkCloseTag("a `</think>`", 0) == null);
+}
+
+test "a visible answer quoting a think block in a code span stays one answer" {
+    // The answer after a closed thought writes the tags it was asked not to; they are text, not a second thought.
+    const answer = "Reading `<think>plan A</think>Done` gives plan A and Done.";
+    try testing.expect(indexOfThinkOpenTag(answer, 0) == null);
+    try testing.expect(try normalizeEmbeddedThinkBlocks(testing.allocator, answer) == null);
+    // The same tags outside a span still open and close a thought.
+    try testing.expect(indexOfThinkOpenTag("Answer.\n<think>plan A</think>Done", 0) != null);
+    const merged = (try normalizeEmbeddedThinkBlocks(testing.allocator, "Answer.\n<think>plan A</think>Done")).?;
+    defer testing.allocator.free(merged);
+    try testing.expectEqualStrings("<think>\nplan A</think>\nAnswer.\nDone", merged);
+}
+
+test "openThoughtFlush: an open code span waits so the tag inside it stays quoted" {
+    // `` ` `` + `<think>x` arrived: the span's backtick must still be in the buffer when `</think>` lands.
+    const open = openThoughtFlush("the string `<think>plan", false);
+    try testing.expectEqual(@as(usize, 0), open.skip);
+    try testing.expectEqual(@as(usize, "the string ".len), open.ship);
+    // A run of backticks may still grow; a closed span ships.
+    try testing.expectEqual(@as(usize, "word ".len), openThoughtFlush("word `", false).ship);
+    try testing.expectEqual(@as(usize, "word `x`y".len), openThoughtFlush("word `x`y", false).ship);
+    // A line break ends the span.
+    try testing.expectEqual(@as(usize, "a ` b\nc".len), openThoughtFlush("a ` b\nc", false).ship);
+}
+
+test "split content: text without think tags passes through" {
+    try testing.expectEqualStrings("Hello world", splitThinkBlock("Hello world", true, false).content);
+}
+
+test "splitThinkBlock with complete think block" {
+    const result = splitThinkBlock("<think>reasoning here</think>answer here", false, false);
+    try testing.expectEqualStrings("reasoning here", result.reasoning_content.?);
+    try testing.expectEqualStrings("answer here", result.content);
+}
+
+test "splitThinkBlock with empty reasoning" {
+    const result = splitThinkBlock("<think>\n\n</think>\n\nactual content", false, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("actual content", result.content);
+}
+
+test "splitThinkBlock thinking=true no close tag, literal opener present" {
+    // Model entered thinking but ran out of tokens before closing.
+    const result = splitThinkBlock("<think>partial reasoning", true, false);
+    try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock thinking=true no close tag, template-opened block" {
+    // Qwen 3.6 truncated-thinking leak (regression): the chat template injects
+    // `<think>\n` into the generation prompt, so the model's output starts
+    // INSIDE the think block with no literal opener. If generation stops
+    // (length) before `</think>`, every token so far is reasoning — it must
+    // land in reasoning_content, never in content. Matches the streaming path.
+    const result = splitThinkBlock("The user wants 17*23. Let me compute", true, true);
+    try testing.expectEqualStrings("The user wants 17*23. Let me compute", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock thinking=true no close tag, no opener, template did NOT open" {
+    // Gemma-style direct answer: thinking enabled but the template injects no
+    // opener and the model answered without a thought channel. The answer must
+    // stay visible as content.
+    const result = splitThinkBlock("It is currently 8:15 AM PDT.", true, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("It is currently 8:15 AM PDT.", result.content);
+}
+
+test "splitThinkBlock template-opened block with close tag still splits" {
+    // Normal Qwen 3.6 round: no literal opener (template-injected), close tag
+    // present — reasoning before it, content after.
+    const result = splitThinkBlock("compute 340+51=391</think>\n\n391.", true, true);
+    try testing.expectEqualStrings("compute 340+51=391", result.reasoning_content.?);
+    try testing.expectEqualStrings("391.", result.content);
+}
+
+test "splitThinkBlock thinking=false no tags" {
+    const result = splitThinkBlock("just content", false, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("just content", result.content);
+}
+
+test "splitThinkBlock strips think prefix in thinking mode" {
+    const result = splitThinkBlock("<think>my reasoning", true, false);
+    try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "promptTailOpensThink detects template-injected opener" {
+    // Qwen 3.6 generation prompt tail with thinking on
+    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think>\n"));
+    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think>"));
+    // Thinking off renders a CLOSED empty block — must not match
+    try testing.expect(!promptTailOpensThink("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    // Gemma 4 prompt tail (no injected opener)
+    try testing.expect(!promptTailOpensThink("<|turn>model\n"));
+    try testing.expect(!promptTailOpensThink(""));
+}
+
+test "promptThinkTailClass resolves bare and plain tails" {
+    try testing.expectEqual(ThinkTailClass.bare, promptThinkTailClass("<|im_start|>assistant\n<think>\n"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think:opensource>"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|im_start|>assistant\n"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<|start|>assistant"));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass(""));
+    try testing.expectEqual(ThinkTailClass.none, promptThinkTailClass("<think"));
+}
+
+test "parseToolCalls JSON format" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    // arguments should be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "parseToolCalls Qwen3.6 MoE nested-name garbage (real capture)" {
+    // Captured verbatim from Qwen3.6-35B-A3B-6bit generating a tool call in
+    // streaming mode with enable_thinking=false and tools present.
+    // parseToolCalls previously returned null here because the top-level "name"
+    // is an object, not a string — tokens then leaked as plain-text content.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name": {"name": {"name":  "write", "arguments": {"path": "/tmp/x/app.test.js", "content": "hello"}}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/x/app.test.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hello", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls Qwen MoE double-nested name" {
+    // Two layers of nesting — defensive test for a slightly different shape.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name":{"name":"shell","arguments":{"command":"ls"}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "parseToolCalls flat Qwen MoE shape (no arguments wrapper)" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"shell\", \"command\": \"mkdir -p 2ddungeon\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mkdir -p 2ddungeon", parsed.value.object.get("command").?.string);
+    try testing.expect(parsed.value.object.get("name") == null);
+}
+
+test "parseToolCalls flat shape with multiple top-level args" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"writeFile\", \"path\": \"/tmp/a\", \"content\": \"hi\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/a", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hi", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls flat shape ignores id/type metadata" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"id\": \"call_1\", \"type\": \"function\", \"name\": \"shell\", \"command\": \"ls\"}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
+    try testing.expect(parsed.value.object.get("id") == null);
+    try testing.expect(parsed.value.object.get("type") == null);
+}
+
+test "parseToolCalls repairs Qwen MoE missing-arguments-key shape" {
+    const allocator = testing.allocator;
+    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
+    // {"name": "shell",  {"command":"ls"}}  — `, {` instead of `, "arguments": {`
+    const text = "<tool_call>\n{\"name\":  \"shell\",     {\"command\":\"ls -la\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls repairs Qwen MoE missing-opening-quote on arguments key" {
+    const allocator = testing.allocator;
+    // Real broken output observed from Qwen3.6-35B-A3B-6bit:
+    // {"name": "shell", arguments": {"command":"mkdir -p src/app"}}
+    // — missing the OPENING `"` on the `arguments` key.
+    const text = "<tool_call>\n{\"name\": \"shell\", arguments\": {\"command\": \"mkdir -p src/app\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mkdir -p src/app", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with RAW newlines (small-model big-file escaping)" {
+    const allocator = testing.allocator;
+    // Small models writing a big file often emit literal newlines inside the
+    // JSON `content` string instead of `\n` — strict JSON rejects raw control
+    // bytes, so pre-fix the whole call was dropped and the file leaked as text.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"a.js\",\"content\":\"const x = 1;\nconst y = 2;\n\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("const x = 1;\nconst y = 2;\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with RAW tab" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"m.py\",\"content\":\"def f():\n\treturn 1\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("def f():\n\treturn 1", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with UNESCAPED inner quotes (HTML)" {
+    const allocator = testing.allocator;
+    // HTML/code with attribute quotes — `<meta charset="UTF-8">` — is the other
+    // half of the escaping class: the model forgets to backslash the inner `"`.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"i.html\",\"content\":\"<meta charset=\"UTF-8\"><a href=\"x\">go</a>\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("i.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("<meta charset=\"UTF-8\"><a href=\"x\">go</a>", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with BOTH raw newlines and unescaped quotes" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"p.html\",\"content\":\"<!DOCTYPE html>\n<meta charset=\"UTF-8\">\n<title>Hi</title>\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("<!DOCTYPE html>\n<meta charset=\"UTF-8\">\n<title>Hi</title>", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers content with lone backslash (Windows path / regex)" {
+    const allocator = testing.allocator;
+    // `\U` and `\d` are invalid JSON escapes — strict parse rejects them.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"C:\\Users\\app.js\",\"content\":\"re.match(\\d+)\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("C:\\Users\\app.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("re.match(\\d+)", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers Gemma 4 call:NAME{json} with raw newline content" {
+    const allocator = testing.allocator;
+    // Gemma 4's JSON-first branch hits the same strict-parse wall on raw bytes.
+    const text = "<|tool_call>call:writeFile{\"path\":\"g.txt\",\"content\":\"line1\nline2\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line1\nline2", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls leaves valid escaped content untouched (no regression)" {
+    const allocator = testing.allocator;
+    // Already-correct JSON must pass straight through — the recovery path only
+    // runs after strict parse fails, so this never touches looseRepair.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"ok.js\",\"content\":\"a\\nb\\t\\\"q\\\"\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a\nb\t\"q\"", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers truncated <function=writeFile> (max_tokens mid-content)" {
+    const allocator = testing.allocator;
+    // Live JFK-novel capture (2026-06-20): a Hermes-format writeFile dumped a
+    // 19k-char novel into one <parameter=content> and hit the token cap before
+    // any closing tag. Pre-fix the close_rel==null branch only tried JSON, so
+    // the whole call was DROPPED and leaked as visible text. We must recover at
+    // least the tool NAME (args may be empty — content is truncated, not
+    // salvaged) so the client fires the chunk/append nudge instead of "use JSON".
+    const text = "<tool_call>\n<function=writeFile>\n<parameter=content>\n# THE LION OF MASSACHUSETTS\n\nChapter 1. The young senator rose before dawn";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    // Args are valid JSON (empty object) — the parameter never closed.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "parseToolCalls recovers EOS-before-close-tag <function=> with full args" {
+    const allocator = testing.allocator;
+    // Bonus from the same fix: a Hermes call that closed </parameter></function>
+    // but hit EOS before </tool_call> now recovers WITH its args, not just the
+    // name (parseHermesToolCall reads the closed parameter).
+    const text = "<tool_call>\n<function=shell>\n<parameter=command>ls -la</parameter>\n</function>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls recovers a bare <function=> call with NO <tool_call> opener" {
+    const allocator = testing.allocator;
+    // Live capture (soak, 2026-07-09, Qwen3.6-class via Claude Code): the model
+    // emitted the CLOSING </tool_call> but DROPPED the opening <tool_call>, so the
+    // whole call arrived as `<function=Write>…</function></tool_call>`. The outer
+    // scan triggers on the substring `<tool` — which `</tool_call>` does NOT
+    // contain (it is `</too…`) — so parseHermesToolCall was never reached and the
+    // entire Write (with its raw <function=/<parameter= markup) leaked into the
+    // user-visible text. Same big-file-write dropped-delimiter CLASS as the
+    // truncated-opener bugs; recover the call so the markup never leaks.
+    const text = "\n\n<function=Write>\n<parameter=file_path>\n/tmp/index.html\n</parameter>\n" ++
+        "<parameter=content>\n<!DOCTYPE html>\n<html></html>\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("Write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/index.html", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("<!DOCTYPE html>\n<html></html>", parsed.value.object.get("content").?.string);
+}
+
+test "parseHermesToolCall ends a function name whose > is missing at the line break" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { text: []const u8, path: ?[]const u8 }{
+        .{ .text = "<tool_call>\n<function=read_file\n</parameter>\n</function>\n</tool_call>", .path = null },
+        .{ .text = "<tool_call>\n<function=read_file\n<parameter=path>\n./a.txt\n</parameter>\n</function>\n</tool_call>", .path = "./a.txt" },
+        .{ .text = "<tool_call>\n<function=read_file<parameter=path>./a.txt</parameter></function>\n</tool_call>", .path = "./a.txt" },
+    };
+    for (cases) |case| {
+        const calls = (try parseToolCalls(allocator, case.text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("read_file", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        if (case.path) |p| {
+            try testing.expectEqualStrings(p, parsed.value.object.get("path").?.string);
+        } else {
+            try testing.expectEqual(@as(usize, 0), parsed.value.object.count());
+        }
+    }
+}
+
+test "parseHermesToolCall never emits invalid JSON on a malformed <parameter=> tag" {
+    // Live soak capture (record 317): the model wrote `<parameter=limit=1` — using
+    // `=1` instead of closing the tag with `>` and a value. The `>`-scan then
+    // spilled the 'name' across a newline into `</parameter`, and the raw
+    // (unescaped) name interpolation produced INVALID JSON args that flowed to the
+    // client. Two guarantees: (1) args are ALWAYS valid JSON; (2) the well-formed
+    // sibling `<parameter=path>` is still recovered.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=cat>\n<parameter=limit=1\n</parameter>\n<parameter=path>\n./parse.py\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("cat", calls[0].name);
+    // Hard invariant: valid JSON object, no matter how malformed the tag was.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    // The clean sibling parameter is recovered.
+    try testing.expectEqualStrings("./parse.py", parsed.value.object.get("path").?.string);
+}
+
+test "parseHermesToolCall dedups a repeated <parameter=> name (no duplicate JSON key)" {
+    // Live soak capture (record 443, Qwen3.5-0.8B): the model emitted TWO
+    // `<parameter=edits>` blocks in one call. Pre-fix that produced
+    // `{"edits":…,"edits":…,"path":…}`, which std.json rejects with
+    // error.DuplicateField — invalid JSON to the client. Dedup so the args are
+    // always a valid object.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=edit>\n<parameter=edits>\nfirst\n</parameter>\n" ++
+        "<parameter=edits>\nsecond\n</parameter>\n<parameter=path>\n./notes.md\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    try testing.expectEqualStrings("./notes.md", parsed.value.object.get("path").?.string);
+    // Exactly one `edits` key survives.
+    try testing.expect(parsed.value.object.get("edits") != null);
+}
+
+test "parseHermesToolCall keeps leading/trailing whitespace inside a parameter value" {
+    // The Hermes/Qwen XML template frames a value with EXACTLY one newline on
+    // each side (`<parameter=NAME>\nVALUE\n</parameter>` — pinned by the
+    // Qwen3.8 render test above), so that framing is the only thing the parser
+    // may remove. It also did `std.mem.trim(u8, p_val, " ")`, which ate an
+    // `old_string`/`new_string`'s own indentation: an Edit whose needle must
+    // match the file "exactly, including indentation" then either failed, or —
+    // worse — matched a DIFFERENT, un-indented occurrence mid-line and wrote
+    // the replacement at the wrong nesting. Trailing whitespace is payload too
+    // (a `new_string` that must end in two spaces, a markdown hard line break).
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=Edit>\n<parameter=file_path>\n/tmp/app.py\n</parameter>\n" ++
+        "<parameter=old_string>\n        return None\n</parameter>\n" ++
+        "<parameter=new_string>\n        return self.value  \n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/app.py", parsed.value.object.get("file_path").?.string);
+    try testing.expectEqualStrings("        return None", parsed.value.object.get("old_string").?.string);
+    try testing.expectEqualStrings("        return self.value  ", parsed.value.object.get("new_string").?.string);
+}
+
+test "parseHermesToolCall strips only the ONE framing newline on each side" {
+    // A value that legitimately begins or ends with a blank line keeps it: the
+    // template adds one newline, not "any run of newlines". A multi-line
+    // `content` written into a file is byte-exact or the file is wrong.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=write>\n<parameter=path>\n./a.md\n</parameter>\n" ++
+        "<parameter=content>\n\n# Title\n\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("\n# Title\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseHermesToolCall still types a space-padded scalar from its spelling" {
+    // The other half: whitespace around a NUMBER or BOOLEAN carries no meaning,
+    // so a one-line `<parameter=limit> 5 </parameter>` must still ship JSON 5,
+    // not the string " 5 " — fixing the string class must not break the literal
+    // class (`isJsonLiteral` never matches a padded token).
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n<function=ls>\n<parameter=path>\n./src\n</parameter>\n" ++
+        "<parameter=limit> 5 </parameter>\n<parameter=recursive>\n true \n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 5), parsed.value.object.get("limit").?.integer);
+    try testing.expectEqual(true, parsed.value.object.get("recursive").?.bool);
+}
+
+test "parseHermesToolCall strips a CRLF framing pair as one unit" {
+    // A model that emits Windows line endings frames the value with
+    // `>\r\nVALUE\r\n</parameter>`. Dropping the "\n" half alone would leave a
+    // stray CR at both ends of every value — the framing is one unit.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\r\n<function=write>\r\n<parameter=content>\r\n" ++
+        "  hi\r\n</parameter>\r\n</function>\r\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("  hi", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls does NOT treat prose mentioning <function=> as a call" {
+    const allocator = testing.allocator;
+    // The bare-<function=> fallback must not fire on prose. Without a matching
+    // </function> AND a real <parameter=, parseHermesToolCall recovers nothing
+    // useful — but guard against a false positive on a lone mention.
+    const text = "To define one you write `<function=name>` in the Hermes format.";
+    const calls = try parseToolCalls(allocator, text);
+    if (calls) |cs| {
+        defer {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        }
+        // If it parsed anything, it must at least be well-formed JSON args —
+        // never leak the raw prose as a tool name.
+        try testing.expect(cs.len == 0);
+    }
+}
+
+test "looseRepair does not fabricate a tool call from non-JSON prose" {
+    const allocator = testing.allocator;
+    // A stray `{` in prose must not become a tool call via the recovery path.
+    const text = "Here is the plan {step one, step two} and we proceed.";
+    const calls = try parseToolCalls(allocator, text);
+    if (calls) |cs| {
+        for (cs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(cs);
+    }
+    try testing.expect(calls == null);
+}
+
+test "endsWithPartialThinkOpen holds back partial opener tails (pi GGUF leak repro)" {
+    // The exact failure shape: `<|channel>` flushed as content before
+    // "thought" arrived; the buffer tail was a partial opener at every step.
+    try testing.expect(endsWithPartialThinkOpen("prose ends here.<|channel>"));
+    try testing.expect(endsWithPartialThinkOpen("prose ends here.<|chan"));
+    try testing.expect(endsWithPartialThinkOpen("prose ends here.<|channel>thoug"));
+    try testing.expect(endsWithPartialThinkOpen("prose <"));
+    try testing.expect(endsWithPartialThinkOpen("prose <think"));
+    try testing.expect(endsWithPartialThinkOpen("<th"));
+    // Prose and HTML-ish tags keep flowing.
+    try testing.expect(!endsWithPartialThinkOpen("just prose."));
+    try testing.expect(!endsWithPartialThinkOpen("prose <table"));
+    try testing.expect(!endsWithPartialThinkOpen("a > b"));
+    try testing.expect(!endsWithPartialThinkOpen(""));
+}
+
+const test_tools_write_bash =
+    \\[{"type":"function","function":{"name":"Write","description":"Write a file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}},"required":["file_path","content"]}}},
+    \\ {"type":"function","function":{"name":"Bash","description":"Run a command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+;
+
+test "inferBareJsonToolCalls maps bare-args fenced JSON to the unique matching tool (Claude Code capture)" {
+    const allocator = testing.allocator;
+    // Shape captured live from gemma-4-12b via Claude Code /v1/messages: thought
+    // block, then a ```json fence holding ONLY the Write tool's arguments.
+    const text = "<|channel>thought\nI will create this file using Write.<channel|>```json\n{\n  \"file_path\": \"/Users/user/mlx_info.html\",\n  \"content\": \"<h1>MLX</h1>\"\n}\n```\nI've created the file.";
+    const calls = (try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("Write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/Users/user/mlx_info.html", parsed.value.object.get("file_path").?.string);
+}
+
+test "inferBareJsonToolCalls unfenced bare object at content start" {
+    const allocator = testing.allocator;
+    const text = "{\"command\": \"ls -la\"}";
+    const calls = (try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("Bash", calls[0].name);
+}
+
+test "inferBareJsonToolCalls refuses ambiguous and non-matching objects" {
+    const allocator = testing.allocator;
+    // Two tools share the same key → ambiguous → null.
+    const dup_tools =
+        \\[{"type":"function","function":{"name":"a","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}},
+        \\ {"type":"function","function":{"name":"b","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}}]
+    ;
+    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"x\": \"1\"}", dup_tools)) == null);
+    // Keys not in any tool's properties → null.
+    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"zzz\": 1}", test_tools_write_bash)) == null);
+    // Missing a required key → null.
+    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"file_path\": \"a.txt\"}", test_tools_write_bash)) == null);
+}
+
+test "inferBareJsonToolCalls ignores JSON that does not lead the content" {
+    const allocator = testing.allocator;
+    // Example object mid-prose must never be promoted to a call.
+    const text = "Here is an example of the payload you could send: {\"command\": \"ls\"} — adjust as needed.";
+    try testing.expect((try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) == null);
+}
+
+test "parseToolCalls returns null for name-only object (no real args)" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"shell\"}\n</tool_call>";
+    const result = try parseToolCalls(allocator, text);
+    try testing.expect(result == null);
+}
+
+test "parseToolCalls marks raw-JSON fallback calls as inferred, tag calls as explicit" {
+    const allocator = testing.allocator;
+    // Tagged call → explicit (never schema-name-filtered).
+    {
+        const calls = (try parseToolCalls(allocator, "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>")).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expect(!calls[0].inferred);
+    }
+    // Bare raw-JSON object → inferred (flat shape included).
+    {
+        const calls = (try parseToolCalls(allocator, "prefix text {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None\"} suffix")).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expect(calls[0].inferred);
+        try testing.expectEqualStrings("George Washington", calls[0].name);
+    }
+}
+
+test "filterInferredBySchema drops undeclared inferred calls, keeps declared and explicit ones" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    // Inferred + undeclared → dropped; slice becomes null.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 1);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "George Washington"),
+            .arguments = try allocator.dupe(u8, "{\"num\":1}"),
+            .inferred = true,
+        };
+        try testing.expect((try filterInferredBySchema(allocator, calls, tools)) == null);
+    }
+    // Inferred + declared → kept.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 1);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "write"),
+            .arguments = try allocator.dupe(u8, "{\"path\":\"a\"}"),
+            .inferred = true,
+        };
+        const kept = (try filterInferredBySchema(allocator, calls, tools)).?;
+        defer {
+            for (kept) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(kept);
+        }
+        try testing.expectEqual(@as(usize, 1), kept.len);
+    }
+    // Explicit + undeclared → kept (client feedback, not our guess); the
+    // inferred sibling with an undeclared name is dropped and the slice shrinks.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 2);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "searchWeb"),
+            .arguments = try allocator.dupe(u8, "{\"q\":\"zig\"}"),
+            .inferred = false,
+        };
+        calls[1] = .{
+            .name = try allocator.dupe(u8, "John Adams"),
+            .arguments = try allocator.dupe(u8, "{\"num\":2}"),
+            .inferred = true,
+        };
+        const kept = (try filterInferredBySchema(allocator, calls, tools)).?;
+        defer {
+            for (kept) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(kept);
+        }
+        try testing.expectEqual(@as(usize, 1), kept.len);
+        try testing.expectEqualStrings("searchWeb", kept[0].name);
+    }
+}
+
+test "toolNameIsDeclared: wrapped + flat forms; unparseable schema never drops" {
+    const allocator = testing.allocator;
+    const wrapped =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const flat =
+        \\[{"name":"write","parameters":{"type":"object","properties":{}}}]
+    ;
+    try testing.expect(toolNameIsDeclared(allocator, wrapped, "write"));
+    try testing.expect(toolNameIsDeclared(allocator, flat, "write"));
+    try testing.expect(!toolNameIsDeclared(allocator, wrapped, "George Washington"));
+    // Broken schema JSON → safe default TRUE (never drop on OUR parse failure).
+    try testing.expect(toolNameIsDeclared(allocator, "not json", "anything"));
+}
+
+test "parseToolCalls multiple calls" {
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name": "func_a", "arguments": {"x": 1}}
+        \\</tool_call>
+        \\<tool_call>
+        \\{"name": "func_b", "arguments": {"y": 2}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("func_a", calls[0].name);
+    try testing.expectEqualStrings("func_b", calls[1].name);
+}
+
+test "parseToolCalls returns null for no tool calls" {
+    const allocator = testing.allocator;
+    const result = try parseToolCalls(allocator, "Hello, how can I help you?");
+    try testing.expect(result == null);
+}
+
+// ── DSV4 training-bias tool-call shapes ──
+// DSV4-Flash via ds4 emits tool calls in two non-standard variants the
+// reference parser previously dropped on the floor:
+//   1. Attribute form: `<tool_call name="X">{args}</tool_call>` — name as an
+//      XML attribute, body is JUST the args object.
+//   2. Mismatched closing tag: `<tool_call>{full json}</tool_request>` — open
+//      tag is `tool_call`, close is `tool_request`. Hermes-style trained on a
+//      mixed corpus.
+// These tests are the regression guard. Without the fix they fail because
+// the parser hard-matched on `<tool_call>…</tool_call>` exactly.
+
+test "parseToolCalls DSV4 attribute form: <tool_call name=\"X\">{args}</tool_call>" {
+    const allocator = testing.allocator;
+    const text = "<tool_call name=\"webSearch\">{\"query\":\"top open source inference applications\"}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("webSearch", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("top open source inference applications", parsed.value.object.get("query").?.string);
+}
+
+test "parseToolCalls DSV4 mismatched close: <tool_call>{json}</tool_request>" {
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name": "shell", "arguments": {"command": "mkdir -p prisma src/lib"}}
+        \\</tool_request>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mkdir -p prisma src/lib", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls DSV4 attribute + mismatched close combined" {
+    // Worst-case combo observed from DSV4: attribute-style open, body is
+    // just the args object (no top-level "name" key), and the closing tag
+    // is `</tool_request>` instead of `</tool_call>`.
+    const allocator = testing.allocator;
+    const text = "<tool_call name=\"shell\">{\"command\":\"ls /tmp\"}</tool_request>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls /tmp", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Hermes double-brace body: <tool_call>{{json}}</tool_call>" {
+    // Some models (seen on small GGUF instruct models echoing a Jinja `{{ }}`
+    // example) wrap the args object in an extra brace layer. The body must still
+    // parse into a tool call rather than leaking through as raw content.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{{"name": "get_weather", "arguments": {"city": "Paris"}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Paris", parsed.value.object.get("city").?.string);
+}
+
+test "parseToolCalls DSV4 attribute single-quoted: <tool_call name='X'>" {
+    // Some captures used single quotes around the attribute value. Same
+    // semantics — accept both quote styles.
+    const allocator = testing.allocator;
+    const text = "<tool_call name='browse'>{\"action\":\"navigate\",\"url\":\"https://example.com\"}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+}
+
+test "parseToolCalls DSV4 plural-tag form: <tool_calls>{json}</tool_calls>" {
+    // Real capture from DSV4-Flash in MLX Core ChatView:
+    //   <tool_calls>
+    //   {"name": "shell", "arguments": {"command": "df -h /"}}
+    //   </tool_calls>
+    // Plural open + plural close, single JSON object inside. Without the
+    // fix the parser hard-matches `<tool_call` (the suffix `s>` makes the
+    // `>`-scan walk past the tool name), the body never extracts, and the
+    // raw XML leaks into the chat bubble.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_calls>
+        \\{"name": "shell", "arguments": {"command": "df -h /"}}
+        \\</tool_calls>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("df -h /", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls DSV4 plural-tag with attribute: <tool_calls name=\"X\">{args}</tool_calls>" {
+    const allocator = testing.allocator;
+    const text = "<tool_calls name=\"webSearch\">{\"query\":\"hi\"}</tool_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("webSearch", calls[0].name);
+}
+
+test "qwen xml: the live <function=…>/<parameter=…> capture (package.json class)" {
+    // Verbatim from ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via pi (2026-08-12).
+    // Qwen 3.5/3.6's OWN template dictates this dialect ("ONLY reply in the
+    // following format"), so it is the checkpoint's contract, not a mangle.
+    // The JSON-only reader mined the first balanced object out of the body —
+    // the file CONTENT — and promoted its "name" key to the tool name, so pi
+    // answered "Tool voxel-pagoda-garden not found" and the model looped.
+    const allocator = testing.allocator;
+    const text =
+        "<tool_call>\n<function=write>\n<parameter=path>\n" ++
+        "/Users/d/pi-lfm/package.json\n</parameter>\n<parameter=content>\n" ++
+        "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}\n" ++
+        "</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("/Users/d/pi-lfm/package.json", o.get("path").?.string);
+    // The value is RAW BYTES: a JSON file stays a STRING (typing by spelling
+    // is what turned this call into `{"name": "voxel-pagoda-garden", …}`).
+    // Types come from the schema at the request chokepoint, never from here.
+    try testing.expectEqualStrings(
+        "{\n  \"name\": \"voxel-pagoda-garden\",\n  \"version\": \"1.0.0\"\n}",
+        o.get("content").?.string,
+    );
+}
+
+test "qwen xml: truncated mid-parameter ships NAME + the completed params only" {
+    const allocator = testing.allocator;
+    const text =
+        "<tool_call>\n<function=write>\n<parameter=path>\n/tmp/a.ts\n</parameter>\n" ++
+        "<parameter=content>\nexport const half = ";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/a.ts", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "pythonic: the real LFM2.5 capture, with every literal type" {
+    // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
+    // (2026-08-04). The model emits full Python repr — note `True` and the
+    // SINGLE-quoted list, which is NOT the `tojson` form its own template
+    // renders history with. A JSON-only value reader gets both wrong.
+    const allocator = testing.allocator;
+    const text = "...I should call the get_weather function.</think>" ++
+        "<|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("Paris", o.get("city").?.string);
+    try testing.expectEqual(@as(i64, 3), o.get("days").?.integer);
+    // A schema `boolean` must arrive as a real bool, not the string "True".
+    try testing.expectEqual(true, o.get("metric").?.bool);
+    // A schema `array` must arrive as a real array — the #94 defect in the
+    // grammar where it is easiest to ship: the value is literal text.
+    const tags = o.get("tags").?.array;
+    try testing.expectEqual(@as(usize, 2), tags.items.len);
+    try testing.expectEqualStrings("trip", tags.items[0].string);
+    try testing.expectEqualStrings("eu", tags.items[1].string);
+}
+
+test "pythonic: several calls in one bracket list, and None/float/dict values" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[read_file(path='a.txt'), " ++
+        "plot(scale=1.5, title=None, opts={'grid': True, 'dpi': 96})]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("read_file", calls[0].name);
+    try testing.expectEqualStrings("plot", calls[1].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqual(@as(f64, 1.5), o.get("scale").?.float);
+    try testing.expectEqual(std.json.Value.null, o.get("title").?);
+    try testing.expectEqual(true, o.get("opts").?.object.get("grid").?.bool);
+    try testing.expectEqual(@as(i64, 96), o.get("opts").?.object.get("dpi").?.integer);
+}
+
+test "pythonic: separators inside a string value are not separators" {
+    // `)` `,` `[` inside the quoted value must not end the arg or the call —
+    // the delimiter-drop class in reverse (a naive scan cuts here).
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[shell(cmd='ls -la (tmp), [x]', dir='/a')]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la (tmp), [x]", parsed.value.object.get("cmd").?.string);
+    try testing.expectEqualStrings("/a", parsed.value.object.get("dir").?.string);
+}
+
+test "pythonic: escapes are unescaped, and a double-quoted string is accepted" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[write(body='line1\\nit\\'s \\\\ done', path=\"b.txt\")]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line1\nit's \\ done", parsed.value.object.get("body").?.string);
+    try testing.expectEqualStrings("b.txt", parsed.value.object.get("path").?.string);
+}
+
+test "pythonic: a truncated call recovers the NAME with EMPTY args, never a partial value" {
+    // max_tokens cut mid-argument. Shipping half a file body is worse than
+    // re-issuing the call (the truncated-opener rule); the name is enough for
+    // the client to see a tool_calls finish and retry.
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[write_file(path='a.html', content='<!DOCTYPE html>\\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "pythonic: tolerates a dropped outer bracket and a dropped end marker" {
+    const allocator = testing.allocator;
+    // No `[`, no `<|tool_call_end|>` — one delimiter drop must not cost the call.
+    const calls = (try parseToolCalls(allocator, "<|tool_call_start|>get_time(tz='UTC')")).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_time", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("UTC", parsed.value.object.get("tz").?.string);
+}
+
+test "pythonic: an unparseable value stays honest as a string, and keys dedup" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[run(mode=fast, mode=slow)]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    // Bare identifier is not a Python literal — kept verbatim rather than
+    // guessed at, so a client's own validation error stays honest. First wins.
+    try testing.expectEqualStrings("fast", parsed.value.object.get("mode").?.string);
+}
+
+test "pythonic: the marker is required — prose that mentions a call is not one" {
+    const allocator = testing.allocator;
+    try testing.expect((try parseToolCalls(allocator, "Call get_weather(city='Paris') to do that.")) == null);
+}
+
+test "issue #94: a container param carried as literal TEXT coerces to a real array/object" {
+    // #94 reports this as an open gap on the strength of the doc comment
+    // ("only SCALARS are touched"), which was stale — `coerceValueToType` has
+    // had its array/object arm since 60ba5ec (2026-07-09), two weeks before
+    // the issue was filed. Pinned as a TEST rather than left as a code read,
+    // so the claim is settled by evidence and cannot silently regress.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"stats","parameters":{"type":"object","properties":{"nums":{"type":"array","items":{"type":"integer"}},"opts":{"type":"object"},"label":{"type":"string"}}}}}]
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "stats"),
+        .arguments = try allocator.dupe(u8, "{\"nums\":\"[1, 2, 3]\",\"opts\":\"{\\\"grid\\\": true}\",\"label\":\"[not an array]\"}"),
+    }};
+    defer {
+        allocator.free(calls[0].name);
+        allocator.free(calls[0].arguments);
+    }
+
+    try coerceToolArgsToSchema(allocator, &calls, tools);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+
+    const nums = o.get("nums").?.array;
+    try testing.expectEqual(@as(usize, 3), nums.items.len);
+    try testing.expectEqual(@as(i64, 2), nums.items[1].integer);
+    try testing.expectEqual(true, o.get("opts").?.object.get("grid").?.bool);
+    // A STRING param whose content merely looks bracket-y is untouched — the
+    // schema decides, never the spelling.
+    try testing.expectEqualStrings("[not an array]", o.get("label").?.string);
+}
+
+test "parseToolCalls DSV4 nested <tool name=\"X\"> inside <tool_calls> wrapper" {
+    // Real capture from DSV4-Flash:
+    //   <tool_calls>
+    //   <tool name="webSearch">{"query": "top 10 ..."}</tool_calls>
+    //   <tool name="webSearch">{"query": "best ..."}</tool_calls>
+    //   </tool_calls>
+    // Two inner calls, each opening with `<tool name="X">` and closing with
+    // `</tool_calls>` (the model conflates open and close tag names). The
+    // outer `<tool_calls>` wrapper has no content of its own — it's a
+    // decorative parent.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_calls>
+        \\<tool name="webSearch">{"query": "top 10 open source AI inference engines 2024 2025"}</tool_calls>
+        \\<tool name="webSearch">{"query": "best open source AI inference engines vllm tensorrt mlx comparison"}</tool_calls>
+        \\</tool_calls>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    // Both inner calls must be recovered.
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("webSearch", calls[0].name);
+    try testing.expectEqualStrings("webSearch", calls[1].name);
+    const a0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer a0.deinit();
+    try testing.expect(std.mem.indexOf(u8, a0.value.object.get("query").?.string, "top 10") != null);
+    const a1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer a1.deinit();
+    try testing.expect(std.mem.indexOf(u8, a1.value.object.get("query").?.string, "best") != null);
+}
+
+test "parseToolCalls bare <tool>{json}</tool>" {
+    // Hypothetical minimal form — `<tool>` open with no attribute, JSON
+    // body carries the name. Belt-and-suspenders for future model output.
+    const allocator = testing.allocator;
+    const text = "<tool>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}}</tool>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "parseToolCalls DSV4 <parameters> wrapper inside <tool name=\"X\">" {
+    // Real capture from DSV4-Flash:
+    //   <tool_calls>
+    //   <tool name="browse"><parameters>{"action":"navigate","url":"…"}</parameters></tool>
+    //   …
+    //   </tool_calls>
+    // The args object is wrapped in <parameters>…</parameters> before being
+    // placed inside the <tool> body. Strip that wrapper before JSON-parsing.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_calls>
+        \\<tool name="browse"><parameters>{"action":"navigate","url":"https://example.com"}</parameters></tool>
+        \\<tool name="browse"><parameters>{"action":"navigate","url":"https://example.org"}</parameters></tool>
+        \\</tool_calls>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    const a0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer a0.deinit();
+    try testing.expectEqualStrings("navigate", a0.value.object.get("action").?.string);
+    try testing.expectEqualStrings("https://example.com", a0.value.object.get("url").?.string);
+    const a1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer a1.deinit();
+    try testing.expectEqualStrings("https://example.org", a1.value.object.get("url").?.string);
+}
+
+test "parseToolCalls DSV4 trailing extra closing brace in args body" {
+    // DSV4 occasionally emits an extra `}` after the args object — likely a
+    // training-data artifact. Be tolerant: find the first balanced JSON
+    // object and ignore trailing garbage.
+    const allocator = testing.allocator;
+    const text =
+        "<tool name=\"browse\"><parameters>{\"action\":\"navigate\",\"url\":\"https://dev.to/agdex_ai/post\"}}</parameters></tool>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    const a0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer a0.deinit();
+    try testing.expectEqualStrings("navigate", a0.value.object.get("action").?.string);
+}
+
+test "splitThinkBlock with think block before tool call" {
+    const text = "<think>I need to call the calculator</think>\n<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"a\": 5}}\n</tool_call>";
+    const result = splitThinkBlock(text, false, false);
+    try testing.expectEqualStrings("I need to call the calculator", result.reasoning_content.?);
+    // `content` is VISIBLE text, so the call block is cut: parseToolCalls runs
+    // on the raw output, and whatever it leaves behind is markup the client
+    // must never render.
+    try testing.expectEqualStrings("", result.content);
+    // The keeping-markup variant is what the one parse-from-content caller
+    // (/v1/messages non-streaming) uses, and it still hands over the block.
+    const raw = splitThinkBlockKeepingMarkup(text, false, false);
+    try testing.expect(std.mem.startsWith(u8, raw.content, "<tool_call>"));
+}
+
+test "splitThinkBlock with think block before regular content" {
+    const text = "<think>Let me think about this</think>\n\nThe answer is 42.";
+    const result = splitThinkBlock(text, false, false);
+    try testing.expectEqualStrings("Let me think about this", result.reasoning_content.?);
+    try testing.expectEqualStrings("The answer is 42.", result.content);
+}
+
+test "splitThinkBlock with empty think block" {
+    const text = "<think>\n\n</think>\n\nJust content here.";
+    const result = splitThinkBlock(text, false, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("Just content here.", result.content);
+}
+
+test "splitThinkBlock no think tags with tool call" {
+    const text = "<tool_call>\n{\"name\": \"search\", \"arguments\": {}}\n</tool_call>";
+    const result = splitThinkBlock(text, false, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("", result.content);
+    try testing.expectEqualStrings(text, splitThinkBlockKeepingMarkup(text, false, false).content);
+}
+
+test "parseToolCalls with think block" {
+    const allocator = testing.allocator;
+    const text = "<think>reasoning</think>\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"test\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("search", calls[0].name);
+}
+
+test "parseToolCalls raw JSON without tags" {
+    const allocator = testing.allocator;
+    const text = "{\"name\": \"get_time\", \"arguments\": {}}";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_time", calls[0].name);
+}
+
+test "parseToolCalls Hermes format" {
+    const allocator = testing.allocator;
+    const text = "<tool_call><function=get_weather><parameter=location>Tokyo</parameter></function></tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    // Should have {"location":"Tokyo"}
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "split content: Gemma 4 channel tags never reach content" {
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning here<channel|>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning<channel|>\nHello", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nstill thinking...", true, false).content);
+}
+
+test "splitThinkBlock Gemma 4 channel tags" {
+    const result = splitThinkBlock("<|channel>thought\nmy reasoning<channel|>answer here", false, false);
+    try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("answer here", result.content);
+}
+
+test "splitThinkBlock Gemma 4 thinking in progress" {
+    const result = splitThinkBlock("<|channel>thought\npartial reasoning", true, false);
+    try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock truncated mid-thinking does not leak channel tag" {
+    // Truncation regression: the model emitted the Gemma 4 *content* channel
+    // opener (`<|channel>\n…`) directly — no thought block and no `<channel|>`
+    // close — then hit the output cap. The raw `<|channel>` control tag must
+    // never reach visible content (it used to leak straight through).
+    {
+        const r = splitThinkBlock("<|channel>\nThe answer is 42.", true, false);
+        try testing.expect(r.reasoning_content == null);
+        try testing.expectEqualStrings("The answer is 42.", r.content);
+    }
+    // Bare dangling opener (cut off right after the tag) → nothing visible.
+    {
+        const r = splitThinkBlock("<|channel>", true, false);
+        try testing.expectEqualStrings("", r.content);
+    }
+    {
+        const r = splitThinkBlock("<|channel>\n", true, false);
+        try testing.expectEqualStrings("", r.content);
+    }
+    // The template-injected-but-no-tags case must still pass through untouched.
+    {
+        const r = splitThinkBlock("It is currently 8:15 AM PDT.", true, false);
+        try testing.expect(r.reasoning_content == null);
+        try testing.expectEqualStrings("It is currently 8:15 AM PDT.", r.content);
+    }
+}
+
+test "splitThinkBlock trailing unclosed thought opener does not leak (Gemma 12B pi regression)" {
+    // Gemma 4 12B answers in prose, then opens a NEW thought channel right
+    // before the turn ends (its known channel-thought tail behavior). The raw
+    // `<|channel>thought` opener — and any unclosed thought text after it —
+    // must never reach visible content; pi rendered the literal tag to users.
+    {
+        // Bare trailing opener, nothing after.
+        const r = splitThinkBlock("Here is the design.\n<|channel>thought", true, false);
+        try testing.expectEqualStrings("Here is the design.", r.content);
+        try testing.expect(r.reasoning_content == null);
+    }
+    {
+        // Trailing opener with unclosed thought text → thought is reasoning.
+        const r = splitThinkBlock("Here is the design.\n<|channel>thought\nI should now write the file", true, false);
+        try testing.expectEqualStrings("Here is the design.", r.content);
+        try testing.expectEqualStrings("I should now write the file", r.reasoning_content.?);
+    }
+    {
+        // Same shape for the <think> family.
+        const r = splitThinkBlock("Done.\n<think>wait, maybe I", true, false);
+        try testing.expectEqualStrings("Done.", r.content);
+        try testing.expectEqualStrings("wait, maybe I", r.reasoning_content.?);
+    }
+}
+
+test "split content: trailing unclosed thought opener does not leak" {
+    // The visible text must be truncated at a trailing unclosed opener (the
+    // tag and dangling thought are reasoning, never content).
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought", true, false).content);
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought\nI should now write", true, false).content);
+    try testing.expectEqualStrings("Done.", splitThinkBlock("Done.\n<think>hmm", true, false).content);
+}
+
+test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
+    // Untouched when there is no marker (the overwhelmingly common case —
+    // the returned slice must be the input itself, not a trimmed copy).
+    try testing.expectEqualStrings("plain prose", trimLeakedToolMarkup("plain prose"));
+    try testing.expectEqualStrings("ends in a tag <b>", trimLeakedToolMarkup("ends in a tag <b>"));
+
+    // Every wrapper family cuts, and the trailing whitespace before the
+    // marker goes with it.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"x\">"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<|tool_call>{}"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_call>{}"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<tool_calls>"));
+
+    // A marker with nothing before it leaves nothing behind — a bare marker
+    // is not an answer (live: DSV4 answered a question and then emitted a
+    // lone `<｜DSML｜` with no call behind it).
+    try testing.expectEqualStrings("", trimLeakedToolMarkup("\n\n<｜DSML｜\n"));
+
+    // Earliest marker wins when several families appear.
+    try testing.expectEqualStrings("a", trimLeakedToolMarkup("a<tool_call>b<｜DSML｜c"));
+}
+
+test "in-thought tool markup never rides out as reasoning" {
+    // Live 2026-08-01 (DeepSeek-V4-Flash-0731 agent session): the model
+    // emitted a complete DSML call INSIDE its think block, closed the block,
+    // then issued a different call in content. parseToolCalls works on the
+    // post-think text, so the in-thought call is deliberately skipped — but
+    // it rode out verbatim in reasoning_content, and the client round-tripped
+    // it into every later prompt.
+    const raw = "Let me check the directory.<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"listFiles\">\n" ++
+        "<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls></think>I'll build it.";
+    const split = splitThinkBlock(raw, true, true);
+    try testing.expectEqualStrings("Let me check the directory.", split.reasoning_content.?);
+    try testing.expectEqualStrings("I'll build it.", split.content);
+
+    // Reasoning that is NOTHING but markup reports no reasoning at all.
+    const only_markup = splitThinkBlock("<｜DSML｜tool_calls>\n</｜DSML｜tool_calls></think>answer", true, true);
+    try testing.expectEqual(@as(?[]const u8, null), only_markup.reasoning_content);
+    try testing.expectEqualStrings("answer", only_markup.content);
+}
+
+test "a tool marker split across tokens is only visible once concatenated" {
+    // The streaming tools flush holds a tail that looked like a tool call and
+    // ships it when nothing parses. DSV4 spells the DSML marker as `<` then
+    // `｜DSML｜` (two tokens), so a per-token filter sees neither piece as a
+    // marker and both went out as visible content (live 2026-08-01). The
+    // flush concatenates first for exactly this reason.
+    const pieces = [_][]const u8{ "My name is", "<", "｜DSML｜", "\n" };
+    var joined: [64]u8 = undefined;
+    var n: usize = 0;
+    for (pieces) |p| {
+        @memcpy(joined[n .. n + p.len], p);
+        n += p.len;
+    }
+    for (pieces) |p| try testing.expectEqualStrings(p, trimLeakedToolMarkup(p));
+    try testing.expectEqualStrings("My name is", trimLeakedToolMarkup(joined[0..n]));
+}
+
+test "splitThinkBlock re-opened thought opener right after close does not leak" {
+    // 2026-06-19 live regression (gemma-4): the model closed its thought
+    // channel and IMMEDIATELY re-opened a fresh one with nothing between, then
+    // the turn ended. The leading-strip consumed the first closed block,
+    // leaving the bare re-opened opener at pos 0 of the remainder — it must
+    // still vanish, and `<|channel>thought` must never be mis-stripped as a
+    // CONTENT channel (`<|channel>`), which leaked a glued "thought".
+    {
+        const r = splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false);
+        try testing.expectEqualStrings("", r.content);
+        try testing.expectEqualStrings("Let me plan.", r.reasoning_content.?);
+    }
+    {
+        // <think> family equivalent.
+        const r = splitThinkBlock("<think>plan</think>\n<think>", true, false);
+        try testing.expectEqualStrings("", r.content);
+    }
+    {
+        // Content BETWEEN the close and the re-open must survive the cut.
+        const r = splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false);
+        try testing.expectEqualStrings("Ready.", r.content);
+    }
+}
+
+test "split content: re-opened thought opener right after close does not leak" {
+    // Same regression, content side — this is the exact form that reached
+    // chat-history.json (`<|channel>thought\n` as the whole content).
+    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("Ready.", splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock("<think>plan</think>\n<think>", true, false).content);
+}
+
+test "parseToolCalls Gemma 4 format" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call>call:get_weather{\"location\": \"Tokyo\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "parseToolCalls Gemma 4 with channel thinking" {
+    const allocator = testing.allocator;
+    const text = "<|channel>thought\nLet me check the weather<channel|>\n<|tool_call>call:get_weather{\"city\": \"Paris\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+}
+
+test "parseToolCalls Gemma 4 truncated (no closing tag)" {
+    const allocator = testing.allocator;
+    // Model hit EOS before generating <tool_call|>
+    const text = "<|tool_call>call:browse{action:<|\"|>browse<|\"|>,url:<|\"|>https://finance.yahoo.com<|\"|>}";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    // Should have parsed at least the action argument
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("browse", parsed.value.object.get("action").?.string);
+}
+
+test "parseToolCalls Gemma 4 truncated mid-value drops the partial value" {
+    const allocator = testing.allocator;
+    // Model stopped mid-URL: no closing <|"|>, no `}`, no <tool_call|>. POLICY
+    // (2026-07-14, aligned with the Hermes truncation rule): a value whose scan
+    // runs to end-of-body without its terminator is a truncation FRAGMENT —
+    // partial bytes must never ship as a real argument (a client executes them:
+    // a fragmentary url browses garbage, a fragmentary content writes a corrupt
+    // file "successfully"). The completed pair before it survives, and the tool
+    // NAME is always recovered so the client's steering fires.
+    const text = "<|tool_call>call:browse{action:<|\"|>navigate<|\"|>,url:<|\"|>https://finance.";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("browse", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("navigate", parsed.value.object.get("action").?.string);
+    // The truncated URL must be DROPPED, never shipped as partial bytes.
+    try testing.expect(parsed.value.object.get("url") == null);
+}
+
+test "parseToolCalls Gemma 4 loop-stop truncated content dropped, name recovered (php.html capture)" {
+    const allocator = testing.allocator;
+    // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html): the
+    // model repetition-looped INSIDE the write call's content string and the
+    // scheduler's degenerate-tail-loop guard cut generation mid-word — the
+    // buffered call arrived with NO closing delimiter, NO `}`, NO <tool_call|>,
+    // and `path` never emitted at all. Pre-fix the salvage shipped
+    // {"content":"<1.1 KB of loop garbage>"}; pi rejected the call on the
+    // missing path and echoed the garbage back into the model's context.
+    const text = "<|tool_call>call:write{content:<|\"|><!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <title>PHP</title>\n</head>\n<body>\n    <p>PHP is a widely-used general-purpose scripting language. It is a server-side scripting language, server-side scripting language, server-side scripting language, server-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    try testing.expect(parsed.value.object.get("content") == null);
+    try testing.expect(parsed.value.object.get("path") == null);
+}
+
+test "parseToolCalls Gemma 4 truncated content after a complete path keeps path, drops fragment" {
+    const allocator = testing.allocator;
+    // The ordering that would CORRUPT a file: `path` completed BEFORE the cut.
+    // Pre-fix salvage = {path, <partial garbage content>} — a schema-valid call
+    // the client executes, writing a fragment to a real path and reporting
+    // success. The completed path survives (the client's missing-content error
+    // steers a clean re-issue); the fragment never ships.
+    const text = "<|tool_call>call:write{path:<|\"|>plang/php.html<|\"|>,content:<|\"|><!DOCTYPE html>\n<p>PHP is a server-side scripting language, server-side scripting language, server-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("plang/php.html", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Gemma 4 bare rich value truncated at end-of-body is dropped" {
+    const allocator = testing.allocator;
+    // Both <|"|> delimiters dropped AND the generation truncated (no `}`, no
+    // close tag anywhere in the rest): the run-to-end scan must not ship the
+    // fragment as content.
+    const text = "<|tool_call>call:write{content:<!DOCTYPE html>\n<h1>Hi</h1>\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Gemma 4 truncated edits container dropped, complete path kept" {
+    const allocator = testing.allocator;
+    // Cut INSIDE a container arg (pi-style edits array): the list is a fragment
+    // — more edits were coming — and applying a partial edit list is the same
+    // fragmentary-work hazard as partial content. The whole container drops;
+    // the completed scalar before it survives.
+    const text = "<|tool_call>call:edit{path:<|\"|>a.sh<|\"|>,edits:[{oldText:<|\"|>x<|\"|>,newText:<|\"|>y<|\"|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("edit", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.sh", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("edits") == null);
+}
+
+test "parseToolCalls Gemma 4 EOS after a complete pair keeps the pair (no over-drop)" {
+    const allocator = testing.allocator;
+    // Truncation landing BETWEEN pairs (after a completed value + comma) must
+    // not over-drop: only the value the cut landed INSIDE is a fragment.
+    const text = "<|tool_call>call:write{path:<|\"|>a.html<|\"|>,";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.html", parsed.value.object.get("path").?.string);
+}
+
+test "parseToolCalls Gemma 4 EOS right after the key colon drops the key" {
+    const allocator = testing.allocator;
+    // `path:` then nothing — pre-fix this shipped {"path":""} and a client
+    // would create a file with an EMPTY name (or reject on a bogus value).
+    // An absent value is a fragment; drop the key, recover the name.
+    const text = "<|tool_call>call:write{path:";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("path") == null);
+}
+
+test "parseToolCalls Gemma 4 JSON-style truncated string value is dropped" {
+    const allocator = testing.allocator;
+    // Same truncation class through the JSON-quoted spelling: the closing `"`
+    // never arrived. Pre-fix the verbatim copy emitted an UNCLOSED JSON string
+    // (invalid args, caught only by the {}-fallback safety net); the complete
+    // first pair must survive and the fragment must drop.
+    const text = "<|tool_call>call:write{\"path\":\"plang/php.html\",\"content\":\"<!DOCTYPE html>\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("plang/php.html", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Gemma 4 unterminated string must not swallow the closing brace (pi write regression)" {
+    const allocator = testing.allocator;
+    // Gemma 4 12B emitted a write call whose LAST string value was missing
+    // its closing <|"|> delimiter and carried a stray markdown backtick
+    // before the args object's `}`. The unterminated-string scan ran to end
+    // of body, so the parsed path was literally "mlx_pi1.html`}" — and pi
+    // created a file with that name on disk.
+    const text = "<|tool_call>call:write{content:<|\"|><!DOCTYPE html><html></html><|\"|>,path:<|\"|>mlx_pi1.html`}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mlx_pi1.html", parsed.value.object.get("path").?.string);
+
+    // Plain missing-delimiter variant (no backtick): same brace exclusion.
+    const text2 = "<|tool_call>call:write{content:<|\"|>X<|\"|>,path:<|\"|>out.html}<tool_call|>";
+    const calls2 = (try parseToolCalls(allocator, text2)).?;
+    defer {
+        for (calls2) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls2);
+    }
+    const parsed2 = try std.json.parseFromSlice(std.json.Value, allocator, calls2[0].arguments, .{});
+    defer parsed2.deinit();
+    try testing.expectEqualStrings("out.html", parsed2.value.object.get("path").?.string);
+}
+
+test "parseToolCalls Gemma 4 quoted keys with custom delimiters" {
+    const allocator = testing.allocator;
+    // Model mixes JSON-style quoted keys with <|"|> delimiters — JSON parse fails,
+    // convertGemma4ArgsToJson must strip quotes from keys to produce valid JSON.
+    const text =
+        \\<|tool_call>call:shell{"command":<|"|>ls -la<|"|>}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Gemma 4 quoted keys with bare values" {
+    const allocator = testing.allocator;
+    // Model uses quoted keys but bare (non-JSON, non-delimited) values
+    const text = "<|tool_call>call:shell{\"command\":ls -la}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Gemma 4 dropped OPENING delimiter on big content (E4B live)" {
+    const allocator = testing.allocator;
+    // Verbatim shape captured from gemma-4-e4b-it-4bit writing a full HTML page
+    // (test_tool_matrix_small.sh): the model dropped the OPENING <|"|> on
+    // `content` but kept the CLOSING one, so the bare-value scan cut content at
+    // the FIRST comma (inside `<meta ... content="width=device-width, ...">`)
+    // and shredded the rest of the markup into bogus keys → invalid args. The
+    // closing <|"|> (followed by `,path`) is the real boundary.
+    const text = "<|tool_call>call:write_file{content:<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html><|\"|>,path:<|\"|>mars.html<|\"|>}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mars.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings(
+        "<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html>",
+        parsed.value.object.get("content").?.string,
+    );
+}
+
+test "parseToolCalls Gemma 4 dropped BOTH delimiters on single content field" {
+    const allocator = testing.allocator;
+    // Both delimiters dropped, content is the only/last field → run to the
+    // object's closing brace.
+    const text = "<|tool_call>call:write_file{content:<h1>Hi</h1>\n<p>a, b, c</p>}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("<h1>Hi</h1>\n<p>a, b, c</p>", parsed.value.object.get("content").?.string);
+}
+
+test "convertGemma4ArgsToJson nested braces in value" {
+    const allocator = testing.allocator;
+    // Content value contains JSON-like structures (e.g., JavaScript code with objects)
+    const input = "{path:<|\"|>server.js<|\"|>,content:<|\"|>const x = {a: 1, b: {c: 2}};<|\"|>}";
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    // Verify it produces valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("server.js", parsed.value.object.get("path").?.string);
+    const content = parsed.value.object.get("content").?.string;
+    try testing.expect(std.mem.indexOf(u8, content, "{a: 1") != null);
+}
+
+test "convertGemma4ArgsToJson bare array value" {
+    const allocator = testing.allocator;
+    // Bare array value should be preserved via brace-matching
+    const input = "{stops:[\"Rome\",\"Venice\",\"Athens\"],price:1200}";
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.get("stops").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1200), parsed.value.object.get("price").?.integer);
+}
+
+test "convertGemma4ArgsToJson bare nested object value" {
+    const allocator = testing.allocator;
+    // Bare nested object should be preserved via brace-matching
+    const input = "{name:test,config:{\"port\":3000,\"host\":\"localhost\"}}";
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("config").?.object;
+    try testing.expectEqual(@as(i64, 3000), config.get("port").?.integer);
+}
+
+// Issue #16: nested objects/arrays that themselves use Gemma 4's custom
+// `<|"|>`-delimited string format (or bare keys) must be converted recursively,
+// not passed through verbatim.
+test "convertGemma4ArgsToJson issue#16 nested array of custom strings" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_array:[<|"|>foo<|"|>,<|"|>bar<|"|>]}
+    ;
+    const expected =
+        \\{"nested_array":["foo","bar"]}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested object custom format" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_object:{foo:<|"|>bar<|"|>}}
+    ;
+    const expected =
+        \\{"nested_object":{"foo":"bar"}}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested object inside array" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_object_in_array:[{foo:<|"|>bar<|"|>}]}
+    ;
+    const expected =
+        \\{"nested_object_in_array":[{"foo":"bar"}]}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested array inside object" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_array_in_object:{foo:[<|"|>bar<|"|>]}}
+    ;
+    const expected =
+        \\{"nested_array_in_object":{"foo":["bar"]}}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+// Issue #16, real capture: this is the verbatim output of gemma-4-e4b-it-8bit
+// for a tool with nested-object + nested-array params. The model nests its
+// custom `<|"|>`/bare-key format, so the client must still receive valid,
+// fully-converted JSON arguments (no surviving <|"|> delimiters / bare keys).
+test "parseToolCalls Gemma 4 nested object + array args (issue#16 real capture)" {
+    const allocator = testing.allocator;
+    const text =
+        \\<|tool_call>call:send_notification{message:<|"|>Deploy complete<|"|>,metadata:{priority:<|"|>high<|"|>,tags:[<|"|>ci<|"|>,<|"|>release<|"|>]},recipients:[<|"|>alice<|"|>,<|"|>bob<|"|>]}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("send_notification", calls[0].name);
+    // The arguments must be valid JSON (would fail to parse with raw <|"|> in them).
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Deploy complete", parsed.value.object.get("message").?.string);
+    const metadata = parsed.value.object.get("metadata").?.object;
+    try testing.expectEqualStrings("high", metadata.get("priority").?.string);
+    const tags = metadata.get("tags").?.array;
+    try testing.expectEqual(@as(usize, 2), tags.items.len);
+    try testing.expectEqualStrings("ci", tags.items[0].string);
+    try testing.expectEqualStrings("release", tags.items[1].string);
+    const recipients = parsed.value.object.get("recipients").?.array;
+    try testing.expectEqual(@as(usize, 2), recipients.items.len);
+    try testing.expectEqualStrings("alice", recipients.items[0].string);
+    try testing.expectEqualStrings("bob", recipients.items[1].string);
+}
+
+// Gemma 4 12B leaks a trailing ':' into the function name (`call:shell:{…}`),
+// producing an unresolvable tool name `shell:`. The parser must strip it so the
+// client resolves a real tool instead of looping on "Unknown tool 'shell:'".
+test "parseToolCalls Gemma 4 strips trailing colon from tool name" {
+    const allocator = testing.allocator;
+    const text =
+        \\<|tool_call>call:shell:{"command":<|"|>ls<|"|>}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
+}
+
+test "sanitizeToolName strips trailing colons and whitespace" {
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell:"));
+    try testing.expectEqualStrings("shell", sanitizeToolName("  shell  "));
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell : "));
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell::"));
+    try testing.expectEqualStrings("cwd", sanitizeToolName("cwd"));
+    try testing.expectEqualStrings("", sanitizeToolName(":"));
+}
+
+test "isJsonLiteral" {
+    try testing.expect(isJsonLiteral("true"));
+    try testing.expect(isJsonLiteral("false"));
+    try testing.expect(isJsonLiteral("null"));
+    // Objects/arrays are now handled by brace-matching in convertGemma4ArgsToJson, not isJsonLiteral
+    try testing.expect(!isJsonLiteral("{\"key\":1}"));
+    try testing.expect(!isJsonLiteral("[1,2,3]"));
+    try testing.expect(isJsonLiteral("42"));
+    try testing.expect(isJsonLiteral("3.14"));
+    try testing.expect(!isJsonLiteral("hello"));
+    try testing.expect(!isJsonLiteral(""));
+}
+
 test "appendJsonString escapes special chars" {
     const allocator = testing.allocator;
     var buf = std.ArrayList(u8).empty;
@@ -1644,8 +9715,8 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     // was the first whose history held a tool result with a raw ESC byte (the
     // interactive `npx sv create` output). The Jinja render failed on the
     // unescaped messages JSON and silently downgraded to fallbackFormatChat's
-    // text format — not special tokens for Gemma 4, so generation never
-    // stopped at turn end. The render must SUCCEED via
+    // Gemma-2/3 `<start_of_turn>` text format — not special tokens for Gemma
+    // 4, so generation never stopped at turn end. The render must SUCCEED via
     // the template (template marker present, fallback marker absent).
     const allocator = testing.allocator;
     const tpl =
@@ -1678,17 +9749,21 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "Which template") != null);
     // Fallback format must NOT have been used.
-    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
 }
 
 test "templateConsumesEffort: the real templates that READ the effort word" {
     // The families whose templates act on `reasoning_effort`. For these
     // the word is the lever and an effort-derived TOKEN budget on top is pure
     // truncation (see the fn doc).
-    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_flash_next_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_chat_template.jinja")));
+    try testing.expect(templateConsumesEffort(@embedFile("fixtures/qwen38_27b_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/dsv41_chat_template.jinja")));
     try testing.expect(templateConsumesEffort(@embedFile("fixtures/glm53_chat_template.jinja")));
 
+    // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
+    // the budget from a family the word never reaches, silently uncapping it.
+    try testing.expect(!templateConsumesEffort(@embedFile("fixtures/muse_chat_template.jinja")));
     // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, Ling,
     // Nemotron, llama, mistral) reads neither: thinking is a bool there.
     try testing.expect(!templateConsumesEffort(
@@ -1698,14 +9773,17 @@ test "templateConsumesEffort: the real templates that READ the effort word" {
 
 test "renderChatTemplate: a tool with no description/parameters still renders (no silent fallback)" {
     // OpenAI's schema makes `description` optional and a no-arg tool needs no
-    // `parameters`, but a template that dumps those keys through `tojson` RAISES
-    // on Undefined and fell back to ChatML with no tools preamble at all. The
-    // defaults are filled for ALL templates.
+    // `parameters`, but muse's template dumps all three through `tojson`, and
+    // `tojson` RAISES on Undefined — so a description-less tool killed the
+    // render and fell back to ChatML with no tools preamble at all (found
+    // 2026-08-14 by a sweep whose own test tool omitted the key). Every family
+    // that dumps `tool | tojson` wholesale is one missing key from the same
+    // class, so the defaults are filled for ALL templates, not just this one.
     const allocator = testing.allocator;
     var config = ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/muse_chat_template.jinja"),
         .bos_token = null,
-        .eos_token = "<|im_end|>",
+        .eos_token = "<|eot|>",
         .add_bos_token = false,
         .allocator = allocator,
     };
@@ -1715,12 +9793,13 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     const bare =
         \\[{"type":"function","function":{"name":"note"}}]
     ;
-    const before = template_fallbacks.load(.monotonic);
     const rendered = try renderChatTemplate(allocator, &messages, &config, bare, null, true, null, false);
     defer allocator.free(rendered);
-    try testing.expectEqual(before, template_fallbacks.load(.monotonic));
-    try testing.expect(std.mem.indexOf(u8, rendered, "# Tools") != null);
+    // The muse tools preamble proves the REAL template ran; the fallback emits
+    // ChatML markers instead and would carry no tools text at all.
+    try testing.expect(std.mem.indexOf(u8, rendered, "In this environment you have access to a set of tools") != null);
     try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"note\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
 
     // A COMPLETE declaration re-emits nothing: null means the caller keeps the
     // client's own bytes, so no request that works today is re-serialized
@@ -1751,7 +9830,7 @@ test "renderChatTemplate folds a late system turn only where the template refuse
     // A Qwen3.8 revision the adapter does not pin raises on a system turn past index 0 (the raise was
     // the generic fallback), so the turn is folded into the leading one.
     {
-        const revised = try std.mem.concat(allocator, u8, &.{ @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), "{#- revision #}" });
+        const revised = try std.mem.concat(allocator, u8, &.{ @embedFile("fixtures/qwen38_chat_template.jinja"), "{#- revision #}" });
         defer allocator.free(revised);
         var config = ChatConfig{
             .chat_template = revised,
@@ -1783,7 +9862,8 @@ test "renderChatTemplate folds a late system turn only where the template refuse
 }
 
 const qwen_late_templates = [_][]const u8{
-    @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+    @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+    @embedFile("fixtures/qwen38_chat_template.jinja"),
 };
 
 test "stock Qwen late system notes render in place and keep tool rounds a prefix" {
@@ -1941,6 +10021,139 @@ test "real Qwen pack loaded through ChatConfig keeps late notes in place" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, next, "<tools>"));
 }
 
+test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallback (hermetic)" {
+    // src/fixtures/qwen38_chat_template.jinja is verbatim from
+    // Qwen/Qwen3.8-2.4T-A95B, the first public Qwen3.8 checkpoint (the VL
+    // siblings keep this body and re-add the vision macro). Qwen3.8 added two
+    // raise_exception gates that make our previous extra-context values
+    // unrenderable on this family:
+    //   - `enable_thinking is false` -> 'Disabling thinking is not supported.'
+    //   - reasoning_effort outside (xhigh, medium, low) -> raise, and we sent
+    //     "high" on every thinking request, "no_think" on every off one.
+    // A raise is a silent fallbackFormatChat, and this family's fallback is
+    // ChatML too, so the downgrade shows up only as a missing tools preamble.
+    // Both arms pinned.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking ON, no client effort: OUR default, which is deliberately NOT
+    // the checkpoint's (see qwen38EffortFor) — xhigh reasons without a bound
+    // and a client that sends nothing gets no bound either.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<function=get_time>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<parameter=timezone>\nUTC\n</parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response>\n12:34 UTC\n</tool_response>") != null);
+        // Unconditional think opener at the generation prompt.
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // OpenAI's "high" is this family's "xhigh"; "medium" injects no preamble.
+    {
+        const hi = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high", false);
+        defer allocator.free(hi);
+        try testing.expect(std.mem.indexOf(u8, hi, "Reasoning effort is set to xhigh.") != null);
+
+        const med = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "medium", false);
+        defer allocator.free(med);
+        try testing.expect(std.mem.indexOf(u8, med, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, med, "You have access to the following functions:") != null);
+    }
+    // Thinking OFF: the template REFUSES to disable thinking, so the render
+    // must stay on the low-effort arm and the block the template opened is
+    // closed in the prompt (noThinkTailSuffix) instead.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "</think>"));
+        try testing.expect(!promptTailOpensThink(rendered));
+    }
+}
+
+test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {
+    // Same family, DIFFERENT gates: `qwen38_chat_template.jinja` (2.4T-A95B)
+    // raises on `enable_thinking is false`, while the 27B's template answers
+    // that arm the 3.6 way — a CLOSED `<think>\n\n</think>\n\n` and no
+    // reasoning-instructions preamble at all (its effort validation lives
+    // INSIDE the thinking-on branch). Sniffing the shared `'xhigh'` literal
+    // for both decisions forced every thinking-off request onto the
+    // thinking-on arm at effort low, which injects a system line the
+    // checkpoint never renders for that arm and leaves the block to be closed
+    // by `noThinkTailSuffix` instead of by the template. The effort mapping is
+    // still keyed on `'xhigh'` (both templates raise on OpenAI's "high"); only
+    // the enable_thinking override is keyed on the refusal itself.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What time is it?" },
+    };
+
+    // Thinking ON is unchanged: OpenAI's "high" still has to become this
+    // family's "xhigh" or the render raises and silently falls back.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, "high", false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to xhigh.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n"));
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // Absent client effort takes OUR default (low), not the template's xhigh.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to low.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "set to xhigh") == null);
+    }
+    // Thinking OFF renders the template's OWN no-think prompt: closed block,
+    // no reasoning preamble, and nothing appended after it.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning effort is set to") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        try testing.expect(!promptTailOpensThink(rendered));
+    }
+}
+
 const forced_choice_tools =
     \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
 ;
@@ -1948,7 +10161,8 @@ const forced_choice_tools =
 test "renderChatTemplate: a forced tool_choice reaches templates that render tools themselves" {
     const allocator = testing.allocator;
     const templates = [_][]const u8{
-        @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
         @embedFile("fixtures/mimo_v26_chat_template.jinja"),
     };
     const instr = "\nYou MUST call the function \"get_time\". Do not respond with text.";
@@ -1990,7 +10204,8 @@ test "forcedCallText reads each family's call markup from its own template" {
     const allocator = testing.allocator;
     const Case = struct { tpl: []const u8, sep: []const u8, required: []const u8, named: []const u8, name_tail: []const u8 };
     const cases = [_]Case{
-        .{ .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
+        .{ .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
+        .{ .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .sep = "\n\n", .required = "<tool_call>\n<function=", .named = "<tool_call>\n<function=get_time>\n", .name_tail = ">\n" },
         .{ .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .sep = "", .required = "<tool_call><function=", .named = "<tool_call><function=get_time>", .name_tail = ">" },
     };
     for (cases) |c| {
@@ -2034,7 +10249,8 @@ test "renderChatTemplate: preserve_thinking keeps or drops Qwen3.8's prior-turn 
         .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
     };
     const templates = [_][]const u8{
-        @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
     };
     for (templates) |tpl| {
         var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = allocator };
@@ -2457,6 +10673,52 @@ test "fallbackFormatChat ChatML tool response uses user role" {
     try testing.expect(std.mem.indexOf(u8, result, "<|im_start|>tool") == null);
 }
 
+test "fallbackFormatChat Gemma tool response uses user role" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Run ls" },
+        .{ .role = "tool", .content = "file1.txt" },
+    };
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<eos>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Gemma tool results should be in user turn
+    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>user\nTool result: file1.txt") != null);
+    // Should NOT have <start_of_turn>tool (invalid role)
+    try testing.expect(std.mem.indexOf(u8, result, "<start_of_turn>tool") == null);
+}
+
+test "fallbackFormatChat Llama tool response uses ipython role" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "tool", .content = "hello" },
+    };
+    var config = ChatConfig{
+        .chat_template = "start_header_id",
+        .bos_token = null,
+        .eos_token = try allocator.dupe(u8, "<|eot_id|>"),
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    defer if (config.eos_token) |t| allocator.free(t);
+
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    defer allocator.free(result);
+
+    // Llama tool results use ipython role
+    try testing.expect(std.mem.indexOf(u8, result, "<|start_header_id|>ipython<|end_header_id|>") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "hello") != null);
+}
+
 test "fallbackFormatChat ChatML assistant with empty content and tool_calls" {
     const allocator = testing.allocator;
     const tool_calls = [_]ToolCall{
@@ -2662,6 +10924,86 @@ test "renderChatTemplate: DSV4-style template gets tool fallback applied" {
     try testing.expect(std.mem.indexOf(u8, rendered, "list my files") != null);
 }
 
+// ── DSV4 agentic-flow compositions (round-trip + multi-turn + edge cases) ──
+
+test "DSV4 agentic round-trip: model-generated <tool_call> parses + replays" {
+    // Simulates the full agent loop step:
+    //   1. Model emits a `<tool_call>` block in its generated content.
+    //   2. parseToolCalls extracts the structured ToolCall(s).
+    //   3. The agent builds the next prompt with role:assistant(tool_calls=...) +
+    //      role:tool(content=result).
+    //   4. synthesizeToolFallbackMessages rewrites both for the DSV4 template
+    //      (assistant tool_calls → <tool_call> block, tool → user
+    //      <tool_response>).
+    //   5. The same call should round-trip: the rewritten assistant content
+    //      should contain a parseable <tool_call> matching the original.
+    const allocator = testing.allocator;
+
+    // 1. Pretend the model wrote this:
+    const generated =
+        \\<tool_call>
+        \\{"name": "shell", "arguments": {"command": "date"}}
+        \\</tool_call>
+    ;
+    const parsed_calls = (try parseToolCalls(allocator, generated)).?;
+    defer {
+        for (parsed_calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(parsed_calls);
+    }
+    try testing.expectEqual(@as(usize, 1), parsed_calls.len);
+    try testing.expectEqualStrings("shell", parsed_calls[0].name);
+
+    // 2. Agent builds the next-turn history with the parsed call + the result.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const tc = [_]ToolCall{
+        .{ .id = "tc_0", .name = parsed_calls[0].name, .arguments = parsed_calls[0].arguments },
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "what is the date?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "Mon May 13 2026", .tool_call_id = "tc_0" },
+    };
+
+    // 3. Run through the DSV4 fallback. inject_tool_prompt=true mirrors how
+    // renderChatTemplate calls it when the template lacks tool support.
+    const tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]";
+    const out = try synthesizeToolFallbackMessages(a, &messages, tools_json, null, true, true, true);
+
+    // Should produce: system(tool-prompt), user, assistant(<tool_call>), user(<tool_response>).
+    try testing.expectEqual(@as(usize, 4), out.len);
+    try testing.expectEqualStrings("system", out[0].role);
+    try testing.expectEqualStrings("user", out[1].role);
+    try testing.expectEqualStrings("assistant", out[2].role);
+    try testing.expectEqualStrings("user", out[3].role);
+
+    // 4. The assistant's rewritten content must contain a <tool_call> block
+    //    that re-parses back to the same name + arguments. This is the
+    //    closed-loop test.
+    try testing.expect(out[2].tool_calls == null);
+    const reparsed = (try parseToolCalls(allocator, out[2].content)).?;
+    defer {
+        for (reparsed) |t| {
+            allocator.free(t.name);
+            allocator.free(t.arguments);
+        }
+        allocator.free(reparsed);
+    }
+    try testing.expectEqual(@as(usize, 1), reparsed.len);
+    try testing.expectEqualStrings("shell", reparsed[0].name);
+    try testing.expect(std.mem.indexOf(u8, reparsed[0].arguments, "date") != null);
+
+    // 5. The tool-result rewrite must wrap the result in <tool_response>...
+    try testing.expect(std.mem.indexOf(u8, out[3].content, "<tool_response>") != null);
+    try testing.expect(std.mem.indexOf(u8, out[3].content, "Mon May 13 2026") != null);
+    try testing.expect(std.mem.indexOf(u8, out[3].content, "</tool_response>") != null);
+}
+
 test "DSV4 multi-turn agent history: every role correctly rewritten" {
     // Realistic 6-message agent transcript:
     //   1. user (initial question)
@@ -2750,6 +11092,1815 @@ test "DSV4 fallback: null tools_json with inject_tool_prompt does not synthesize
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqualStrings("user", out[0].role);
     try testing.expectEqualStrings("hello", out[0].content);
+}
+
+test "streamShouldBufferForTools: empty + plain prose" {
+    try testing.expect(!streamShouldBufferForTools(""));
+    try testing.expect(!streamShouldBufferForTools("hello world"));
+    try testing.expect(!streamShouldBufferForTools("Let me look at this."));
+}
+
+test "streamShouldBufferForTools: trailing partial prefixes of <tool" {
+    // The exact regression from the screenshot: model emits `<tool` as a
+    // single BPE token, server must buffer instead of streaming it as
+    // content (so the next token can either complete the open or be flushed
+    // together as harmless prose).
+    try testing.expect(streamShouldBufferForTools("<"));
+    try testing.expect(streamShouldBufferForTools("<t"));
+    try testing.expect(streamShouldBufferForTools("<to"));
+    try testing.expect(streamShouldBufferForTools("<too"));
+    try testing.expect(streamShouldBufferForTools("<tool"));
+    try testing.expect(streamShouldBufferForTools("Let me look at the CLI help:\n<tool"));
+}
+
+test "streamShouldBufferForTools: trailing partial prefixes of <|tool_call" {
+    try testing.expect(streamShouldBufferForTools("<|"));
+    try testing.expect(streamShouldBufferForTools("<|t"));
+    try testing.expect(streamShouldBufferForTools("<|too"));
+    try testing.expect(streamShouldBufferForTools("<|tool"));
+    try testing.expect(streamShouldBufferForTools("<|tool_"));
+    try testing.expect(streamShouldBufferForTools("<|tool_c"));
+    try testing.expect(streamShouldBufferForTools("<|tool_cal"));
+}
+
+test "streamShouldBufferForTools: bare <tool> open (DSV4)" {
+    try testing.expect(streamShouldBufferForTools("<tool>"));
+    try testing.expect(streamShouldBufferForTools("<tool>{\"name\":\"shell\""));
+    try testing.expect(streamShouldBufferForTools("<tool name=\"shell\">"));
+    try testing.expect(streamShouldBufferForTools("hello <tool>{}"));
+}
+
+test "streamShouldBufferForTools: canonical <tool_call*> opens" {
+    try testing.expect(streamShouldBufferForTools("<tool_call>"));
+    try testing.expect(streamShouldBufferForTools("<tool_call>{\"name\":"));
+    try testing.expect(streamShouldBufferForTools("<tool_calls>"));
+    try testing.expect(streamShouldBufferForTools("<tool_request>"));
+    try testing.expect(streamShouldBufferForTools("prose first then <tool_call>"));
+}
+
+test "streamShouldBufferForTools: Gemma 4 <|tool_call" {
+    try testing.expect(streamShouldBufferForTools("<|tool_call>"));
+    try testing.expect(streamShouldBufferForTools("hello <|tool_call name=\"x\">"));
+}
+
+test "streamShouldBufferForTools: false positives — <toolkit> etc." {
+    // `<toolkit>` and `<toolbar>` have `<tool` as a prefix but the char
+    // after is `k` / `b` — not a tag terminator. Must NOT buffer.
+    try testing.expect(!streamShouldBufferForTools("here is <toolkit>"));
+    try testing.expect(!streamShouldBufferForTools("here is <toolbar>"));
+    try testing.expect(!streamShouldBufferForTools("HTML: <toolset>"));
+    // But a later real `<tool>` should still trip detection:
+    try testing.expect(streamShouldBufferForTools("HTML: <toolset> then <tool>{"));
+}
+
+test "streamShouldBufferForTools: raw JSON shape" {
+    try testing.expect(streamShouldBufferForTools("{\"name\":\"shell\",\"arguments\":{}}"));
+    try testing.expect(streamShouldBufferForTools("{\"name\":\"shell\""));
+    // Just `{` or JSON without `"name"` shouldn't false-trigger.
+    try testing.expect(!streamShouldBufferForTools("{"));
+    try testing.expect(!streamShouldBufferForTools("{\"foo\":1}"));
+}
+
+test "streamThinkGate: template-opened thinking holds tag-free prose" {
+    // The Claude Code leak class: with thinking on and the opener injected by
+    // the template, the model's prose has NO tags — it must still be held,
+    // never flushed as visible text.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The user is asking about their system specs.", true, false));
+    // …and split exactly when the close tag arrives.
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("The user is asking.\n</think>\n\nI don't have direct access.", true, false));
+}
+
+test "streamThinkGate: after the split, prose flushes (hidden-answer guard)" {
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("The visible answer streams normally.", true, true));
+}
+
+test "streamThinkGate: explicit openers hold even with thinking off or closed" {
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Sure.<|channel>thought\nlet me reconsider", true, true));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("<think>hmm", false, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("<|channel>thought\nplan<channel|>done", false, false));
+}
+
+test "streamThinkGate: partial opener at the buffer tail holds" {
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The answer is 391.\n<|channel>", false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Done. <thi", false, false));
+}
+
+test "streamThinkGate: plain prose with thinking off flushes" {
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("17 × 23 = 391.", false, false));
+}
+
+test "streamThinkGate: a prompt-opened block is held even with thinking OFF" {
+    // LFM2.5 renders `…assistant\n<think>` UNCONDITIONALLY — there is no
+    // enable_thinking branch in its template, so the model always reasons and
+    // the opener is never in the OUTPUT. The gate saw tag-free prose with
+    // thinking off and flushed the entire chain-of-thought as the answer
+    // (live 2026-08-04, streaming only — non-streaming strips it because the
+    // `</think>` is present by the time the text is split).
+    //
+    // Whether the prompt ends inside a think block is a fact about the
+    // RENDERED BYTES, not about our request flag, which is why it needs its
+    // own argument rather than riding `enable_thinking`.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, true));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2("The user wants 5 words.</think>Hi there, how are you?", false, false, true));
+
+    // Containment, both directions. Same buffers with the prompt flag FALSE
+    // behave exactly as before — every other family's template renders the
+    // closed `<think></think>` signature (or no tag) when thinking is off, so
+    // `promptTailOpensThink` is false for them and this term can never fire.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, false));
+    // And once the block has closed, a prompt-opened flag must not re-hold the
+    // visible answer — that would hide every reply after the first.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("Hi there, how are you?", false, true, true));
+}
+
+test "unstreamedReasoning: only the remainder, and never a resend" {
+    try testing.expectEqualStrings("cde", unstreamedReasoning("abcde", 2).?);
+    try testing.expectEqualStrings("abcde", unstreamedReasoning("abcde", 0).?);
+    // Nothing new since the last delta.
+    try testing.expect(unstreamedReasoning("abcde", 5) == null);
+    // The split SHRANK (a tool marker appeared mid-thought and the leaked-markup
+    // cut took the tail). Deltas cannot be retracted, so send nothing more —
+    // resending from the top would duplicate the whole thought.
+    try testing.expect(unstreamedReasoning("ab", 5) == null);
+    try testing.expect(unstreamedReasoning("", 0) == null);
+}
+
+test "streamTailIsReasoning: an unopened block was content all along" {
+    // Gemma 4 with enable_thinking:true answering "391" directly — no opener
+    // in the prompt (its template renders a bare `<|turn>model\n`) and none in
+    // the output. Streamed, the whole answer arrived as reasoning_content with
+    // EMPTY content while non-streaming returned it as content (live
+    // 2026-08-04). Content is the correct reading: nothing ever opened.
+    try testing.expect(!streamTailIsReasoning(true, false, false));
+
+    // A template-opened block that never closed IS reasoning — the truncated
+    // thought must not leak into content (Qwen/LFM2.5 pre-inject the opener).
+    try testing.expect(streamTailIsReasoning(true, true, false));
+    // A model-emitted opener is the same evidence (Gemma's `<|channel>thought`,
+    // a `<think>` the model writes itself), even with no prompt opener.
+    try testing.expect(streamTailIsReasoning(true, false, true));
+    // Already closed and split ⇒ the tail is the visible answer.
+    try testing.expect(!streamTailIsReasoning(false, true, true));
+}
+
+test "cutThoughtDelta: a thought cut at its opener delivers nothing, as the split does" {
+    // `max_tokens: 1` on a model that opens its own block: the stream holds only the seeded opener.
+    try testing.expectEqualStrings("", cutThoughtDelta("<think>", false, false));
+    try testing.expectEqualStrings("", cutThoughtDelta("<|channel>thought", false, false));
+    try testing.expectEqualStrings("", splitThinkBlock("<think>", true, false).reasoning_content orelse "");
+    // A prompt-opened thought cut before its first word, and one cut after it.
+    try testing.expectEqualStrings("", cutThoughtDelta("\n", false, false));
+    try testing.expectEqualStrings("Ok", cutThoughtDelta("\nOk", false, false));
+    // Once the opener is consumed, the same bytes are the thought's own text.
+    try testing.expectEqualStrings("<think>", cutThoughtDelta("<think>", true, false));
+    // After a delta shipped, the held run (withheld whitespace, a partial close) goes out as is.
+    try testing.expectEqualStrings(" \n</thi", cutThoughtDelta(" \n</thi", true, true));
+}
+
+test "promptTailOpensThink does not match Gemma's channel opener" {
+    // The containment boundary for the prompt-opened-think stream arm: it
+    // detects the close with `</think>` ONLY, which is sound exactly because
+    // the flag can only be set by a `<think`-family opener. Gemma 4 opens with
+    // `<|channel>thought` and closes with `<channel|>`, so it never enters
+    // that arm and its streaming is byte-unchanged.
+    //
+    // If `thinkOpenTagLenAt` ever grows the channel opener, this test fails —
+    // and `server.zig`'s arm then needs `<channel|>` in its close check, or a
+    // Gemma turn would be held forever waiting for a tag that never arrives.
+    try testing.expect(!promptTailOpensThink("<|turn>model\n<|channel>thought\n"));
+    try testing.expect(!promptTailOpensThink("<|turn>model\n"));
+    // The `<think>` family it DOES match.
+    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think>"));
+}
+
+test "streamThinkGate: the 3-arg form is the 4-arg form with no prompt opener" {
+    // The old signature is kept as the no-prompt-opener case so every existing
+    // call site and test pins the SAME behavior it always did.
+    const cases = [_][]const u8{
+        "The user is asking about their system specs.",
+        "The user is asking.\n</think>\n\nI don't have direct access.",
+        "<think>hmm",
+        "17 × 23 = 391.",
+        "The answer is 391.\n<|channel>",
+    };
+    for (cases) |c| {
+        for ([_]bool{ true, false }) |think| {
+            for ([_]bool{ true, false }) |closed| {
+                try testing.expectEqual(streamThinkGate(c, think, closed), streamThinkGate2(c, think, closed, false));
+            }
+        }
+    }
+}
+
+test "parseToolCalls: self-closing <tool name=... arguments=... />" {
+    const allocator = testing.allocator;
+    // Clean form. We use the literal byte sequence the model actually emits —
+    // unescaped `"` inside the attribute value. That's XML-invalid but
+    // perfectly JSON-parseable once we snap to the inner `{…}`.
+    const text =
+        \\<tool name="shell" arguments="{"command": "ls -la"}"/>
+    ;
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"command\"") != null);
+}
+
+test "parseToolCalls: DSV4 broken-quote self-closing fragment (regression repro)" {
+    // Verbatim capture from the failing turn in test_agent_stop_repro.py.
+    // The model opened arguments with `"`, closed with `'`, embedded
+    // unescaped `"` inside the JSON, and finished with `'/>`. The parser
+    // must still recover the JSON object and produce a single tool call.
+    const allocator = testing.allocator;
+    const text =
+        "\n\n<tool_calls>\n" ++
+        "<tool name=\"shell\" arguments=\"{\"command\": \"ls -la && cat package.json 2>/dev/null || echo 'no package.json yet'\"}'/>\n" ++
+        "</tool_calls>";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    // Args should be the balanced JSON object — starts with `{` and ends `}`.
+    try testing.expect(calls[0].arguments.len > 0);
+    try testing.expectEqual(@as(u8, '{'), calls[0].arguments[0]);
+    try testing.expectEqual(@as(u8, '}'), calls[0].arguments[calls[0].arguments.len - 1]);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"command\"") != null);
+}
+
+test "parseToolCalls: multiple self-closing tool tags in one response" {
+    const allocator = testing.allocator;
+    const text =
+        \\<tool name="cwd" arguments="{"path": "src"}"/>
+        \\<tool name="listFiles" arguments="{"recursive": "true"}"/>
+    ;
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("cwd", calls[0].name);
+    try testing.expectEqualStrings("listFiles", calls[1].name);
+}
+
+test "parseToolCalls: canonical <tool_call>JSON</tool_call> still parses" {
+    // Regression guard — adding the self-closing branch must not break the
+    // canonical Hermes form.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "parseToolCalls: empty body + attribute-args + explicit </tool_call> close" {
+    // Verbatim capture from the user's failed chat-history.json. The model
+    // emitted args via XML attribute and used `></tool_call>` (not `/>`)
+    // as the terminator, with empty body. Without explicit handling this
+    // shape parses as "empty body" → no JSON to extract → no tool call.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_calls>
+        \\<tool_call name="cwd" arguments="{"path": "/Users/user/.sushi/workspace"}"></tool_call>
+        \\</tool_calls>
+    ;
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("cwd", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"path\"") != null);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, ".sushi/workspace") != null);
+}
+
+test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
+    // The model emitted `<tool_call>` + well-formed args JSON, then hit
+    // EOS before completing the close marker. Output looks like:
+    //   "\n\n<tool_call>\n{\"name\": \"writeFile\", \"arguments\":{...}}\n</tool_cal"
+    // Previously this fell through to the orphan branch and got silently
+    // dropped — that's the second failure mode the agent-stops repro
+    // surfaced. We snap to a balanced JSON body and parse it.
+    const allocator = testing.allocator;
+    const text = "\n\n<tool_call>\n" ++
+        \\{"name": "writeFile", "arguments": {"path": "vite.config.js", "content": "ok"}}
+        ++ "\n</tool_cal";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"path\"") != null);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "\"content\"") != null);
+}
+
+test "parseToolCalls: mismatched </tool_action> close still parses" {
+    // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): opened
+    // with <tool_call>, closed with the hallucinated </tool_action>. The
+    // edit call must parse; pre-fix it leaked into visible text and the
+    // agent executed nothing.
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n" ++
+        \\{"name": "edit", "arguments": {"path":"mlx.html", "edits":[{"oldText": "  </ul>\n</body>", "newText": "  </ul>\n  <button onclick=\"alert('Hello from MLX')\">Click me</button>\n</body>"}]}
+        ++ "\n</tool_action>";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("edit", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "mlx.html") != null);
+}
+
+test "parseToolCalls: fenced JSON array of parallel calls parses all" {
+    const allocator = testing.allocator;
+    const text = "```json\n[\n  {\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris, France\"}},\n  {\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo, Japan\"}}\n]\n```";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "Paris, France") != null);
+    try testing.expect(std.mem.indexOf(u8, calls[1].arguments, "Tokyo, Japan") != null);
+}
+
+test "parseToolCalls: XML-element tool form (tool_name + arg children)" {
+    // Verbatim DSV4-Flash capture (2026-06-10, MLX Core agent chat): the
+    // tool name and each argument arrive as XML child elements — no JSON.
+    const allocator = testing.allocator;
+    const text = "Let me check the available disk space on this device.\n\n<tool_calls>\n<tool_name>shell</tool_name>\n<command>df -h / | grep -v \"Filesystem\"</command>\n</tool_calls>";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "df -h / | grep -v \\\"Filesystem\\\"") != null);
+}
+
+test "parseToolCalls: XML-element-TAG form (<tool_NAME> with arg children)" {
+    // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): the tool
+    // name rides in the tag itself — <tool_read>, <tool_edit> — with each
+    // argument as an XML child element. Nested elements (the <edits> body)
+    // stay verbatim as the arg's string value, matching what working models
+    // send pi for the same tool.
+    const allocator = testing.allocator;
+    const text = "Let me read the current file first.\n\n<tool_read>\n<path>mlx.html</path>\n</tool_read>Now I'll add a button:\n\n<tool_edit>\n<path>mlx.html</path>\n<edits>\n  <oldText>    <h1>MLX</h1></oldText>\n  <newText>    <h1>MLX</h1>\n    <button onclick=\"alert('hi')\">Say Hello</button></newText>\n</edits>\n</tool_edit>";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("read", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "mlx.html") != null);
+    try testing.expectEqualStrings("edit", calls[1].name);
+    // Args must be valid JSON with the nested XML preserved as a string value.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mlx.html", parsed.value.object.get("path").?.string);
+    const edits = parsed.value.object.get("edits").?.string;
+    try testing.expect(std.mem.indexOf(u8, edits, "<oldText>") != null);
+    try testing.expect(std.mem.indexOf(u8, edits, "Say Hello") != null);
+}
+
+test "parseToolCalls: XML-element-TAG form with JSON args body" {
+    // Verbatim-shape DSV4-Flash capture (2026-06-10 pi html-ds4, second
+    // sampling): same name-in-tag form but the body is a bare JSON args
+    // object instead of XML elements — `<tool_write>\n{…}\n</tool_write>`.
+    const allocator = testing.allocator;
+    const text = "Here's the HTML page:\n\n<tool_write>\n{\"path\": \"/tmp/ws/mlx.html\", \"content\": \"<!DOCTYPE html>\\n<html lang=\\\"en\\\">\\n<body>\\n</body>\\n</html>\"}\n</tool_write>\n\npage ready";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/ws/mlx.html", parsed.value.object.get("path").?.string);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("content").?.string, "<!DOCTYPE html>") != null);
+}
+
+test "parseToolCalls: <tool_NAME> with prose body containing braces is NOT a tool call" {
+    // Prose with incidental {braces} inside an unknown tool-ish tag must not
+    // produce arguments — the JSON-body variant requires the body to BE the
+    // args object, not merely contain one.
+    const allocator = testing.allocator;
+    const text = "<tool_summary>The config {a: 1} was applied.</tool_summary>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: hallucinated <tool_output> result tag is NOT a tool call" {
+    // Verbatim DSV4-Flash capture (same session, turn 1): the model invented
+    // a tool RESULT without calling anything. A plain-text body must never
+    // produce a call to a tool named "output".
+    const allocator = testing.allocator;
+    const text = "Here's the page I created for you:\n\n<tool_output>Page ready: mlx.html</tool_output>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: <tool_output> with element children is still NOT a tool call" {
+    // A hallucinated result tag can carry element-shaped content (e.g. an
+    // echoed HTML fragment). Result-ish names are denylisted outright.
+    const allocator = testing.allocator;
+    const text = "<tool_output>\n<status>ok</status>\n</tool_output>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: XML-element form without a tool_name is NOT a tool call" {
+    // Prose-ish markup inside a <tool_calls> wrapper must not half-execute.
+    const allocator = testing.allocator;
+    const text = "<tool_calls>\n<note>this has no tool name element</note>\n</tool_calls>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: prose list array is NOT a tool call" {
+    // All-or-nothing: an array whose elements aren't {name, arguments}
+    // objects must pass through as text.
+    const allocator = testing.allocator;
+    const text = "[\"apples\", \"oranges\", \"pears\"]";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: <toolkit> is not a tool tag" {
+    // The self-closing scan must not false-fire on HTML-ish prose. `<toolkit>`
+    // has `<tool` as a prefix but the terminator (`k`) isn't valid, so the
+    // outer scan rejects it before parseSelfClosingToolTag even runs.
+    const allocator = testing.allocator;
+    const text = "Here's a doc about <toolkit> and <toolbar>. No actual tool call.";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+// ── Schema-aware argument coercion (value-spelling type-inference class) ──
+
+/// The Edit tool as Claude Code declares it (OpenAI shape, post
+/// `buildOpenAIToolsJson`): `replace_all` is a BOOLEAN, the rest are strings.
+const edit_tools_json_test =
+    \\[{"type":"function","function":{"name":"Edit","description":"Edit a file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","default":false}},"required":["file_path","old_string","new_string"]}}}]
+;
+
+fn parseArgsObj(allocator: std.mem.Allocator, args: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, args, .{});
+}
+
+test "coerceToolArgsToSchema: Python-style False on a boolean param becomes JSON false" {
+    // VERBATIM capture, 2026-07-09, Qwen3.6-35B-A3B via Claude Code on
+    // ~/.sushi/logs/sushi-11234.log:109471. The model emits the Hermes
+    // XML parameter form with Python's `False`; parseHermesToolCall's
+    // isJsonLiteral only knows lowercase, so it shipped the STRING "False" and
+    // Claude Code rejected every Edit with
+    //   "The parameter `replace_all` type is expected as `boolean` but provided as `string`"
+    // — six times in a row, until the model gave up and rewrote the whole file.
+    const allocator = testing.allocator;
+    const raw =
+        "\n<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
+        "<parameter=file_path>\n/Users/user/doom/index.html\n</parameter>\n" ++
+        "<parameter=old_string>\n  <script src=\"game.js\"></script>\n</parameter>\n" ++
+        "<parameter=new_string>\n  <script src=\"game.js\" type=\"module\"></script>\n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const v = parsed.value.object.get("replace_all").?;
+    try testing.expect(v == .bool);
+    try testing.expectEqual(false, v.bool);
+    // Same capture, the whitespace half of the class: `old_string` must match
+    // the file "exactly, including indentation", so the two leading spaces the
+    // model sent are payload. Trimming them either failed the edit or matched a
+    // DIFFERENT, un-indented occurrence mid-line and rewrote it at the wrong
+    // nesting; coercion leaves a declared string alone, so the parser is the
+    // only layer that can preserve them.
+    try testing.expectEqualStrings(
+        "  <script src=\"game.js\"></script>",
+        parsed.value.object.get("old_string").?.string,
+    );
+    try testing.expectEqualStrings(
+        "  <script src=\"game.js\" type=\"module\"></script>",
+        parsed.value.object.get("new_string").?.string,
+    );
+}
+
+test "coerceToolArgsToSchema: a STRING param spelled `false` stays a string" {
+    // The inverse half of the same class: isJsonLiteral guesses the type from
+    // the value's SPELLING, so a code edit whose old_string is literally the
+    // token `false` was shipped as JSON `false` (boolean) — "expected string,
+    // provided boolean". The schema is the only thing that can disambiguate.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>\n<function=Edit>\n<parameter=file_path>\na.js\n</parameter>\n" ++
+        "<parameter=old_string>\nfalse\n</parameter>\n<parameter=new_string>\n42\n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const old = parsed.value.object.get("old_string").?;
+    try testing.expect(old == .string);
+    try testing.expectEqualStrings("false", old.string);
+    const new = parsed.value.object.get("new_string").?;
+    try testing.expect(new == .string);
+    try testing.expectEqualStrings("42", new.string);
+}
+
+test "coerceToolArgsToSchema: quoted boolean in a JSON body is coerced too" {
+    // Same class, different producer: the model emits well-formed JSON but
+    // quotes the boolean. Strict parse succeeds, so no repair path ever runs.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>{\"name\":\"Edit\",\"arguments\":{\"file_path\":\"a.js\"," ++
+        "\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":\"true\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const v = parsed.value.object.get("replace_all").?;
+    try testing.expect(v == .bool);
+    try testing.expectEqual(true, v.bool);
+}
+
+test "coerceToolArgsToSchema: unknown tool / unknown key / undecidable value pass through" {
+    const allocator = testing.allocator;
+    // Unknown tool name → args untouched.
+    {
+        const raw = "<tool_call>{\"name\":\"Nope\",\"arguments\":{\"replace_all\":\"False\"}}</tool_call>";
+        const calls = (try parseToolCalls(allocator, raw)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+        const parsed = try parseArgsObj(allocator, calls[0].arguments);
+        defer parsed.deinit();
+        try testing.expect(parsed.value.object.get("replace_all").? == .string);
+    }
+    // Known tool, boolean param, value that is not a recognizable boolean →
+    // left alone so the client's validation error stays honest.
+    {
+        const raw = "<tool_call>{\"name\":\"Edit\",\"arguments\":{\"replace_all\":\"maybe\"}}</tool_call>";
+        const calls = (try parseToolCalls(allocator, raw)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+        const parsed = try parseArgsObj(allocator, calls[0].arguments);
+        defer parsed.deinit();
+        const v = parsed.value.object.get("replace_all").?;
+        try testing.expect(v == .string);
+        try testing.expectEqualStrings("maybe", v.string);
+    }
+}
+
+/// pi's `edit` tool, verbatim from its own schema
+/// (@earendil-works/pi-coding-agent dist/core/tools/edit.js — typebox
+/// `editSchema`). Two facts the tests below lean on: `path` is REQUIRED at the
+/// TOP level, and the array's item schema declares ONLY oldText/newText — it
+/// never declares `path`. That asymmetry is what makes a buried `path`
+/// provably misplaced rather than a judgment call.
+const pi_edit_tools_json_test =
+    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
+;
+
+const edit_array_tools_json_test =
+    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"dry_run":{"type":"boolean"}},"required":["path","edits"]}}}]
+;
+
+test "coerceToolArgsToSchema: an ARRAY param passed through Hermes XML is not left a string" {
+    // Live capture class (15 occurrences in one session): `<parameter=edits>` holds
+    // a JSON array, but parseHermesToolCall's isJsonLiteral only recognizes
+    // scalars, so the whole array shipped as a STRING. Strict clients reject it
+    // ("edits: want array, got str"); lenient ones silently mis-execute.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>\n<function=edit>\n<parameter=path>\n/tmp/a.js\n</parameter>\n" ++
+        "<parameter=edits>\n[{\"oldText\": \"const a = 1;\", \"newText\": \"const a = 2;\"}]\n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_array_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits == .array);
+    try testing.expectEqual(@as(usize, 1), edits.array.items.len);
+    try testing.expectEqualStrings("const a = 2;", edits.array.items[0].object.get("newText").?.string);
+    // sibling scalars still coerce/pass through
+    try testing.expectEqualStrings("/tmp/a.js", parsed.value.object.get("path").?.string);
+}
+
+test "coerceToolArgsToSchema: identical duplicate keys inside a container param still coerce; conflicting ones do not" {
+    // Issue #402: Qwen Code's ask_user_question array arrived as a string whose
+    // items repeated `header` with the same value; strict parse rejects the
+    // duplicate, the tolerant re-emit keeps it, and the string reached the
+    // client unchanged. Identical duplicates carry no ambiguity; conflicting
+    // ones do, and guessing a value is worse than leaving the string alone.
+    const allocator = testing.allocator;
+    const cases = [_]struct { inner: []const u8, want_array: bool }{
+        .{ .inner = "[{\"header\":\"Scope\",\"question\":\"Which scope?\",\"header\":\"Scope\",\"options\":[{\"label\":\"Small\"}]}]", .want_array = true },
+        .{ .inner = "[{\"header\":\"Scope\",\"header\":\"Size\"}]", .want_array = false },
+    };
+    for (cases) |c| {
+        const raw = try std.fmt.allocPrint(allocator, "<tool_call>\n<function=edit>\n<parameter=edits>\n{s}\n</parameter>\n</function>\n</tool_call>", .{c.inner});
+        defer allocator.free(raw);
+        const calls = (try parseToolCalls(allocator, raw)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try coerceToolArgsToSchema(allocator, calls, edit_array_tools_json_test);
+        const parsed = try parseArgsObj(allocator, calls[0].arguments);
+        defer parsed.deinit();
+        const edits = parsed.value.object.get("edits").?;
+        if (c.want_array) {
+            try testing.expect(edits == .array);
+            try testing.expectEqualStrings("Scope", edits.array.items[0].object.get("header").?.string);
+            try testing.expectEqual(@as(usize, 3), edits.array.items[0].object.count());
+        } else {
+            try testing.expect(edits == .string);
+        }
+    }
+}
+
+test "coerceToolArgsToSchema: a STRING param whose content is JSON stays a string" {
+    // The inverse guard for arrays/objects: `old_string` may legitimately BE the
+    // text `[1,2]`. Only the schema decides.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>\n<function=Edit>\n<parameter=file_path>\na.js\n</parameter>\n" ++
+        "<parameter=old_string>\n[1,2]\n</parameter>\n<parameter=new_string>\n{\"k\":1}\n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("old_string").? == .string);
+    try testing.expectEqualStrings("[1,2]", parsed.value.object.get("old_string").?.string);
+    try testing.expect(parsed.value.object.get("new_string").? == .string);
+}
+
+test "coerceToolArgsToSchema: already-conforming args are byte-identical (no-op guard)" {
+    // The auto-correct layer must never touch a good call. Property: when every
+    // declared type already matches, `arguments` comes out byte-for-byte the same.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>{\"name\":\"Edit\",\"arguments\":{\"file_path\":\"a.js\",\"old_string\":\"a\"," ++
+        "\"new_string\":\"b\",\"replace_all\":true}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const before = try allocator.dupe(u8, calls[0].arguments);
+    defer allocator.free(before);
+    try coerceToolArgsToSchema(allocator, calls, edit_tools_json_test);
+    try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+// ── Auto-correct safety properties (deterministic fuzz) ─────────────────────
+// The repair layer is only ever allowed to touch input that is actually broken.
+// These generate well-formed tool calls whose values deliberately SPELL other
+// JSON types ("false", "42", "[1,2]", "null") — exactly the strings the
+// value-spelling inference used to mis-type — and assert round-trip identity.
+
+fn jsonValueEql(a: std.json.Value, b: std.json.Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .bool => a.bool == b.bool,
+        .integer => a.integer == b.integer,
+        .float => a.float == b.float,
+        .number_string => std.mem.eql(u8, a.number_string, b.number_string),
+        .string => std.mem.eql(u8, a.string, b.string),
+        .array => blk: {
+            if (a.array.items.len != b.array.items.len) break :blk false;
+            for (a.array.items, b.array.items) |x, y| if (!jsonValueEql(x, y)) break :blk false;
+            break :blk true;
+        },
+        .object => blk: {
+            if (a.object.count() != b.object.count()) break :blk false;
+            var it = a.object.iterator();
+            while (it.next()) |e| {
+                const other = b.object.get(e.key_ptr.*) orelse break :blk false;
+                if (!jsonValueEql(e.value_ptr.*, other)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+/// Value strings chosen to collide with every JSON literal spelling the
+/// tag-format parsers used to guess from.
+const adversarial_strings = [_][]const u8{
+    "false",      "true",         "False",   "True",    "null",   "None",
+    "42",         "-7",           "3.14",    "0",       "1",      "",
+    "[1,2]",      "{\"k\":1}",    "nan",     "inf",     "  ",     "yes",
+    "a\"b",       "line\nline",   "tab\there", "back\\slash", "café ☕", "0x1f",
+    "{not json",  "[unclosed",    "1e400",   "00",      "+5",     "-",
+};
+
+test "fuzz: a conforming tool call round-trips byte-identical through parse+coerce" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_1234);
+    const rand = prng.random();
+
+    const types = [_][]const u8{ "string", "integer", "number", "boolean", "array", "object" };
+
+    var iter: usize = 0;
+    while (iter < 400) : (iter += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Build a random schema + a CONFORMING args object for it.
+        var props: std.json.ObjectMap = .empty;
+        var args: std.json.ObjectMap = .empty;
+        const nprops = 1 + rand.uintLessThan(usize, 5);
+        var p: usize = 0;
+        while (p < nprops) : (p += 1) {
+            const key = try std.fmt.allocPrint(arena, "p{d}", .{p});
+            const want = types[rand.uintLessThan(usize, types.len)];
+
+            var prop: std.json.ObjectMap = .empty;
+            try prop.put(arena, "type", .{ .string = want });
+            try props.put(arena, key, .{ .object = prop });
+
+            const v: std.json.Value = if (std.mem.eql(u8, want, "string"))
+                .{ .string = adversarial_strings[rand.uintLessThan(usize, adversarial_strings.len)] }
+            else if (std.mem.eql(u8, want, "integer"))
+                .{ .integer = @as(i64, @intCast(rand.uintLessThan(u32, 1000))) - 500 }
+            else if (std.mem.eql(u8, want, "number"))
+                .{ .float = 1.5 }
+            else if (std.mem.eql(u8, want, "boolean"))
+                .{ .bool = rand.boolean() }
+            else if (std.mem.eql(u8, want, "array")) blk: {
+                var arr = std.json.Array.init(arena);
+                try arr.append(.{ .string = "x" });
+                try arr.append(.{ .integer = 1 });
+                break :blk .{ .array = arr };
+            } else blk: {
+                var o: std.json.ObjectMap = .empty;
+                try o.put(arena, "k", .{ .string = "v" });
+                break :blk .{ .object = o };
+            };
+            try args.put(arena, key, v);
+        }
+
+        var func: std.json.ObjectMap = .empty;
+        try func.put(arena, "name", .{ .string = "t" });
+        var params: std.json.ObjectMap = .empty;
+        try params.put(arena, "type", .{ .string = "object" });
+        try params.put(arena, "properties", .{ .object = props });
+        try func.put(arena, "parameters", .{ .object = params });
+        var tool: std.json.ObjectMap = .empty;
+        try tool.put(arena, "type", .{ .string = "function" });
+        try tool.put(arena, "function", .{ .object = func });
+        var tools_arr = std.json.Array.init(arena);
+        try tools_arr.append(.{ .object = tool });
+        const tools_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .array = tools_arr }, .{});
+
+        // Serialize as a canonical Hermes JSON call — always VALID input.
+        const args_json = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = args }, .{});
+        const raw = try std.fmt.allocPrint(arena,
+            "<tool_call>{{\"name\":\"t\",\"arguments\":{s}}}</tool_call>", .{args_json});
+
+        const calls = (try parseToolCalls(allocator, raw)) orelse {
+            std.debug.print("\n[fuzz iter {d}] valid tool call did not parse\n  {s}\n", .{ iter, raw });
+            return error.FuzzFailed;
+        };
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+
+        const before = try arena.dupe(u8, calls[0].arguments);
+        try coerceToolArgsToSchema(allocator, calls, tools_json);
+
+        // Property 1: a conforming call is left BYTE-identical.
+        if (!std.mem.eql(u8, before, calls[0].arguments)) {
+            std.debug.print("\n[fuzz iter {d}] auto-correct mutated a conforming call\n  before: {s}\n  after : {s}\n", .{ iter, before, calls[0].arguments });
+            return error.FuzzFailed;
+        }
+
+        // Property 2: the values survive verbatim (no spelling-based retyping).
+        var got = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer got.deinit();
+        if (!jsonValueEql(std.json.Value{ .object = args }, got.value)) {
+            std.debug.print("\n[fuzz iter {d}] value mismatch\n  want: {s}\n  got : {s}\n", .{ iter, args_json, calls[0].arguments });
+            return error.FuzzFailed;
+        }
+
+        // Property 3: conformance holds, and coercion is idempotent.
+        try testing.expect(toolCallConformsToSchema(allocator, calls[0], tools_json));
+        try coerceToolArgsToSchema(allocator, calls, tools_json);
+        try testing.expectEqualStrings(before, calls[0].arguments);
+    }
+}
+
+test "coerceToolArgsToSchema: a MANGLED array-typed param is tolerantly repaired" {
+    // Live soak capture (record 268): pi's `edits` array with a MISSING COMMA
+    // between two object values — `"newText": "..." "path": "..."`. Strict parse
+    // rejects it, so pre-fix `edits` stayed a STRING (schema contradiction). The
+    // tolerant container repair recovers a real array.
+    const allocator = testing.allocator;
+    const raw = "<tool_call>\n<function=edit>\n<parameter=path>\n./game.js\n</parameter>\n" ++
+        "<parameter=edits>\n[{\"oldText\": \"  speed: 8,\", \"newText\": \"  vy: 0,\" \"extra\": \"x\"}]\n</parameter>\n" ++
+        "</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, pi_edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits == .array);
+    try testing.expectEqual(@as(usize, 1), edits.array.items.len);
+    try testing.expectEqualStrings("  speed: 8,", edits.array.items[0].object.get("oldText").?.string);
+}
+
+// ── Misplaced required param (buried-`path` class) ──────────────────────────
+//
+// VERBATIM captured arguments, 2026-07-13 pi session (gemma-4-26B-A4B-it-qat-4bit,
+// ~/.sushi/logs/sushi-11234.log around the us_presidents run). The model
+// put `path` INSIDE each edits[] item and emitted no top-level `path`, so pi
+// answered
+//     Validation failed for tool "edit":
+//       - path: must have required properties path
+// three times in a row. Each rejection was a full multi-thousand-token
+// generation; the model then abandoned `edit` and rewrote the whole file with
+// `write` — the same "give up on the cheap tool, re-emit the expensive one"
+// degradation as the Claude Code replace_all loop.
+//
+// The parse layer is NOT at fault (verified: convertGemma4Object/Array are a
+// structural walk that preserves the model's own nesting and key order, and
+// coerceToolArgsToSchema only rewrites values in place) — the model genuinely
+// emitted it this way. The schema is what makes it provably fixable: `path` is
+// required at the TOP level and the item schema declares only oldText/newText.
+//
+// The script bodies are the real ones, excerpted for readability — their LENGTH
+// is not load-bearing (the JSON was already valid and correctly escaped; that is
+// exactly why no repair path fired). The nesting and the escaping are verbatim.
+const pi_buried_path_args_captured =
+    \\{"edits":[{"newText":"#!/bin/bash\n\n# Get the directory where the script is located\nSCRIPT_DIR=\"$( cd \"$( dirname \"${BASH_SOURCE[0]}\" )\" && pwd )\"\ncd \"$SCRIPT_DIR\"\n","oldText":"#!/bin/bash\n\n# Data for the presidents\n# Format: \"Name|Term|Bio\"\n","path":"us_presidents/generate_site.sh"}]}
+;
+
+test "hoistMisplacedRequiredParams: pi's buried `path` is lifted out of the edits items" {
+    const allocator = testing.allocator;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, pi_buried_path_args_captured),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+
+    // The required param now satisfies the schema at the top level…
+    const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
+    try testing.expect(path == .string);
+    try testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
+
+    // …and is gone from the item, whose schema never declared it.
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits == .array);
+    try testing.expectEqual(@as(usize, 1), edits.array.items.len);
+    const item = edits.array.items[0].object;
+    try testing.expect(item.get("path") == null);
+
+    // The payload the model worked for survives byte-exact, escaping intact.
+    try testing.expectEqualStrings(
+        "#!/bin/bash\n\n# Data for the presidents\n# Format: \"Name|Term|Bio\"\n",
+        item.get("oldText").?.string,
+    );
+    try testing.expect(std.mem.startsWith(u8, item.get("newText").?.string, "#!/bin/bash\n"));
+    try testing.expect(std.mem.indexOf(u8, item.get("newText").?.string, "${BASH_SOURCE[0]}") != null);
+
+    // The whole call now conforms — which is the point: pi accepts it.
+    try testing.expect(toolCallConformsToSchema(allocator, calls[0], pi_edit_tools_json_test));
+}
+
+test "hoistMisplacedRequiredParams: a buried `path` survives the Gemma 4 parse path end to end" {
+    // The same class through the REAL parse chain (Gemma's call:name{...} form —
+    // this session's model). The raw pre-parse bytes were not dumped (the server
+    // was not at --log-level debug), so the tag wrapper here is reconstructed;
+    // the ARGUMENT SHAPE it produces is the verbatim captured one asserted above,
+    // which is what the hoist actually operates on.
+    const allocator = testing.allocator;
+    const raw = "<|tool_call>call:edit{edits:[{oldText:<|\"|>old line<|\"|>,newText:<|\"|>new line<|\"|>," ++
+        "path:<|\"|>us_presidents/generate_site.sh<|\"|>}]}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try hoistMisplacedRequiredParams(allocator, calls, pi_edit_tools_json_test);
+    try coerceToolArgsToSchema(allocator, calls, pi_edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
+    try testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits.array.items[0].object.get("path") == null);
+    try testing.expectEqualStrings("old line", edits.array.items[0].object.get("oldText").?.string);
+}
+
+test "hoistMisplacedRequiredParams: a compliant call is byte-identical" {
+    // The strong-model path: nothing may re-serialize when nothing was misplaced.
+    const allocator = testing.allocator;
+    const args =
+        \\{"path":"a.js","edits":[{"oldText":"a","newText":"b"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: never touches a key the item schema DECLARES" {
+    // Safety gate. A tool whose items legitimately carry their own `path` (a
+    // multi-file edit) must never have it stripped out from under them — hoisting
+    // there would DESTROY data, not repair it. The item schema declaring the key
+    // is the proof that it belongs where it is.
+    const allocator = testing.allocator;
+    const multifile_schema =
+        \\[{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"}},"required":["path","oldText"]}}},"required":["path","edits"]}}}]
+    ;
+    const args =
+        \\{"edits":[{"path":"a.js","oldText":"a"},{"path":"b.js","oldText":"b"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, multifile_schema);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: items that DISAGREE on the value stay honest" {
+    // Two items, two different paths, and the tool edits ONE file. There is no
+    // correct hoist here — picking either would silently write the wrong file.
+    // Leave it broken so the client's validation error reaches the model.
+    const allocator = testing.allocator;
+    const args =
+        \\{"edits":[{"oldText":"a","newText":"b","path":"a.js"},{"oldText":"c","newText":"d","path":"b.js"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: a wrong-typed buried value is never hoisted" {
+    // `path` is declared a string; an object spelled `path` inside the item is
+    // not the missing param. Hoisting it would just move the schema violation.
+    const allocator = testing.allocator;
+    const args =
+        \\{"edits":[{"oldText":"a","newText":"b","path":{"nested":"x"}}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: quoted integer/number strings coerce to numeric" {
+    // A model emitting `"limit":"5"` for an integer param → strict clients reject
+    // "expected integer, got string". Coerce string→numeric per the schema.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"Read","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"scale":{"type":"number"}}}}}]
+    ;
+    const raw = "<tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"a.txt\",\"limit\":\"5\",\"scale\":\"1.5\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 5), parsed.value.object.get("limit").?.integer);
+    const scale = parsed.value.object.get("scale").?;
+    try testing.expect(scale == .float or scale == .integer);
+    // A string param is untouched.
+    try testing.expectEqualStrings("a.txt", parsed.value.object.get("path").?.string);
+}
+
+test "coerceToolArgsToSchema: nullable union type [\"string\",\"null\"] coerces to the non-null member" {
+    // Real schemas declare optional params as a type UNION. declaredJsonType
+    // picks the first non-null member, so a boolean-spelled value under
+    // ["boolean","null"] still coerces.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"flag":{"type":["boolean","null"]},"note":{"type":["string","null"]}}}}}]
+    ;
+    const raw = "<tool_call>\n<function=E>\n<parameter=flag>\nFalse\n</parameter>\n<parameter=note>\nhi\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("flag").? == .bool);
+    try testing.expectEqual(false, parsed.value.object.get("flag").?.bool);
+    try testing.expectEqualStrings("hi", parsed.value.object.get("note").?.string);
+}
+
+test "coerceToolArgsToSchema: an explicit JSON null satisfies any typed param (not coerced away)" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"limit":{"type":"integer"}}}}}]
+    ;
+    const raw = "<tool_call>{\"name\":\"E\",\"arguments\":{\"limit\":null}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const before = try allocator.dupe(u8, calls[0].arguments);
+    defer allocator.free(before);
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    // null is a valid absent-value marker for any type — left byte-identical.
+    try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: coercion is SHALLOW — values nested inside a param are untouched" {
+    // Documented boundary: the layer coerces TOP-LEVEL params against the tool's
+    // declared property types. It does NOT recurse into array/object element
+    // properties (the tool schema's `items`/nested `properties` are the client's
+    // to validate). A nested `"port":"8080"` stays a string — byte-identical.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"W","parameters":{"type":"object","properties":{"config":{"type":"object"}}}}}]
+    ;
+    const raw = "<tool_call>{\"name\":\"W\",\"arguments\":{\"config\":{\"port\":\"8080\",\"tls\":\"false\"}}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const before = try allocator.dupe(u8, calls[0].arguments);
+    defer allocator.free(before);
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: an unmodelled declared type leaves the value alone" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"x":{"type":"weird"}}}}}]
+    ;
+    const raw = "<tool_call>{\"name\":\"E\",\"arguments\":{\"x\":\"False\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const before = try allocator.dupe(u8, calls[0].arguments);
+    defer allocator.free(before);
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    try testing.expectEqualStrings(before, calls[0].arguments);
+}
+
+test "coerceToolArgsToSchema: anyOf, oneOf, allOf and a local $ref resolve to a concrete type" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"S","parameters":{"type":"object","properties":{
+        \\"limit":{"anyOf":[{"type":"integer"},{"type":"null"}]},
+        \\"ratio":{"oneOf":[{"type":"null"},{"type":"number"}]},
+        \\"tags":{"allOf":[{"type":"array","items":{"type":"string"}}]},
+        \\"cfg":{"$ref":"#/$defs/Cfg"},
+        \\"deep":{"$ref":"#/definitions/Wrap"},
+        \\"flag":{"anyOf":[{"type":"boolean"},{"type":"string"}]},
+        \\"plain":{"type":"integer"},
+        \\"loop":{"$ref":"#/$defs/Loop"}},
+        \\"$defs":{"Cfg":{"type":"object"},"Loop":{"$ref":"#/$defs/Loop"}},
+        \\"definitions":{"Wrap":{"anyOf":[{"$ref":"#/$defs/Cfg"},{"type":"null"}]}}}}}]
+    ;
+    const raw = "<tool_call>S<arg_key>limit</arg_key><arg_value>5</arg_value>" ++
+        "<arg_key>ratio</arg_key><arg_value>0.5</arg_value>" ++
+        "<arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value>" ++
+        "<arg_key>cfg</arg_key><arg_value>{\"k\":1}</arg_value>" ++
+        "<arg_key>deep</arg_key><arg_value>{\"k\":2}</arg_value>" ++
+        "<arg_key>flag</arg_key><arg_value>no</arg_value>" ++
+        "<arg_key>plain</arg_key><arg_value>7</arg_value>" ++
+        "<arg_key>loop</arg_key><arg_value>5</arg_value></tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqual(@as(i64, 5), o.get("limit").?.integer);
+    try testing.expect(o.get("ratio").? == .float);
+    try testing.expectEqual(@as(usize, 2), o.get("tags").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1), o.get("cfg").?.object.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), o.get("deep").?.object.get("k").?.integer);
+    // A value the first branch cannot take but a later one matches is kept.
+    try testing.expectEqualStrings("no", o.get("flag").?.string);
+    try testing.expectEqual(@as(i64, 7), o.get("plain").?.integer);
+    // A self-referencing $ref terminates and leaves the value alone.
+    try testing.expect(o.get("loop") != null);
+}
+
+test "toolCallConformsToSchema: a value matching any anyOf branch conforms" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"S","parameters":{"type":"object","properties":{"v":{"anyOf":[{"type":"integer"},{"type":"string"}]}}}}}]
+    ;
+    const ok = ParsedToolCall{ .name = "S", .arguments = "{\"v\":\"abc\"}" };
+    try testing.expect(toolCallConformsToSchema(allocator, ok, tools));
+    const bad = ParsedToolCall{ .name = "S", .arguments = "{\"v\":[1]}" };
+    try testing.expect(!toolCallConformsToSchema(allocator, bad, tools));
+}
+
+test "convertGemma4 dedups a repeated key + escapes a key with special chars (valid JSON)" {
+    // Same class as the parseHermesToolCall dup-key / raw-name bugs, but in the
+    // Gemma `call:name{...}` converter: a repeated key produced a DUPLICATE JSON
+    // key (std.json → error.DuplicateField), and a key with a `"` was appended
+    // raw → invalid JSON. Both must yield a valid JSON object.
+    const allocator = testing.allocator;
+    // Duplicate key.
+    {
+        const raw = "<|tool_call>call:shell{command:<|\"|>ls<|\"|>,command:<|\"|>pwd<|\"|>}<tool_call|>";
+        const calls = (try parseToolCalls(allocator, raw)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expect(parsed.value == .object);
+        try testing.expect(parsed.value.object.get("command") != null);
+    }
+    // Key containing a double-quote must not break the JSON.
+    {
+        const raw = "<|tool_call>call:shell{a\"b:<|\"|>v<|\"|>}<tool_call|>";
+        const calls = try parseToolCalls(allocator, raw);
+        defer if (calls) |cs| {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        };
+        if (calls) |cs| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+            defer parsed.deinit();
+            try testing.expect(parsed.value == .object);
+        }
+    }
+}
+
+test "parseXmlElementToolCall is already dup-key + escape safe (characterization)" {
+    // The DSV4 XML-element path builds args via std.json.ObjectMap.put + Stringify,
+    // which dedups keys (last wins) and escapes values — so it is structurally
+    // immune to the dup-key/raw-interpolation class that bit parseHermesToolCall
+    // and convertGemma4Object. This characterization test pins that guarantee.
+    const allocator = testing.allocator;
+    const raw = "<tool_calls>\n<tool_name>shell</tool_name>\n<command>echo \"a\"</command>\n<command>echo \"b\"</command>\n</tool_calls>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    // Valid JSON despite the duplicate <command> and the inner quotes.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    try testing.expect(parsed.value.object.get("command") != null);
+}
+
+test "parseToolCalls: NO path emits invalid JSON args (final safety net)" {
+    // Bullet-proof invariant: whatever a converter builds, the arguments a client
+    // receives are ALWAYS valid JSON. convertGemma4Value copies a JSON-style
+    // string verbatim, so a bad escape (`\q`) would otherwise emit invalid JSON.
+    const allocator = testing.allocator;
+    const cases = [_][]const u8{
+        // Gemma regular-JSON-string value with an INVALID escape.
+        "<|tool_call>call:write{path:\"a\\qb\"}<tool_call|>",
+        // Gemma custom-string is fine, but mix a bad JSON string sibling.
+        "<|tool_call>call:write{path:<|\"|>ok<|\"|>,x:\"y\\z\"}<tool_call|>",
+    };
+    for (cases) |text| {
+        const calls = try parseToolCalls(allocator, text);
+        defer if (calls) |cs| {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        };
+        if (calls) |cs| {
+            for (cs) |tc| {
+                const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
+                    std.debug.print("\nINVALID JSON args emitted: {s}\n", .{tc.arguments});
+                    return error.InvalidJsonEmitted;
+                };
+                parsed.deinit();
+            }
+        }
+    }
+    // The `\q` case is REPAIRABLE (looseRepair doubles the bad backslash), so the
+    // path survives as the literal `a\qb` — the safety net repairs, only falling
+    // back to `{}` when even tolerant repair fails.
+    {
+        const calls = (try parseToolCalls(allocator, "<|tool_call>call:write{path:\"a\\qb\"}<tool_call|>")).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("a\\qb", parsed.value.object.get("path").?.string);
+    }
+}
+
+test "split content: trailing <channel|> close-marker spam never leaks (degenerate model output)" {
+    // Live soak capture (record 2151, a Gemma reasoning variant): the model emitted
+    // reasoning, one <channel|> close, a scrap of content, then SPAMMED 16 more bare
+    // <channel|> close markers. The leading cut takes the FIRST close, and the
+    // trailing-open cut only handles unclosed OPENERS — so the 16 stray CLOSE markers
+    // leaked into visible content. A close marker is never valid at the tail of
+    // content; trailing closers (and openers) are trimmed so <channel|> can't leak.
+    const text = "Reasoning here about the file.\n<channel|>`glob` `./game.js`\n\n" ++
+        "<channel|><channel|><channel|><channel|><channel|>";
+    const content = splitThinkBlock(text, true, false).content;
+    try testing.expect(std.mem.indexOf(u8, content, "<channel|>") == null);
+    // The scrap of real content before the spam survives.
+    try testing.expect(std.mem.indexOf(u8, content, "glob") != null);
+}
+
+test "split content: trailing </think> close spam never leaks" {
+    const text = "<think>plan</think>The answer.</think></think></think>";
+    const content = splitThinkBlock(text, true, false).content;
+    try testing.expect(std.mem.indexOf(u8, content, "</think>") == null);
+    try testing.expect(std.mem.indexOf(u8, content, "The answer.") != null);
+}
+
+test "split content: orphan Gemma <tool_call|> close never leaks (no-tag-leak)" {
+    // Live 2026-07-16 soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
+    // tools needed" probe at temp 0.7): the model degenerated into a bare
+    // 1-token <tool_call|> CLOSE with NO <|tool_call> opener, so parseToolCalls
+    // found no call and the orphan control token leaked as the ENTIRE visible
+    // content (server response content == "<tool_call|>"). A tool CLOSE marker is
+    // never valid at the tail of content — same class as the <channel|> spam.
+    // parseToolCalls already extracted any real call before this split runs, so
+    // any residual <tool_call|> here is orphan by construction.
+    try testing.expectEqualStrings("", splitThinkBlock("<tool_call|>", true, false).content);
+    try testing.expectEqualStrings("Sure.", splitThinkBlock("Sure.<tool_call|>", true, false).content);
+    // Legit prose (no control token) is untouched.
+    try testing.expectEqualStrings("2 + 2 = 4", splitThinkBlock("2 + 2 = 4", true, false).content);
+}
+
+test "splitThinkBlock content never keeps trailing channel close spam" {
+    const text = "<|channel>thought\nplan<channel|>\n<|channel>\nThe answer.<channel|><channel|><channel|>";
+    const split = splitThinkBlock(text, true, false);
+    try testing.expect(std.mem.indexOf(u8, split.content, "<channel|>") == null);
+    try testing.expect(std.mem.indexOf(u8, split.content, "The answer.") != null);
+}
+
+// ── GLM arg_key/arg_value tag-format tool calls ──
+
+test "streamThinkGate holds a partial re-opened <think at the tail" {
+    // Template-opened thinking: reasoning streams in with no literal opener.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("partial reasoning", true, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("reasoning</think>ans", true, false));
+    // Mid-text re-open arriving token by token: the partial tail must hold the
+    // flush (leaking "<thin" into visible text is the tag-leak class).
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("visible<thin", false, true));
+    // Prose that merely mentions "<think about it" is NOT a partial opener.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("let's <think about it", false, true));
+}
+
+test "parseToolCalls arg_key/arg_value format (single call, hostile value bytes)" {
+    const raw = "<tool_call>write_file\n" ++
+        "<arg_key>path</arg_key>\n" ++
+        "<arg_value>jfk.txt</arg_value>\n" ++
+        "<arg_key>content</arg_key>\n" ++
+        "<arg_value>Hello \"world\"\nline2\ttabbed</arg_value>\n" ++
+        "</tool_call>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expect(!calls[0].inferred);
+    // Arguments must be VALID JSON with both keys, hostile bytes escaped.
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("jfk.txt", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("Hello \"world\"\nline2\ttabbed", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls arg_key: duplicate arg key — first wins, args stay valid JSON" {
+    const raw = "<tool_call>edit\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>b.txt</arg_value>\n" ++
+        "</tool_call>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.txt", parsed.value.object.get("path").?.string);
+}
+
+test "parseToolCalls arg_key: truncated mid-value recovers name + closed args only" {
+    // max_tokens cut the generation inside the second value — recover the call
+    // with the CLOSED pair only; never salvage the partial content (the
+    // truncated-opener class: a half-written file is worse than a retry).
+    const raw = "<tool_call>write_file\n" ++
+        "<arg_key>path</arg_key>\n<arg_value>x.txt</arg_value>\n" ++
+        "<arg_key>content</arg_key>\n<arg_value>a very long novel that never clos";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("x.txt", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls arg_key: mangled name-close + key-close still recovers name AND args" {
+    // A weak model closes the NAME with </arg_value> and closes the arg KEY
+    // block with </arg_value> instead of </arg_key> — the VALUE block is
+    // well-formed. A strict parser bails and the whole call LEAKS as content
+    // (finish_reason stop), so the client sees bash({}) and loops. The
+    // corruption is small and regular, so recover the FULL call.
+    const raw = "<tool_call>bash</arg_value>\n" ++
+        "<arg_key>command</arg_value>\n" ++
+        "<arg_value>ls -la</arg_value>\n" ++
+        "</tool_call>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+// ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
+
+fn freeParsedCalls(calls: []ParsedToolCall) void {
+    for (calls) |tc| {
+        testing.allocator.free(tc.name);
+        testing.allocator.free(tc.arguments);
+    }
+    testing.allocator.free(calls);
+}
+
+test "parseToolCalls dsml: canonical two-call block, string and JSON params" {
+    const raw = "I'll check the weather.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"get_weather\">\n" ++
+        "<｜DSML｜parameter name=\"city\" string=\"true\">San Francisco</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "<｜DSML｜invoke name=\"get_time\">\n" ++
+        "<｜DSML｜parameter name=\"tz\" string=\"true\">PST</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"San Francisco\",\"days\":3}", calls[0].arguments);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{\"tz\":\"PST\"}", calls[1].arguments);
+    try testing.expect(!calls[0].inferred);
+}
+
+test "parseToolCalls dsml: dropped invoke close before the next call still parses both" {
+    // Delimiter-drop tolerance: the model omits </｜DSML｜invoke>
+    // between back-to-back calls.
+    const raw = "<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"first\">\n" ++
+        "<｜DSML｜parameter name=\"a\" string=\"true\">x</｜DSML｜parameter>\n" ++
+        "<｜DSML｜invoke name=\"second\">\n" ++
+        "<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("first", calls[0].name);
+    try testing.expectEqualStrings("{\"a\":\"x\"}", calls[0].arguments);
+    try testing.expectEqualStrings("second", calls[1].name);
+    try testing.expectEqualStrings("{\"b\":true}", calls[1].arguments);
+}
+
+test "parseToolCalls dsml: truncation salvages NAME + completed pairs, never fragments" {
+    // Server-side cut mid-value: the unterminated pair is dropped (a half-
+    // written file is worse than a re-issued write), completed pairs survive.
+    const raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/a.txt</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"content\" string=\"true\">first half of a long fi";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", calls[0].arguments);
+}
+
+test "parseToolCalls dsml: rich string value runs to the confirmed close" {
+    // Newlines, quotes, braces, `<` inside a string value — value ends ONLY
+    // at the closing parameter tag (the Gemma dropped-quote class).
+    const raw = "<｜DSML｜invoke name=\"bash\">\n" ++
+        "<｜DSML｜parameter name=\"cmd\" string=\"true\">grep -r \"a < b\" src/\necho {done}</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("grep -r \"a < b\" src/\necho {done}", parsed.value.object.get("cmd").?.string);
+}
+
+test "parseToolCalls dsml: duplicate keys dedup (last wins) and invalid JSON value degrades to string" {
+    const raw = "<｜DSML｜invoke name=\"t\">\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">old</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">new</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"n\" string=\"false\">not[json</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("new", parsed.value.object.get("k").?.string);
+    try testing.expectEqualStrings("not[json", parsed.value.object.get("n").?.string);
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+}
+
+test "parseToolCalls dsml: zero-arg call and thinking prefix" {
+    const raw = "thinking about it</think>Sure.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"list_files\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("list_files", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "streamShouldBufferForTools: lone DSML closer holds, ordinary closing tags flush" {
+    try testing.expect(streamShouldBufferForTools("Done.\n\n</｜DSML｜ parameter>"));
+    try testing.expect(streamShouldBufferForTools("Done. </"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DS"));
+    try testing.expect(streamShouldBufferForTools("Done. </｜DSML\xef\xbd"));
+    try testing.expect(!streamShouldBufferForTools("Use </div> here"));
+    try testing.expect(!streamShouldBufferForTools("a </b> then more"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n</｜DSML｜ calls>"));
+}
+
+test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hold" {
+    try testing.expect(streamShouldBufferForTools("Sure.\n\n<｜DSML｜tool_calls>"));
+    try testing.expect(streamShouldBufferForTools("<｜DSML｜invoke name=\"x\">"));
+    // partial fullwidth-bar prefix at the tail — next token may complete it
+    try testing.expect(streamShouldBufferForTools("answer text <｜DSML"));
+    try testing.expect(streamShouldBufferForTools("answer text <｜"));
+    // plain prose with a fullwidth bar elsewhere must NOT hold
+    try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
+}
+
+test "renderChatTemplate: muse_glimmer shipped template renders byte-identical to python jinja2 (hermetic)" {
+    // src/fixtures/muse_chat_template.jinja is the VERBATIM template
+    // meta-models/Muse-Glimmer-30B ships; muse_render_reference.txt is python
+    // jinja2's render of the exact message set below (regenerate with the
+    // script in the fixture header if either changes). Byte equality pins:
+    // <|start|>role<|message|>…<|eot|> framing, PRIOR-turn reasoning dropped
+    // before the template runs (harmony convention — the reference is jinja2's
+    // render of the message set with that field already nulled; the
+    // current-turn keep arm is pinned by the drops-PRIOR-turn test below),
+    // tool calls as to=<fn> ATEM blocks with dict arguments
+    // (string params RAW, bools bare), tool results as
+    // "<|start|>tool <name><|message|><tool_output …>", the namespaced tool
+    // catalog + "# Valid recipients" line, and the bare "<|start|>assistant"
+    // generation prompt (NO <|message|> — the model emits its own recipient).
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    const expected = @embedFile("fixtures/muse_render_reference.txt");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "weather.get", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    ;
+    // Alphabetical argument keys on purpose: a sorted-map JSON layer must
+    // produce the same parameter order as python's insertion-ordered dicts.
+    const tc = [_]ToolCall{.{ .id = "call_1", .name = "weather.get", .arguments = "{\"city\": \"Paris\", \"detailed\": false, \"units\": \"celsius\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are a helpful assistant." },
+        .{ .role = "user", .content = "What's the weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "thanks, and in kelvin?" },
+    };
+
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings(expected, rendered);
+}
+
+test "renderChatTemplate: muse thinking-off no-tools commits the to=user channel" {
+    // Thinking off must SKIP the reasoning pass, not generate-and-discard it:
+    // spending the recipient header in the prompt makes a `to=self` segment
+    // unreachable. Tools stay bare — a tool call is a `to=<fn>` header.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(off);
+    try testing.expect(std.mem.endsWith(u8, off, "<|start|>assistant to=user<|message|>"));
+
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(on);
+    try testing.expect(std.mem.endsWith(u8, on, "<|start|>assistant"));
+
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]
+    ;
+    const off_tools = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null, false);
+    defer allocator.free(off_tools);
+    try testing.expect(std.mem.endsWith(u8, off_tools, "<|start|>assistant"));
+}
+
+test "renderChatTemplate: muse template dedups a client-supplied reasoning directive" {
+    // Upstream a4e59da (#35): a system prompt already carrying a "Reasoning
+    // effort/strength" line used to get the template's own "Reasoning
+    // strength: high." appended after it — two conflicting directives, ours
+    // stomping the client's. The template now normalizes the spelling and
+    // skips its own line. Rendered through OUR jinja.cpp because the fix
+    // rides the `replace`/`lower` filters and the `in` operator — a silently
+    // no-op filter keeps the duplicate while the render still succeeds.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "system", .content = "Be terse.\nReasoning effort: low." },
+        .{ .role = "user", .content = "hi" },
+    };
+    const r = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "Reasoning strength: low.") != null);
+    try testing.expect(std.mem.indexOf(u8, r, "Reasoning effort") == null);
+    const first = std.mem.indexOf(u8, r, "Reasoning strength").?;
+    try testing.expect(std.mem.indexOfPos(u8, r, first + 1, "Reasoning strength") == null);
+}
+
+test "renderChatTemplate: thinking-off closes a template-opened think block (LFM2.5 class)" {
+    // LFM2.5's template opens `<think>` unconditionally; thinking-off used to
+    // mean generating the whole reasoning pass and discarding it. Closing the
+    // block in the prompt skips it. Thinking ON keeps the opener untouched.
+    const allocator = testing.allocator;
+    const tpl = "{%- for message in messages -%}<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n<think>{%- endif -%}";
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "",
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+
+    const off = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(off);
+    try testing.expect(std.mem.endsWith(u8, off, "<think></think>"));
+
+    const on = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, false);
+    defer allocator.free(on);
+    try testing.expect(std.mem.endsWith(u8, on, "<think>"));
 }
 
 test "renderChatTemplate: continuation appends the partial reply into the OPEN assistant turn" {
@@ -2858,6 +13009,1407 @@ test "renderChatTemplate: continuation is declined when the last message is not 
     try testing.expect(std.mem.endsWith(u8, cont, "<|im_start|>assistant"));
 }
 
+test "renderChatTemplate: muse commits its content channel before the partial reply" {
+    // Muse's turn header is `<|start|>assistant to=<recipient><|message|>`, and
+    // an uncommitted header means the model picks the channel — including
+    // `to=self`, which would make the continuation reasoning.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|return|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "Hello, I was say" },
+    };
+    const cont = try renderChatTemplate(allocator, &messages, &config, null, null, true, null, true);
+    defer allocator.free(cont);
+    try testing.expect(std.mem.endsWith(u8, cont, " to=user<|message|>Hello, I was say"));
+}
+
+test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current tool round's" {
+    // Harmony (muse's format ancestor) drops analysis from turns before the
+    // last user message. Without that, the app's reasoning round-trip renders
+    // every old chain — a loop-cut tail included — as a to=self history
+    // segment the model reads back on every later turn (live 2026-08-10: one
+    // repetition-primed turn poisoned the rest of the chat).
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/muse_chat_template.jinja");
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = "<|begin_of_text|>",
+        .eos_token = "<|end_of_text|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    // Prior turn: assistant reasoning BEFORE the last user message → dropped;
+    // its content survives.
+    const prior = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello there", .reasoning_content = "waffling chain" },
+        .{ .role = "user", .content = "and again?" },
+    };
+    const r1 = try renderChatTemplate(allocator, &prior, &config, null, null, true, null, false);
+    defer allocator.free(r1);
+    try testing.expect(std.mem.indexOf(u8, r1, "to=self") == null);
+    try testing.expect(std.mem.indexOf(u8, r1, "waffling chain") == null);
+    try testing.expect(std.mem.indexOf(u8, r1, "hello there") != null);
+
+    // Current turn: a tool round AFTER the last user message keeps its chain —
+    // that is where the model needs it.
+    const tools_json =
+        \\[{"type": "function", "function": {"name": "weather.get", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "call_1", .name = "weather.get", .arguments = "{\"city\": \"Paris\"}" }};
+    const current = [_]Message{
+        .{ .role = "user", .content = "weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc, .reasoning_content = "Need the weather tool." },
+        .{ .role = "tool", .content = "{\"temp\": 21}", .tool_call_id = "call_1" },
+    };
+    const r2 = try renderChatTemplate(allocator, &current, &config, tools_json, null, true, null, false);
+    defer allocator.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "<|start|>assistant to=self<|message|>Need the weather tool.<|eom|>") != null);
+
+    // A non-muse template that persists history reasoning is
+    // untouched — the round-trip rule stays per-family.
+    const generic_tpl = "{%- for m in messages -%}{%- if m.get('reasoning_content') -%}<think>{{ m['reasoning_content'] }}</think>{%- endif -%}{{ m['role'] }}: {{ m['content'] }}\n{%- endfor -%}";
+    var generic = ChatConfig{
+        .chat_template = generic_tpl,
+        .bos_token = "",
+        .eos_token = "",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const r3 = try renderChatTemplate(allocator, &prior, &generic, null, null, true, null, false);
+    defer allocator.free(r3);
+    try testing.expect(std.mem.indexOf(u8, r3, "<think>waffling chain</think>") != null);
+}
+
+test "splitMuseChannels: headerless first segment (prompt-committed header) is content" {
+    // With `to=user<|message|>` committed in the prompt, the model's first
+    // bytes are BODY. If it then re-opens a segment, the leading text must
+    // survive as content, not vanish.
+    const split = splitMuseChannels("answer<|eom|><|start|>assistant to=self<|message|>notes").?;
+    try testing.expectEqualStrings("answer", split.content);
+    try testing.expectEqualStrings("notes", split.reasoning_content.?);
+    // A truncated bare header is still never content.
+    const hdr = splitMuseChannels(" to=self<|eom|><|start|>assistant to=user<|message|>hi").?;
+    try testing.expectEqualStrings("hi", hdr.content);
+    try testing.expect(hdr.reasoning_content == null);
+}
+
+test "harmonyAnalysisHeaderLen: measures the header the streaming split must skip" {
+    // With and without the leading <|start|>assistant (the generation prompt
+    // commits that part on the FIRST segment, so the model's first bytes are
+    // the bare <|channel|>).
+    const bare = "<|channel|>analysis<|message|>thinking...";
+    try std.testing.expectEqual(@as(?usize, "<|channel|>analysis<|message|>".len), harmonyAnalysisHeaderLen(bare));
+    const full = "<|start|>assistant<|channel|>analysis<|message|>x";
+    try std.testing.expectEqual(@as(?usize, "<|start|>assistant<|channel|>analysis<|message|>".len), harmonyAnalysisHeaderLen(full));
+    // A header still arriving has no length yet — the split must not fire.
+    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("<|channel|>analysis"));
+    // Only the ANALYSIS channel: `final` is content, not reasoning.
+    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("<|channel|>final<|message|>hi"));
+    try std.testing.expectEqual(@as(?usize, null), harmonyAnalysisHeaderLen("plain text"));
+}
+
+test "stripHarmonySegmentHeader: drops a leading segment header of any channel" {
+    try std.testing.expectEqualStrings(
+        "The answer.",
+        stripHarmonySegmentHeader("<|start|>assistant<|channel|>final<|message|>The answer."),
+    );
+    try std.testing.expectEqualStrings(
+        "Working.",
+        stripHarmonySegmentHeader("<|channel|>commentary<|message|>Working."),
+    );
+    // Nothing to strip — returned untouched, never truncated.
+    try std.testing.expectEqualStrings("plain content", stripHarmonySegmentHeader("plain content"));
+    try std.testing.expectEqualStrings(
+        "<|start|>assistant<|channel|>fin",
+        stripHarmonySegmentHeader("<|start|>assistant<|channel|>fin"),
+    );
+}
+
+test "splitHarmonyChannels: analysis→reasoning, final→content, headers stripped" {
+    // What gpt-oss emits after the generation prompt's bare `<|start|>assistant`.
+    const text = "<|channel|>analysis<|message|>Let me think.<|end|>" ++
+        "<|start|>assistant<|channel|>final<|message|>The answer is 4.<|return|>";
+    const split = splitHarmonyChannels(text).?;
+    try std.testing.expectEqualStrings("Let me think.", split.reasoning_content.?);
+    try std.testing.expectEqualStrings("The answer is 4.", split.content);
+}
+
+test "splitHarmonyChannels: commentary to=functions.X is a TOOL body, never content" {
+    // A tool call rides the commentary channel with a `functions.` recipient.
+    // Routing it to content would print raw JSON at the user; routing it to
+    // reasoning would lose the call entirely.
+    const text = "<|channel|>analysis<|message|>Need weather.<|end|>" ++
+        "<|start|>assistant to=functions.get_weather<|channel|>commentary <|constrain|>json<|message|>" ++
+        "{\"location\":\"SF\"}<|call|>";
+    const split = splitHarmonyChannels(text).?;
+    try std.testing.expectEqualStrings("Need weather.", split.reasoning_content.?);
+    try std.testing.expectEqualStrings("{\"location\":\"SF\"}", split.content);
+}
+
+test "splitHarmonyChannels: recipient may sit AFTER the channel name" {
+    // Harmony allows `<|channel|>commentary to=functions.x`; the header is
+    // scanned as a whole so both orderings resolve to the same recipient.
+    const text = "<|start|>assistant<|channel|>commentary to=functions.ping<|message|>{}<|call|>";
+    const split = splitHarmonyChannels(text).?;
+    try std.testing.expectEqualStrings("{}", split.content);
+    try std.testing.expect(split.reasoning_content == null);
+}
+
+test "splitHarmonyChannels: bare commentary (no recipient) is user-visible content" {
+    const text = "<|channel|>commentary<|message|>Working on it.<|end|>";
+    const split = splitHarmonyChannels(text).?;
+    try std.testing.expectEqualStrings("Working on it.", split.content);
+}
+
+test "splitHarmonyChannels: an unresolved header is never content" {
+    // A header still streaming in (no <|message|> yet) must not be claimed.
+    try std.testing.expect(splitHarmonyChannels("<|channel|>anal") == null);
+    try std.testing.expect(splitHarmonyChannels("<|start|>assistant<|channel|>fin") == null);
+}
+
+test "splitHarmonyChannels: declines muse traffic (no <|channel|> marker)" {
+    // Both families emit <|message|>, so the muse router cannot be the one
+    // that keys on it alone — <|channel|> is the discriminator, and harmony
+    // must not claim a muse turn (or vice versa).
+    try std.testing.expect(splitHarmonyChannels(" to=self<|message|>notes<|eom|>") == null);
+}
+
+test "splitMuseChannels: declines harmony traffic (<|channel|> present)" {
+    // The mirror of the case above. Without this, gpt-oss reasoning routes
+    // through muse's recipient rules — an `analysis` header carries no `to=`,
+    // so it would land in CONTENT and the answer would be preceded by the
+    // model's private reasoning.
+    const harmony = "<|channel|>analysis<|message|>secret<|end|>" ++
+        "<|start|>assistant<|channel|>final<|message|>hi<|return|>";
+    try std.testing.expect(splitMuseChannels(harmony) == null);
+}
+
+test "splitMuseChannels: to=self reasoning + to=user content, headers stripped" {
+    // The exact shape muse emits after the prompt's `<|start|>assistant`.
+    const text = " to=self<|message|>Let me think.<|eom|><|start|>assistant to=user<|message|>The answer is 4.";
+    const split = splitThinkBlock(text, true, false);
+    try testing.expectEqualStrings("Let me think.", split.reasoning_content.?);
+    try testing.expectEqualStrings("The answer is 4.", split.content);
+
+    // Direct answer: no reasoning segment at all.
+    const direct = splitThinkBlock(" to=user<|message|>Hi there.", true, false);
+    try testing.expect(direct.reasoning_content == null);
+    try testing.expectEqualStrings("Hi there.", direct.content);
+
+    // Length-truncated mid-thought: reasoning so far, never content.
+    const cut = splitThinkBlock(" to=self<|message|>Half a thou", true, false);
+    try testing.expectEqualStrings("Half a thou", cut.reasoning_content.?);
+    try testing.expectEqualStrings("", cut.content);
+
+    // A trailing partial header after <|eom|> is dropped, not content.
+    const partial = splitThinkBlock(" to=self<|message|>R done.<|eom|><|start|>assistant to=us", true, false);
+    try testing.expectEqualStrings("R done.", partial.reasoning_content.?);
+    try testing.expectEqualStrings("", partial.content);
+
+    // Non-muse text (no <|message|> marker) is never claimed.
+    const plain = splitThinkBlock("just prose with to=user in it", true, false);
+    try testing.expect(plain.reasoning_content == null);
+    try testing.expectEqualStrings("just prose with to=user in it", plain.content);
+}
+
+test "splitMuseChannels: tool segment markup never rides out as content (wrapper cut)" {
+    const text = " to=self<|message|>Need the tool.<|eom|><|start|>assistant to=weather.get<|message|><atem:function_calls>\n<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+    // Display split: the ATEM markup is CUT from content.
+    const split = splitThinkBlock(text, true, false);
+    try testing.expectEqualStrings("Need the tool.", split.reasoning_content.?);
+    try testing.expectEqualStrings("", split.content);
+    // KeepingMarkup split: the markup survives for the tool parser.
+    const keeping = splitThinkBlockKeepingMarkup(text, true, false);
+    try testing.expect(std.mem.indexOf(u8, keeping.content, "<atem:invoke") != null);
+}
+
+test "serializeMessagesJsonOpts: harmony gets \"\" for empty content, everyone else keeps null" {
+    // The harmony template guards with `if \"content\" in message` and then
+    // does `\"…\" in message.content`. A null passes the first and breaks the
+    // second, and the message that carries no content is precisely the
+    // tool-calling assistant turn — so this is the whole tool round-trip.
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "weather?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &[_]ToolCall{
+            .{ .id = "call_1", .name = "get_weather", .arguments = "{\"location\":\"SF\"}" },
+        } },
+    };
+
+    const harmony = try serializeMessagesJsonOpts(allocator, &messages, .empty_string);
+    defer allocator.free(harmony);
+    const hp = try std.json.parseFromSlice(std.json.Value, allocator, harmony, .{});
+    defer hp.deinit();
+    const hmsg = hp.value.array.items[1].object;
+    try testing.expect(hmsg.get("content").? == .string);
+    try testing.expectEqualStrings("", hmsg.get("content").?.string);
+    // The tool call itself still round-trips.
+    try testing.expectEqualStrings(
+        "get_weather",
+        hmsg.get("tool_calls").?.array.items[0].object.get("function").?.object.get("name").?.string,
+    );
+
+    // Every other family keeps the null it has always been given.
+    const legacy = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(legacy);
+    const lp = try std.json.parseFromSlice(std.json.Value, allocator, legacy, .{});
+    defer lp.deinit();
+    try testing.expect(lp.value.array.items[1].object.get("content").? == .null);
+}
+
+test "parseHarmonyToolCalls: name comes from the HEADER, arguments from the body" {
+    // gpt-oss puts the tool name in the segment header's recipient
+    // (`to=functions.NAME`) and the arguments — already JSON — in the body.
+    // Nothing in the body names the function, so a body-only parser finds
+    // an anonymous JSON object and infers nothing.
+    const text = "<|start|>assistant to=functions.get_weather<|channel|>commentary " ++
+        "<|constrain|>json<|message|>{\"location\": \"SF\", \"unit\": \"c\"}<|call|>";
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expectEqualStrings("get_weather", calls.items[0].name);
+    try std.testing.expectEqualStrings("{\"location\": \"SF\", \"unit\": \"c\"}", calls.items[0].arguments);
+    try std.testing.expect(!calls.items[0].inferred);
+}
+
+test "parseHarmonyToolCalls: recipient after the channel name parses the same" {
+    const text = "<|start|>assistant<|channel|>commentary to=functions.ping<|message|>{\"n\":1}<|call|>";
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expectEqualStrings("ping", calls.items[0].name);
+    try std.testing.expectEqualStrings("{\"n\":1}", calls.items[0].arguments);
+}
+
+test "parseHarmonyToolCalls: truncated arguments ship NAME + {}, never a fragment" {
+    // Cut mid-value. The call is real (the header resolved), so the name must
+    // survive, but a partial value must never be presented as an argument.
+    const text = "<|start|>assistant to=functions.search<|channel|>commentary<|message|>{\"q\": \"how do I";
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.items.len);
+    try std.testing.expectEqualStrings("search", calls.items[0].name);
+    try std.testing.expectEqualStrings("{}", calls.items[0].arguments);
+}
+
+test "parseHarmonyToolCalls: analysis and final segments are NOT tool calls" {
+    const text = "<|channel|>analysis<|message|>thinking<|end|>" ++
+        "<|start|>assistant<|channel|>final<|message|>done<|return|>";
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(@as(usize, 0), calls.items.len);
+}
+
+test "parseHarmonyToolCalls: two tool segments both parse" {
+    const text = "<|start|>assistant to=functions.a<|channel|>commentary<|message|>{\"x\":1}<|call|>" ++
+        "<|start|>assistant to=functions.b<|channel|>commentary<|message|>{\"y\":2}<|call|>";
+    var calls: std.ArrayList(ParsedToolCall) = .empty;
+    defer {
+        for (calls.items) |tc| {
+            std.testing.allocator.free(tc.name);
+            std.testing.allocator.free(tc.arguments);
+        }
+        calls.deinit(std.testing.allocator);
+    }
+    try parseHarmonyToolCalls(std.testing.allocator, text, &calls);
+    try std.testing.expectEqual(@as(usize, 2), calls.items.len);
+    try std.testing.expectEqualStrings("a", calls.items[0].name);
+    try std.testing.expectEqualStrings("b", calls.items[1].name);
+}
+
+test "parseAtemToolCalls: canonical block — raw strings, spelled types, schema untouched" {
+    const allocator = testing.allocator;
+    const text = " to=weather.get<|message|><atem:function_calls>\n<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris, France</atem:parameter>\n<atem:parameter name=\"detailed\">false</atem:parameter>\n<atem:parameter name=\"days\">3</atem:parameter>\n<atem:parameter name=\"tags\">[\"trip\", \"eu\"]</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("weather.get", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqualStrings("Paris, France", obj.get("city").?.string);
+    try testing.expectEqual(false, obj.get("detailed").?.bool);
+    try testing.expectEqual(@as(i64, 3), obj.get("days").?.integer);
+    try testing.expectEqual(@as(usize, 2), obj.get("tags").?.array.items.len);
+}
+
+test "parseAtemToolCalls: multiline string values keep exact bytes (no trimming)" {
+    const allocator = testing.allocator;
+    const text = "<atem:invoke name=\"fs.write\">\n<atem:parameter name=\"content\">line one\n  \"quoted\" line\n</atem:parameter>\n</atem:invoke>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    // Exact bytes incl. the trailing newline — the reference does not strip.
+    try testing.expectEqualStrings("line one\n  \"quoted\" line\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseAtemToolCalls: truncation salvages NAME + completed params, never fragments" {
+    const allocator = testing.allocator;
+    // Cut mid-value: the completed param ships, the fragment is dropped.
+    {
+        const text = "<atem:invoke name=\"weather.get\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n<atem:parameter name=\"units\">celsi";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("weather.get", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("Paris", parsed.value.object.get("city").?.string);
+        try testing.expect(parsed.value.object.get("units") == null);
+    }
+    // Cut right after the opener: NAME + {}.
+    {
+        const text = "<atem:function_calls>\n<atem:invoke name=\"weather.get\">";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("weather.get", calls[0].name);
+        try testing.expectEqualStrings("{}", calls[0].arguments);
+    }
+}
+
+test "parseAtemToolCalls: parallel invokes each parse; dropped wrapper still parses" {
+    const allocator = testing.allocator;
+    const text = "<atem:invoke name=\"a.one\">\n<atem:parameter name=\"x\">1</atem:parameter>\n</atem:invoke>\n<atem:invoke name=\"a.two\">\n<atem:parameter name=\"y\">two</atem:parameter>\n</atem:invoke>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("a.one", calls[0].name);
+    try testing.expectEqualStrings("a.two", calls[1].name);
+}
+
+test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
+    const allocator = testing.allocator;
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">cd /x && ls -la</parameter>\n<parameter name=\"timeout\">30</parameter>\n</invoke>\n</function_calls>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    // Not the model's own dialect: it must name a declared tool to survive.
+    try testing.expect(calls[0].inferred);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && ls -la", parsed.value.object.get("command").?.string);
+    try testing.expectEqual(@as(i64, 30), parsed.value.object.get("timeout").?.integer);
+    try testing.expect((try parseToolCalls(allocator, "I <invoked> it with <parameters> set.")) == null);
+    // An unparsed block never reaches content; prose naming the tag stays.
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));
+    const prose = "Claude's format wraps each call in <invoke name=\"x\"> tags.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+}
+
+test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {
+    const text = "<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n</function_calls>";
+    for ([_]usize{ 0, std.mem.indexOf(u8, text, "<invoke").? }) |start| {
+        var end = start + 2;
+        while (end <= text.len) : (end += 1) {
+            testing.expect(streamShouldBufferForTools(text[start..end])) catch |e| {
+                std.debug.print("gate flushed a prefix of an accepted call: '{s}'\n", .{text[start..end]});
+                return e;
+            };
+        }
+    }
+    try testing.expect(!streamShouldBufferForTools("I <invoked> the <function_callback> helper"));
+}
+
+test "muse streaming gate: headers hold, self holds then splits, user splits" {
+    // Growing bare header — never flush the ` to=…` text. The sub-"to="
+    // prefixes are the live 2026-08-10 leak (" to" shipped as a text delta
+    // on a thinking-off /v1/messages stream).
+    try testing.expect(museStreamVerdict(" t") == StreamThinkGate.hold_thinking);
+    try testing.expect(museStreamVerdict(" to") == StreamThinkGate.hold_thinking);
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to", true, false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=se", true, false, false));
+    // Reasoning in progress streams via hold_thinking; <|eom|> splits.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=self<|message|>thinking…", true, false, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2(" to=self<|message|>done<|eom|>", true, false, false));
+    // Direct answer resolves to a split (the handler strips the header once).
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2(" to=user<|message|>Hi", true, false, false));
+    // A next-segment header mid-stream holds again.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(" to=self<|message|>d<|eom|><|start|>assistant to=w", true, false, false));
+    // Prose that merely starts with to= releases at the first non-recipient byte.
+    try testing.expect(museStreamVerdict("to=5 grams of flour") == null);
+    // The memoized gate agrees on the muse arms.
+    var scan = ThinkScan{};
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGateScan(" to=self<|message|>done<|eom|>", true, false, false, &scan));
+}
+
+test "muse streamShouldBufferForTools: tool headers hold, self/user release" {
+    // Unresolved header could still name a tool — including sub-"to="
+    // prefixes (the live " to" text-delta leak).
+    try testing.expect(streamShouldBufferForTools(" t"));
+    try testing.expect(streamShouldBufferForTools(" to"));
+    try testing.expect(streamShouldBufferForTools(" to=weath"));
+    try testing.expect(streamShouldBufferForTools(" to=self<|message|>r<|eom|><|start|>assistant to=wea"));
+    // Resolved tool recipient keeps holding (body is ATEM payload).
+    try testing.expect(streamShouldBufferForTools(" to=weather.get<|message|>"));
+    // ATEM markup anywhere holds.
+    try testing.expect(streamShouldBufferForTools("<atem:function_calls>"));
+    try testing.expect(streamShouldBufferForTools("prefix <atem"));
+    // Resolved self/user releases so reasoning/content can stream.
+    try testing.expect(!streamShouldBufferForTools(" to=self<|message|>thinking about tools"));
+    try testing.expect(!streamShouldBufferForTools(" to=user<|message|>plain answer"));
+    // Ordinary prose that starts with to= releases at the first space.
+    try testing.expect(!streamShouldBufferForTools("to=5 grams"));
+}
+
+test "museThinkOpenerAt: self opens reasoning, others answer directly, partials grow" {
+    try testing.expectEqual(MuseThinkOpener.growing, museThinkOpenerAt(" to=se"));
+    switch (museThinkOpenerAt(" to=self<|message|>")) {
+        .self_opened => |hl| try testing.expectEqual(@as(usize, " to=self<|message|>".len), hl),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (museThinkOpenerAt(" to=user<|message|>Hi")) {
+        .direct => |hl| try testing.expectEqual(@as(usize, " to=user<|message|>".len), hl),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(MuseThinkOpener.not_muse, museThinkOpenerAt("Okay, the user wants X."));
+    // Complete next-segment header skip; incomplete returns null.
+    try testing.expectEqual(@as(usize, "<|start|>assistant to=user<|message|>".len), museContentHeaderSkip("<|start|>assistant to=user<|message|>Hello").?);
+    try testing.expect(museContentHeaderSkip("<|start|>assistant to=us") == null);
+}
+
+test "serializeExtraContext: muse maps effort onto reasoning_strength" {
+    const allocator = testing.allocator;
+    var muse = ChatConfig{
+        .chat_template = "…{%- set rs = reasoning_strength if reasoning_strength is defined else 'high' -%}…",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const cases = [_]struct { thinking: bool, effort: ?[]const u8, want: []const u8 }{
+        .{ .thinking = true, .effort = null, .want = "\"reasoning_strength\":\"high\"" },
+        .{ .thinking = true, .effort = "low", .want = "\"reasoning_strength\":\"low\"" },
+        .{ .thinking = true, .effort = "medium", .want = "\"reasoning_strength\":\"medium\"" },
+        .{ .thinking = true, .effort = "xhigh", .want = "\"reasoning_strength\":\"high\"" },
+        .{ .thinking = false, .effort = null, .want = "\"reasoning_strength\":\"low\"" },
+    };
+    for (cases) |case| {
+        const r = try serializeExtraContext(allocator, &muse, case.thinking, case.effort);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, case.want) != null);
+    }
+    // Non-muse templates never see the key.
+    var plain = ChatConfig{
+        .chat_template = "{{ messages }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const r = try serializeExtraContext(allocator, &plain, true, null);
+    defer allocator.free(r);
+    try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
+}
+
+test "ThinkScan: incremental gate matches the fresh gate at every prefix length" {
+    // The gate is O(buffer) per token today (measured 47.99 us/token at 113 KB
+    // with no close in the buffer), i.e. O(n^2) over a reasoning block. A
+    // cursor makes it O(new bytes) — but only if it is EXACT, and the failure
+    // a naive cursor introduces is a marker split across two token arrivals.
+    // Feeding prefix-by-prefix IS that case, at every possible split point.
+    const corpus = [_][]const u8{
+        "plain visible prose with no markup at all",
+        "<think>reasoning here</think>the answer",
+        // A </think> inside a tool ARGUMENT is payload, not a block close.
+        "<think>plan<tool_call>f<arg_key>k</arg_key><arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible",
+        "<|channel>thought hidden<channel|>visible",
+        "prose where a < b and nothing else happens",
+        "trailing partial opener at the end <thi",
+        "trailing partial close </thin",
+    };
+    const flags = [_][2]bool{ .{ true, false }, .{ false, false }, .{ false, true } };
+    for (corpus) |full| {
+        for (flags) |f| {
+            const enable_thinking = f[0];
+            const prompt_opened = f[1];
+            var scan: ThinkScan = .{};
+            var n: usize = 0;
+            while (n <= full.len) : (n += 1) {
+                const buf = full[0..n];
+                const want = streamThinkGate2(buf, enable_thinking, false, prompt_opened);
+                const got = streamThinkGateScan(buf, enable_thinking, false, prompt_opened, &scan);
+                if (want != got) {
+                    std.debug.print("prefix {d} of \"{s}\" (think={}, opened={}): {any} != {any}\n", .{ n, full, enable_thinking, prompt_opened, got, want });
+                    return error.IncrementalGateDiverged;
+                }
+            }
+        }
+    }
+}
+
+test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
+    // The whole point. A smaller constant is not the fix — the re-examined
+    // span must not grow with the buffer, or a 32K-token thought pays 8x what
+    // the 113 KB bench measured.
+    var scan: ThinkScan = .{};
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var max_span: usize = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        // A think block that never closes — the expensive arm of the bench.
+        try buf.appendSlice(testing.allocator, if (i == 0) "<think>" else "token words and more ");
+        _ = streamThinkGateScan(buf.items, true, false, false, &scan);
+        if (i > 0 and scan.last_scan_span > max_span) max_span = scan.last_scan_span;
+    }
+    try testing.expect(buf.items.len > 60_000);
+    // Bounded by one token's bytes plus the trailing partial-marker candidate.
+    try testing.expect(max_span <= 64);
+
+    // A growing partial marker at the tail is re-examined, and only it.
+    var scan2: ThinkScan = .{};
+    var buf2 = std.ArrayList(u8).empty;
+    defer buf2.deinit(testing.allocator);
+    try buf2.appendSlice(testing.allocator, "<think>");
+    var j: usize = 0;
+    while (j < 500) : (j += 1) try buf2.appendSlice(testing.allocator, "filler ");
+    _ = streamThinkGateScan(buf2.items, true, false, false, &scan2);
+    for ("</think:opensou") |c| {
+        try buf2.append(testing.allocator, c);
+        _ = streamThinkGateScan(buf2.items, true, false, false, &scan2);
+        try testing.expect(scan2.last_scan_span <= 64);
+    }
+}
+
+test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
+    // The buffer is NOT append-only — the stream loop trims and resets it at
+    // every emit. A stale cursor then points past the end or into different
+    // bytes, which is the second failure mode a naive cursor introduces.
+    var scan: ThinkScan = .{};
+    const first = "<think>reasoning</think>";
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGateScan(first, true, false, false, &scan));
+    scan.reset();
+    // Same scan struct, fresh (shorter) buffer: must not carry the old close.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
+}
+
+test "the streaming handlers route the think gate through a persistent ThinkScan" {
+    // A memoized scan nobody threads through is a silent no-op that is
+    // output-identical to the unmemoized gate — the exact shape of the
+    // hardcoded-use_drafter=false class. Both streaming surfaces must hold a
+    // scan beside their buffer AND reset it where they clear that buffer.
+    // Needles are ++-split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("server.zig");
+    const call = "streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think" ++ "_scan)";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, call));
+    // The unmemoized 4-arg gate must be GONE from the streaming paths.
+    const old = "chat_mod.streamThinkGate2(" ++ "buf,";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+    // One reset per buffer clear in those handlers.
+    const reset = "think_scan" ++ ".reset();";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, reset));
+}
+
+test "bench: streaming think gate scans BYTES, memoized vs fresh" {
+    // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
+    // not merely smaller. Wall clock is unavailable in a hermetic test under
+    // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes
+    // examined is the thing that was quadratic, and it is deterministic.
+    // Mirrors the 4b.4 harness: 4000 tokens growing to ~104 KB.
+    const a = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    var scan: ThinkScan = .{};
+    try buf.appendSlice(a, "<think>");
+    var memo_bytes: u64 = 0;
+    var fresh_bytes: u64 = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        try buf.appendSlice(a, "some reasoning words here ");
+        const g = streamThinkGateScan(buf.items, true, false, false, &scan);
+        try testing.expectEqual(StreamThinkGate.hold_thinking, g);
+        memo_bytes += scan.last_scan_span;
+        // What the unmemoized gate re-reads every token: the whole buffer, and
+        // more than once (open scan + close scan + two substring scans).
+        fresh_bytes += buf.items.len;
+    }
+    errdefer std.debug.print(
+        "[think-gate] {d} tokens to {d} KB: fresh >= {d} KB scanned, memoized {d} KB ({d}x)\n",
+        .{ 4000, buf.items.len / 1024, fresh_bytes / 1024, memo_bytes / 1024, fresh_bytes / @max(memo_bytes, 1) },
+    );
+    // Linear-in-total, not quadratic: the memoized scan reads each byte a
+    // bounded number of times.
+    try testing.expect(memo_bytes < buf.items.len * 4);
+}
+
+test "streaming content agrees with the non-streaming split on leading whitespace" {
+    // LFM2.5 class: the template opens <think> unconditionally, so the first
+    // generated token is the newline pair after the closer. The non-streaming
+    // split drops it; the stream must reach the same bytes.
+    const out = "\n\nOne, two, three.";
+    const expected = splitThinkBlock(out, true, false).content;
+    try testing.expectEqualStrings("One, two, three.", expected);
+
+    const tokens = [_][]const u8{ "\n\n", "One", ", two", ", three." };
+    var streamed: std.ArrayList(u8) = .empty;
+    defer streamed.deinit(testing.allocator);
+    var content_started = false;
+    for (tokens) |tt| {
+        const emit = streamContentLead(tt, content_started);
+        if (emit.len == 0) continue;
+        content_started = true;
+        try streamed.appendSlice(testing.allocator, emit);
+    }
+    try testing.expectEqualStrings(expected, streamed.items);
+}
+test "streamContentLead never touches whitespace inside the answer" {
+    // Only the LEAD is suppressed: once anything visible has been sent, a
+    // newline token is ordinary content (markdown paragraphs, code blocks).
+    try testing.expectEqualStrings("\n\n", streamContentLead("\n\n", true));
+    try testing.expectEqualStrings("  x", streamContentLead("  x", true));
+    // And a lead that is not whitespace is untouched.
+    try testing.expectEqualStrings("Hello", streamContentLead("Hello", false));
+    // A token is never cut in half: one carrying whitespace AND text rides
+    // whole, so its logprobs entry still describes bytes that reached content.
+    try testing.expectEqualStrings("\nHello", streamContentLead("\nHello", false));
+}
+
+
+test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
+    // A 4 KB edit call that hit EOS inside a string value. The object never
+    // balances, so the balanced-snap arm declines; without a name salvage the
+    // whole turn was dropped at the flush (empty `stop`, nothing for the client
+    // to nudge on). Same rule as every other dialect: NAME + `{}`.
+    const allocator = testing.allocator;
+    const text = "Fixing it.\n<tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\": \"a.ts\", \"oldText\": \"function foo() {\\n  return 1;";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("edit", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+    // Reversed key order + whitespace variants still find the name.
+    const text2 = "<tool_call>{ \"arguments\" : {\"name\": \"nope\", \"s\": \"a}b\"}, \"name\" : \"real\", \"extra\": \"unterm";
+    const c2 = (try parseToolCalls(allocator, text2)) orelse return error.NoCalls;
+    defer freeParsedCalls(c2);
+    try testing.expectEqualStrings("real", c2[0].name);
+    // No name anywhere: still nothing (no invented call).
+    try testing.expect((try parseToolCalls(allocator, "<tool_call>\n{\"arguments\": {\"path\": \"a")) == null);
+}
+
+// ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
+
+test "parseToolCalls minicpm5: single string arg (shell pwd)" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: shell echo hello" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("echo hello", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: git status" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: git log -1" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">git log -1</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("git log -1", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: multiple arguments in one call" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">notes.txt</param>\n" ++
+        "  <param name=\"content\">hello world</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+    try testing.expectEqualStrings("notes.txt", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hello world", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls minicpm5: a param value keeps its own leading/trailing blank lines" {
+    // Upstream #295 (stripHermesValueFraming) established the rule for the
+    // Hermes dialect: the template frames a value with EXACTLY one newline per
+    // side, so exactly one is what the parser may remove. Eating a RUN destroys
+    // content the model meant to send - an old_string that must match a file
+    // "exactly, including indentation" then edits at the wrong place (#294).
+    //
+    // NOTE the captured model output is value-adjacent, so this framing case is
+    // NOT yet observed in the wild; it is the conservative handling for the
+    // newline-framed layout rather than a claim that MiniCPM5 emits it. This pins it - the value here is
+    // framed by one newline per side AND legitimately begins and ends with a
+    // blank line of its own, which must survive.
+    const text = "<function name=\"write\">\n<param name=\"content\">\n\nhi\n\n</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedToolCall;
+    defer freeParsedCalls(calls);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("\nhi\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls minicpm5: CDATA param value kept verbatim" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\"><![CDATA[notes.txt]]></param>\n" ++
+        "  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line one\nline <two> & \"three\"", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls minicpm5: character data AFTER a CDATA section is not discarded" {
+    // `<![CDATA[x]]>tail` used to return just `x`: the scan took the LAST
+    // `]]>` anywhere in the probe, so anything following the section was
+    // silently dropped. Silent truncation of a tool argument is the worst
+    // failure mode here - the call still looks well-formed to the client.
+    const text = "<function name=\"w\"><param name=\"c\"><![CDATA[x]]>tail</param></function>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedToolCall;
+    defer freeParsedCalls(calls);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    // Not a CDATA-wrapped VALUE (the section does not end it), so it is text.
+    try testing.expectEqualStrings("<![CDATA[x]]>tail", parsed.value.object.get("c").?.string);
+}
+
+test "parseToolCalls minicpm5: CDATA payload containing a literal </param> is not truncated" {
+    // A write_file call documenting this very XML format — the CDATA payload
+    // legitimately contains the substring `</param>`. A naive substring
+    // search for the closing tag would cut the value there; CDATA exists
+    // precisely so this content is carried verbatim.
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">docs.txt</param>\n" ++
+        "  <param name=\"content\"><![CDATA[Example: <param name=\"x\">y</param> then more text]]></param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "Example: <param name=\"x\">y</param> then more text",
+        parsed.value.object.get("content").?.string,
+    );
+}
+
+test "parseToolCalls minicpm5: CDATA payload containing a literal </function> is not truncated, and a second real call still parses" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">docs.txt</param>\n" ++
+        "  <param name=\"content\"><![CDATA[Close a call with </function> like this]]></param>\n" ++
+        "</function>\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("Close a call with </function> like this", first.value.object.get("content").?.string);
+    try testing.expectEqualStrings("shell", calls[1].name);
+    const second = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[1].arguments, .{});
+    defer second.deinit();
+    try testing.expectEqualStrings("pwd", second.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: two sequential calls, no wrapper" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("pwd", first.value.object.get("command").?.string);
+    const second = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[1].arguments, .{});
+    defer second.deinit();
+    try testing.expectEqualStrings("ls -la", second.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: duplicate param — first occurrence wins" {
+    const raw = "<function name=\"shell\">\n" ++
+        "  <param name=\"command\">pwd</param>\n" ++
+        "  <param name=\"command\">ls -la</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: undeclared function name is still parsed (kept, not guessed away)" {
+    const raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("delete_everything", calls[0].name);
+    try testing.expectEqual(false, calls[0].inferred);
+}
+
+test "parseToolCalls minicpm5: missing param is never fabricated" {
+    const raw = "<function name=\"write\">\n  <param name=\"path\">notes.txt</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls minicpm5: unrecognized param passes through untouched" {
+    const raw = "<function name=\"shell\">\n" ++
+        "  <param name=\"command\">pwd</param>\n" ++
+        "  <param name=\"timeout_ms\">5000</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("5000", parsed.value.object.get("timeout_ms").?.string);
+}
+
+test "parseToolCalls minicpm5: a harmony ANALYSIS channel is never scanned for this dialect" {
+    // gpt-oss/harmony (upstream #247) landed a reasoning transcript format whose
+    // analysis channel carries the model's private thinking. This dialect's
+    // fallback scanned that text too, so a harmony model merely EXPLAINING the
+    // MiniCPM5 syntax produced a real, unrequested `get_time({})` call.
+    // Introduced by adding this arm - before it, `<function name=` parsed nowhere.
+    const analysis = "<|start|>assistant<|channel|>analysis<|message|>The user asks about <function name=\"get_time\"></function> syntax.<|end|>";
+    if (try parseToolCalls(testing.allocator, analysis)) |calls| {
+        defer freeParsedCalls(calls);
+        std.debug.print("harmony analysis became a call: {s}({s})\n", .{ calls[0].name, calls[0].arguments });
+        return error.HarmonyAnalysisBecameToolCall;
+    }
+
+    // The dialect itself is untouched: no harmony markers, still parses.
+    const plain = "<function name=\"get_time\"></function>";
+    const c = (try parseToolCalls(testing.allocator, plain)) orelse return error.ExpectedToolCall;
+    defer freeParsedCalls(c);
+    try testing.expectEqualStrings("get_time", c[0].name);
+}
+
+test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
+    // The earlier defect was two individually-green tests that CONTRADICTED
+    // each other: the parser called a string prose while the scrubber cut it as
+    // markup. Neither test could see it because neither ran both layers. This
+    // one does, so that shape cannot recur silently.
+    //
+    // Fixtures marked LIVE are verbatim raw emissions of
+    // mlx-community/MiniCPM5-1B-OptiQ-4bit captured via SUSHI_RAW_DUMP_FILE.
+    const Case = struct {
+        raw: []const u8,
+        is_call: bool, // parser must produce a call
+        keeps_text: bool, // scrubber must leave the text intact
+        args: ?[]const u8 = null, // when set, the exact arguments JSON
+    };
+    const cases = [_]Case{
+        // LIVE: normal parameterised call - value-adjacent, no framing newlines.
+        .{ .raw = "<function name=\"shell\"><param name=\"command\">git status</param></function>", .is_call = true, .keeps_text = false },
+        // LIVE: zero-argument call, closed with an empty body.
+        .{ .raw = "<function name=\"get_time\"></function>", .is_call = true, .keeps_text = false },
+        // LIVE: truncated at max_tokens - a real call, ZERO completed params.
+        // Salvages the NAME with empty args; the unterminated value never ships
+        // (a fragment argument is worse than none - the call looks complete).
+        .{ .raw = "<function name=\"shell\"><param name=\"command\">git status", .is_call = true, .keeps_text = false, .args = "{}" },
+        // Prose naming a function: no <param, no close. Neither layer may act.
+        .{ .raw = "Document the syntax as <function name=\"shell\"> before discussing parameters.", .is_call = false, .keeps_text = true },
+        .{ .raw = "Wrap it in a <functional> block - just prose.", .is_call = false, .keeps_text = true },
+        // Malformed (dropped quote) WITH structural evidence: not a call, but
+        // it is markup, so it must be scrubbed rather than rendered.
+        .{ .raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>", .is_call = false, .keeps_text = false },
+    };
+    for (cases) |c| {
+        const parsed = try parseToolCalls(testing.allocator, c.raw);
+        if (parsed) |calls| {
+            if (c.args) |want| try testing.expectEqualStrings(want, calls[0].arguments);
+            freeParsedCalls(calls);
+        }
+        const got_call = parsed != null;
+        testing.expectEqual(c.is_call, got_call) catch |e| {
+            std.debug.print("parser disagreed on: '{s}' (got call={})\n", .{ c.raw, got_call });
+            return e;
+        };
+        const kept = std.mem.eql(u8, std.mem.trimEnd(u8, c.raw, "\n\r\t "), trimLeakedToolMarkup(c.raw));
+        testing.expectEqual(c.keeps_text, kept) catch |e| {
+            std.debug.print("scrubber disagreed on: '{s}' -> '{s}'\n", .{ c.raw, trimLeakedToolMarkup(c.raw) });
+            return e;
+        };
+        // THE invariant: text the parser calls prose is text the scrubber keeps.
+        if (!got_call and !kept) {
+            const still_markup = std.mem.indexOf(u8, c.raw, "<param") != null or
+                std.mem.indexOf(u8, c.raw, "</function>") != null;
+            testing.expect(still_markup) catch |e| {
+                std.debug.print("CONTRADICTION: parser says prose, scrubber cut it: '{s}'\n", .{c.raw});
+                return e;
+            };
+        }
+    }
+}
+
+test "parseToolCalls minicpm5: an UNCLOSED named opener in prose is not a call" {
+    // The truncation salvage recovers NAME + complete params when EOS cut a
+    // real call. It cannot, on its own, tell that apart from a model WRITING
+    // ABOUT the syntax - and an unclosed opener with no params was being
+    // promoted into an executable `shell({})`. For a zero-arg tool that is an
+    // unintended invocation; otherwise it replaces the answer with a bogus call.
+    //
+    // Rule: an unclosed function must carry structural evidence that a call was
+    // under way - at minimum a `<param` opener. (It was briefly a COMPLETE
+    // `<param>...</param>`; a real max_tokens capture has zero completed pairs,
+    // so that discarded genuine calls.) A properly CLOSED zero-arg call is
+    // still a call - the close tag is the model's own commitment.
+    const prose = [_][]const u8{
+        "Document the syntax as <function name=\"shell\"> before discussing parameters.",
+        "You write <function name=\"get_time\"> to open a call.",
+    };
+    for (prose) |t| {
+        if (try parseToolCalls(testing.allocator, t)) |calls| {
+            defer freeParsedCalls(calls);
+            std.debug.print("PROSE became a call: '{s}' -> {s}({s})\n", .{ t, calls[0].name, calls[0].arguments });
+            return error.ProseBecameToolCall;
+        }
+    }
+
+    // A CLOSED zero-arg call still parses.
+    const closed = "<function name=\"get_time\"></function>";
+    const c1 = (try parseToolCalls(testing.allocator, closed)) orelse return error.ExpectedToolCall;
+    defer freeParsedCalls(c1);
+    try testing.expectEqualStrings("get_time", c1[0].name);
+    try testing.expectEqualStrings("{}", c1[0].arguments);
+
+    // A genuinely TRUNCATED call that got one complete param through still
+    // salvages - that is the case the branch exists for.
+    const cut = "<function name=\"shell\">\n<param name=\"command\">ls</param>\n<param name=\"cwd\">/tm";
+    const c2 = (try parseToolCalls(testing.allocator, cut)) orelse return error.ExpectedToolCall;
+    defer freeParsedCalls(c2);
+    try testing.expectEqualStrings("shell", c2[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c2[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
+    try testing.expect(parsed.value.object.get("cwd") == null);
+}
+
+test "parseToolCalls minicpm5: malformed open tag (dropped quote) never guesses a call" {
+    const raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>\nI'll run that now.";
+    const calls = try parseToolCalls(testing.allocator, raw);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls minicpm5: prose before and after a call, and function-like false positives" {
+    const raw = "Sure, let me check the working directory.\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n" ++
+        "Done — see the result above.";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+
+    // `<functional>`/`<function-like>` are prose, not the attribute-quoted
+    // MiniCPM5 form (no whitespace right after `<function`) — no call.
+    const prose = "Wrap it in a <functional> or <function-like> block — just prose, no call here.";
+    try testing.expect(try parseToolCalls(testing.allocator, prose) == null);
+}
+
+test "parseToolCalls minicpm5: no tool call in plain prose" {
+    const raw = "The `shell` function name attribute isn't used here at all — just chatting.";
+    try testing.expect(try parseToolCalls(testing.allocator, raw) == null);
+}
+
+test "parseToolCalls minicpm5: existing bare Hermes <function=...> form is unaffected" {
+    const raw = "<function=shell><parameter=command>pwd</parameter></function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: adversarial malformed input never hangs or crashes" {
+    // 200 back-to-back unterminated openers — the scan must advance past each
+    // one rather than re-finding the same offset forever. Built with a
+    // comptime loop because Zig 0.17 no longer has the `**` repeat operator.
+    const many_openers = comptime blk: {
+        var s: []const u8 = "";
+        for (0..200) |_| s = s ++ "<function name=\"a\">";
+        break :blk s;
+    };
+    const inputs = [_][]const u8{
+        "<function",
+        "<function ",
+        "<function name=",
+        "<function name=\"",
+        "<function name=\"a\">",
+        "<function name=\"a\"><param",
+        "<function name=\"a\"><param name=",
+        "<function name=\"a\"><param name=\"\"></param></function>",
+        "<function name=\"\"></function>",
+        "<function><function><function>",
+        many_openers,
+    };
+    for (inputs) |raw| {
+        const calls = try parseToolCalls(testing.allocator, raw);
+        if (calls) |cs| {
+            for (cs) |tc| {
+                testing.allocator.free(tc.name);
+                testing.allocator.free(tc.arguments);
+            }
+            testing.allocator.free(cs);
+        }
+    }
+}
+
+test "streamShouldBufferForTools: MiniCPM5 <function name=...> open" {
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">"));
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">\n  <param name=\"command\">pwd"));
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">\n  <param name=\"command\">pwd</param></functio"));
+    try testing.expect(streamShouldBufferForTools("Sure, running that:\n<function name=\"shell\">"));
+}
+
+test "parseToolCalls minicpm5: the three <function arms stay disjoint" {
+    // MiniCPM5 and the two equals-sign Hermes paths all key on the SAME
+    // `<function` marker and are discriminated ONLY by the byte after it
+    // (`=` vs whitespace). Upstream's standing rule — "a `<tool_call>` body
+    // carrying `<function=` is the XML dialect and is read FIRST (the qwen 3.5+
+    // template mandates it)" — means the new arm must not be able to steal
+    // those bytes. This pins the ordering against the real arm chain rather
+    // than assuming it: the MiniCPM5 arm is gated on `calls.items.len == 0` and
+    // sits after both Hermes paths, so it only ever sees text they declined.
+    const allocator = testing.allocator;
+    const Case = struct { text: []const u8, name: []const u8, key: []const u8, value: []const u8 };
+    const cases = [_]Case{
+        // 1. WRAPPED `<function=` — the <tool_call> arm owns it.
+        .{
+            .text = "<tool_call><function=shell><parameter=command>ls -la</parameter></function></tool_call>",
+            .name = "shell",
+            .key = "command",
+            .value = "ls -la",
+        },
+        // 2. BARE `<function=` + `<parameter=` — the bare-Hermes arm owns it.
+        .{
+            .text = "<function=shell><parameter=command>ls -la</parameter></function>",
+            .name = "shell",
+            .key = "command",
+            .value = "ls -la",
+        },
+        // 3. `<function name="…">` — only this one reaches the MiniCPM5 arm.
+        .{
+            .text = "<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>",
+            .name = "shell",
+            .key = "command",
+            .value = "ls -la",
+        },
+    };
+    for (cases) |c| {
+        const calls = (try parseToolCalls(allocator, c.text)) orelse {
+            std.debug.print("no call parsed for: '{s}'\n", .{c.text});
+            return error.ExpectedToolCall;
+        };
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings(c.name, calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(c.value, parsed.value.object.get(c.key).?.string);
+    }
+}
+
+test "streamShouldBufferForTools: EVERY growing prefix of <function holds" {
+    // DERIVED, not enumerated. The previous version of this test was a second
+    // hand-written copy of `tail_prefixes` and inherited its hole: `<funct` was
+    // missing from BOTH, so a token boundary landing exactly there flushed the
+    // fragment and leaked the rest of the tag (`<f` id 54303 + `unct` id 14185
+    // decode to exactly `<funct` in this vocabulary — a real decomposition, not
+    // a hypothetical). Generating the assertions from the marker string means a
+    // rung missing from the array fails here even if nobody remembers to add an
+    // assertion for it.
+    const marker = "<function";
+    var i: usize = 2;
+    while (i <= marker.len) : (i += 1) {
+        try testing.expect(streamShouldBufferForTools(marker[0..i]));
+    }
+}
+
+test "streamShouldBufferForTools: MiniCPM5 opener holds while unresolved, releases when resolved-and-not-a-call" {
+    // HOLD — the opener is either unresolved (no `>` yet, so the next token
+    // could still complete a real call) or resolved WITH a quoted name.
+    const hold = [_][]const u8{
+        "<f",                        "<fu",
+        "<fun",                      "<func",
+        "<funct",                    "<functi",
+        "<functio",                  "<function",
+        "<function ",                "<function n",
+        "<function na",              "<function name",
+        "<function name=",           "<function name=\"",
+        "<function name=\"shell",    "<function name=\"shell\">",
+        // Parser-ACCEPTED oddity: miniCpm5AttrValue finds `name=` anywhere in
+        // the opener, so this IS a real call. The gate must therefore hold it —
+        // a gate stricter than its parser flushes a genuine call's opener as
+        // content and then the end-of-stream parse emits the call anyway: leak
+        // AND duplicate, the exact class this work exists to fix.
+        "<function foo name=\"x\">",
+    };
+    for (hold) |buf| {
+        testing.expect(streamShouldBufferForTools(buf)) catch |e| {
+            std.debug.print("expected HOLD, got flush: '{s}'\n", .{buf});
+            return e;
+        };
+    }
+
+    // RELEASE — resolved (`>` seen) and demonstrably not a MiniCPM5 call, or
+    // never this dialect at all. Holding these buys nothing and costs the whole
+    // remainder of the response: the hold is monotonic, so one `<function foo>`
+    // in prose silences every later token of a tool-enabled turn.
+    const release = [_][]const u8{
+        "<functional",
+        "<function-like>",
+        "<function>",
+        "<function foo>",
+        "<function >",
+        "<function name=unquoted>",
+        // Empty name: the parser rejects it (`fn_name.len == 0` → skip), so the
+        // gate releases too. The strictly-earlier prefix `<function name="` is
+        // pinned in the hold set above, so the unresolved form still holds.
+        "<function name=\"\">",
+        "Use a <function foo> block to wrap it, then carry on writing prose.",
+    };
+    for (release) |buf| {
+        testing.expect(!streamShouldBufferForTools(buf)) catch |e| {
+            std.debug.print("expected RELEASE, got hold: '{s}'\n", .{buf});
+            return e;
+        };
+    }
+}
+
+test "streamShouldBufferForTools: false positive — bare <function> with no attribute" {
+    try testing.expect(!streamShouldBufferForTools("here is <function>"));
+    try testing.expect(!streamShouldBufferForTools("Wrap it in a <functional> block"));
+}
+
+test "streamShouldBufferForTools: the gate is a strict SUPERSET of parseMiniCpm5ToolCalls" {
+    // The load-bearing invariant, checked by DERIVATION rather than by a
+    // hand-listed set: for every text the parser turns into a real call, every
+    // prefix from the marker onward must hold. Any prefix that flushed would be
+    // content already on the wire (SSE is append-only) followed by the same call
+    // arriving properly at end of stream.
+    const accepted = [_][]const u8{
+        "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>",
+        "<function name=\"get_weather\">\n  <param name=\"city\">Paris</param>\n  <param name=\"unit\">c</param>\n</function>",
+        "<function foo name=\"x\"><param name=\"a\">1</param></function>",
+    };
+    for (accepted) |text| {
+        const calls = (try parseToolCalls(testing.allocator, text)) orelse {
+            std.debug.print("fixture is not parser-accepted: '{s}'\n", .{text});
+            return error.ExpectedToolCall;
+        };
+        defer {
+            for (calls) |tc| {
+                testing.allocator.free(tc.name);
+                testing.allocator.free(tc.arguments);
+            }
+            testing.allocator.free(calls);
+        }
+        const start = std.mem.indexOf(u8, text, "<function").?;
+        var end = start + 2; // shortest rung the ladder covers
+        while (end <= text.len) : (end += 1) {
+            testing.expect(streamShouldBufferForTools(text[start..end])) catch |e| {
+                std.debug.print("gate flushed a prefix of an ACCEPTED call: '{s}'\n", .{text[start..end]});
+                return e;
+            };
+        }
+    }
+}
+
 test "renderChatTemplate: a NUL byte in message content does not truncate the prompt" {
     // Bar: content after the NUL, and the assistant header, survive the render.
     const allocator = testing.allocator;
@@ -2887,6 +14439,112 @@ test "renderChatTemplate: a NUL byte in message content does not truncate the pr
     try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant") != null);
 }
 
+test "parseToolCalls qwen: a truncated <function= call is never renamed by a JSON parameter value" {
+    // Bar: a call cut before any close tag keeps the name its `<function=`
+    // opener declared, whatever the parameter value looks like.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/package.json\n</parameter>\n" ++
+        "<parameter=content>\n{\"name\": \"voxel-pagoda-garden\", \"version\": \"1.0.0\"}";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("write_file", calls[0].name);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </parameter> is not emptied" {
+    // Bar: the value ends at the close tag that actually ends it, byte-exact.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nsee </parameter> in the docs\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("see </parameter> in the docs", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value carrying </tool_call> is not dropped" {
+    // Bar: a required parameter survives a value that spells the wrapper close.
+    const allocator = testing.allocator;
+    const raw =
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n" ++
+        "<parameter=content>\nemit </tool_call> here\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("emit </tool_call> here", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls qwen: a parameter value types from JSON's number grammar, not parseFloat" {
+    // Bar: only a spelling JSON itself calls a number stays unquoted.
+    const allocator = testing.allocator;
+    const Case = struct { spelling: []const u8, number: bool };
+    const cases = [_]Case{
+        .{ .spelling = "Infinity", .number = false },
+        .{ .spelling = "nan", .number = false },
+        .{ .spelling = "+1", .number = false },
+        .{ .spelling = "0755", .number = false },
+        .{ .spelling = ".5", .number = false },
+        .{ .spelling = "5.", .number = false },
+        .{ .spelling = "1.5", .number = true },
+        .{ .spelling = "-2", .number = true },
+        .{ .spelling = "3e5", .number = true },
+        .{ .spelling = "0", .number = true },
+    };
+    for (cases) |c| {
+        const raw = try std.mem.concat(allocator, u8, &.{
+            "<tool_call>\n<function=edit>\n<parameter=mode>\n", c.spelling, "\n</parameter>\n</function>\n</tool_call>",
+        });
+        defer allocator.free(raw);
+        const calls = (try parseToolCalls(allocator, raw)) orelse return error.NoToolCall;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{}) catch {
+            std.debug.print("\n{s}: args not valid JSON: {s}\n", .{ c.spelling, calls[0].arguments });
+            return error.ArgsNotValidJson;
+        };
+        defer parsed.deinit();
+        const v = parsed.value.object.get("mode") orelse return error.MissingParam;
+        if (c.number) {
+            if (v == .string) {
+                std.debug.print("\n{s}: shipped as a string\n", .{c.spelling});
+                return error.NumberQuoted;
+            }
+        } else {
+            if (v != .string) {
+                std.debug.print("\n{s}: shipped unquoted as {s}\n", .{ c.spelling, @tagName(v) });
+                return error.NonNumberUnquoted;
+            }
+            try testing.expectEqualStrings(c.spelling, v.string);
+        }
+    }
+}
+
 test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-exact" {
     // Bar: the escaper's output is always well-formed UTF-8 (nlohmann rejects
     // anything else), and every valid sequence survives unchanged.
@@ -2908,6 +14566,42 @@ test "appendJsonString: invalid UTF-8 becomes U+FFFD, valid multibyte is byte-ex
     try testing.expectEqualStrings("\"a\u{FFFD}\"", buf.items);
 }
 
+test "a muse header the MODEL writes at position 0 is resolved, self means reasoning" {
+    // The prompt ends at `<|start|>assistant`; the model's ` to=self<|message|>` used to
+    // stream as content because only a `<|start|>` TOKEN armed the header skip.
+    try std.testing.expect(promptTailOpensMuseHeader("...<|eot|><|start|>assistant"));
+    try std.testing.expect(promptTailOpensMuseHeader("<|start|>assistant\n"));
+    try std.testing.expect(!promptTailOpensMuseHeader("<|start|>assistant to=user<|message|>"));
+    try std.testing.expect(museHeaderOpensReasoning(" to=self"));
+    try std.testing.expect(museHeaderOpensReasoning("assistant to=self\n"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=user"));
+    try std.testing.expect(!museHeaderOpensReasoning(" to=selfish"));
+    try std.testing.expect(!museHeaderOpensReasoning(""));
+}
+
+test "a model-opened think block latches from its own opener token" {
+    // Both openers are dropped from visible deltas as channel markers, so without
+    // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>").?);
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>\n").?);
+    try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(true, "thought").?);
+    try std.testing.expect(modelThinkOpener(false, "thought") == null);
+    // Prose that merely BEGINS with the word is not the opener token.
+    try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
+    try std.testing.expect(modelThinkOpener(true, "\n") == null);
+    try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
+}
+
+test "K2-Horizon: the rendered prompt opens one of three think tags; thinking-off closes the SAME one" {
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think>\n"));
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_fast>\n"));
+    try testing.expect(promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|think_faster>\n"));
+    try testing.expect(!promptTailOpensThink("<|ifm|im_start|>assistant\n<ifm|thinker>\n"));
+    try testing.expectEqualStrings("</ifm|think_fast>", contentChannelTail("", "<|ifm|im_start|>assistant\n<ifm|think_fast>\n", true));
+    try testing.expectEqualStrings("</ifm|think>", contentChannelTail("", "x<ifm|think>\n", true));
+    try testing.expectEqualStrings("</think>", contentChannelTail("", "x<think>\n", true));
+}
+
 test "serializeMessagesJson: a string-content template gets each image as its atom where it sits, blank-line joined" {
     const a = testing.allocator;
     const parts = [_]MediaPart{ .{ .at = 0, .kind = .image }, .{ .at = 5, .kind = .image }, .{ .at = 5, .kind = .video } };
@@ -2917,7 +14611,7 @@ test "serializeMessagesJson: a string-content template gets each image as its at
         .{ .role = "user", .content = "plain" },
     };
     var cfg = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = "<IMG>" };
-    const json = try serializeMessagesJsonFor(a, &msgs, &cfg);
+    const json = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
     defer a.free(json);
     try testing.expectEqualStrings(
         "[{\"role\":\"user\",\"content\":\"<IMG>\\n\\nAAAAA\\n\\n<IMG>\\n\\nBBB\"}," ++
@@ -2926,9 +14620,38 @@ test "serializeMessagesJson: a string-content template gets each image as its at
     );
     // Without the atom the same message renders as typed parts.
     cfg.image_placeholder = null;
-    const typed = try serializeMessagesJsonFor(a, msgs[0..1], &cfg);
+    const typed = try serializeMessagesJsonFor(a, msgs[0..1], .null_literal, &cfg);
     defer a.free(typed);
     try testing.expect(std.mem.indexOf(u8, typed, "{\"type\":\"image\"}") != null);
+}
+
+test "K2-Horizon: assistant history always carries a thinking field, and the effort word is high|medium|low" {
+    const k2_tpl = "{%- set think_tag = 'ifm|think' -%}{%- set effort = reasoning_effort | default('high') -%}";
+    const cfg = ChatConfig{ .chat_template = k2_tpl, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "hello" },
+        .{ .role = "assistant", .content = "again", .reasoning_content = "why" },
+    };
+    const json = try serializeMessagesJsonFor(testing.allocator, &messages, .null_literal, &cfg);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"content\":\"hello\",\"reasoning_content\":\"\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"reasoning_content\":\"why\"") != null);
+    // Other families keep omitting the key.
+    const plain = ChatConfig{ .chat_template = "{{ messages }}", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    const json2 = try serializeMessagesJsonFor(testing.allocator, messages[0..2], .null_literal, &plain);
+    defer testing.allocator.free(json2);
+    try testing.expect(std.mem.indexOf(u8, json2, "reasoning_content") == null);
+
+    const cases = [_]struct { in: ?[]const u8, want: []const u8 }{
+        .{ .in = null, .want = "high" },     .{ .in = "high", .want = "high" },     .{ .in = "xhigh", .want = "high" },
+        .{ .in = "max", .want = "high" },    .{ .in = "medium", .want = "medium" }, .{ .in = "low", .want = "low" },
+        .{ .in = "minimal", .want = "low" }, .{ .in = "none", .want = "low" },      .{ .in = "bogus", .want = "high" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c.want, k2EffortFor(c.in));
+    const extra = try serializeExtraContext(testing.allocator, &cfg, true, "xhigh");
+    defer testing.allocator.free(extra);
+    try testing.expect(std.mem.indexOf(u8, extra, "\"reasoning_effort\":\"high\"") != null);
 }
 
 test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
@@ -3141,27 +14864,11 @@ test "GLM-5.3 template: parallel results come back in the order of the calls" {
     );
 }
 
-test "a template that raises or is missing is refused unless the model ends turns with <|im_end|>" {
-    const user = [_]Message{.{ .role = "user", .content = "hi" }};
-    for ([_][]const u8{ "{{ raise_exception('refused') }}", "" }) |tpl| {
-        for ([_]?[]const u8{ null, "<|endoftext|>", "<｜end▁of▁sentence｜>" }) |eos| {
-            var config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = eos, .add_bos_token = false, .allocator = testing.allocator };
-            const before = template_fallbacks.load(.monotonic);
-            try testing.expectError(error.ChatTemplateUnusable, renderChatTemplate(testing.allocator, &user, &config, null, null, true, null, false));
-            try testing.expectEqual(before, template_fallbacks.load(.monotonic));
-        }
-        var chatml = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
-        const rendered = try renderChatTemplate(testing.allocator, &user, &chatml, null, null, true, null, false);
-        defer testing.allocator.free(rendered);
-        try testing.expect(std.mem.endsWith(u8, rendered, "<|im_start|>assistant\n"));
-    }
-}
-
 test "a template that raises counts one generic fallback" {
     var config = ChatConfig{
         .chat_template = "{{ raise_exception('refused') }}",
         .bos_token = null,
-        .eos_token = "<|im_end|>",
+        .eos_token = null,
         .add_bos_token = false,
         .allocator = testing.allocator,
     };
@@ -3236,7 +14943,7 @@ test "chat: V4.1 renders images as the release's encoder does, an atom for each 
     const tpl_z = try a.dupeSentinel(u8, cfg.chat_template, 0);
     defer a.free(tpl_z);
     for (cases) |c| for ([_]struct { mode: []const u8, want: []const u8 }{ .{ .mode = "chat", .want = c.chat }, .{ .mode = "thinking", .want = c.thinking } }) |arm| {
-        const json = try serializeMessagesJsonFor(a, c.msgs, &cfg);
+        const json = try serializeMessagesJsonFor(a, c.msgs, .null_literal, &cfg);
         defer a.free(json);
         const json_z = try a.dupeSentinel(u8, json, 0);
         defer a.free(json_z);
@@ -3292,7 +14999,7 @@ test "chat: the V4.1 effort words stay on the encoder's low|high|max ladder" {
 
 /// One DeepSeek-V4.1 turn replayed the way a client does: the model's tokens for `raw`, the server's split and parse of
 /// its text, and the next request's prompt tokens through the real template.
-pub const Dsv41Replay = struct {
+const Dsv41Replay = struct {
     gen: []u32,
     /// Generated tokens the next prompt repeats, from the first one.
     reused: usize,
@@ -3301,10 +15008,118 @@ pub const Dsv41Replay = struct {
     think_close_at: ?usize,
     markup_at: ?usize,
 
-    pub fn deinit(self: *Dsv41Replay, a: std.mem.Allocator) void {
+    fn deinit(self: *Dsv41Replay, a: std.mem.Allocator) void {
         a.free(self.gen);
     }
 };
+
+fn dsv41Replay(a: std.mem.Allocator, tok: *const Tokenizer, tools: ?[]const u8, thinking: bool, raw: []const u8) !Dsv41Replay {
+    var cfg = ChatConfig{ .chat_template = @embedFile("fixtures/dsv41_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = dsv41_image_atom };
+    const first = [_]Message{.{ .role = "user", .content = "q" }};
+    const p1_text = try renderChatTemplate(a, &first, &cfg, tools, null, thinking, "high", false);
+    defer a.free(p1_text);
+    const p1 = try tok.encode(a, p1_text);
+    defer a.free(p1);
+    const gen = try tok.encode(a, raw);
+    errdefer a.free(gen);
+
+    const split = splitThinkBlock(raw, true, thinking);
+    const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
+    defer if (parsed) |calls| {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    };
+    var calls: [4]ToolCall = undefined;
+    if (parsed) |pc| for (pc, 0..) |c, i| {
+        calls[i] = .{ .id = "call_1", .name = c.name, .arguments = c.arguments };
+    };
+    const assistant: Message = .{
+        .role = "assistant",
+        .content = split.content,
+        .reasoning_content = split.reasoning_content,
+        .tool_calls = if (parsed) |pc| calls[0..pc.len] else null,
+    };
+    const tail: Message = if (parsed != null) .{ .role = "tool", .content = "ok", .tool_call_id = "call_1" } else .{ .role = "user", .content = "next" };
+    const second = [_]Message{ first[0], assistant, tail };
+    const p2_text = try renderChatTemplate(a, &second, &cfg, tools, null, thinking, "high", false);
+    defer a.free(p2_text);
+    const p2 = try tok.encode(a, p2_text);
+    defer a.free(p2);
+
+    const keep = p1.len <= p2.len and std.mem.eql(u32, p1, p2[0..p1.len]);
+    var reused: usize = 0;
+    if (keep) {
+        const tail_ids = p2[p1.len..];
+        while (reused < gen.len and reused < tail_ids.len and gen[reused] == tail_ids[reused]) reused += 1;
+    }
+    const close_ids = try tok.encode(a, "</think>");
+    defer a.free(close_ids);
+    const markup_ids = try tok.encode(a, "\xef\xbd\x9cDSML\xef\xbd\x9c");
+    defer a.free(markup_ids);
+    return .{
+        .gen = gen,
+        .reused = reused,
+        .prefix_kept = keep,
+        .think_close_at = std.mem.indexOfScalar(u32, gen, close_ids[0]),
+        .markup_at = std.mem.indexOfScalar(u32, gen, markup_ids[0]),
+    };
+}
+
+const dsv41_replay_tools =
+    \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"tags":{"type":"array"}}}}}]
+;
+
+test "dsv41 replay: what the next prompt shares with a generated turn (DeepSeek tokenizer.json)" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw");
+    var tok = tokenizer_mod.loadTokenizer(testing.io, testing.allocator, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    const a = testing.allocator;
+    const D = "\xef\xbd\x9cDSML\xef\xbd\x9c";
+    const call = "\n\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"read_file\">\n<" ++ D ++ " parameter name=\"path\" string=\"true\">src/main.zig</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const call_json = "\n\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"read_file\">\n<" ++ D ++ " parameter name=\"path\" string=\"true\">src/main.zig</" ++ D ++ " parameter>\n<" ++ D ++ " parameter name=\"tags\" string=\"false\">[\"a\",\"b\"]</" ++ D ++ " parameter>\n<" ++ D ++ " parameter name=\"limit\" string=\"false\">40</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const call_code = "\n\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write_file\">\n<" ++ D ++ " parameter name=\"path\" string=\"true\">a.zig</" ++ D ++ " parameter>\n<" ++ D ++ " parameter name=\"content\" string=\"true\">const s = \"a\\nb\"; // <x> & 'y' \\ \xe2\x80\x94 \n\tfn f() void {}\n</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const Reuse = enum {
+        /// Every generated token comes back.
+        whole,
+        /// Through the call's first marker, then the re-render differs.
+        into_call,
+        /// Through the thought minus the whitespace the server trims off its end.
+        thought_less_trim,
+        /// The turn is not re-rendered as it was generated.
+        none,
+    };
+    const cases = [_]struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: Reuse }{
+        .{ .name = "thinking, tools, content then a call", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
+        // jinja's `tojson` spaces the array's items, the model wrote none.
+        .{ .name = "thinking, tools, a call with JSON values", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .into_call },
+        .{ .name = "thinking, tools, a call with code in a string", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_code, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.\n\nIt parses the flags first.", .reuse = .whole },
+        .{ .name = "thinking, tools, reasoning ends in a newline", .tools = dsv41_replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>The entry point is `src/main.zig`.", .reuse = .thought_less_trim },
+        // Without tools the template drops an earlier turn's thought and opens it `</think>`, not `<think>`.
+        .{ .name = "thinking, no tools", .tools = null, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.", .reuse = .none },
+        .{ .name = "chat, tools, content then a call", .tools = dsv41_replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },
+        .{ .name = "chat, no tools", .tools = null, .thinking = false, .raw = "The entry point is `src/main.zig`.", .reuse = .whole },
+    };
+    for (cases) |c| {
+        var r = try dsv41Replay(a, &tok, c.tools, c.thinking, c.raw);
+        defer r.deinit(a);
+        errdefer std.debug.print("{s}: {d} tokens, prefix kept {}, reused {d}, </think> at {?d}, markup at {?d}\n", .{ c.name, r.gen.len, r.prefix_kept, r.reused, r.think_close_at, r.markup_at });
+        switch (c.reuse) {
+            .whole => try testing.expectEqual(r.gen.len, r.reused),
+            .into_call => try testing.expect(r.reused > r.markup_at.? and r.reused < r.gen.len),
+            .thought_less_trim => try testing.expectEqual(r.think_close_at.? - 1, r.reused),
+            .none => try testing.expect(!r.prefix_kept),
+        }
+        // The point behind the closer is inside what the next prompt shares, unless the thought's edge is whitespace.
+        if (c.thinking and c.tools != null and c.reuse != .thought_less_trim) try testing.expect(r.reused > r.think_close_at.?);
+    }
+}
 
 /// One turn of a hybrid-state arch replayed the way a client does (the pack's own template and tokenizer): the
 /// generated tokens for `raw`, the server's split and parse of its text, and the next request's prompt.
@@ -3316,12 +15131,12 @@ const Replay = struct {
     prefix_kept: bool,
     think_close_at: ?usize,
 
-    pub fn deinit(self: *Replay, a: std.mem.Allocator) void {
+    fn deinit(self: *Replay, a: std.mem.Allocator) void {
         a.free(self.gen);
     }
 };
 
-pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatConfig, tools: ?[]const u8, thinking: bool, raw: []const u8) !Replay {
+fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatConfig, tools: ?[]const u8, thinking: bool, raw: []const u8) !Replay {
     const first = [_]Message{.{ .role = "user", .content = "q" }};
     const p1_text = try renderChatTemplate(a, &first, cfg, tools, null, thinking, null, false);
     defer a.free(p1_text);
@@ -3330,8 +15145,8 @@ pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatC
     const gen = try tok.encodeMarked(a, raw);
     errdefer a.free(gen);
 
-    const split = think_tags.splitThinkBlock(raw, true, thinking);
-    const parsed = if (tools != null) try tool_calls_mod.parseToolCalls(a, raw) else null;
+    const split = splitThinkBlock(raw, true, thinking);
+    const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
     defer if (parsed) |calls| {
         for (calls) |c| {
             a.free(c.name);
@@ -3380,4 +15195,62 @@ const NextReuse = enum {
     none,
 };
 
-pub const ReplayCase = struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: NextReuse };
+const replay_tools =
+    \\[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer"},"tags":{"type":"array"}}}}}]
+;
+
+const ReplayCase = struct { name: []const u8, tools: ?[]const u8, thinking: bool, raw: []const u8, reuse: NextReuse };
+
+fn expectReplays(pack: []const u8, cases: []const ReplayCase) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try @import("test_models.zig").packPath(&buf, pack);
+    const a = testing.allocator;
+    var tok = tokenizer_mod.loadTokenizer(testing.io, a, dir) catch return error.SkipZigTest;
+    defer tok.deinit();
+    var cfg = loadChatConfig(testing.io, a, dir) catch return error.SkipZigTest;
+    defer cfg.deinit();
+    for (cases) |c| {
+        var r = try replayTurn(a, &tok, &cfg, c.tools, c.thinking, c.raw);
+        defer r.deinit(a);
+        errdefer std.debug.print("{s}: {d} tokens, prefix kept {}, reused {d}, </think> at {?d}\n", .{ c.name, r.gen.len, r.prefix_kept, r.reused, r.think_close_at });
+        switch (c.reuse) {
+            .whole => try testing.expectEqual(r.gen.len, r.reused),
+            .thought_short => try testing.expect(r.reused <= r.think_close_at.?),
+            .none => try testing.expect(!r.prefix_kept or r.reused == 0),
+        }
+        // The state behind the closer is a restore point the next prompt reaches only when it repeats the closer.
+        if (c.thinking and c.reuse != .thought_short and c.reuse != .none) try testing.expect(r.reused > r.think_close_at.?);
+    }
+}
+
+test "qwen4 replay: what the next prompt shares with a generated turn (Flash-Next tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n</function>\n</tool_call>";
+    const call_json = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.zig\n</parameter>\n<parameter=tags>\n[\"a\",\"b\"]\n</parameter>\n<parameter=limit>\n40\n</parameter>\n</function>\n</tool_call>";
+    const call_code = "<tool_call>\n<function=write_file>\n<parameter=content>\nconst s = \"a\\nb\"; // <x> & 'y' \\ \xe2\x80\x94 \n\tfn f() void {}\n</parameter>\n</function>\n</tool_call>";
+    try expectReplays("Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nI will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with code in a string", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\n" ++ call_code, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, no tools", .tools = null, .thinking = true, .raw = reasoning ++ "\n</think>\n\nThe entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, no newline before the closer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>\n\n" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file.\n\n" ++ call, .reuse = .whole },
+        .{ .name = "chat, no tools", .tools = null, .thinking = false, .raw = "The entry point is `src/main.zig`.", .reuse = .whole },
+    });
+}
+
+test "glm5 replay: what the next prompt shares with a generated turn (GLM-5.3 tokenizer.json, real template)" {
+    const reasoning = "The user wants the entry point. I should read src/main.zig first, then look at how the arguments are parsed.";
+    const call = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value></tool_call>";
+    const call_json = "<tool_call>read_file<arg_key>path</arg_key><arg_value>src/main.zig</arg_value><arg_key>tags</arg_key><arg_value>[\"a\",\"b\"]</arg_value><arg_key>limit</arg_key><arg_value>40</arg_value></tool_call>";
+    try expectReplays("GLM-5.3-Flash-Sushi-2.4bpw", &.{
+        .{ .name = "thinking, tools, content then a call", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>I will read the file." ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call alone", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call, .reuse = .whole },
+        .{ .name = "thinking, tools, a call with JSON values", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>" ++ call_json, .reuse = .whole },
+        .{ .name = "thinking, tools, plain answer", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "</think>The entry point is `src/main.zig`.", .reuse = .whole },
+        .{ .name = "thinking, tools, the thought ends in a newline", .tools = replay_tools, .thinking = true, .raw = reasoning ++ "\n</think>" ++ call, .reuse = .thought_short },
+        .{ .name = "chat, tools, content then a call", .tools = replay_tools, .thinking = false, .raw = "I will read the file." ++ call, .reuse = .whole },
+    });
+}

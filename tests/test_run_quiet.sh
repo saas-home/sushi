@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # `sushi run` (TTY REPL mode) must not print `[discovery] skip …` lines.
 #

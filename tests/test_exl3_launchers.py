@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sushi-test: tier=host
 """Exercise the standalone launchers without loading a model."""
 import io
 import os

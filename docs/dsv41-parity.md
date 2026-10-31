@@ -15,8 +15,8 @@ item).
 | Native speculative decode, greedy | works; text is the same at every round-width mix (`SUSHI_DSV41_DSPARK_EXACT=0` trades that for the faster arms) | `[spec-stats] mode=dspark` in the server log; `dsv41 generator: with exact DSpark rounds`. Adaptive DSpark picks plain or drafted rounds from measured timings, and each linear has one arm at every verify width, so greedy text does not depend on the mix; it can still part from `--no-mtp` at a near-tie, and a stream and a non-stream reply carry the same bytes ([dsv41-arch](dsv41-arch.md#dspark)) |
 | Spec decode for sampled requests | works | point-mass draft, exact accept rule (`Generator.dsparkSampledVerdict`); sampled determinism test |
 | Spec decode under repeat / presence / think penalty | works | verify rows shifted by `penaltyShiftRows`, `thinkShiftRows`; distinct-id test |
-| Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds (a round is cut to the thought room), DSpark resumes for the answer; `a thinking bound that fires mid-round` |
-| Spec decode with logprobs, grammar, forced call | N/A | MTP refuses the same three (`mtp_plan.mtpRefusal`); they decode serially |
+| Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds, then serial; `a thinking bound fires between DSpark rounds` |
+| Spec decode with logprobs, grammar, forced call | N/A | MTP refuses the same three (`mtpRefusal`); they decode serially |
 | Batched decode, several slots | gap | `ownsModuleDecodeState`: one request at a time; `/props` `batching.reason = exclusive` |
 | Hot / SSD prefix cache | works | restore points of the whole state, RAM and SSD tiers, bit-identical to cold ([dsv41-arch](dsv41-arch.md#prefix-cache)) |
 | Per-request prefill chunk ladder | works | `perRequestPrefillChunk` is true for the arch; each request takes the widest rung its bill admits ([dsv41-arch](dsv41-arch.md#ced)) |
@@ -39,7 +39,7 @@ item).
 | `sushi launch <agent>` | works by construction | rows come from `/v1/models`; the efforts list is the arch's four words |
 | `model-settings.json` | works | `ssd_budget_gb`, `mtp`, `ctx_size`; `kv_quant` is ignored |
 | `sushi kld` | works | capture and compare through the generic path; `--drop-expert` scores a pruned student ([quality-kld](quality-kld.md)) |
-| Smoke and format matrices | works | `tests/test_smoke_matrix.sh` carries a `deepseek_v41` row; `tests/test_format_matrix.sh` attaches to every model pass |
+| Smoke and format matrices | works | `tests/test_smoke_matrix.sh`, `tests/test_format_matrix.sh` carry a `deepseek_v41` row |
 | Engram read-ahead | works | every pass reads its rows on a thread from `beginPass` ([dsv41-arch](dsv41-arch.md#what-loads)) |
 
 ## Larger gaps
@@ -65,15 +65,15 @@ Ranked by what an agent client feels.
 All with `--ssd-budget-gb` sized to the box, a binary built from the head under test (stamp commit and mtime beside every
 number), under the GPU lock.
 
-1. `tests/run.sh --tier live --model dsv41 --only test_smoke_matrix.sh` (cells `default` and `nospec`; the pass SKIPs the
-   KV cells): every check ok, and `dspark: a sampled request drafts`.
-2. `tests/run.sh --tier live --model dsv41 --only test_format_matrix.sh`: tool-call fidelity, stream and non-stream.
+1. `tests/test_smoke_matrix.sh` with `SMOKE_ARCHES=deepseek_v41 SMOKE_CONFIGS=default,nospec`: every check ok, and
+   `dspark: a sampled request drafts`. One boot per cell.
+2. `tests/test_format_matrix.sh` with `FORMAT_MODELS=deepseek_v41`: tool-call fidelity, stream and non-stream.
 3. Sampled speculation: one request at `temperature 1, top_p 0.95`, 14k to 28k context, thinking off. Expect
    `[spec-stats] mode=dspark` with `per_draft_pct` between the greedy and zero, and decode above the serial figure.
 4. Thinking bound: Anthropic `/v1/messages` with `thinking: {type: enabled, budget_tokens: 256}`. Expect
-   `[think-bound] reasoning budget 256 reached ...; thought closed`, then `[dspark] resumed after the forced thought close` and `[spec-stats] mode=dspark` counting rounds past the close.
+   `[think-bound] reasoning budget 256 reached ...; thought closed` and `[spec-stats] mode=dspark` for the rounds before it.
 5. Penalties: `repeat_penalty 1.2` request; expect `mode=dspark` in its stats line and no repeated-token run.
 6. Boot log: `[kv-cache] off (default)`, no `[mtp] depth range` line; `--kv-quant 4` (and `--qwen-gdn 16`, `--mtp-head-kv-quant`) each exit at start with the named error before any weights load; a settings `kv_quant` boots with
    one ignored line. A request with no thinking field returns `reasoning_content`.
 7. Forced tool call: `tool_choice` naming a declared function; expect the `[tool-choice] forced call` line and a parsed call.
-8. `tests/test_media.sh`: image input live.
+8. `tests/test_dsv41_media.sh`: image input live.

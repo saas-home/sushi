@@ -452,7 +452,6 @@ const FixedHessians = struct {
 };
 
 test "convert: a tiny layer converts to a shard that decodes near its source, and a starved expert falls back to identity" {
-    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var prng = std.Random.DefaultPrng.init(77);
@@ -519,7 +518,6 @@ test "convert: a tiny layer converts to a shard that decodes near its source, an
 }
 
 test "convert: the MTP head's layer reads mtp.* and writes the mtp shard with the policy's provenance" {
-    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var prng = std.Random.DefaultPrng.init(78);
@@ -557,7 +555,6 @@ test "convert: the MTP head's layer reads mtp.* and writes the mtp shard with th
 }
 
 test "convert: expert groups of any size write the same shard bytes" {
-    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var prng = std.Random.DefaultPrng.init(79);

@@ -1,14 +1,11 @@
 #!/bin/bash
-# sushi-test: tier=bench
 # bench.sh — the release bench for ONE model: boots a sushi server, drives it with `sushi bench`, stops it.
 #
 #   ./tests/bench.sh --version 1.4.0 <pack> [-- <sushi serve flags>]
-#   ./tests/bench.sh --tag try1 <pack> -- --ssd-budget-gb 108
-#   ./tests/bench.sh --rungs 4k,16k --tokens 128 <pack>
+#   ./tests/bench.sh --tag try1 <pack> -- --ssd-budget-gb 108 --ctx-size 1000000 --max-tokens 128000
 #
 # <pack> is a directory, or a name under ${SUSHI_MODELS_DIR:-$HOME/.sushi/models}. Everything after `--` goes to
-# the server; the shipping defaults (speculative mode, kv8) stay on unless a flag changes them. --rungs and --tokens
-# go to `sushi bench` (default rungs 4k,8k,16k,32k,64k,128k; 256 tokens a sample). The protocol,
+# the server; the shipping defaults (speculative mode, kv8) stay on unless a flag changes them. The protocol,
 # the order rule and the report format are in docs/process-measurement.md (release bench).
 #
 # What it takes on for the box rules: a clean tree and a fresh ReleaseFast build, the QUIET marker, AC power, the GPU
@@ -28,12 +25,11 @@ LOCK="$ROOT/scripts/gpu-lock.sh"
 TAG="$(date +%Y%m%d-%H%M%S)"
 VERSION=""
 PORT=11250
-TOKENS=256
-RUNGS=""
+DECODE_TOKENS=256
 PACK=""
 SERVER_FLAGS=()
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 die() { echo "bench.sh: $*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
@@ -41,8 +37,7 @@ while [[ $# -gt 0 ]]; do
         --version)       VERSION="${2:?--version needs a value}"; shift 2 ;;
         --tag)           TAG="${2:?--tag needs a value}"; shift 2 ;;
         --port)          PORT="${2:?--port needs a value}"; shift 2 ;;
-        --tokens|--decode-tokens) TOKENS="${2:?--tokens needs a value}"; shift 2 ;;
-        --rungs)         RUNGS="${2:?--rungs needs a value}"; shift 2 ;;
+        --decode-tokens) DECODE_TOKENS="${2:?--decode-tokens needs a value}"; shift 2 ;;
         -h|--help)       usage ;;
         --)              shift; SERVER_FLAGS=("$@"); break ;;
         -*)              die "unknown flag: $1 (try --help)" ;;
@@ -137,7 +132,7 @@ if [[ -n "$VERSION" ]]; then
     REPORT=(--report "$ROOT/docs/bench/v$VERSION/$NAME.md" --version "$VERSION")
 fi
 taskpolicy -a "$BINARY" bench --url "127.0.0.1:$PORT" --out "$OUT" --log "$OUT/server.log" \
-    --tokens "$TOKENS" ${RUNGS:+--rungs "$RUNGS"} --stamp "$STAMP" ${REPORT[@]+"${REPORT[@]}"} 2>&1 | tee -a "$OUT/bench.log"
+    --decode-tokens "$DECODE_TOKENS" --stamp "$STAMP" ${REPORT[@]+"${REPORT[@]}"} 2>&1 | tee -a "$OUT/bench.log"
 rc=${PIPESTATUS[0]}
 echo "bench.sh: sushi bench rc=$rc; raw samples and the server log are in $OUT"
 exit "$rc"

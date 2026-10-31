@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # test_serving_deps.sh — the served binary's runtime dependency and refusal contract.
 #

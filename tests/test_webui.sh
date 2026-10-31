@@ -1,5 +1,4 @@
 #!/bin/bash
-# sushi-test: tier=host
 . "$(dirname "$0")/private_cache.sh"
 # The browser chat page: `GET /`, `GET /chat` and `GET /dashboard` serve the page embedded from
 # src/webui/index.html, every other method on those paths is a 405, the API
@@ -211,11 +210,8 @@ if command -v node >/dev/null 2>&1; then
         check "tests/test_webui_dashboard.cjs passes and names its pass" \
             "$([ "$dash_rc" -eq 0 ] && echo "$dash_out" | grep -q 'Web UI dashboard: passed' && echo 1 || echo 0)"
     fi
-    cache_out="$(node tests/test_webui_prefix_cache.cjs 2>&1)"
     check "the prefix-cache meter test names its pass" \
-        "$(echo "$cache_out" | grep -q 'prefix-cache meter: passed' && echo 1 || echo 0)"
-    check "the dashboard's write-counter card test names its pass" \
-        "$(echo "$cache_out" | grep -q 'prefix-cache writes: passed' && echo 1 || echo 0)"
+        "$(node tests/test_webui_prefix_cache.cjs 2>&1 | grep -q 'prefix-cache meter: passed' && echo 1 || echo 0)"
 else
     echo "  (node not installed: skipped)"
 fi

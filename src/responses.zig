@@ -348,7 +348,8 @@ pub const MediaFault = struct {
 /// + libwebp). Returns null when it appended the image, else the reason it
 /// could not, recorded as `image_fault` so the surface refuses by name.
 /// Appends one entry per tower call an `image_url` expands into — usually one,
-/// so a decoder may produce more than one per URL.
+/// but LFM2-VL splits a large source into tiles plus a thumbnail. Appending
+/// rather than returning is what lets a single URL produce several.
 pub const ImageUrlDecoder = *const fn (
     allocator: std.mem.Allocator,
     list: *std.ArrayList(chat_mod.ImageData),
@@ -1260,7 +1261,7 @@ test "ResponseStore evicts LRU at cap" {
 fn expectSameQwenPrompt(actual: []const chat_mod.Message, expected: []const chat_mod.Message) !void {
     const a = testing.allocator;
     const config = chat_mod.ChatConfig{
-        .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"),
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
         .bos_token = null,
         .eos_token = "<|im_end|>",
         .add_bos_token = false,

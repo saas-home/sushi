@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# sushi-test: tier=hermetic
 # Hermetic tests for release.sh — the SemVer parse and the "only dispatch when
 # build.zig.zon and the CHANGELOG agree on an unreleased version" gate. No
 # network and no real release: release.sh is SOURCED (its main() doesn't
