@@ -10,8 +10,7 @@ set -e  # Exit on error
 # CONFIGURATION
 # ============================================================================
 
-# Model rate & directories. Published Sushi packs for Qwen3.8-Flash-Next (src/cli.zig aliases):
-# 2bpw, STQ-2.75bpw, 4bpw
+# Model rate & directories (options: STQ-2.75bpw, 2.6bpw, 3.0bpw)
 MODEL_BPW="${MODEL_BPW:-STQ-2.75bpw}"  # Default: STQ-2.75bpw (recommended for 64 GB Mac)
 HOME_DIR="${HOME}"
 SUSHI_DIR="${HOME_DIR}/.sushi"
@@ -26,6 +25,8 @@ SUSHI_BIN="${SUSHI_BIN:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
 if [ -n "${SCRIPT_DIR}" ] && [ -d "${SCRIPT_DIR}/../.git" ]; then
     REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+elif [ -d "/Users/localadmin/github-sources/sushi/.git" ]; then
+    REPO_DIR="/Users/localadmin/github-sources/sushi"
 elif [ -d "${PWD}/.git" ]; then
     REPO_DIR="${PWD}"
 else
@@ -34,13 +35,13 @@ fi
 
 # Primary script path
 PRIMARY_SCRIPT="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+if [ ! -f "${PRIMARY_SCRIPT}" ]; then
+    PRIMARY_SCRIPT="/Users/localadmin/github-sources/sushi/scripts/sushi-setup-and-run-M1Max64GB.sh"
+fi
 
 # Release URLs for prebuilt binary auto-update and installation
 RELEASE_TAR_URL="https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-macos-arm64.tar.gz"
 RELEASES_API_URL="https://api.github.com/repos/beamivalice/sushi/releases/latest"
-# Upstream is fetched by URL: the `origin` remote may be configured with a transport that
-# does not work on this machine, and a silent fetch failure makes every delta check lie.
-UPSTREAM_GIT_URL="${UPSTREAM_GIT_URL:-https://github.com/beamivalice/sushi.git}"
 
 # Model configuration
 DEFAULT_MODEL_NAME="Qwen3.8-Flash-Next"
@@ -60,8 +61,7 @@ PROFILE_NAME="Thinking Mode"
 TEMP="${TEMP:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
-# Per-request sampling parameters (accepted by /v1/chat/completions, used by `test` only);
-# the server itself is configured by --temp/--top-p/--top-k alone.
+MIN_P="${MIN_P:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-${REPEAT_PENALTY:-1.0}}"
 REPEAT_PENALTY="${REPETITION_PENALTY}"
@@ -70,6 +70,7 @@ FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0.0}"
 CTX_SIZE="${CTX_SIZE:-228000}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
+MAX_CONCURRENT="${MAX_CONCURRENT:-2}"
 WIRED_MARGIN_GIB="${WIRED_MARGIN_GIB:-2}"
 PREFILL_DECODE_SHARE="${PREFILL_DECODE_SHARE:-0.25}"
 
@@ -90,6 +91,13 @@ MTP_MAX_DEPTH="${MTP_MAX_DEPTH:-${MTP_DEPTH}}"
 MTP_TYPICAL="${MTP_TYPICAL:-0.2}"
 MTP_GREEDY_TAIL="${MTP_GREEDY_TAIL:-true}"  # Optimizes draft acceptance beside typical MTP
 PRESERVE_THINKING="${PRESERVE_THINKING:-on}"
+
+# DFlash2 Speculative Decoding configuration
+# When enabled and drafter is found, DFlash2 replaces MTP for speculative decoding
+ENABLE_DFLASH="${ENABLE_DFLASH:-false}"
+DFLASH_DIR="${DFLASH_DIR:-${SUSHI_DIR}/dflash2}"
+DRAFTER_MIN_DEPTH="${DRAFTER_MIN_DEPTH:-2}"
+DRAFTER_MAX_DEPTH="${DRAFTER_MAX_DEPTH:-8}"
 
 # Production & Reliability settings
 TIMEOUT="${TIMEOUT:-300}"                  # Stall timeout in seconds
@@ -133,14 +141,11 @@ print_error() {
     echo -e "${RED}[✗]${NC} $1"
 }
 
-sushi_bin_version() {
-    # Echo the version from `sushi --version`, or "unknown"; never fails the caller.
-    local v=""
-    if [ -x "${1:-}" ]; then
-        v="$("${1}" --version 2>/dev/null | awk '/^sushi / {print $2; exit}')" || true
+check_command() {
+    if ! command -v "$1" &> /dev/null; then
+        print_error "$1 is not installed. Please install it and try again."
+        exit 1
     fi
-    [ -n "${v}" ] || v="unknown"
-    echo "${v}"
 }
 
 install_latest_sushi() {
@@ -150,21 +155,7 @@ install_latest_sushi() {
     temp_tar="$(mktemp "/tmp/sushi-bin-XXXXXX.tar.gz" 2>/dev/null || echo "/tmp/sushi-bin-$$.tar.gz")"
     local temp_dir
     temp_dir="$(mktemp -d "/tmp/sushi-extract-XXXXXX" 2>/dev/null || echo "/tmp/sushi-extract-$$")"
-    local temp_sha
-    temp_sha="$(mktemp "/tmp/sushi-sha-XXXXXX" 2>/dev/null || echo "/tmp/sushi-sha-$$.txt")"
-    if curl -fL --retry 3 "${RELEASE_TAR_URL}" -o "${temp_tar}" \
-       && curl -fL --retry 3 "${RELEASE_TAR_URL}.sha256" -o "${temp_sha}"; then
-        local want have
-        want="$(awk 'NR==1 {print tolower($1); exit}' "${temp_sha}" 2>/dev/null)"
-        have="$(shasum -a 256 "${temp_tar}" 2>/dev/null | awk '{print $1}')"
-        rm -f "${temp_sha}"
-        if [ -z "${want}" ] || [ "${want}" != "${have}" ]; then
-            print_error "SHA256 mismatch for release tarball (expected ${want:-<unreadable>}, got ${have:-<unreadable>})"
-            rm -f "${temp_tar}"
-            rm -rf "${temp_dir}"
-            return 1
-        fi
-        print_success "Release tarball SHA256 verified (${want:0:12}...)"
+    if curl -fL --retry 3 "${RELEASE_TAR_URL}" -o "${temp_tar}"; then
         tar -xzf "${temp_tar}" -C "${temp_dir}"
         rm -f "${temp_tar}"
         chmod -R u+w "${BIN_DIR}" 2>/dev/null || true
@@ -179,29 +170,23 @@ install_latest_sushi() {
         cp -f "${BIN_DIR}/sushi" "${BIN_DIR}/sushi.release"
         SUSHI_BIN="${BIN_DIR}/sushi"
         local ver
-        ver="$(sushi_bin_version "${SUSHI_BIN}")"
-        {
-            echo "FLAVOR_TYPE=release"
-            [ "${ver}" != "unknown" ] && echo "FLAVOR_TAG=v${ver}"
-            echo "FLAVOR_DATE=\"$(date -u '+%Y-%m-%d %H:%M:%S UTC')\""
-        } > "${BIN_DIR}/.sushi_flavor"
-        [ "${ver}" != "unknown" ] || print_warning "Could not read --version from ${SUSHI_BIN}; flavor tag left unset."
+        ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "latest")
+        cat << EOF > "${BIN_DIR}/.sushi_flavor"
+FLAVOR_TYPE=release
+FLAVOR_TAG=v${ver}
+FLAVOR_DATE="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+EOF
         print_success "Installed prebuilt Sushi (${ver}) to ${SUSHI_BIN}"
     else
-        rm -f "${temp_tar}" "${temp_sha}"
+        rm -f "${temp_tar}"
         rm -rf "${temp_dir}"
         print_error "Failed to download Sushi release from ${RELEASE_TAR_URL}"
         return 1
     fi
 }
 
-# Pop our stash entry only when the push actually saved one (git stash silently
-# skips submodule dirt, so an unconditional pop would false-alarm).
-restore_local_stash() {
-    if (cd "${REPO_DIR}" && git stash list | head -1 | grep -q "sushi-local-customizations"); then
-        (cd "${REPO_DIR}" && git stash pop) \
-            || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
-    fi
+install_prebuilt_binary() {
+    switch_to_release_binary
 }
 
 build_and_deploy_from_source() {
@@ -222,10 +207,8 @@ build_and_deploy_from_source() {
     fi
 
     # 1. Fetch latest upstream commits
-    print_info "Fetching latest commits from upstream (${UPSTREAM_GIT_URL})..."
-    if ! (cd "${REPO_DIR}" && git fetch "${UPSTREAM_GIT_URL}" refs/heads/main:refs/remotes/origin/main); then
-        print_warning "Could not fetch upstream; building from local HEAD."
-    fi
+    print_info "Fetching latest commits from upstream (origin)..."
+    (cd "${REPO_DIR}" && git fetch origin 2>/dev/null || true)
 
     # 2. Check branch & delta (only auto-merge origin/main when working on main)
     local current_branch
@@ -236,22 +219,15 @@ build_and_deploy_from_source() {
         if [ "${behind_count}" -gt 0 ]; then
             print_info "Merging ${behind_count} new upstream commit(s) into main..."
             local has_local_changes=false
-            # build-mlx.sh leaves the submodules patch-dirty on purpose; git stash cannot
-            # stash submodule content, so that dirt must not trigger the stash dance.
-            if [ -n "$(cd "${REPO_DIR}" && git status --porcelain --ignore-submodules=dirty 2>/dev/null | grep -E '^ M|^M ')" ]; then
+            if [ -n "$(cd "${REPO_DIR}" && git status --porcelain 2>/dev/null | grep -E '^ M|^M ')" ]; then
                 has_local_changes=true
                 print_info "Stashing local customizations..."
                 (cd "${REPO_DIR}" && git stash push -m "sushi-local-customizations")
             fi
-            if ! (cd "${REPO_DIR}" && git merge origin/main); then
-                print_error "Merge with origin/main hit conflicts; aborting the merge and the build."
-                (cd "${REPO_DIR}" && git merge --abort 2>/dev/null || true)
-                restore_local_stash
-                return 1
-            fi
+            (cd "${REPO_DIR}" && git merge origin/main)
             if [ "${has_local_changes}" = "true" ]; then
                 print_info "Restoring local customizations..."
-                restore_local_stash
+                (cd "${REPO_DIR}" && git stash pop 2>/dev/null || true)
             fi
         else
             print_success "Main branch is already up to date with origin/main."
@@ -260,17 +236,7 @@ build_and_deploy_from_source() {
         print_info "Building from active feature branch: '${current_branch}' (preserving branch without merging origin/main)."
     fi
 
-    # 3. Build the pinned mlx + mlx-c (idempotent: skips when the staged stamp matches).
-    # Required: the transient-cap patches live in patches/ and only build-mlx.sh applies them.
-    if [ -f "${REPO_DIR}/scripts/build-mlx.sh" ]; then
-        print_info "Building pinned mlx + mlx-c (skips when already current)..."
-        if ! (cd "${REPO_DIR}" && bash scripts/build-mlx.sh); then
-            print_error "scripts/build-mlx.sh failed; cannot link without the staged mlx libraries."
-            return 1
-        fi
-    fi
-
-    # 4. Compile ReleaseFast binary
+    # 3. Compile ReleaseFast binary
     print_info "Compiling ReleaseFast binary via Zig toolchain (LLVM optimized for Apple Silicon)..."
     (cd "${REPO_DIR}" && "${zig_bin}" build -Doptimize=ReleaseFast)
 
@@ -279,33 +245,12 @@ build_and_deploy_from_source() {
         return 1
     fi
 
-    # 5. Deploy and rewire dynamic libraries
+    # 4. Deploy and rewire dynamic libraries
     mkdir -p "${BIN_DIR}/lib"
     cp -f "${REPO_DIR}/zig-out/bin/sushi" "${BIN_DIR}/sushi"
     if [ -d "${REPO_DIR}/lib/mlx/lib" ]; then
         cp -f "${REPO_DIR}/lib/mlx/lib/"*.dylib "${BIN_DIR}/lib/" 2>/dev/null || true
         cp -f "${REPO_DIR}/lib/mlx/lib/mlx.metallib" "${BIN_DIR}/lib/" 2>/dev/null || true
-        # The staged dylibs reference each other through @rpath, whose baked search
-        # paths are relative to the BUILD tree; a copied bundle cannot resolve them
-        # (dyld: Library not loaded: @rpath/libmlx.dylib). Rewire every intra-bundle
-        # @rpath reference to @loader_path so BIN_DIR/lib is self-contained, then
-        # re-sign (install_name_tool invalidates the signature; dyld kills unsigned edits).
-        if command -v install_name_tool >/dev/null 2>&1; then
-            for dep in "${BIN_DIR}/lib/"*.dylib; do
-                [ -f "${dep}" ] || continue
-                while IFS= read -r ref; do
-                    base="$(basename "${ref}")"
-                    [ -f "${BIN_DIR}/lib/${base}" ] || continue
-                    install_name_tool -change "${ref}" "@loader_path/${base}" "${dep}" 2>/dev/null || true
-                done < <(otool -L "${dep}" 2>/dev/null | awk 'NR>1 {print $1}' | grep '^@rpath/' || true)
-            done
-        fi
-        if command -v codesign >/dev/null 2>&1; then
-            for dep in "${BIN_DIR}/lib/"*.dylib; do
-                [ -f "${dep}" ] || continue
-                codesign -s - -f "${dep}" 2>/dev/null || true
-            done
-        fi
     fi
     if command -v install_name_tool >/dev/null 2>&1; then
         install_name_tool -change @rpath/libmlxc.dylib @executable_path/lib/libmlxc.dylib "${BIN_DIR}/sushi" 2>/dev/null || true
@@ -319,7 +264,7 @@ build_and_deploy_from_source() {
     SUSHI_BIN="${BIN_DIR}/sushi"
 
     local new_ver
-    new_ver="$(sushi_bin_version "${SUSHI_BIN}")"
+    new_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "latest")
     local head_commit
     head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "main")
 
@@ -348,31 +293,35 @@ switch_to_release_binary() {
         fi
     fi
 
-    # 2. If a sushi.release is cached locally, restore it
+    # 2. If sushi.release or sushi.v1.1.1.original is cached locally, restore it
     if [ -f "${BIN_DIR}/sushi.release" ]; then
         cp -f "${BIN_DIR}/sushi.release" "${BIN_DIR}/sushi"
         chmod +x "${BIN_DIR}/sushi"
         print_info "Restored cached release binary from ${BIN_DIR}/sushi.release"
+    elif [ -f "${BIN_DIR}/sushi.v1.1.1.original" ]; then
+        cp -f "${BIN_DIR}/sushi.v1.1.1.original" "${BIN_DIR}/sushi.release"
+        cp -f "${BIN_DIR}/sushi.v1.1.1.original" "${BIN_DIR}/sushi"
+        chmod +x "${BIN_DIR}/sushi"
+        print_info "Restored original release binary from ${BIN_DIR}/sushi.v1.1.1.original"
     else
         install_latest_sushi || return 1
     fi
 
     SUSHI_BIN="${BIN_DIR}/sushi"
     local ver
-    ver="$(sushi_bin_version "${SUSHI_BIN}")"
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
-    {
-        echo "FLAVOR_TYPE=release"
-        [ "${ver}" != "unknown" ] && echo "FLAVOR_TAG=v${ver}"
-        echo "FLAVOR_DATE=\"$(date -u '+%Y-%m-%d %H:%M:%S UTC')\""
-    } > "${BIN_DIR}/.sushi_flavor"
-    [ "${ver}" != "unknown" ] || print_warning "Could not read --version from ${SUSHI_BIN}; flavor tag left unset."
+    cat << EOF > "${BIN_DIR}/.sushi_flavor"
+FLAVOR_TYPE=release
+FLAVOR_TAG=v${ver}
+FLAVOR_DATE="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+EOF
 
-    print_success "Active engine is now: Official GitHub Release (${ver})"
+    print_success "Active engine is now: Official GitHub Release (v${ver})"
     echo ""
     echo -e "${CYAN}Deployment Summary:${NC}"
-    echo "  Binary: ${SUSHI_BIN} [Official Release ${ver}]"
-    if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ] && [ "${ver}" != "unknown" ]; then
+    echo "  Binary: ${SUSHI_BIN} [Official Release v${ver}]"
+    if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
         local ahead_count
         ahead_count=$(cd "${REPO_DIR}" && git rev-list --count "v${ver}..HEAD" 2>/dev/null || echo 0)
         echo "  Main Branch Delta: ${ahead_count} newer commits available"
@@ -414,9 +363,7 @@ switch_to_main_binary() {
             needs_build=true
         fi
 
-        if ! (cd "${REPO_DIR}" && git fetch "${UPSTREAM_GIT_URL}" refs/heads/main:refs/remotes/origin/main); then
-            print_warning "Could not fetch upstream; comparing against the last-fetched origin/main."
-        fi
+        (cd "${REPO_DIR}" && git fetch origin 2>/dev/null || true)
         local behind_count
         behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         if [ "${behind_count}" -gt 0 ] || [ "${1:-}" = "--rebuild" ] || [ "${1:-}" = "-f" ]; then
@@ -437,9 +384,8 @@ switch_to_main_binary() {
         fi
         build_and_deploy_from_source || return 1
     else
-        # Only back up the active binary to the release cache when it IS the release;
-        # copying a main build here would destroy the sushi.release rollback.
-        if [ -f "${BIN_DIR}/sushi" ] && grep -q "^FLAVOR_TYPE=release$" "${BIN_DIR}/.sushi_flavor" 2>/dev/null; then
+        # Backup active binary to release cache if flavor was release
+        if [ -f "${BIN_DIR}/sushi" ]; then
             cp -f "${BIN_DIR}/sushi" "${BIN_DIR}/sushi.release"
         fi
         cp -f "${BIN_DIR}/sushi.main" "${BIN_DIR}/sushi"
@@ -451,7 +397,7 @@ switch_to_main_binary() {
     local head_commit
     head_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "main")
     local ver
-    ver="$(sushi_bin_version "${SUSHI_BIN}")"
+    ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
     cat << EOF > "${BIN_DIR}/.sushi_flavor"
 FLAVOR_TYPE=main
@@ -463,7 +409,7 @@ EOF
     print_success "Active engine is now: 'main' branch build (${ver} @ ${head_commit})"
     echo ""
     if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
-        echo -e "${CYAN}Active Delta Features & Fixes over release ${ver}:${NC}"
+        echo -e "${CYAN}Active Delta Features & Fixes over v${ver} Release:${NC}"
         (cd "${REPO_DIR}" && git log --format="  • %s" -n 8 HEAD)
         echo ""
         echo "  To rollback to official GitHub release binary anytime, run:"
@@ -487,7 +433,7 @@ check_all_updates() {
     print_info "Inspecting updates across installed binary, GitHub releases, and git main branch..."
     
     local current_bin_ver
-    current_bin_ver="$(sushi_bin_version "${SUSHI_BIN:-${BIN_DIR}/sushi}")"
+    current_bin_ver=$("${SUSHI_BIN:-${BIN_DIR}/sushi}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "unknown")
 
     # 1. Check GitHub Release
     local release_info
@@ -517,19 +463,13 @@ except Exception:
     echo "  Latest GitHub Release:  ${latest_rel_tag:-unknown}"
     
     if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
-        if ! (cd "${REPO_DIR}" && git fetch "${UPSTREAM_GIT_URL}" refs/heads/main:refs/remotes/origin/main); then
-            print_warning "Could not fetch upstream; comparing against the last-fetched origin/main."
-        fi
+        (cd "${REPO_DIR}" && git fetch origin 2>/dev/null || true)
         local local_commit upstream_commit behind_count
         local_commit=$(cd "${REPO_DIR}" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         upstream_commit=$(cd "${REPO_DIR}" && git rev-parse --short origin/main 2>/dev/null || echo "unknown")
         behind_count=$(cd "${REPO_DIR}" && git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
         local ahead_release_count
-        if [ -n "${latest_rel_ver}" ]; then
-            ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver}..HEAD" 2>/dev/null || echo "n/a")
-        else
-            ahead_release_count="n/a"
-        fi
+        ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${latest_rel_ver:-1.2.4}..HEAD" 2>/dev/null || echo 0)
         
         echo "  Git Local Commit:       ${local_commit}"
         echo "  Git Upstream Commit:    ${upstream_commit} (origin/main)"
@@ -594,7 +534,7 @@ ensure_latest_sushi_binary() {
     fi
 
     local current_ver
-    current_ver="$(sushi_bin_version "${SUSHI_BIN}")"
+    current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
 
     # Read flavor metadata if available
     local flavor_type="unknown"
@@ -605,7 +545,7 @@ ensure_latest_sushi_binary() {
     fi
 
     if [ "${flavor_type}" = "release" ]; then
-        print_success "Sushi Engine: Running official GitHub Release (${current_ver})"
+        print_success "Sushi Engine: Running official GitHub Release (v${current_ver})"
         if [ -n "${REPO_DIR}" ] && [ -d "${REPO_DIR}" ]; then
             local ahead_count
             ahead_count=$(cd "${REPO_DIR}" && git rev-list --count "v${current_ver}..HEAD" 2>/dev/null || echo 0)
@@ -635,10 +575,7 @@ ensure_latest_sushi_binary() {
                     echo ""
 
                     local do_rebuild="y"
-                    if [ "${SUSHI_NO_BUILD:-0}" = "1" ]; then
-                        print_info "Daemon context (run-service): not rebuilding; using the deployed binary (${current_binary_commit})."
-                        do_rebuild="n"
-                    elif [ -t 0 ]; then
+                    if [ -t 0 ]; then
                         read -r -p "Do you want to recompile and deploy the latest binary now? [Y/n] " do_rebuild
                         do_rebuild="${do_rebuild:-y}"
                     else
@@ -650,7 +587,7 @@ ensure_latest_sushi_binary() {
                         [yY][eE][sS]|[yY])
                             print_info "Rebuilding and deploying latest binary from source..."
                             build_and_deploy_from_source || return 1
-                            current_ver="$(sushi_bin_version "${SUSHI_BIN}")"
+                            current_ver=$("${SUSHI_BIN}" --version 2>/dev/null | awk '/^sushi / {print $2}' || echo "1.2.4")
                             current_binary_commit="${repo_head_commit}"
                             ;;
                         *)
@@ -661,11 +598,7 @@ ensure_latest_sushi_binary() {
             fi
 
             local ahead_release_count behind_count
-            if [ "${current_ver}" != "unknown" ]; then
-                ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${current_ver}..HEAD" 2>/dev/null || echo 0)
-            else
-                ahead_release_count=0
-            fi
+            ahead_release_count=$(cd "${REPO_DIR}" && git rev-list --count "v${current_ver}..HEAD" 2>/dev/null || echo 0)
             
             if [ "${ahead_release_count}" -gt 0 ]; then
                 print_success "Sushi Engine: Running 'main' branch build (${current_binary_commit:-${repo_head_commit}}, ${ahead_release_count} commits ahead of v${current_ver} release)"
@@ -726,7 +659,7 @@ is_model_complete() {
     local p="$1"
     [ -n "${p}" ] && [ -d "${p}" ] && [ -f "${p}/config.json" ] || return 1
     local weights
-    weights=$(find "${p}" -maxdepth 1 -name "*.safetensors" -print -quit 2>/dev/null)
+    weights=$(find "${p}" -maxdepth 1 \( -name "*.safetensors" -o -name "*.gguf" \) -print -quit 2>/dev/null)
     [ -n "${weights}" ] || return 1
     local partials
     partials=$(find "${p}" -maxdepth 2 -name "*.partial" -print -quit 2>/dev/null)
@@ -812,19 +745,11 @@ sync_model_files() {
             print_warning "Failed to update model with 'sushi pull'"
             return 1
         }
-        # 'sushi pull' writes into ${SUSHI_DIR}/models/<repo>, not into the requested dest.
-        local pulled="${SUSHI_DIR}/models/${repo}"
-        if is_model_complete "${pulled}"; then
-            MODEL_PATH="${pulled}"
-        else
-            print_warning "'sushi pull' finished but ${pulled} is not a complete pack."
-            return 1
-        fi
     else
         print_error "No download tool found (hf, huggingface-cli, or sushi binary)."
         return 1
     fi
-    print_success "Model update complete at ${MODEL_PATH}"
+    print_success "Model update complete at ${dest}"
     return 0
 }
 
@@ -929,7 +854,8 @@ download_model() {
     
     local repo="${MODEL_REPO:-${DEFAULT_MODEL_REPO}}"
     print_info "No complete model found in ${MODELS_DIR}."
-    print_info "Downloading model: ${repo} (size depends on the pack; may take several minutes)..."
+    print_info "Downloading model: ${repo}..."
+    print_info "This may take several minutes (model is ~47 GB)..."
     
     sync_model_files "${repo}" "${MODEL_PATH}" || exit 1
     
@@ -1041,53 +967,11 @@ generate_plist() {
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/bin:${BIN_DIR}</string>
         <key>HOME</key>
         <string>${HOME}</string>
-        <key>HOST</key><string>${HOST}</string>
-        <key>PORT</key><string>${PORT}</string>
-        <key>MODEL_BPW</key><string>${MODEL_BPW}</string>
-        <key>MODEL_NAME</key><string>${MODEL_NAME}</string>
-        <key>MODEL_REPO</key><string>${MODEL_REPO}</string>
-        <key>TEMP</key><string>${TEMP}</string>
-        <key>TOP_P</key><string>${TOP_P}</string>
-        <key>TOP_K</key><string>${TOP_K}</string>
-        <key>CTX_SIZE</key><string>${CTX_SIZE}</string>
-        <key>MAX_TOKENS</key><string>${MAX_TOKENS}</string>
-        <key>REASONING_EFFORT</key><string>${REASONING_EFFORT}</string>
-        <key>KV_QUANT</key><string>${KV_QUANT}</string>
-        <key>WIRED_MARGIN_GIB</key><string>${WIRED_MARGIN_GIB}</string>
-        <key>PREFILL_DECODE_SHARE</key><string>${PREFILL_DECODE_SHARE}</string>
-        <key>PREFIX_CACHE_ENTRIES</key><string>${PREFIX_CACHE_ENTRIES}</string>
-        <key>PREFIX_CACHE_MEM</key><string>${PREFIX_CACHE_MEM}</string>
-        <key>PREFIX_CACHE_DISK</key><string>${PREFIX_CACHE_DISK}</string>
-        <key>PREFILL_CHUNK</key><string>${PREFILL_CHUNK}</string>
-        <key>QWEN_GDN</key><string>${QWEN_GDN}</string>
-        <key>MTP_MIN_DEPTH</key><string>${MTP_MIN_DEPTH}</string>
-        <key>MTP_MAX_DEPTH</key><string>${MTP_MAX_DEPTH}</string>
-        <key>MTP_TYPICAL</key><string>${MTP_TYPICAL}</string>
-        <key>MTP_GREEDY_TAIL</key><string>${MTP_GREEDY_TAIL}</string>
-        <key>PRESERVE_THINKING</key><string>${PRESERVE_THINKING}</string>
-        <key>GPU_WARM_SECS</key><string>${GPU_WARM_SECS}</string>
-        <key>TIMEOUT</key><string>${TIMEOUT}</string>
-        <key>METRICS_ENABLED</key><string>${METRICS_ENABLED}</string>
-        <key>SUSHI_BIN</key><string>${SUSHI_BIN:-}</string>
-        <key>HF_TOKEN</key><string>${HF_TOKEN}</string>
-        <key>API_KEY</key><string>${API_KEY}</string>
     </dict>
 </dict>
 </plist>
 EOF
     print_success "Generated launchd plist at ${PLIST_PATH}"
-}
-
-# Poll /health for up to N seconds (default 120; model load on this box can take minutes).
-wait_for_health() {
-    local secs="${1:-120}"
-    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
-    local i
-    for ((i = 0; i < secs; i++)); do
-        curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1 && return 0
-        sleep 1
-    done
-    return 1
 }
 
 install_service() {
@@ -1143,24 +1027,29 @@ start_service() {
     fi
 
     # 5. Wait for server to come up and verify health
-    print_info "Waiting for Sushi server to become healthy (model load can take a few minutes)..."
-    if wait_for_health 120; then
-        print_success "Sushi server is active under launchd supervision!"
-        local cur_pid
-        cur_pid=$(cat "${PID_FILE}" 2>/dev/null || pgrep -f "sushi serve" | head -n 1 || echo "")
-        if [ -n "${cur_pid}" ]; then
-            print_success "Process PID: ${cur_pid}"
+    print_info "Waiting for Sushi server to become healthy..."
+    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
+    for i in {1..60}; do
+        if curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1; then
+            print_success "Sushi server is active under launchd supervision!"
+            local cur_pid
+            cur_pid=$(cat "${PID_FILE}" 2>/dev/null || pgrep -f "sushi serve" | head -n 1 || echo "")
+            if [ -n "${cur_pid}" ]; then
+                print_success "Process PID: ${cur_pid}"
+            fi
+            print_success "Auto-restart is ACTIVE: if the server stops or crashes, macOS launchd will restart it immediately."
+            echo ""
+            echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
+            echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
+            echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
+            echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
+            echo "Health check:         curl http://127.0.0.1:${PORT}/health"
+            return 0
         fi
-        print_success "Auto-restart is ACTIVE: if the server stops or crashes, macOS launchd will restart it immediately."
-        echo ""
-        echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
-        echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
-        echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
-        echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
-        echo "Health check:         curl http://127.0.0.1:${PORT}/health"
-    else
-        print_warning "Server starting up... Check logs: tail -f ${LOGS_DIR}/sushi-launchd.log"
-    fi
+        sleep 1
+    done
+
+    print_warning "Server starting up... Check logs: tail -f ${LOGS_DIR}/sushi-launchd.log"
 }
 
 stop_service() {
@@ -1226,8 +1115,27 @@ query_metrics() {
     }
 }
 
-# The serve argument list, built once for both run_service (launchd) and start_server (nohup).
-build_server_args() {
+run_service() {
+    # File descriptor limit: macOS defaults to 256/1024; production servers need 65536
+    ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true
+
+    setup_directories
+    rotate_logs
+    ensure_latest_sushi_binary
+    if ! resolve_latest_model; then
+        print_error "No complete model found in ${MODELS_DIR}."
+        exit 1
+    fi
+
+    # Save PID so 'status' and 'test' commands know we are running
+    echo "$$" > "${PID_FILE}"
+    trap 'rm -f "${PID_FILE}"; exit 0' SIGTERM SIGINT EXIT
+
+    local launcher=()
+    if command -v taskpolicy >/dev/null 2>&1; then
+        launcher=(taskpolicy -a)
+    fi
+
     local chunk_args=()
     if [ -n "${PREFILL_CHUNK}" ] && [ "${PREFILL_CHUNK}" != "auto" ]; then
         chunk_args=(--prefill-chunk "${PREFILL_CHUNK}")
@@ -1259,11 +1167,20 @@ build_server_args() {
         fi
     fi
 
-    SERVER_ARGS=("${SUSHI_BIN}" serve \
+    local spec_args=()
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        print_info "Speculative decoding: DFlash2 enabled (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+        spec_args+=(--drafter "${DFLASH_DIR}" --drafter-min-depth "${DRAFTER_MIN_DEPTH}" --drafter-max-depth "${DRAFTER_MAX_DEPTH}")
+    else
+        spec_args+=(--mtp --mtp-min-depth "${MTP_MIN_DEPTH}" --mtp-max-depth "${MTP_MAX_DEPTH}" --mtp-head-kv-quant)
+    fi
+
+    print_info "Executing Sushi in foreground under launchd supervision (PID: $$)..."
+    exec "${launcher[@]}" "${SUSHI_BIN}" serve \
         --model "${MODEL_PATH}" \
         --host "${HOST}" \
         --port "${PORT}" \
-        --mtp --mtp-min-depth "${MTP_MIN_DEPTH}" --mtp-max-depth "${MTP_MAX_DEPTH}" --mtp-head-kv-quant \
+        "${spec_args[@]}" \
         --kv-quant "${KV_QUANT}" \
         --skip-mem-preflight \
         --ctx-size "${CTX_SIZE}" \
@@ -1281,38 +1198,11 @@ build_server_args() {
         --temp "${TEMP}" \
         --top-p "${TOP_P}" \
         --top-k "${TOP_K}" \
+        --max-concurrent "${MAX_CONCURRENT}" \
         --mtp-typical "${MTP_TYPICAL}" \
         --qwen-gdn "${QWEN_GDN}" \
         --log-level info \
-        --log-file "${LOG_FILE}")
-}
-
-run_service() {
-    # File descriptor limit: macOS defaults to 256/1024; production servers need 65536
-    ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || true
-
-    setup_directories
-    rotate_logs
-    # The daemon must never rebuild or merge the repo at boot; builds are explicit (build/use-main).
-    export SUSHI_NO_BUILD=1
-    ensure_latest_sushi_binary
-    if ! resolve_latest_model; then
-        print_error "No complete model found in ${MODELS_DIR}."
-        exit 1
-    fi
-
-    # Save PID so 'status' and 'test' commands know we are running
-    echo "$$" > "${PID_FILE}"
-    trap 'rm -f "${PID_FILE}"; exit 0' SIGTERM SIGINT EXIT
-
-    local launcher=()
-    if command -v taskpolicy >/dev/null 2>&1; then
-        launcher=(taskpolicy -a)
-    fi
-
-    print_info "Executing Sushi in foreground under launchd supervision (PID: $$)..."
-    build_server_args
-    exec "${launcher[@]}" "${SERVER_ARGS[@]}"
+        --log-file "${LOG_FILE}"
 }
 
 start_server() {
@@ -1353,13 +1243,22 @@ start_server() {
     echo "  Temperature: ${TEMP}"
     echo "  Top P: ${TOP_P}"
     echo "  Top K: ${TOP_K}"
+    echo "  Min P: ${MIN_P}"
+    echo "  Presence penalty: ${PRESENCE_PENALTY}"
+    echo "  Repetition penalty: ${REPEAT_PENALTY}"
+    echo "  Frequency penalty: ${FREQUENCY_PENALTY}"
     echo "  Context: ${CTX_SIZE} tokens"
     echo "  KV Quantization: ${KV_QUANT}-bit affine"
+    echo "  Max concurrent: ${MAX_CONCURRENT}"
     echo "  Wired margin: ${WIRED_MARGIN_GIB} GiB"
     echo "  Prefill decode share: ${PREFILL_DECODE_SHARE}"
     echo "  Reasoning effort: ${REASONING_EFFORT}"
     echo "  Preserve thinking: ${PRESERVE_THINKING}"
-    echo "  Speculative decoding: MTP (depth: ${MTP_MIN_DEPTH}..${MTP_MAX_DEPTH})"
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        echo "  Speculative decoding: DFlash2 (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+    else
+        echo "  Speculative decoding: MTP (depth: ${MTP_MIN_DEPTH}..${MTP_MAX_DEPTH})"
+    fi
     echo "  Prefill chunk: ${PREFILL_CHUNK} tokens"
     echo "  MTP typical: ${MTP_TYPICAL}"
     echo "  GPU warm: ${GPU_WARM_SECS} s"
@@ -1380,34 +1279,99 @@ start_server() {
         launcher=(taskpolicy -a)
         print_info "Process priority: pinned to high-performance cores (taskpolicy -a)"
     fi
-
-    # Start the server in background, preserving startup logs in LOG_FILE.
-    # Detach into its own session: nohup alone leaves the job in the terminal's
-    # foreground process group, so a Ctrl-C in the launching shell would SIGINT the
-    # server mid-load. perl+setsid exec's in place, so $! stays the server's PID.
-    build_server_args
-    if command -v perl >/dev/null 2>&1; then
-        nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV or die "exec failed: $!"' \
-            "${launcher[@]}" "${SERVER_ARGS[@]}" >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
-    else
-        nohup "${launcher[@]}" "${SERVER_ARGS[@]}" >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
+    
+    local chunk_args=()
+    if [ -n "${PREFILL_CHUNK}" ] && [ "${PREFILL_CHUNK}" != "auto" ]; then
+        chunk_args=(--prefill-chunk "${PREFILL_CHUNK}")
     fi
+
+    local extra_args=()
+    if [ -n "${GPU_WARM_SECS}" ] && [ "${GPU_WARM_SECS}" != "0" ]; then
+        extra_args+=(--gpu-warm-secs "${GPU_WARM_SECS}")
+    fi
+    if [ -n "${REASONING_EFFORT}" ]; then
+        extra_args+=(--think "${REASONING_EFFORT}")
+    fi
+    if [ "${MTP_GREEDY_TAIL}" = "true" ]; then
+        extra_args+=(--mtp-greedy-tail)
+    fi
+
+    local prod_args=()
+    if [ "${METRICS_ENABLED}" = "true" ]; then
+        prod_args+=(--metrics)
+    fi
+    if [ -n "${TIMEOUT}" ] && [ "${TIMEOUT}" != "0" ]; then
+        prod_args+=(--timeout "${TIMEOUT}")
+    fi
+    if [ -n "${API_KEY}" ]; then
+        export SUSHI_API_KEY="${API_KEY}"
+        prod_args+=(--api-key-env SUSHI_API_KEY)
+        if [ "${API_KEY_STRICT}" = "true" ]; then
+            prod_args+=(--api-key-strict)
+        fi
+    fi
+    
+    local spec_args=()
+    if [ "${ENABLE_DFLASH}" = "true" ] && [ -d "${DFLASH_DIR}" ]; then
+        print_info "Speculative decoding: DFlash2 enabled (${DFLASH_DIR}, rows: ${DRAFTER_MIN_DEPTH}..${DRAFTER_MAX_DEPTH})"
+        spec_args+=(--drafter "${DFLASH_DIR}" --drafter-min-depth "${DRAFTER_MIN_DEPTH}" --drafter-max-depth "${DRAFTER_MAX_DEPTH}")
+    else
+        spec_args+=(--mtp --mtp-min-depth "${MTP_MIN_DEPTH}" --mtp-max-depth "${MTP_MAX_DEPTH}" --mtp-head-kv-quant)
+    fi
+
+    # Start the server in background, preserving startup logs in LOG_FILE
+    nohup "${launcher[@]}" "${SUSHI_BIN}" serve \
+        --model "${MODEL_PATH}" \
+        --host "${HOST}" \
+        --port "${PORT}" \
+        "${spec_args[@]}" \
+        --kv-quant "${KV_QUANT}" \
+        --skip-mem-preflight \
+        --ctx-size "${CTX_SIZE}" \
+        --max-tokens "${MAX_TOKENS}" \
+        --preserve-thinking "${PRESERVE_THINKING}" \
+        --prefix-cache-disk "${PREFIX_CACHE_DISK}" \
+        --prefix-cache-entries "${PREFIX_CACHE_ENTRIES}" \
+        --prefix-cache-mem "${PREFIX_CACHE_MEM}" \
+        --wired-margin-gib "${WIRED_MARGIN_GIB}" \
+        --prefill-decode-share "${PREFILL_DECODE_SHARE}" \
+        --no-update-check \
+        "${chunk_args[@]}" \
+        "${extra_args[@]}" \
+        "${prod_args[@]}" \
+        --temp "${TEMP}" \
+        --top-p "${TOP_P}" \
+        --top-k "${TOP_K}" \
+        --max-concurrent "${MAX_CONCURRENT}" \
+        --mtp-typical "${MTP_TYPICAL}" \
+        --qwen-gdn "${QWEN_GDN}" \
+        --log-level info \
+        --log-file "${LOG_FILE}" \
+        >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
+    
     NEW_PID=$!
     echo "${NEW_PID}" > "${PID_FILE}"
     
     # Wait for server to start
-    print_info "Waiting for server to start (model load can take a few minutes)..."
-    if wait_for_health 120; then
-        print_success "Sushi server started successfully (PID: ${NEW_PID})"
-        echo ""
-        echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
-        echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
-        echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
-        echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
-        echo "Health check:         curl http://127.0.0.1:${PORT}/health"
-        return 0
-    fi
-
+    print_info "Waiting for server to start (this may take 30-60 seconds)..."
+    local connect_host="$([ "${HOST}" = "0.0.0.0" ] && echo "127.0.0.1" || echo "${HOST}")"
+    for i in {1..120}; do
+        if curl -sf "http://${connect_host}:${PORT}/health" > /dev/null 2>&1; then
+            print_success "Sushi server started successfully (PID: ${NEW_PID})"
+            echo ""
+            echo -e "${GREEN}Server is ready on port ${PORT}!${NC}"
+            echo "Local API endpoint:   http://127.0.0.1:${PORT}/v1/chat/completions"
+            echo "Network API endpoint: http://${HOST}:${PORT}/v1/chat/completions"
+            echo "Prometheus metrics:   http://${HOST}:${PORT}/metrics"
+            echo "Health check:         curl http://127.0.0.1:${PORT}/health"
+            return 0
+        fi
+        if [ $((i % 10)) -eq 0 ]; then
+            echo -n "."
+        fi
+        sleep 1
+    done
+    
     print_error "Server failed to start within 120 seconds"
     print_info "Check logs: tail -n 50 ${LOG_FILE}"
     exit 1
@@ -1513,6 +1477,7 @@ test_api() {
             \"temperature\": ${TEMP},
             \"top_p\": ${TOP_P},
             \"top_k\": ${TOP_K},
+            \"min_p\": ${MIN_P},
             \"presence_penalty\": ${PRESENCE_PENALTY},
             \"repeat_penalty\": ${REPEAT_PENALTY},
             \"repetition_penalty\": ${REPEAT_PENALTY},
@@ -1552,7 +1517,7 @@ Core Lifecycle Commands:
   ${GREEN}status${NC}             - Show server status and health check
 
 Binary Build & Version Switching Options:
-  ${GREEN}use-release${NC}         - Switch / Rollback to the latest official GitHub release binary
+  ${GREEN}use-release${NC}         - Switch / Rollback to official GitHub release binary (v1.2.4)
   ${GREEN}use-main${NC}            - Switch to bleeding-edge 'main' branch build (rebuilds if needed)
   ${GREEN}build${NC}               - Fetch latest commits from upstream main, recompile ReleaseFast & deploy
   ${GREEN}check-updates${NC}       - Compare installed binary vs GitHub releases vs upstream git main
@@ -1576,7 +1541,7 @@ Examples:
   # Inspect updates & upstream delta (release vs main branch)
   $0 check-updates
 
-  # Rollback to the official GitHub release binary (latest release)
+  # Rollback to official GitHub release binary (e.g. v1.2.4)
   $0 use-release
 
   # Switch to latest main branch build
@@ -1607,7 +1572,7 @@ Configuration:
   Metrics endpoint: http://${HOST}:${PORT}/metrics (Prometheus /metrics & /metrics.json)
   Models directory: ${MODELS_DIR}
   Model: ${MODEL_PATH:-auto-detected latest from ${MODELS_DIR}}
-  Sampling: ${PROFILE_NAME} (server defaults temp=${TEMP}, top_p=${TOP_P}, top_k=${TOP_K}; penalties are per-request)
+  Sampling: ${PROFILE_NAME} (temp=${TEMP}, top_p=${TOP_P}, top_k=${TOP_K}, min_p=${MIN_P}, presence_penalty=${PRESENCE_PENALTY}, repetition_penalty=${REPEAT_PENALTY})
   Reasoning effort: ${REASONING_EFFORT}
   Preserve thinking: ${PRESERVE_THINKING}
   Performance: prefill_chunk=${PREFILL_CHUNK}, qwen_gdn=${QWEN_GDN}, mtp_min_depth=${MTP_MIN_DEPTH}, mtp_max_depth=${MTP_MAX_DEPTH}, mtp_typical=${MTP_TYPICAL}
