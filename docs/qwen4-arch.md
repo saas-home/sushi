@@ -2,7 +2,7 @@
 
 How the engine serves Qwen3.8-Flash-Next: the three blocks it adds around the qwen3_5 GDN+MoE trunk, which
 module state is shared, where the oracle lives, and the facts a change to this arch must respect. Read this before
-touching `forwardQwen4With`, `src/qwen4_exp.zig` or `src/hc_prefill.zig`.
+touching `forwardQwen4With`, `src/qwen4/qwen4_exp.zig` or `src/hc_prefill.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engine-exl3-experts.md),
 [engine-expert-streaming](engine-expert-streaming.md), [engine-mtp](engine-mtp.md),
@@ -19,10 +19,11 @@ hidden 2560, expert intermediate 640.
 
 | File | Role |
 |---|---|
-| `src/qwen4_forward.zig` / `src/qwen4_hc.zig` / `src/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
-| `src/transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3` |
-| `src/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
+| `src/qwen4/qwen4_forward.zig` / `src/qwen4/qwen4_hc.zig` / `src/qwen4/qwen4_qsa.zig` | Flash Next trunk = `forwardQwen4With` (attention, GDN, native MTP, decode/verify rows) / hyper-connections + PLE / QSA mask and block selection |
+| `src/transformer.zig` | shared `Transformer`, `ForwardCtx`, arch dispatch; EXL3 MoE = `moeExl3`; `KVCache` is in `src/kv_cache.zig`, the SSM cache in `src/ssm_cache.zig` |
+| `src/qwen4/qwen4_exp.zig` | Host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped `ngram_table.bin` row gather (2/3/4/5/6/8-bit or raw bf16) + `PrefetchPool`/`startWarm` |
 | `src/hc_prefill.zig` | Fused hyper-connection norm/mix prefill kernels (chunk width as a scalar INPUT, never a template) |
+| `src/trunk_stq.zig` | Trunk projections stored as trellis banks: the loader (`load`), the one-launch stacking (`fuse`, `sharedProject`), the matmul |
 | `src/mtp.zig` | Shared MTP machinery (depth caps, cost profiles, draft rerank); the head itself is `Qwen4Mtp` in `qwen4_forward.zig`, see [engine-mtp](engine-mtp.md) |
 
 ## Trunk rules
@@ -40,8 +41,27 @@ hidden 2560, expert intermediate 640.
   A host token read inside the graph build serialized the build with the GPU.
 - **Decode kernels**: the fused hc read is LATENCY-bound (`hcWrite` DEFERS into the next
   read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
-  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/gdn_decode.zig`), then the norm-gate. Details in
+  verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/qwen4/gdn_decode.zig`), then the norm-gate. Details in
   [engine-kernels](engine-kernels.md).
+- **Trunk storage is per tensor** ([pack-format](pack-format.md#qwen4-stq)): a projection is the affine/dense `(w, s, b)`
+  triple or a trellis bank carried in the same three slots (`w` the U16 trellis `[1, in/16, out/16, n]`, `s` and `b` the
+  F16 scales), and `Transformer.qmatmul` tells them apart by `w`'s dtype, so every call site serves a mixed pack. Tensors
+  too narrow for a 16x16 tile grid (GDN a/b, the router, HC mixes) stay affine; the embedding stays affine (a row gather).
+  - **A row rounds the same beside others as alone**: trellis projections run with `project_rows.rows_exact` pinned
+    (one arm per machine at every width up to eight: NAX where the box has it, else SIMD,
+    [engine-exl3-experts](engine-exl3-experts.md#dense-linears)), so batched ticks, MTP verify blocks and serial ticks
+    agree bit for bit on that arm (hermetic: `a GDN layer on trellis projections verifies bit-identically to serial
+    decode`); NAX and SIMD boxes may differ from each other. A chunk past eight rows runs the sorted GEMM, as the affine
+    trunk's qmm differs from its qmv.
+  - **Stacked launches**: q/k/v, GDN qkv/z, the shared expert's gate/up and a dense layer's gate/up load as one bank each
+    (`stackProjs`), up to eight rows one launch, the parts views of it for a wider chunk. `Transformer.init` consumes the
+    stored banks of a stack from the weight map (held once), so a second `init` on the same map needs a fresh load. A
+    stacked row is not bitwise a separate launch's, but it is the same row at every width.
+  - **The joined slot rows decline a trellis projection** (`decodeRowsProjection`, `verifyJoinedProjection` need affine8):
+    concurrent slots and cross-slot verify run those projections per slot, bytes unchanged. The shared-expert fold
+    (`qwen_riders`) declines a trellis shared expert and the separate chain runs. The trellis lm_head is read whole by the
+    draft (`fullReadoutArgmax`), with no coarse rerank copy.
+  - Load logs `[trunk-stq] N trellis projections (M stacked), lm_head trellis|affine; <codebook> window W`.
 - **A GDN trunk's `KVCache.step` is 0 forever**: see [engine-kv-cache](engine-kv-cache.md#gdn).
 
 <a id="vision-tower"></a>
@@ -113,7 +133,7 @@ native tree.
   drafter's context grows by the committed taps only.
 - **Verify**: ONE batched forward of `[t1, drafts]` with per-position GDN capture; a partial accept rolls GDN, PLE and
   QSA state back through `ssmRollbackFromCapture`, shared with the MTP verify (rows are decode-identical up to 9).
-  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
+  Greedy DFlash2 output equals greedy serial output byte for byte (`tests/qwen4/test_dflash2_qwen.sh`: seven prompts incl. an image, stream ==
   non-stream, opt-out, a sampled bank at T1.0 / top_p 0.95 / top_k 20, and that a drafter beside the pack is ignored; run on Sushi-2bpw, 2.6bpw, 4bpw and an STQ SPEC1
   pack, and streamed at `--ssd-budget-gb 32` on 2.6bpw).
 - **Rows**: a verify row is bytes, not dispatches (about 3.3 ms per row on Sushi-2.6bpw). The drafter drafts a block of
@@ -140,7 +160,7 @@ native tree.
 
 ## Oracle and fixtures
 
-- `tests/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare
+- `tests/qwen4/dump_qwen4_exp_fixtures.py` is the oracle dumper. HF `hidden_states[i]` is the INPUT of layer i: compare
   layer-i output with stream_{i+1}.
 - The converters, allocators and imatrix drivers live in the private converter repo; the format they owe us is
   [pack-format](pack-format.md).

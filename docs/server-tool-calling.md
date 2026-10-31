@@ -2,7 +2,7 @@
 
 How prompts are rendered and how model output is split into reasoning, content and tool calls: the Jinja render and
 its silent fallback, the tool-call parse chain and its one chokepoint, think-tag handling, loop stops, and the
-replay-pinned invariants. Read this before touching `src/chat.zig`, the tool paths in `src/server.zig`, or
+replay-pinned invariants. Read this before touching `src/chat.zig`, `src/tool_calls.zig`, `src/tool_schema.zig`, `src/think_tags.zig`, the tool paths in `src/server.zig`, or
 `src/format_corpus_test.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-http-apis.md),
@@ -33,14 +33,16 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - One-shot CLI prompts carry the same thinking fields through the chat request policy; no CLI render may hardcode thinking off.
 
-- **Control bytes**: ONE raw byte <0x20 in history kills the strict render → SILENT `fallbackFormatChat` (model loses
-  its stop token). Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
+- **Control bytes**: ONE raw byte <0x20 in history kills the strict render → `fallbackFormatChat` on a `<|im_end|>` model
+  (ChatML, the stop token kept), a named 500 `chat template unusable: <jinja error>` on any other. Everything through `appendJsonString`; wrong-family tags out ⇒ suspect silent fallback first. A
   NUL byte truncated the rendered prompt (`jinja_render_chat` returns its LENGTH; tell: the same `prompt=` count on
   consecutive turns).
 - **A parse or runtime gap in jinja.cpp is the same silent downgrade**: GLM-5.3's `m.content.0.output` (a number after
   a dot) failed to parse on EVERY tool message, so each agent turn after a tool result ran in the untrained generic
   format and broke prefix reuse. Fixed in `lib/jinja_cpp` (`x.0` is `x[0]`; `x.1.0` is two subscripts, never a float);
-  the pack template is a committed fixture. A fallback logs `jinja render failed (…)` at warn on every render and
+  the pack template is a committed fixture. Only a model whose turns end in `<|im_end|>` (Qwen, MiMo) has a fallback
+  format, ChatML; GLM and DeepSeek answer a raise or a missing template with 500 `chat template unusable: <reason>` on
+  every generative surface, streamed or not. A fallback logs `jinja render failed (…)` at warn on every render and
   counts into `/props.template_fallbacks`: nonzero on a model that ships a template means a broken prompt, so grep
   that line first. A new template ships its fixture and a no-fallback case in the `format corpus` tool-traffic test.
   Cross-check suspect templates against Python Jinja2 on the same JSON before blaming the model.
@@ -51,11 +53,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   as "no inline template" so the sidecar loads. Grep the log for `jinja` first.
 - A template can raise on OUR extra-context values: `serializeExtraContext` sniffs the family; tool-call `arguments`
   stay OBJECTS (a history call whose arguments are empty, null, an array, a scalar or malformed text embeds `{}`:
-  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; only a refusing template gets `noThinkTailSuffix`.
+  `arguments|items` on anything else raises into the silent fallback); history tool_calls carry `"id"`; `noThinkTailSuffix` closes the block a template opens unconditionally (GLM-5.3's
+  `<|assistant|><think>`) when thinking is off.
 - **A system turn past index 0 renders where the template allows it**: a template that raises on it or drops it gets
   it folded into the leading system (`templateProbeRendersLateSystem`, every surface); MiMo's role loop keeps it in
   place, byte for byte. The fold rewrites every earlier byte of the prompt, so the two byte-pinned stock Qwen3.8
-  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, and the 2.4T one) get ONLY their
+  templates (`qwenLateSystemTemplate`: the one the Flash-Next packs ship, fixture `qwen38_flash_next_chat_template.jinja`) get ONLY their
   "System message must be at the beginning" branch replaced and render the note in place; any other revision keeps
   the fold. The adapter runs only when a late system turn exists, so a prompt without one is byte-identical; a second
   LEADING system turn is now a turn of its own too. `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test
@@ -88,7 +91,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   partial values, never ship raw markup as content. Model-mangled arg JSON → `looseRepairToolCallJson`, never drop
   the whole call. A tag parser never bails on ONE missing delimiter.
 - **Claude's `<function_calls><invoke name=…><parameter name=…>` is a call** when no other family matched
-  (`BARE_INVOKE`, ATEM's grammar without the namespace; qwen4_exp writes it after Claude transcripts). It is
+  (`BARE_INVOKE`; qwen4_exp writes it after Claude transcripts). It is
   `inferred`, so an undeclared name stays prose. The stream gate holds `<function_calls>` and `<invoke ` with every
   growing prefix (`invokeOpenerHoldsForTools`); the scrubber cuts it only beside a `<parameter ` or `</invoke>`
   (`bareInvokeMarkupCut`), and the parser reads it only beside one of them too (`parseInvokeToolCalls`), so prose
@@ -112,7 +115,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 ## tool_choice
 
-- **One parser, every wire shape** (`chat.parseToolChoice`): chat nests the name under `function`, Responses and
+- **One parser, every wire shape** (`tool_calls.parseToolChoice`): chat nests the name under `function`, Responses and
   Anthropic carry it flat, Anthropic spells required `any`; anything else is `auto`, which is unchanged.
 - **`none` withholds the tools, skips the parser, and on chat completions bans the call opener**: a model that sees
   earlier calls in the history writes one anyway, as raw text in the answer. `server.noneCallBan` adds a -100 bias on
@@ -133,7 +136,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   model (MiMo), the opener is committed at token 0, as a prompt-opened block would be. A thought that ends the turn
   (EOS, `length`, loop stop) ends it without a call.
 - While the call is pending each successor is decided after its predecessor is known (no pipelined fast path), draft
-  paths stay off for the request (`draftsRefused`), and the batched tick leaves the slot serial (`forced_call`).
+  paths stay off for the request (`mtp_plan.draftsRefused`), and the batched tick leaves the slot serial (`forced_call`).
 - A named choice for a function the request does not declare is a 400 on every surface. Guard:
   `tests/test_tool_choice_forced.sh`.
 
@@ -153,26 +156,49 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   thought the model opens after visible text then split over the WHOLE buffer and shipped that text again as
   reasoning (the block read `Done\n<think>plan` after `Done` had streamed). The end-of-stream path already had this
   shape, since it rebuilds from the pending tokens only.
+- **A per-token stream check scans only new bytes** (`ThinkScan`, `ToolHoldScan`, `ThoughtScan`: a marker overlap, not the
+  reply); each has a whole-buffer twin kept as its oracle, and reset wherever its buffer starts anew (split, flush).
+  Guards: the `incremental` tests in `think_tags.zig`, the format corpus and the tool-traffic replay.
 - Thinking-off is enforced in the PROMPT; generated reasoning is ALWAYS delivered (every site splits via
   `splitThinkBlock(text, true, …)`).
-- **A thought is decided at its first byte when no opener can start it** (`chat.thinkOpenerPossible`: every opener
-  starts with `<` or is a Muse `assistant` / `to=` header); otherwise the three stream sites wait for 7 bytes. On the
+- **A thought is decided at its first byte when no opener can start it** (`think_tags.thinkOpenerPossible`: every opener
+  starts with `<`); otherwise the three stream sites wait for 7 bytes. On the
   surface budget path (`armThinkBound` declined) the budget then counts from that earlier consumption.
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
-  a close tag still arriving wait (`chat.settledReasoning` on the tools path, `chat.openThoughtFlush` /
+  a close tag still arriving wait (`think_tags.settledReasoning` on the tools path, `think_tags.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
 - **A think tag inside an inline code span is text** (`openCodeSpanStart`, read by `indexOfThinkCloseTag` and
   `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
   its format writes `` `<think>x</think>` `` into a thought or an answer. The verdict reads only the bytes BEFORE the
   tag, so a stream never revises it; `openThoughtFlush` therefore keeps an open span in the buffer. A span ends with
   its line and three backticks are a fence. Tags quoted any other way (plain or double quotes) are still structure.
-- **A thought the length limit cuts ends on what its split delivers** (`chat.cutThoughtDelta`): a lone opener is
+- **A thought the length limit cuts ends on what its split delivers** (`think_tags.cutThoughtDelta`): a lone opener is
   structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
+- **A token that opens an assistant turn ends the reply** (`ModelConfig.turn_opener`, merged into the eos ids at load
+  by `mergeTokenizerStops`): the GLM pack answers, then writes `<|assistant|>` and a second short thought and answer,
+  which rode out as content with an orphan `</think>`. The cause is the checkpoint, on serial and DFlash2 alike; the stop
+  is the engine's boundary. A KLD run keeps the config's own eos set.
+- **A closer in content is dropped wherever it lands, on every surface**: a stream drops the marker token
+  (`isChannelMarkerToken`), so `normalizeEmbeddedThinkBlocks` cuts closers out of the content between and after blocks
+  (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
+  `<think>t</think>391</think>391` is content `391391` stream and non-stream.
+- **Every stream's content arm is `think_tags.ContentStream`**: a think tag token inside an open code span is text
+  (`CodeSpan`, the `openCodeSpanStart` reading kept as bytes arrive); a `<think>` outside one re-opens a thought,
+  which streams as reasoning joined by `\n\n` (`ThoughtJoin`) while the content parts around it are trimmed and
+  joined by `\n`, as `normalizeEmbeddedThinkBlocks` merges them. Whitespace waits only as whole tokens.
+  A re-opened thought cut by the end of the reply is reasoning on both sides. Anthropic gives a thought after
+  text its own thinking block (a stopped block takes no deltas); Responses keeps one reasoning item, listed after
+  the message when the stream opened it there (`responsesReasoningFirst`).
+- **A live row never asserts that a model thinks**: a thought the model closes empty (`</think>42`) has no reasoning
+  and no thinking block, on every surface. Rows 4 and 20 of `tests/test_format_matrix.sh` branch on an
+  independent non-stream turn: a stream's billed reasoning tokens come from what it delivered, so they prove nothing.
 
 ## Loop stops
 
-A short exact cycle convicts on SPAN (`degenerate_loop_min_span` 128; a 24-wide map row is legit), near-repeat needs
-THREE low ratios incl. PROGRESS (1024-token window, `near_repeat_min_span` 4096), long-period tier 9..64 at 10 reps.
+A short exact cycle convicts on SPAN (`degenerate.degenerate_loop_min_span` 128; a 24-wide map row is legit), near-repeat needs
+THREE low ratios incl. PROGRESS (1024-token window, `degenerate.near_repeat_min_span` 4096), long-period tier 9..64 at 10 reps.
 Cuts are intentional stops: `finish_reason "stop"`, `finish_details:{"type":"repetition_loop"}`, `[loop-stop]`
 logged, non-streaming trimmed to the span start. Guard: `tests/test_loop_stop_signal.sh`.
+The decode loop asks every tick through `degenerate.TailGuard`, which counts the window's distinct tokens as tokens arrive and runs the
+full near-repeat judgement only when that vocabulary ratio could convict; `degenerateTail` is its oracle and must give the same verdict.
 - **A loop convicted inside an open thought closes the thought instead of ending the turn** (`closeThoughtOnLoop`): a `stop` with no answer or call reads as a finished agent turn. The reasoning budget's early-stop line and closer are committed once per request (`[loop-recover]`) and the model answers; an answer-side loop, a second loop or no room before `max_tokens` keeps the cut. The line is built when the loop is convicted (`server.loopCloseBound`), never armed at request start: a request carrying a `think_bound` is refused DFlash2 (`glmDflashEligible`). The forced tokens ride `commitThoughtClose` like the budget's, so stream and non-stream see the same bytes.

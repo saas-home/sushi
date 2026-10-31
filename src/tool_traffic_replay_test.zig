@@ -27,7 +27,9 @@
 
 const std = @import("std");
 const testing = std.testing;
-const chat = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 
 const fixture = @embedFile("fixtures/tool_traffic.jsonl");
 
@@ -69,7 +71,7 @@ fn hardFail(comptime what: []const u8, idx: usize, detail: []const u8) void {
 
 test "tool traffic replay: captured agent traffic survives parse + schema coercion" {
     g_fail_count = 0;
-    dump_soft = @import("transformer.zig").diagEnvOn("REPLAY_DUMP_SOFT");
+    dump_soft = @import("io_util.zig").diagEnvOn("REPLAY_DUMP_SOFT");
     var line_it = std.mem.splitScalar(u8, fixture, '\n');
     var idx: usize = 0;
     var records: usize = 0;
@@ -78,33 +80,49 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     var unresolved: usize = 0; // calls left non-conforming (genuinely-broken model output)
     var soft_wrapper_leaks: usize = 0; // unparseable <tool_call> wrappers shown as text
 
+    // A `{"tools_id", "tools"}` line defines a tools array once; it precedes every record that names it.
+    var table_arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer table_arena_state.deinit();
+    const table_arena = table_arena_state.allocator();
+    var tools_by_id = std.StringHashMap([]const u8).init(table_arena);
+
     while (line_it.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-        idx += 1;
 
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
         var rec = std.json.parseFromSlice(std.json.Value, arena, line, .{}) catch |e| {
-            std.debug.print("\n[replay record {d}] fixture line is not valid JSON: {}\n", .{ idx, e });
+            std.debug.print("\n[replay record {d}] fixture line is not valid JSON: {}\n", .{ idx + 1, e });
             return error.ToolTrafficReplayFailed;
         };
         defer rec.deinit();
         if (rec.value != .object) continue;
 
-        const raw = (rec.value.object.get("raw") orelse continue).string;
-        const tools_val = rec.value.object.get("tools") orelse continue;
-        const tools_json = try std.json.Stringify.valueAlloc(arena, tools_val, .{});
+        const obj = rec.value.object;
+        if (obj.get("raw") == null) {
+            const id = obj.get("tools_id") orelse continue;
+            const tools_val = obj.get("tools") orelse continue;
+            try tools_by_id.put(try table_arena.dupe(u8, id.string), try std.json.Stringify.valueAlloc(table_arena, tools_val, .{}));
+            continue;
+        }
+        idx += 1;
+
+        const raw = obj.get("raw").?.string;
+        const tools_json = if (obj.get("tools_id")) |id| tools_by_id.get(id.string) orelse {
+            std.debug.print("\n[replay record {d}] names tools_id {s} that no line defines\n", .{ idx, id.string });
+            return error.ToolTrafficReplayFailed;
+        } else try std.json.Stringify.valueAlloc(arena, obj.get("tools") orelse continue, .{});
         records += 1;
 
         // Mirror the server exactly: normalize → parse → (bare-JSON inference is
         // schema-dependent and skipped here) → coerce.
-        const normalized = try chat.normalizeEmbeddedThinkBlocks(testing.allocator, raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(testing.allocator, raw);
         defer if (normalized) |n| testing.allocator.free(n);
         const text: []const u8 = normalized orelse raw;
 
-        const calls = try chat.parseToolCalls(testing.allocator, text);
+        const calls = try tool_calls_mod.parseToolCalls(testing.allocator, text);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 testing.allocator.free(tc.name);
@@ -116,7 +134,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         if (calls == null) {
             // Nothing parsed as a call ⇒ the text is shown to the user
             // (content side of the always-delivered split, same as the server).
-            const content = chat.splitThinkBlock(text, true, false).content;
+            const content = think_tags.splitThinkBlock(text, true, false).content;
             // Legitimate output has AT MOST ONE close marker per style per turn
             // (one thought block). The strip logic guarantees no leak for that.
             // A model that emits ≥2 bare closes with no matching structure is
@@ -156,10 +174,10 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         const before = try arena.alloc([]const u8, cs.len);
         for (cs, 0..) |tc, i| before[i] = try arena.dupe(u8, tc.arguments);
         const conformed_before = try arena.alloc(bool, cs.len);
-        for (cs, 0..) |tc, i| conformed_before[i] = chat.toolCallConformsToSchema(testing.allocator, tc, tools_json);
+        for (cs, 0..) |tc, i| conformed_before[i] = tool_schema.toolCallConformsToSchema(testing.allocator, tc, tools_json);
 
-        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
-        try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
+        try tool_schema.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
+        try tool_schema.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
 
         for (cs, 0..) |tc, i| {
             // R1: emitted arguments must be valid JSON (HARD — a client parses them).
@@ -171,7 +189,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
                 hardFail("emitted arguments are not valid JSON", idx, tc.arguments);
             }
 
-            const conforms_after = if (parse_ok) chat.toolCallConformsToSchema(testing.allocator, tc, tools_json) else false;
+            const conforms_after = if (parse_ok) tool_schema.toolCallConformsToSchema(testing.allocator, tc, tools_json) else false;
 
             // R2 (no-regression): coercion may only IMPROVE conformance, never
             // reduce it. A call that did NOT conform and STILL doesn't is
@@ -197,8 +215,8 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         // R3: coercion is idempotent.
         const once = try arena.alloc([]const u8, cs.len);
         for (cs, 0..) |tc, i| once[i] = try arena.dupe(u8, tc.arguments);
-        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
-        try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
+        try tool_schema.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
+        try tool_schema.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
         for (cs, 0..) |tc, i| {
             if (!std.mem.eql(u8, once[i], tc.arguments)) {
                 hardFail("coercion is not idempotent", idx, tc.arguments);
@@ -211,4 +229,21 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     // Only HARD invariant violations fail the gate. Soft signals (genuinely-broken
     // model output that the layer correctly declines to fabricate) are reported.
     if (g_fail_count != 0) return error.ToolTrafficReplayFailed;
+}
+
+test "tool traffic replay: the incremental stream gates agree with the full rescan on captured replies" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var line_it = std.mem.splitScalar(u8, fixture, '\n');
+    var idx: usize = 0;
+    while (line_it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
+        _ = arena_state.reset(.retain_capacity);
+        const rec = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), line, .{});
+        if (rec != .object) continue;
+        const raw = rec.object.get("raw") orelse continue;
+        idx += 1;
+        try think_tags.expectIncrementalGatesAgree(raw.string, idx);
+    }
+    try testing.expect(idx > 0);
 }

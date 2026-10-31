@@ -2,7 +2,7 @@
 //!
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
-//! `chat.splitThinkBlock` / `chat.parseToolCalls` —
+//! `think_tags.splitThinkBlock` / `tool_calls.parseToolCalls` —
 //! and back through the INPUT layer (`chat.serializeMessagesJson`), since
 //! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
@@ -34,18 +34,20 @@
 //! "mlx_pi1.html`}" reached disk). The other two (final answer misfiled as
 //! reasoning_content in tools+thinking streams; omitted max_tokens defaulting
 //! to 256) live in server.zig request handling and are pinned by
-//! tests/test_format_matrix.sh checks 4 and 7 plus tests/test_thinking_split.sh.
+//! tests/test_format_matrix.sh checks 2-4, 7 and 9-11.
 
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
-const mtp = @import("mtp.zig");
+const think_tags = @import("think_tags.zig");
+const tool_calls_mod = @import("tool_calls.zig");
+const tool_schema = @import("tool_schema.zig");
 const stop_sequences = @import("stop_sequences.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
         fn run(counter: *std.atomic.Value(i64), ids: *[64]i64) void {
-            for (ids) |*id| id.* = @import("server.zig").nextCompletionId(counter, 1234);
+            for (ids) |*id| id.* = @import("io_util.zig").nextCompletionId(counter, 1234);
         }
     };
     var counter = std.atomic.Value(i64).init(0);
@@ -71,8 +73,7 @@ test "format corpus: late system notes never vanish, and a template that places 
     // `in_place` templates render a late note where it was sent (the stock Qwen ones through the
     // adapter); the rest fold it into the leading turn, which rewrites earlier bytes by design.
     const templates = [_]struct { source: []const u8, in_place: bool }{
-        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
-        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .in_place = true },
         .{ .source = @embedFile("fixtures/dsv41_chat_template.jinja"), .in_place = true },
         .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
@@ -163,9 +164,9 @@ test "format corpus: control-token text in a user, system or tool message stays 
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    const server = @import("server.zig");
-    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<|im_start|>", "<|im_end|>" });
-    defer server.deinitTestTokenizer(&tok);
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<|im_start|>", "<|im_end|>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
     const think = tok.specialTokenId("<think>").?;
     const im_end = tok.specialTokenId("<|im_end|>").?;
     const im_start = tok.specialTokenId("<|im_start|>").?;
@@ -202,7 +203,7 @@ test "format corpus: control-token text in a user, system or tool message stays 
     // The bytes are the template's render: literal text changes the ids, never the prompt.
     const rendered = try chat.renderChatTemplate(a, &messages, &config, null, null, false, null, false);
     defer a.free(rendered);
-    const text = try tok.decode(a, ids, false);
+    const text = try tok.decode(a, ids);
     defer a.free(text);
     try testing.expectEqualStrings(rendered, text);
 }
@@ -211,9 +212,9 @@ test "format corpus: marking literal control text keeps media offsets on the sam
     const a = testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
-    const server = @import("server.zig");
-    var tok = try server.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
-    defer server.deinitTestTokenizer(&tok);
+    const tokenizer_mod = @import("tokenizer.zig");
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
 
     const content = "a <think> b </think> c";
     for ([_]usize{ 0, 2, 3, 10, content.len }) |at| {
@@ -223,45 +224,6 @@ test "format corpus: marking literal control text keeps media offsets on the sam
         const tail = try tok.markLiteralSpecials(arena_state.allocator(), content[at..]);
         const got = marked[0].content[marked[0].media_parts.?[0].at..];
         try testing.expectEqualStrings(tail, got);
-    }
-}
-
-test "format corpus: MTP cost profiles classify full target tensor surfaces" {
-    const Case = struct {
-        bits: u32,
-        group_size: u32,
-        target: mtp.MtpNaxTargetSurface,
-        want: mtp.MtpCostProfile,
-    };
-    const cases = [_]Case{
-        .{ .bits = 8, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q8_gs32 },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_quantized_embedding, .want = .g17_nax_q4_gs32 },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_quantized_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .uniform_bf16_embedding, .want = .g17_nax_q4_gs64 },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .g17_nax_q6_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .g17_nax_q8_gs64 },
-        .{ .bits = 8, .group_size = 64, .target = .uniform_q6_quantized_embedding, .want = .generic },
-        .{ .bits = 6, .group_size = 64, .target = .uniform_q8_bf16_embedding, .want = .generic },
-        .{ .bits = 4, .group_size = 64, .target = .oqe_quantized_embedding, .want = .g17_nax_oq4e_q4_gs64 },
-        .{ .bits = 4, .group_size = 64, .target = .none, .want = .generic },
-        .{ .bits = 4, .group_size = 32, .target = .uniform_bf16_embedding, .want = .generic },
-        .{ .bits = 8, .group_size = 32, .target = .oqe_quantized_embedding, .want = .generic },
-    };
-
-    for (cases) |case| {
-        try testing.expectEqual(
-            case.want,
-            mtp.m5NaxCostProfileForFingerprint(case.bits, case.group_size, case.target),
-        );
-    }
-
-    // A sidecar's quantization label never selects a calibrated target
-    // surface by itself. Unsupported sidecars remain generic for every target.
-    inline for (std.meta.tags(mtp.MtpNaxTargetSurface)) |target| {
-        try testing.expectEqual(
-            mtp.MtpCostProfile.generic,
-            mtp.m5NaxCostProfileForFingerprint(3, 32, target),
-        );
     }
 }
 
@@ -292,7 +254,7 @@ const Expect = struct {
     last_tool_arg_value: ?[]const u8 = null,
     /// The tools the request declared (OpenAI shape, exactly what server.zig
     /// threads to the parse sites as `tools_json`). When set, the corpus runs
-    /// `chat.coerceToolArgsToSchema` and enforces the universal
+    /// `tool_schema.coerceToolArgsToSchema` and enforces the universal
     /// declared-type invariant below.
     tools_json: ?[]const u8 = null,
     /// Expected BOOLEAN-typed argument in the first call (schema entries only).
@@ -344,13 +306,6 @@ const write_bash_tools_schema =
 /// pi's bash tool (one required string arg).
 const bash_tool_schema =
     \\[{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
-;
-
-/// Mixed-type weather tool — used by the lfm2 pythonic entries. The three
-/// non-string types are the point: `days` integer, `metric` boolean and `tags`
-/// array are what a JSON-only value reader gets wrong in this grammar.
-const pythonic_weather_tool_schema =
-    \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"},"metric":{"type":"boolean"},"tags":{"type":"array","items":{"type":"string"}}},"required":["city"]}}}]
 ;
 
 /// MiniCPM5's own headline example tool — reused by the minicpm5 corpus
@@ -460,6 +415,7 @@ const corpus = [_]Expect{
         .name = "flat-brace missing-arguments-key repair",
         .raw = "<tool_call>\n{\"name\":  \"shell\",     {\"command\":\"ls -la\"}}\n</tool_call>",
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
@@ -470,6 +426,7 @@ const corpus = [_]Expect{
         .name = "missing-opening-quote on arguments key repair",
         .raw = "<tool_call>\n{\"name\": \"shell\", arguments\": {\"command\": \"mkdir -p src/app\"}}\n</tool_call>",
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "mkdir -p src/app",
     },
@@ -574,6 +531,7 @@ const corpus = [_]Expect{
         .raw = "<|channel>thought\nLet me check the weather<channel|>\n<|tool_call>call:get_weather{\"city\": \"Paris\"}<tool_call|>",
         .thinking = true,
         .tool_name = "get_weather",
+        .tool_count = 1,
         .tool_arg_key = "city",
         .tool_arg_value = "Paris",
     },
@@ -870,7 +828,7 @@ const corpus = [_]Expect{
         // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix
         // (2026-06-10): models without a trained tool format emit the call as
         // a ```json fence. The raw-JSON fallback must tolerate the fence.
-        .family = "gemma3",
+        .family = "shared",
         .name = "markdown-fenced raw JSON tool call",
         .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"report_v2.html\", \"content\": \"<h1>Report</h1>\"}}\n```",
         .tool_name = "write",
@@ -883,7 +841,7 @@ const corpus = [_]Expect{
         // JSON ARRAY of {name, arguments} objects. Pre-fix only the first
         // object parsed — the second call was silently dropped on all three
         // API surfaces.
-        .family = "gemma3",
+        .family = "shared",
         .name = "fenced JSON array of parallel tool calls parses ALL calls",
         .raw = "```json\n[\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Paris, France\"\n    }\n  },\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Tokyo, Japan\"\n    }\n  }\n]\n```",
         .tool_name = "get_weather",
@@ -894,7 +852,7 @@ const corpus = [_]Expect{
     },
     .{
         // Unfenced variant of the same shape.
-        .family = "gemma3",
+        .family = "shared",
         .name = "bare JSON array of parallel tool calls parses ALL calls",
         .raw = "[{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris, France\"}}, {\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo, Japan\"}}]",
         .tool_name = "get_weather",
@@ -902,6 +860,16 @@ const corpus = [_]Expect{
         .tool_arg_key = "location",
         .tool_arg_value = "Paris, France",
         .last_tool_arg_value = "Tokyo, Japan",
+    },
+    .{
+        // Raw JSON that spells the argument object `parameters`, not `arguments`.
+        .family = "shared",
+        .name = "bare JSON call with a `parameters` object",
+        .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
+        .tool_name = "write_file",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
     },
     // ── Small-model big-file escaping recovery (looseRepairToolCallJson) ────
     // Class: a model writing a large file in one shot mangles the JSON `content`
@@ -1051,6 +1019,7 @@ const corpus = [_]Expect{
         .name = "EOS before </tool_call> recovers <function=> call with args",
         .raw = "<tool_call>\n<function=shell>\n<parameter=command>ls -la</parameter>\n</function>",
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
@@ -1058,7 +1027,7 @@ const corpus = [_]Expect{
     // Class: the tag formats carry NO type information, so the parser infers it
     // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
     // directions. Only the tool schema disambiguates, so every entry with a
-    // `tools_json` is coerced (chat.coerceToolArgsToSchema) and then checked by
+    // `tools_json` is coerced (tool_schema.coerceToolArgsToSchema) and then checked by
     // the universal declared-type invariant below. Reverting the coercion turns
     // both entries red.
     .{
@@ -1144,7 +1113,7 @@ const corpus = [_]Expect{
         // with `write`. The raw pre-parse bytes were not dumped (the server was
         // not at --log-level debug), so the tag wrapper here is reconstructed; the
         // ARGUMENT SHAPE it produces is the verbatim captured one (pinned
-        // byte-for-byte by the hoistMisplacedRequiredParams tests in chat.zig).
+        // byte-for-byte by the hoistMisplacedRequiredParams tests in tool_schema.zig).
         .family = "gemma4",
         .name = "required `path` buried in the edits items is hoisted to the top level",
         .raw = "<|tool_call>call:edit{edits:[{oldText:<|\"|>old line<|\"|>,newText:<|\"|>new line<|\"|>," ++
@@ -1187,6 +1156,7 @@ const corpus = [_]Expect{
         .raw = "<|tool_call>call:write{path:<|\"|>plang/php.html<|\"|>,content:<|\"|><!DOCTYPE html>\n<p>PHP is a server-side scripting language, server-side scripting language, server-",
         .tools_json = write_read_tools_schema,
         .tool_name = "write",
+        .tool_count = 1,
         .tool_arg_key = "path",
         .tool_arg_value = "plang/php.html",
         .tool_arg_absent = "content",
@@ -1225,7 +1195,7 @@ const corpus = [_]Expect{
     .{
         // The counterweight: models WITHOUT a trained tool format (Gemma 3)
         // emit fenced raw-JSON calls — a declared name must keep parsing.
-        .family = "gemma3",
+        .family = "shared",
         .name = "fenced raw-JSON call with a DECLARED name still parses",
         .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```",
         .tools_json = write_read_tools_schema,
@@ -1293,13 +1263,9 @@ const corpus = [_]Expect{
         .raw = "17 x 24 = **408**.",
         .content_contains = "408",
     },
-    // ── K2-Horizon (IFM) ────────────────────────────────────────────────
-    // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
-    // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
-    // inside a bare plural wrapper. Thinking is template-opened
-    // (`…assistant\n<ifm|think>\n`, decoded `<think>`).
+    // ── GLM arg_key form inside a bare plural `<tool_calls>` wrapper ────────
     .{
-        .family = "k2_horizon",
+        .family = "glm5",
         .name = "plural wrapper around newline-separated arg pairs",
         .raw = "I'll check the weather.\n<tool_calls>\n<tool_call>get_weather\n" ++
             "<arg_key>city</arg_key>\n<arg_value>Tokyo</arg_value>\n" ++
@@ -1313,7 +1279,7 @@ const corpus = [_]Expect{
         .tool_bool_value = true,
     },
     .{
-        .family = "k2_horizon",
+        .family = "glm5",
         .name = "template-opened thought, then two calls in one wrapper",
         .raw = "Two reads are needed.</think>\n<tool_calls>\n" ++
             "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n</tool_call>\n" ++
@@ -1474,119 +1440,6 @@ const corpus = [_]Expect{
         .no_tool_calls = true,
         .content_contains = "arg_key/arg_value pair",
     },
-    // ── lfm2 (LFM2.5) — pythonic call expressions ──────────────────────
-    // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
-    // against its own rendered template (2026-08-04). Values are PYTHON
-    // literals, so this family is the corpus's only source of natively-typed
-    // arguments — the declared-type invariant reads them without any coercion
-    // firing, which is the property a JSON-only value reader would break.
-    .{
-        .family = "lfm2",
-        .name = "pythonic call after a template-opened think block",
-        .raw = "The user wants weather for Paris. I need the get_weather function.</think><|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>",
-        .thinking = true,
-        .opened_by_template = true,
-        .tools_json = pythonic_weather_tool_schema,
-        .tool_count = 1,
-        .tool_name = "get_weather",
-        .tool_arg_key = "city",
-        .tool_arg_value = "Paris",
-        .tool_bool_key = "metric",
-        .tool_bool_value = true,
-        .reasoning_contains = "weather for Paris",
-    },
-    .{
-        // Parallel calls share ONE bracket list — the separator sits between
-        // `)` and the next name, not between wrappers.
-        .family = "lfm2",
-        .name = "two calls in one bracket list keep their own args",
-        .raw = "<|tool_call_start|>[get_weather(city='Paris'), get_weather(city='Berlin')]<|tool_call_end|>",
-        .tools_json = pythonic_weather_tool_schema,
-        .tool_count = 2,
-        .tool_name = "get_weather",
-        .tool_arg_key = "city",
-        .tool_arg_value = "Paris",
-        .last_tool_arg_value = "Berlin",
-    },
-    .{
-        // Cut inside an argument VALUE: name survives, the fragment does not.
-        .family = "lfm2",
-        .name = "truncated pythonic call salvages name, drops the fragment",
-        .raw = "<|tool_call_start|>[write(path='a.html', content='<!DOCTYPE html>\n<p>cut mid-",
-        .tools_json = write_read_tools_schema,
-        .tool_name = "write",
-        .tool_arg_absent = "content",
-    },
-    .{
-        // Prose describing a call is not a call — the marker is required.
-        .family = "lfm2",
-        .name = "prose naming a python call is not a tool call",
-        .raw = "You can call get_weather(city='Paris') yourself, or ask me to.",
-        .no_tool_calls = true,
-        .content_contains = "get_weather(city='Paris')",
-    },
-
-    // ── Muse-Glimmer (muse_glimmer, meta-models Muse-Glimmer-30B) ──────────
-    // Harmony-style channel segments after the prompt's bare
-    // `<|start|>assistant`: ` to=self<|message|>R<|eom|>` then
-    // `<|start|>assistant to=user<|message|>C` or a to=<fn> ATEM tool block.
-    .{
-        .family = "muse_glimmer",
-        .name = "self reasoning + user content channels split cleanly",
-        .raw = " to=self<|message|>2+2 is 4; answer plainly.<|eom|><|start|>assistant to=user<|message|>4",
-        .thinking = true,
-        .content_exact = "4",
-        .reasoning_contains = "answer plainly",
-    },
-    .{
-        .family = "muse_glimmer",
-        .name = "direct to=user answer strips the header",
-        .raw = " to=user<|message|>Hello! How can I help?",
-        .thinking = true,
-        .content_exact = "Hello! How can I help?",
-    },
-    .{
-        // Length-truncated mid-thought: reasoning, never content.
-        .family = "muse_glimmer",
-        .name = "truncated self segment stays out of content",
-        .raw = " to=self<|message|>The user is asking for a Python function that",
-        .thinking = true,
-        .content_exact = "",
-        .reasoning_contains = "Python function",
-    },
-    .{
-        // ATEM tool call after reasoning; bool spelled bare + schema agrees.
-        .family = "muse_glimmer",
-        .name = "ATEM tool call after thinking",
-        .raw = " to=self<|message|>Need the weather; call get_weather.<|eom|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n<atem:parameter name=\"celsius\">true</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
-        .thinking = true,
-        .tools_json = weather_tool_schema,
-        .tool_name = "get_weather",
-        .tool_arg_key = "city",
-        .tool_arg_value = "Paris",
-        .tool_bool_key = "celsius",
-        .tool_bool_value = true,
-        .reasoning_contains = "call get_weather",
-    },
-    .{
-        // Truncation inside an argument VALUE: NAME + completed params only.
-        .family = "muse_glimmer",
-        .name = "truncated ATEM value salvages name, drops the fragment",
-        .raw = " to=write<|message|><atem:function_calls>\n<atem:invoke name=\"write\">\n<atem:parameter name=\"path\">novel.txt</atem:parameter>\n<atem:parameter name=\"content\">Chapter 1. It was a dark and",
-        .tools_json = write_read_tools_schema,
-        .tool_name = "write",
-        .tool_arg_key = "path",
-        .tool_arg_value = "novel.txt",
-        .tool_arg_absent = "content",
-    },
-    .{
-        // Prose about the ATEM syntax with no invoke marker is not a call.
-        .family = "muse_glimmer",
-        .name = "prose mentioning atem syntax is not a tool call",
-        .raw = " to=user<|message|>Tools are invoked with an atem:function_calls block.",
-        .no_tool_calls = true,
-        .content_contains = "atem:function_calls block",
-    },
 
     // ── Claude-style `<function_calls><invoke>` in place of the model's own dialect ──
     .{
@@ -1626,6 +1479,7 @@ const corpus = [_]Expect{
         .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>",
         .tools_json = shell_tool_schema,
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "pwd",
     },
@@ -1635,6 +1489,7 @@ const corpus = [_]Expect{
         .raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>",
         .tools_json = shell_tool_schema,
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "echo hello",
     },
@@ -1644,6 +1499,7 @@ const corpus = [_]Expect{
         .raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>",
         .tools_json = shell_tool_schema,
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "git status",
     },
@@ -1652,6 +1508,7 @@ const corpus = [_]Expect{
         .name = "CDATA-wrapped param value kept verbatim",
         .raw = "<function name=\"write_file\">\n  <param name=\"path\"><![CDATA[notes.txt]]></param>\n  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n</function>",
         .tool_name = "write_file",
+        .tool_count = 1,
         .tool_arg_key = "content",
         .tool_arg_value = "line one\nline <two> & \"three\"",
     },
@@ -1671,6 +1528,7 @@ const corpus = [_]Expect{
         .raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>",
         .tools_json = write_read_tools_schema,
         .tool_name = "delete_everything",
+        .tool_count = 1,
         .tool_arg_key = "path",
         .tool_arg_value = "/",
     },
@@ -1699,6 +1557,7 @@ const corpus = [_]Expect{
         .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n  <param name=\"command\">ls -la</param>\n</function>",
         .tools_json = shell_tool_schema,
         .tool_name = "shell",
+        .tool_count = 1,
         .tool_arg_key = "command",
         .tool_arg_value = "pwd",
     },
@@ -1797,10 +1656,10 @@ const corpus = [_]Expect{
         .tool_arg_value = "a.txt",
     },
     .{
-        // LIVE capture 2026-09-14 (K2-Horizon 7B, llmprobe agentic): a GLM
+        // LIVE capture 2026-09-14 (llmprobe agentic): a GLM
         // call to a PARAMETERLESS tool has no <arg_key>, the one signal the
         // GLM route keyed on, so it fell to the Hermes path and vanished.
-        .family = "k2",
+        .family = "glm5",
         .name = "GLM call with a bare name and no arguments",
         .raw = "<tool_calls>\n<tool_call>list_files\n</tool_call>\n</tool_calls>",
         .tool_name = "list_files",
@@ -1875,19 +1734,15 @@ const leak_tags = [_][]const u8{
     "<function name=",      "<param name=",    "</function>",       "</param>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
     "<｜DSML｜", "</｜DSML｜",
-    // Muse-Glimmer channel markers (each a single special token). The
-    // `assistant to=` header TEXT between them is covered by the split tests.
-    "<|start|>",            "<|message|>",     "<|eom|>",           "<|eot|>",
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
-/// either. Mirrors `chat.tool_markup_openers` (the cut list) — kept spelled
+/// either. Mirrors `think_tags.tool_markup_openers` (the cut list) — kept spelled
 /// out here so the guard fails if the cut list is narrowed.
 const reasoning_leak_tags = [_][]const u8{
     "<｜DSML｜",
     "<|tool_call",
     "<tool_call",
-    "<atem:",
 };
 
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
@@ -1901,13 +1756,13 @@ test "format corpus: recorded model outputs across families" {
     for (corpus) |entry| {
         // ── Normalize first (mirrors the server: re-opened mid-text thought
         // channels merge into one leading block before any parse/split). ──
-        const normalized = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
         defer if (normalized) |n| allocator.free(n);
         const raw: []const u8 = normalized orelse entry.raw;
 
         // ── Tool calls (when calls parse, content is suppressed and only
         // tool deltas + reasoning are emitted). ──
-        var calls = try chat.parseToolCalls(allocator, raw);
+        var calls = try tool_calls_mod.parseToolCalls(allocator, raw);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 allocator.free(tc.name);
@@ -1924,9 +1779,9 @@ test "format corpus: recorded model outputs across families" {
         // container arg is hoisted back to the top level, and (3) arguments are
         // coerced to the schema's types before any client sees them.
         if (entry.tools_json) |tj| {
-            if (calls) |cs| calls = try chat.filterInferredBySchema(allocator, cs, tj);
-            if (calls) |cs| try chat.hoistMisplacedRequiredParams(allocator, cs, tj);
-            if (calls) |cs| try chat.coerceToolArgsToSchema(allocator, cs, tj);
+            if (calls) |cs| calls = try tool_schema.filterInferredBySchema(allocator, cs, tj);
+            if (calls) |cs| try tool_schema.hoistMisplacedRequiredParams(allocator, cs, tj);
+            if (calls) |cs| try tool_schema.coerceToolArgsToSchema(allocator, cs, tj);
         }
 
         if (entry.no_tool_calls and calls != null) {
@@ -1989,7 +1844,7 @@ test "format corpus: recorded model outputs across families" {
                 // what strict clients validate and reject on. Any future entry
                 // that supplies a `tools_json` is covered automatically.
                 if (entry.tools_json) |tj| {
-                    if (!chat.toolCallConformsToSchema(allocator, tc, tj)) {
+                    if (!tool_schema.toolCallConformsToSchema(allocator, tc, tj)) {
                         try fail(entry, "tool argument type contradicts the declared schema", tc.arguments);
                     }
 
@@ -1999,7 +1854,7 @@ test "format corpus: recorded model outputs across families" {
                     // have required properties X". The chokepoint hoists it, so
                     // nothing may still be buried here. Any future entry with a
                     // tools_json is covered automatically.
-                    if (chat.requiredParamIsBuried(allocator, tc, tj)) {
+                    if (tool_schema.requiredParamIsBuried(allocator, tc, tj)) {
                         try fail(entry, "a required param is still buried inside a container arg", tc.arguments);
                     }
                 }
@@ -2052,9 +1907,9 @@ test "format corpus: recorded model outputs across families" {
         // ── Visible content / reasoning split (server's no-tool-call path). ──
         // ONE path for both thinking flags: the server always splits and
         // DELIVERS whatever reasoning the model generated (thinking-off is
-        // enforced prompt-side via chat.noThinkTailSuffix, never by dropping
+        // enforced prompt-side via think_tags.noThinkTailSuffix, never by dropping
         // generated tokens). `entry.thinking` documents the original request.
-        const split: chat.ThinkSplit = chat.splitThinkBlock(raw, true, entry.opened_by_template);
+        const split: think_tags.ThinkSplit = think_tags.splitThinkBlock(raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
         const content: []const u8 = if (calls != null) "" else split.content;
 
@@ -2111,7 +1966,7 @@ test "format corpus: recorded model outputs across families" {
 
 test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     // Replay every recorded output byte-by-byte through the shared streaming
-    // gate (chat.streamThinkGate — used by both the chat-completions and
+    // gate (think_tags.streamThinkGate — used by both the chat-completions and
     // /v1/messages SSE handlers with tools present). Invariants:
     //   1. With thinking enabled, NOTHING flushes as visible text before the
     //      think close tag has fully arrived — the 2026-06-10 Claude Code
@@ -2127,24 +1982,10 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // helper covers `</think>`).
         const close_end: ?usize = blk: {
             var best: ?usize = null;
-            if (chat.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
+            if (think_tags.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
             if (std.mem.indexOf(u8, entry.raw, "<channel|>")) |p| {
                 const e = p + "<channel|>".len;
                 if (best == null or e < best.?) best = e;
-            }
-            // Muse: a to=self segment closes at <|eom|>; a resolved non-self
-            // header IS the close (immediate split, empty reasoning).
-            switch (chat.museThinkOpenerAt(entry.raw)) {
-                .self_opened => {
-                    if (std.mem.indexOf(u8, entry.raw, "<|eom|>")) |p| {
-                        const e = p + "<|eom|>".len;
-                        if (best == null or e < best.?) best = e;
-                    }
-                },
-                .direct => |hl| {
-                    if (best == null or hl < best.?) best = hl;
-                },
-                else => {},
             }
             break :blk best;
         };
@@ -2153,7 +1994,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         var i: usize = 1;
         while (i <= entry.raw.len) : (i += 1) {
             const buf = entry.raw[0..i];
-            const gate = chat.streamThinkGate(buf, true, think_closed);
+            const gate = think_tags.streamThinkGate(buf, true, think_closed);
             if (think_closed) break; // post-split buffers start fresh in the real path
             if (close_end == null or i < close_end.?) {
                 if (gate == .flush_text) {
@@ -2171,7 +2012,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // Truncated thinking (no close tag at all) must hold to the very end —
         // end-of-stream handling owns it from there.
         if (close_end == null) {
-            const gate = chat.streamThinkGate(entry.raw, true, false);
+            const gate = think_tags.streamThinkGate(entry.raw, true, false);
             if (gate == .flush_text) {
                 try fail(entry, "gate flushed truncated thinking as text", entry.raw);
             }
@@ -2179,7 +2020,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     }
 
     // Invariant 3, directly: once think_closed, prose streams.
-    try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
+    try testing.expectEqual(think_tags.StreamThinkGate.flush_text, think_tags.streamThinkGate("The visible answer.", true, true));
 }
 
 test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
@@ -2214,15 +2055,12 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //
     // Scope is deliberate on both sides:
     //   * Only markers the ladder EXISTS to cover — i.e. ones a tokenizer can
-    //     split. Muse's `<|start|>` is a single special token that arrives
-    //     whole, so no interior offset is reachable and upstream gives it no
-    //     rungs by design; including it here would assert something stricter
-    //     than the tokenizer can produce.
+    //     split.
     //   * Only entries that produce a call. `<function` also occurs inside the
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function", "<invoke",
+        "<tool_call", "<|tool_call", "<｜DSML｜", "<function", "<invoke",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2237,7 +2075,7 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
                 var i: usize = at + 1;
                 while (i < at + marker.len) : (i += 1) {
                     checked += 1;
-                    if (!chat.streamShouldBufferForTools(entry.raw[0..i])) {
+                    if (!think_tags.streamShouldBufferForTools(entry.raw[0..i])) {
                         try fail(entry, "flush boundary inside a tool-call opener", entry.raw[0..i]);
                     }
                 }
@@ -2246,6 +2084,10 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     }
     // The guard is worthless if it silently matched nothing.
     try std.testing.expect(checked > 0);
+}
+
+test "format corpus: the incremental stream gates agree with the full rescan on every recorded reply" {
+    for (corpus, 0..) |entry, i| try think_tags.expectIncrementalGatesAgree(entry.raw, i);
 }
 
 test "format corpus: history round-trip serialization survives any byte content" {
@@ -2348,50 +2190,9 @@ const Dialect = struct {
 
 const dialects = [_]Dialect{
     .{
-        .family = "qwen3.5/3.6",
-        .dialect = "tool_call wrapper + JSON body",
-        .raw = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        // The dialect the checkpoint's OWN template mandates.
-        .family = "qwen3.5/3.6",
-        .dialect = "tool_call wrapper + <function=> body",
-        .raw = "<tool_call>\n<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "qwen3.5/3.6",
-        .dialect = "bare <function=>, no wrapper",
-        .raw = "<function=write_file>\n<parameter=path>\na.txt\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "hermes/chatml",
-        .dialect = "tool_call wrapper, single line",
-        .raw = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}</tool_call>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
         .family = "gemma4",
         .dialect = "channel tool_call",
         .raw = "<|tool_call>call:write_file{path:<|\"|>a.txt<|\"|>,content:<|\"|>hi<|\"|>}<tool_call|>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
-    .{
-        .family = "llama3",
-        .dialect = "raw JSON, name+parameters",
-        .raw = "{\"name\": \"write_file\", \"parameters\": {\"path\": \"a.txt\", \"content\": \"hi\"}}",
         .name = "write_file",
         .key = "path",
         .value = "a.txt",
@@ -2405,18 +2206,10 @@ const dialects = [_]Dialect{
         .key = "path",
         .value = "a.txt",
     },
-    .{
-        .family = "lfm2",
-        .dialect = "pythonic call expression",
-        .raw = "<|tool_call_start|>[write_file(path=\"a.txt\", content=\"hi\")]<|tool_call_end|>",
-        .name = "write_file",
-        .key = "path",
-        .value = "a.txt",
-    },
 };
 
 fn firstCallArg(allocator: std.mem.Allocator, raw: []const u8, key: []const u8) !?struct { name: []const u8, value: ?[]const u8 } {
-    const calls = (try chat.parseToolCalls(allocator, raw)) orelse return null;
+    const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse return null;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -2491,7 +2284,7 @@ test "format corpus: a parameter VALUE never decides the call" {
             const raw = try std.mem.concat(allocator, u8, &.{ shape.pre, value, shape.post });
             defer allocator.free(raw);
 
-            const calls = (try chat.parseToolCalls(allocator, raw)) orelse continue;
+            const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse continue;
             defer {
                 for (calls) |tc| {
                     allocator.free(tc.name);
@@ -2531,7 +2324,7 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
     // result through the serializer, read it back, and require the same call.
     const allocator = testing.allocator;
     for (dialects) |d| {
-        const calls = (try chat.parseToolCalls(allocator, d.raw)) orelse {
+        const calls = (try tool_calls_mod.parseToolCalls(allocator, d.raw)) orelse {
             std.debug.print("\n[{s}] {s}: no call to round-trip\n", .{ d.family, d.dialect });
             return error.DialectNotParsed;
         };
@@ -2712,8 +2505,7 @@ test "format corpus: a system turn past index 0 reaches the prompt once, on ever
     const chatml = "{% for message in messages %}{{ '<|im_start|>' ~ message.role ~ '\\n' ~ message.content ~ '<|im_end|>' }}{% endfor %}";
     const Case = struct { name: []const u8, tpl: []const u8, system_headers: usize };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .system_headers = 2 },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .system_headers = 2 },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja"), .system_headers = 2 },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .system_headers = 0 },
         .{ .name = "role loop", .tpl = chatml, .system_headers = 2 },
@@ -2751,13 +2543,12 @@ test "format corpus: a forced tool_choice reaches the prompt once, on every temp
         "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
     const Case = struct { name: []const u8, tpl: []const u8 };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
         .{ .name = "no tools (fallback injection)", .tpl = no_tools_chatml },
     };
-    const choices = [_]chat.ToolChoice{ .required, .{ .named = "get_time" } };
+    const choices = [_]tool_calls_mod.ToolChoice{ .required, .{ .named = "get_time" } };
     const messages = [_]chat.Message{.{ .role = "user", .content = "What time is it?" }};
     for (cases) |c| {
         var config = chat.ChatConfig{ .chat_template = c.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
@@ -2779,8 +2570,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8, end: []const u8 = "<|im_end|>" };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .end = "<｜end▁of▁sentence｜>" },
     };
@@ -2812,7 +2602,7 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         errdefer std.debug.print("\n[{s}] forced {s}\n answer {s}\n", .{ c.name, forced, answer });
         try testing.expect(std.mem.startsWith(u8, answer, forced));
 
-        const parsed = (try chat.parseToolCalls(allocator, answer)) orelse return error.ForcedCallNotParsed;
+        const parsed = (try tool_calls_mod.parseToolCalls(allocator, answer)) orelse return error.ForcedCallNotParsed;
         defer {
             for (parsed) |tc| {
                 allocator.free(tc.name);
@@ -2834,8 +2624,7 @@ test "format corpus: a string value parses back byte-exact from each family's ow
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8, open: []const u8 = "<tool_call>", close: []const u8 = "</tool_call>" };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .open = "<｜DSML｜ calls>", .close = "</｜DSML｜ calls>" },
     };
@@ -2855,7 +2644,7 @@ test "format corpus: a string value parses back byte-exact from each family's ow
             defer allocator.free(rendered);
             const start = std.mem.indexOf(u8, rendered, c.open).?;
             const end = std.mem.indexOf(u8, rendered, c.close).? + c.close.len;
-            const parsed = (try chat.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
+            const parsed = (try tool_calls_mod.parseToolCalls(allocator, rendered[start..end])) orelse return error.CallNotParsed;
             defer {
                 for (parsed) |tc| {
                     allocator.free(tc.name);
@@ -2879,10 +2668,8 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
     const allocator = testing.allocator;
     const Case = struct { name: []const u8, tpl: []const u8 };
     const cases = [_]Case{
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
-        .{ .name = "muse", .tpl = @embedFile("fixtures/muse_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };
     const partial = "It is half past";
@@ -2900,7 +2687,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
             const want = history[0 .. std.mem.lastIndexOf(u8, history, partial).? + partial.len];
             errdefer std.debug.print("\n[{s}] thinking={}\n want tail {s}\n got tail  {s}\n", .{ c.name, thinking, want[want.len -| 60..], cont[cont.len -| 60..] });
             try testing.expectEqualStrings(want, cont);
-            try testing.expect(!chat.promptTailOpensThink(cont));
+            try testing.expect(!think_tags.promptTailOpensThink(cont));
         }
     }
 }
@@ -2908,7 +2695,7 @@ test "format corpus: a continuation ends on the family's own rendering of the pa
 /// Streams the thought in `raw` one byte at a time the way each chat stream path
 /// does and returns (tools path, no-tools path) deltas joined.
 fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
-    const close_at = chat.indexOfThinkCloseTag(raw, 0).?.pos;
+    const close_at = think_tags.indexOfThinkCloseTag(raw, 0).?.pos;
     const through_close = raw[0 .. close_at + "</think>".len];
 
     // Tools path: the open block's split, settled, then the closed split's rest.
@@ -2917,11 +2704,11 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var streamed: usize = 0;
     for (1..through_close.len + 1) |i| {
         const buf = through_close[0..i];
-        const split = chat.splitThinkBlock(buf, true, opened);
+        const split = think_tags.splitThinkBlock(buf, true, opened);
         const rc = split.reasoning_content orelse continue;
         const closed = i == through_close.len;
-        const ready = if (closed) rc else chat.settledReasoning(rc);
-        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+        const ready = if (closed) rc else think_tags.settledReasoning(rc);
+        if (think_tags.unstreamedReasoning(ready, streamed)) |fresh| {
             try tools.appendSlice(allocator, fresh);
             streamed = ready.len;
         }
@@ -2936,11 +2723,11 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var shipped = false;
     for (raw[body_from .. close_at + "</think>".len]) |byte| {
         try pending.append(allocator, byte);
-        if (chat.indexOfThinkCloseTag(pending.items, 0)) |close| {
-            try plain.appendSlice(allocator, chat.closedThoughtDelta(pending.items[0..close.pos], shipped));
+        if (think_tags.indexOfThinkCloseTag(pending.items, 0)) |close| {
+            try plain.appendSlice(allocator, think_tags.closedThoughtDelta(pending.items[0..close.pos], shipped));
             break;
         }
-        const flush = chat.openThoughtFlush(pending.items, shipped);
+        const flush = think_tags.openThoughtFlush(pending.items, shipped);
         const delta = pending.items[flush.skip..][0..flush.ship];
         if (delta.len > 0) shipped = true;
         try plain.appendSlice(allocator, delta);
@@ -2961,7 +2748,7 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     for (corpus) |e| {
         if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
         // Tool markup inside a thought is cut as a leak, a class of its own.
-        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        if (think_tags.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
         const opens = std.mem.startsWith(u8, e.raw, "<think>");
         if (!opens and !e.opened_by_template) continue;
         try cases.append(allocator, .{ .raw = e.raw, .opened = e.opened_by_template and !opens });
@@ -2980,13 +2767,193 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     for (edges) |raw| try cases.append(allocator, .{ .raw = raw, .opened = true });
     try testing.expect(cases.items.len > edges.len);
     for (cases.items) |c| {
-        const want = chat.splitThinkBlock(c.raw[0 .. chat.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
+        const want = think_tags.splitThinkBlock(c.raw[0 .. think_tags.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
         const got = try streamThought(allocator, c.raw, c.opened);
         defer for (got) |g| allocator.free(g);
         errdefer std.debug.print("\nraw: {s}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, want, got[0], got[1] });
         try testing.expectEqualStrings(want, got[0]);
         try testing.expectEqualStrings(want, got[1]);
     }
+}
+
+fn appendReasoning(allocator: std.mem.Allocator, reasoning: *std.ArrayList(u8), join: *think_tags.ThoughtJoin, delta: []const u8) !void {
+    try reasoning.appendSlice(allocator, join.lead(delta));
+    try reasoning.appendSlice(allocator, delta);
+}
+
+/// The (reasoning, content) a no-tools chat stream delivers for these tokens, through the `think_tags` steps
+/// its arms take: the thought arm streams what the closed thought will deliver, and the content arm
+/// (`ContentStream`) drops markers, re-opens a thought and joins the parts around it.
+fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opened: bool) ![2][]u8 {
+    var reasoning = std.ArrayList(u8).empty;
+    errdefer reasoning.deinit(allocator);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var content = think_tags.ContentStream{};
+    defer content.deinit(allocator);
+    var join = think_tags.ThoughtJoin{};
+    var think_buf = std.ArrayList(u8).empty;
+    defer think_buf.deinit(allocator);
+    var in_think = opened;
+    var skipped = false;
+    var shipped = false;
+    for (tokens) |tt| {
+        if (!in_think) {
+            if (content.thoughtOpener(false, tt)) |opener| {
+                content.endPart();
+                in_think = true;
+                skipped = false;
+                try think_buf.appendSlice(allocator, opener);
+            } else switch (try content.deliver(allocator, tt)) {
+                .send => |bytes| try out.appendSlice(allocator, bytes),
+                else => {},
+            }
+            continue;
+        }
+        try think_buf.appendSlice(allocator, tt);
+        if (!skipped and (think_buf.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(think_buf.items))) {
+            skipped = true;
+            if (think_tags.thinkOpenTagLenAt(think_buf.items)) |l| {
+                var skip = l;
+                while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                const rest = think_buf.items.len - skip;
+                std.mem.copyForwards(u8, think_buf.items[0..rest], think_buf.items[skip..]);
+                think_buf.shrinkRetainingCapacity(rest);
+            }
+        }
+        if (!skipped) continue;
+        if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
+            try appendReasoning(allocator, &reasoning, &join, think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped));
+            join.close();
+            shipped = false;
+            in_think = false;
+            const after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n ");
+            if (after.len > 0) switch (try content.deliver(allocator, after)) {
+                .send => |bytes| try out.appendSlice(allocator, bytes),
+                else => {},
+            };
+            think_buf.clearRetainingCapacity();
+            continue;
+        }
+        const flush = think_tags.openThoughtFlush(think_buf.items, shipped);
+        const delta = think_buf.items[flush.skip..][0..flush.ship];
+        try appendReasoning(allocator, &reasoning, &join, delta);
+        if (delta.len > 0) shipped = true;
+        const keep = think_buf.items.len - flush.skip - flush.ship;
+        std.mem.copyForwards(u8, think_buf.items[0..keep], think_buf.items[flush.skip + flush.ship ..]);
+        think_buf.shrinkRetainingCapacity(keep);
+    }
+    if (in_think) {
+        try appendReasoning(allocator, &reasoning, &join, join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped, shipped)));
+    } else {
+        try out.appendSlice(allocator, content.finish());
+    }
+    const r = try reasoning.toOwnedSlice(allocator);
+    errdefer allocator.free(r);
+    return .{ r, try out.toOwnedSlice(allocator) };
+}
+
+/// The non-stream (reasoning, content) of `raw` must equal the stream's for `tokens`; a stream may still
+/// ship the trailing whitespace the split trims.
+fn expectStreamMatchesReply(allocator: std.mem.Allocator, raw: []const u8, tokens: []const []const u8, opened: bool) !void {
+    const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, raw);
+    defer if (norm) |n| allocator.free(n);
+    const split = think_tags.splitThinkBlock(norm orelse raw, true, opened);
+    const got = try streamedReply(allocator, tokens, opened);
+    defer for (got) |g| allocator.free(g);
+    const want_reasoning = split.reasoning_content orelse "";
+    errdefer std.debug.print("\nraw: {s}\nnon-stream: {s} | {s}\nstream: {s} | {s}\n", .{ raw, want_reasoning, split.content, got[0], got[1] });
+    try testing.expectEqualStrings(want_reasoning, got[0]);
+    try testing.expectEqualStrings(split.content, std.mem.trimEnd(u8, got[1], "\n "));
+}
+
+test "format corpus: a closer in content after the thought is dropped on the stream and the non-stream reply alike" {
+    // The GLM pack writes `</think>391` twice in one reply. Streams drop a marker token wherever it
+    // lands; the split once kept every closer but a trailing one. A think tag inside a code span is text.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, tokens: []const []const u8, opened: bool, content: []const u8 };
+    const cases = [_]Case{
+        .{ .raw = "<think>t</think>391</think>391", .tokens = &.{ "<think>", "t", "</think>", "391", "</think>", "391" }, .opened = false, .content = "391391" },
+        .{ .raw = "t</think>391</think>391", .tokens = &.{ "t", "</think>", "391", "</think>", "391" }, .opened = true, .content = "391391" },
+        .{ .raw = "t</think>\n\n391</think>\n\n391</think>", .tokens = &.{ "t", "</think>", "\n\n", "391", "</think>", "\n\n", "391", "</think>" }, .opened = true, .content = "391\n\n391" },
+        .{ .raw = "<think>t</think>Use `</think>` here", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>", "` here" }, .opened = false, .content = "Use `</think>` here" },
+        .{ .raw = "<think>t</think>Write `<think>` first", .tokens = &.{ "<think>", "t", "</think>", "Write `", "<think>", "` first" }, .opened = false, .content = "Write `<think>` first" },
+        .{ .raw = "<think>t</think>Use `</think>` here", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</", "think>", "` here" }, .opened = false, .content = "Use `</think>` here" },
+        .{ .raw = "<think>t</think>Use `x` </think>here", .tokens = &.{ "<think>", "t", "</think>", "Use `x` ", "</think>", "here" }, .opened = false, .content = "Use `x` here" },
+        .{ .raw = "<think>t</think>Use `</think>", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>" }, .opened = false, .content = "Use `</think>" },
+    };
+    for (cases) |c| {
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        defer if (norm) |n| allocator.free(n);
+        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        try testing.expectEqualStrings("t", split.reasoning_content.?);
+        try testing.expectEqualStrings(c.content, split.content);
+        try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+    }
+}
+
+test "format corpus: a thought re-opened after content is reasoning on the stream and the non-stream reply alike" {
+    // The parts around it are trimmed and joined by one newline; the thoughts by one blank line.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, tokens: []const []const u8, opened: bool, reasoning: []const u8, content: []const u8 };
+    const cases = [_]Case{
+        .{ .raw = "<think>t</think>A <think>u</think>B", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u", "</think>", "B" }, .opened = false, .reasoning = "t\n\nu", .content = "A\nB" },
+        .{ .raw = "t</think>A\n\n<think>\nu\n</think>\n\nB", .tokens = &.{ "t", "</think>", "A", "\n\n", "<think>", "\n", "u", "\n", "</think>", "\n\n", "B" }, .opened = true, .reasoning = "t\n\nu", .content = "A\nB" },
+        .{ .raw = "<think>t</think>A <think>u", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u" }, .opened = false, .reasoning = "t\n\nu", .content = "A" },
+        .{ .raw = "<think>t</think>A <think>u\n", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u", "\n" }, .opened = false, .reasoning = "t\n\nu", .content = "A" },
+        .{ .raw = "<think></think>A<think>u</think>B", .tokens = &.{ "<think>", "</think>", "A", "<think>", "u", "</think>", "B" }, .opened = false, .reasoning = "u", .content = "A\nB" },
+    };
+    for (cases) |c| {
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        defer if (norm) |n| allocator.free(n);
+        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        try testing.expectEqualStrings(c.reasoning, split.reasoning_content.?);
+        try testing.expectEqualStrings(c.content, split.content);
+        try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+    }
+}
+
+test "format corpus: a think tag anywhere in content is the same bytes on the stream and the non-stream reply" {
+    // At every byte boundary of each answer: a closer token, and outside a code span a whole re-opened
+    // thought, closed or cut by the end of the reply. Whether a span is open there decides for both sides.
+    const allocator = testing.allocator;
+    const answers = [_][]const u8{
+        "Use `x` here",
+        "a ``b`` c `d",
+        "```\ncode\n```\ndone `e",
+        "one ` tick\nnext `f` g",
+        "`a` and `b`",
+        "First line.\n\nSecond  line.",
+    };
+    const Insert = enum { closer, thought, cut_thought };
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(allocator);
+    var tokens = std.ArrayList([]const u8).empty;
+    defer tokens.deinit(allocator);
+    for (answers) |answer| for (0..answer.len + 1) |at| for ([_]Insert{ .closer, .thought, .cut_thought }) |insert| {
+        if (insert != .closer) {
+            var span = think_tags.CodeSpan{};
+            span.feed(answer[0..at]);
+            if (span.openStart() != null) continue;
+        }
+        const tag: []const []const u8 = switch (insert) {
+            .closer => &.{"</think>"},
+            .thought => &.{ "<think>", "u", "</think>" },
+            .cut_thought => &.{ "<think>", "u" },
+        };
+        const tail = if (insert == .cut_thought) "" else answer[at..];
+        raw.clearRetainingCapacity();
+        tokens.clearRetainingCapacity();
+        try raw.appendSlice(allocator, "<think>t</think>");
+        try raw.appendSlice(allocator, answer[0..at]);
+        for (tag) |t| try raw.appendSlice(allocator, t);
+        try raw.appendSlice(allocator, tail);
+        try tokens.appendSlice(allocator, &.{ "<think>", "t", "</think>" });
+        for (0..at) |i| try tokens.append(allocator, answer[i..][0..1]);
+        try tokens.appendSlice(allocator, tag);
+        for (0..tail.len) |i| try tokens.append(allocator, tail[i..][0..1]);
+        try expectStreamMatchesReply(allocator, raw.items, tokens.items, false);
+    };
 }
 
 /// Streams `raw` cut by the length limit after `cut` bytes, the way each stream
@@ -2999,9 +2966,9 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer tools.deinit(allocator);
     var streamed: usize = 0;
     for (@max(first, 1)..cut + 1) |i| {
-        const rc = chat.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
-        const ready = if (i == cut) rc else chat.settledReasoning(rc);
-        if (chat.unstreamedReasoning(ready, streamed)) |fresh| {
+        const rc = think_tags.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
+        const ready = if (i == cut) rc else think_tags.settledReasoning(rc);
+        if (think_tags.unstreamedReasoning(ready, streamed)) |fresh| {
             try tools.appendSlice(allocator, fresh);
             streamed = ready.len;
         }
@@ -3011,26 +2978,26 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer plain.deinit(allocator);
     var held = std.ArrayList(u8).empty;
     defer held.deinit(allocator);
-    if (!opened) try held.appendSlice(allocator, chat.modelThinkOpener(false, raw[0..first]).?);
+    if (!opened) try held.appendSlice(allocator, think_tags.modelThinkOpener(false, raw[0..first]).?);
     var consumed = false;
     var shipped = false;
     for (raw[first..cut]) |byte| {
         try held.append(allocator, byte);
-        if (!consumed and (held.items.len >= "<think>".len or !chat.thinkOpenerPossible(held.items))) {
+        if (!consumed and (held.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(held.items))) {
             consumed = true;
-            const l = chat.thinkOpenTagLenAt(held.items) orelse 0;
+            const l = think_tags.thinkOpenTagLenAt(held.items) orelse 0;
             std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);
             held.shrinkRetainingCapacity(held.items.len - l);
         }
         if (!consumed) continue;
-        const flush = chat.openThoughtFlush(held.items, shipped);
+        const flush = think_tags.openThoughtFlush(held.items, shipped);
         try plain.appendSlice(allocator, held.items[flush.skip..][0..flush.ship]);
         if (flush.ship > 0) shipped = true;
         const keep = held.items[flush.skip + flush.ship ..];
         std.mem.copyForwards(u8, held.items[0..keep.len], keep);
         held.shrinkRetainingCapacity(keep.len);
     }
-    try plain.appendSlice(allocator, chat.cutThoughtDelta(held.items, consumed, shipped));
+    try plain.appendSlice(allocator, think_tags.cutThoughtDelta(held.items, consumed, shipped));
     return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
 }
 
@@ -3045,7 +3012,7 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
     defer cases.deinit(allocator);
     for (corpus) |e| {
         if (std.mem.count(u8, e.raw, "</think>") != 1) continue;
-        if (chat.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
+        if (think_tags.streamShouldBufferForTools(e.raw[0..std.mem.indexOf(u8, e.raw, "</think>").?])) continue;
         const opens = std.mem.startsWith(u8, e.raw, "<think>");
         if (!opens and !e.opened_by_template) continue;
         try cases.append(allocator, .{ .raw = e.raw, .opened = !opens });
@@ -3064,7 +3031,7 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
         const first: usize = if (c.opened) 1 else "<think>".len;
         const end = std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len;
         for (first..end) |cut| {
-            const want = chat.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
+            const want = think_tags.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
             const got = try streamCutThought(allocator, c.raw, cut, c.opened);
             defer for (got) |g| allocator.free(g);
             errdefer std.debug.print("\nraw: {s}\ncut: {d}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, cut, want, got[0], got[1] });
@@ -3152,9 +3119,7 @@ test "format corpus: tool traffic renders through every served template, never t
     const Case = struct { name: []const u8, tpl: []const u8, media: bool = true };
     const cases = [_]Case{
         .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
-        // The 2.4T checkpoint is text-only: its template raises on a media part by design.
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja"), .media = false },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .media = false },
     };
@@ -3240,8 +3205,7 @@ test "format corpus: a history call whose arguments are not an object still rend
     const allocator = testing.allocator;
     const templates = [_]struct { name: []const u8, tpl: []const u8 }{
         .{ .name = "glm5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja") },
-        .{ .name = "qwen3.8", .tpl = @embedFile("fixtures/qwen38_chat_template.jinja") },
-        .{ .name = "qwen3.8-27b", .tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja") },
+        .{ .name = "qwen3.8-flash-next", .tpl = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja") },
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja") },
     };

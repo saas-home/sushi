@@ -35,7 +35,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/glm5-kernels.md](docs/glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
 | [docs/glm5-perf.md](docs/glm5-perf.md) | GLM tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long context |
 | [docs/glm5-kld.md](docs/glm5-kld.md) | GLM KLD against the native BF16 teacher |
-| [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ packs, `--drop-expert`, prefix cache, image input |
+| [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ, `--drop-expert`, prefix cache, images |
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
 | [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
@@ -43,7 +43,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |
 | [docs/engine-exl3-encoder.md](docs/engine-exl3-encoder.md) | EXL3 encoder core: trellis search, LDLQ, signs, shard writer, Qwen BF16 reader |
-| [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |
+| [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | how mlx-serve vendors `sushi_exl3`, the API it calls, what the host owes |
 | [docs/mlx-serve-sync.md](docs/mlx-serve-sync.md) | upstream mlx-serve review ledger: cursor, verdicts, how to run the next pass |
 | [docs/engine-expert-streaming.md](docs/engine-expert-streaming.md) | SSD budget ledger, per-layer LRU, slab I/O, imatrix capture, discovery |
 | [docs/engine-mtp.md](docs/engine-mtp.md) | MTP head, verify invariant, draft re-scoring, round-cost table |
@@ -61,7 +61,9 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders |
 | [docs/bench/v1.4.0/summary.md](docs/bench/v1.4.0/summary.md) | release context ladder and per-model benchmark reports |
 | [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
+| [docs/process-ubench.md](docs/process-ubench.md) | `sushi-ubench`: microbench registry, CLI, rungs x arms tables, JSON and compare, the quiet-box steps it takes |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number, the release bench |
+| [docs/testsuite.md](docs/testsuite.md) | what a test may be, tiers (`test-host`, gpu, pack, bench), placement, how a test is built, what a change runs |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
 **Private, local-only** (`docs/private/`, gitignored, main checkout only: a worktree reads them from there). Never
@@ -73,7 +75,7 @@ link to or quote them from a committed file.
 | `docs/private/sashimi-codebooks.md` | MCG decision, decoder dead ends, fractional-rate trellis |
 | `docs/private/quality-kld-research.md` | KLD of every intermediate and experimental pack, sweeps, how packs were made |
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
-| `docs/private/future.md` | work still to explore; an entry leaves when it starts or lands |
+| `docs/private/future.md` | future repo work; read at each release; an entry leaves when it starts or lands |
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
@@ -91,37 +93,37 @@ Box: M5 Max 128 GB, macOS 27.
 
 | File | Role | Doc |
 |---|---|---|
-| `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`); pull, `run` REPL | server-lifecycle |
-| `repl_tools.zig` | `run` REPL client-side tools (web, confined files, images; write needs `/edit`) | server-http-apis |
-| `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` | all HTTP: `/v1/*`, `/metrics(.json)`, WS, `--api-key`; Responses store | server-http-apis |
-| `chat.zig` | chat templates (Jinja2 + fallback), thinking tags, tool-call parse/repair/coercion | server-tool-calling |
+| `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`), REPL | server-lifecycle |
+| `repl_tools.zig` | `run` REPL client tools (web, confined files, images; write needs `/edit`) | server-http-apis |
+| `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` / `http_conn` / `request_policy` / `request_media` / `models_api` / `logprobs` / `generation_stream` / `anthropic` / `completions` / `responses_api` | all HTTP: `/v1/*`, `/metrics`, WS, `--api-key`, Responses store | server-http-apis |
+| `chat.zig` / `think_tags` / `tool_calls` / `tool_schema` | chat templates, thinking tags, tool-call parse/repair/coercion | server-tool-calling |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
-| `launch.zig` | `sushi launch <agent>` configs | server-http-apis |
-| `scheduler.zig` / `generate.zig` | slots, inference thread, batching, admission; generation, sampling, MTP orchestration | server-lifecycle |
-| `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
-| `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution | arch-*, engine-* |
-| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
-| `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
-| `glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
-| `dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1: config, resident loader, forward, QAT, Engram, expert-stream hooks, prefill borrow, prefix state, vision tower; DSpark verify width; `--drop-expert` usage list; pre-tokenizer | dsv41-arch, dsv41-memory |
-| `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
-| `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
-| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
-| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3/STQ decoders and kernels, rate groups, dense trellis linears (`exl3/linear.zig`) | engine-exl3-experts |
-| `encoder/` | `sushi convert exl3`: Metal and CPU trellis search, source readers, trunk and shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
+| `launch.zig` | `sushi launch <agent>` | server-http-apis |
+| `scheduler.zig` / `generate.zig` / `degenerate.zig` / `mtp_plan.zig` / `prefill_plan.zig` / `sampler.zig` / `model_load` / `slot_admission` / `mtp_tick` / `slot_outcome` / `vision_queue` / `mtp_policy` / `mtp_round` | slots, inference thread, batching, admission, load bills; generation; MTP policy/rounds/plan; stop loop, prefill plan, sampler | server-lifecycle |
+| `model.zig` / `effort` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, effort, per-model settings, discovery, registry | server-lifecycle |
+| `transformer.zig` / `kv_cache.zig` / `ssm_cache.zig` / `layer_weights` / `forward_diag` / `test_support` | shared `Transformer`, `ForwardCtx`, arch dispatch, quant resolution, KV/SSM caches, layer weights, `diagEnvOn` | arch-*, engine-* |
+| `nax_gate` / `attn_kernels` / `verify_qmm` / `verify_moe` / `moe_router` / `moe_gqmv` / `moe_stream_compute` | NAX/OS gates; shared attention; verify QMM and MoE; router; gather-QMV; streamed-expert compute | engine-kernels |
+| `qwen4/qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections, PLE / QSA | qwen4-arch, engine-mtp |
+| `mimo2/mimo_forward.zig` | MiMo forward, attention arms, MoE dispatch, batched decode | mimo2-arch |
+| `glm5/glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, kernels, prefix state, vision | glm5-* |
+| `dsv41/dsv41_*.zig` / `dspark_rows.zig` / `expert_usage.zig` / `tokenizer_deepseek.zig` | DeepSeek-V4.1 loader, forward, QAT, Engram, stream hooks, prefill borrow, prefix state, vision; DSpark width; `--drop-expert` list, pre-tokenizer | dsv41-arch, dsv41-memory |
+| `qwen4/qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side, fused HC prefill | qwen4-arch |
+| `qwen4/gdn_decode.zig` | fused GDN decode/verify step (one dispatch) | engine-kernels |
+| `mimo2/mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, stamp check | mimo2-arch |
+| `expert_quant.zig` / `exl3/` (`sushi_exl3` module) / `trunk_stq.zig` | expert layout, EXL3/STQ decoders and kernels, rate groups, dense linears; trellis trunk banks | engine-exl3-experts |
+| `encoder/` | `sushi convert exl3`: trellis search, source readers, trunk/shard writers, calibration; imports `sushi_exl3` | encoder, engine-exl3-encoder |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
-| `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
-| `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
-| `mlx_kernel_keys.zig` | custom-kernel library keys behind `mlx.zig`'s kernel wrappers (`SUSHI_KERNEL_BUILD_LOG`) | engine-mlx-gotchas |
-| `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
+| `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, cost table | engine-mtp |
+| `kv_quant.zig` | quantized KV contract | engine-kv-cache |
+| `prefix_cache.zig` / `kv_disk_cache.zig` / `disk_placement.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier, budget, roots | engine-prefix-cache |
+| `mlx_kernel_keys.zig` | custom-kernel library keys for `mlx.zig` wrappers | engine-mlx-gotchas |
+| `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, `digit_group`; prompt LRU | engine-mlx-gotchas |
+| `vision.zig` / `vision_common.zig` / `qwen4/qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: preprocessing, Qwen3-VL, M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
-| `bench.zig` | `sushi bench`: the release bench's HTTP client (corpus, ladder, report) | process-measurement |
-| `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
-| `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
-
-Flags: `sushi --help` lists them all; the ones the docs lean on are named in each doc.
+| `bench.zig` / `bench_box.zig` | `sushi bench`: release bench client (corpus, ladder, report); fans, cooldown, power | process-measurement |
+| `ubench_main.zig` / `ubench_report.zig` / `exl3/ubench.zig` | `sushi-ubench` (`zig build ubench`) | process-ubench |
+| `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, log | server-http-apis |
+| `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | format corpus, traffic replay | server-tool-calling |
 
 ## Building
 
@@ -137,47 +139,52 @@ Flags: `sushi --help` lists them all; the ones the docs lean on are named in eac
 
 ## Testing — TDD is mandatory
 
-Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) full suite (`zig build test
--Doptimize=ReleaseFast` 0 fail + relevant `tests/*.sh`); (4) refactor. A live curl is a sanity check, NOT a test.
+Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset that
+[testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test.
+- A landing runs its change's subset. The full suite runs only for a wide stacked change (shared files, several areas) or
+  a version bump.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
-Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live:
-`tests/test_qwen4_exp.sh`, `tests/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
-`tests/test_prefix_cache_*.sh`, `tests/test_smoke_matrix.sh`. Matrix: `tests/CLAUDE.md`.
+`zig build test-host` runs the MLX-free tier beside a live server.
+Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live scripts and
+their matrix: `tests/CLAUDE.md`.
 
 - **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe;
   one stray line hangs the runner while the standalone binary passes.
 - **A PASSING test prints NOTHING, on either stream**: Zig 0.17 renders any test stderr through its failure
   renderer (`failed command: … --listen=-`, exit 0), which reads as a failed suite. Diagnostics ride an env switch
-  (`SUSHI_EXL3_LAYER_UBENCH`). Guard: `tests/test_test_runner_quiet.sh`.
+  (`SUSHI_EXL3_PARITY_TRACE`). Guard: `tests/test_test_runner_quiet.sh`.
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour.
   Test the behaviour or state the rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
-- `zig build test` sometimes reports `failed command` on a FIRST run and is green on a direct re-run (Metal
-  contention between parallel test binaries, benign, unpinned).
+- `zig build test` sometimes fails a FIRST run and is green on a direct re-run (Metal contention, benign, unpinned).
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` (`sushi bench`: code and prose arms, ONE cold prefill each,
-8k restore windows, 3 decode samples a rung) on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM 2.4bpw, DeepSeek STQ 1.75bpw),
-report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per release. Protocol:
-[process-measurement](docs/process-measurement.md#release-bench). `/bench` for methodology: same-methodology cells only, spec
-cells are variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in
-ONE process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for
-cross-engine comparisons only.
+`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw,
+GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per
+release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
+- Release order: local tests, push the version bump; `./release.sh` (CI's DRAFT) beside the local perf and KLD gates;
+  both green: publish. Any issue: fix, push, delete the draft and its tag, rerun it.
+- Future repo work (a deferred task or plan) goes to `docs/private/future.md`, never agent memory. A
+  release starts by reading it and telling the owner what is due.
 
-Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
-merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.
+`/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
+same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
+
+Release notes thank every outside contributor by @handle for each merged PR the release ships; a missed credit goes
+into the next release as belated (`/release`).
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
 
-- **Adding a pack** updates, in the same landing, its `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`),
-  the tier table and recommended launch in `docs/usage.md`, and the README pack line once the repo is live.
+- **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
+  `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
+  `docs/usage.md`, and the README pack line once the repo is live.
 
 ## Conventions
 
@@ -227,12 +234,13 @@ Procedures and examples: [docs/process-measurement.md](docs/process-measurement.
 **GPU sharing.** The lock is for jobs that need the box to themselves: a full model load (server boot, KLD, live test)
 and a quiet-box bench or timing whose absolute number is recorded. Conversions, pilots, builds and tests run in
 parallel without it, as long as the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
-- Acquire the lock immediately before EACH run and release right after: `scripts/gpu-lock.sh acquire|release <owner>`;
-  waiters are served FIFO by ticket, `status` shows holder + queue (`${GPU_LOCK_DIR:-/tmp/sushi-gpu.lock.d}`).
+- Take the lock right before EACH run: `scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd>` (releases on any
+  exit; `acquire|release` if it cannot wrap). Declare `--max-min` over ~15 min; model-free tests
+  never take it. FIFO by ticket; `status`: holder, age, queue (`$GPU_LOCK_DIR`).
 - Never hold it across a batch or queue, or while analysing, editing, building or waiting. An A B B A re-acquires per
   arm. Every brief that runs on the GPU names the lock.
-- A holder that looks dead (its run gone, lock still held): a worker never breaks it; it tells the coordinator, who
-  verifies the run is gone, clears it with `gpu-lock.sh break <holder>`, and the queue proceeds.
+- A dead `run` holder frees itself. A plain-`acquire`, OVERDUE or idle one: workers report it; the coordinator
+  verifies, stops it, runs `gpu-lock.sh break <holder>`.
 
 **Baselines.**
 - Never rerun an old-binary/old-code baseline that is already recorded: run only the new arm and compare it with the
@@ -267,7 +275,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Reports partial work to the owner every :00 and :30 while work runs.
 - Relays owner decisions and rule changes to ALL live workers at once.
 - Keeps docs/ fresh: every landing updates the matching doc (knowledge, numbers, lessons learned) in the same
-  landing, and this index when a doc appears. CLAUDE.md stays rules + index, never the knowledge store.
+  landing, and this index when a doc appears.
 
 **Workers.**
 - Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.

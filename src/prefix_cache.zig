@@ -8,8 +8,7 @@
 //! the best one back into `xfm.cache`, and let the existing
 //! truncate-then-prefill path handle the diverged tail.
 //!
-//! Hybrid SSM/conv architectures (qwen3_5/qwen3_5_moe/qwen3_next/nemotron_h/
-//! lfm2) are excluded in v1: their recurrent state can't be rolled back, so
+//! Hybrid SSM/conv architectures (GatedDeltaNet) are excluded in v1: their recurrent state can't be rolled back, so
 //! prefix reuse must reset on any divergence anyway. Plan 03's spec calls
 //! these "hot tier only" — meaning we keep the single-slot path for them.
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
@@ -23,10 +22,11 @@ const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
-const glm5_forward = @import("glm5_forward.zig");
-const glm5_prefix = @import("glm5_prefix.zig");
-const dsv41_model = @import("dsv41_model.zig");
-const dsv41_prefix = @import("dsv41_prefix.zig");
+const glm5_forward = @import("glm5/glm5_forward.zig");
+const glm5_prefix = @import("glm5/glm5_prefix.zig");
+const dsv41_model = @import("dsv41/dsv41_model.zig");
+const dsv41_prefix = @import("dsv41/dsv41_prefix.zig");
+const prefill_plan = @import("prefill_plan.zig");
 
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
@@ -44,7 +44,7 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Minimum forwarded-prefix length for committing a CANCELLED prefill
 /// (client disconnect mid-prefill). Below this an entry is LRU pollution —
-/// chat-template prologues (Gemma=12, Qwen=8, Llama=4 tokens) are identical
+/// chat-template prologues (a handful of tokens) are identical
 /// across every request and "reusable" only in a worthless sense. Same
 /// rationale as an engine session pool's `min_prefix_to_claim`, applied at
 /// commit time instead of claim time.
@@ -157,7 +157,7 @@ pub const LookupResult = struct {
     /// Same contract for the MTP head's committed-history cache: the head's
     /// history is built from trunk hiddens, and a restore forwards NOTHING —
     /// without this every reused prefix drafts against an empty history
-    /// (measured on Qwen3.6-27B echo: ~70 → ~38 tok/s on warm repeats).
+    /// (measured on echo: ~70 → ~38 tok/s on warm repeats).
     mtp_base: ?usize = null,
     /// Did this restore check out its entry (`checkoutEligible`)? Only then does the first
     /// append donate in place; every other restore is a refcount share copied by that append.
@@ -507,12 +507,6 @@ pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool, ram_
     return has_disk and ssdFirstEnabled() and (config.ssdFirstCapable() or !ram_enabled);
 }
 
-/// A GLM commit's MLA rows for each tier; null for any other arch.
-const GlmTierRows = struct {
-    ram: ?glm5_prefix.MlaRows = null,
-    disk: ?glm5_prefix.MlaRows = null,
-};
-
 /// What the live cache held at commit time, captured before the RAM byte-budget trim: the
 /// disk tier gets the full prefix even when RAM keeps a trimmed one. Refcount-shared.
 const PendingDiskFlush = struct {
@@ -771,7 +765,7 @@ pub const HotPrefixCache = struct {
     /// tier (`restoreSpecSnap`). The trunk restore already forwarded nothing,
     /// so without this a disk hit drafted blind — the 92.6% → 66.5%
     /// acceptance class the RAM tier already fixed.
-    fn diskRestoreSpec(
+    pub fn diskRestoreSpec(
         d: *kv_disk_cache.DiskTier,
         idx: usize,
         target: ?DflashTarget,
@@ -803,7 +797,7 @@ pub const HotPrefixCache = struct {
     /// comparison — both need the effective restorable length of a hybrid
     /// entry, which is the highest snapshotted position ≤ the token match, NOT
     /// the raw match length (SSM state only exists at snapshotted positions).
-    fn highestCheckpointAtOrBelow(cps: []const SSMCheckpoint, limit: usize) ?*const SSMCheckpoint {
+    pub fn highestCheckpointAtOrBelow(cps: []const SSMCheckpoint, limit: usize) ?*const SSMCheckpoint {
         var picked: ?*const SSMCheckpoint = null;
         for (cps) |*cp| {
             // A deinit'd stub (`shedCheckpointsToFit`'s realloc-failure
@@ -873,11 +867,8 @@ pub const HotPrefixCache = struct {
     /// every divergence would force a full reset, so we keep the legacy
     /// single-slot path.
     ///
-    /// Both `has_hybrid_layers` and `full_attention_interval > 0` signal
-    /// the model has SSM/GatedDeltaNet layers somewhere — `has_hybrid_layers`
-    /// is set explicitly by the parsers for lfm2 / nemotron_h; the qwen3_5
-    /// family sets `full_attention_interval` to N to mark "every Nth layer
-    /// is full attention, the rest are GatedDeltaNet". Either way the same
+    /// `full_attention_interval > 0` marks "every Nth layer is full attention,
+    /// the rest are GatedDeltaNet": the model has SSM layers, so the
     /// SSM-checkpoint gate applies.
     pub fn shouldUse(
         config: *const model_mod.ModelConfig,
@@ -885,7 +876,7 @@ pub const HotPrefixCache = struct {
     ) bool {
         // deepseek_v41's request state is a checkpoint (`dsv41_prefix`): without them nothing restores.
         if (config.isDsv41()) return enable_ssm_checkpoints;
-        const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
+        const has_ssm_layers = config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
     }
@@ -904,7 +895,7 @@ pub const HotPrefixCache = struct {
         return snapshotBytes(&.{ .entries = cache.entries, .step = cache.step, .allocator = cache.allocator, .config = cache.config });
     }
 
-    fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
+    pub fn snapshotBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
             if (!e.initialized) continue;
@@ -921,7 +912,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// Resident bytes of a speculative-side snap: the KV plus (qwen4_exp) the head's QSA aux half.
-    fn specSnapBytes(snap: *const DflashSnap) u64 {
+    pub fn specSnapBytes(snap: *const DflashSnap) u64 {
         var total = snapshotBytes(&snap.snapshot);
         if (snap.head_aux) |a| {
             // Only the two the head owns: its `conv_state`/`ssm_state` are empty handles.
@@ -938,7 +929,7 @@ pub const HotPrefixCache = struct {
     /// from each array's own shape (bytes / capacity rows), so it prices
     /// quantized triples correctly too. A ringed layer holds a window at any
     /// length (`ringedBytes`), so it has no per-token price.
-    fn snapshotRowBytes(snap: *const KVCacheSnapshot) u64 {
+    pub fn snapshotRowBytes(snap: *const KVCacheSnapshot) u64 {
         var total: u64 = 0;
         for (snap.entries) |e| {
             if (!e.initialized or e.ringed) continue;
@@ -1067,12 +1058,12 @@ pub const HotPrefixCache = struct {
     }
 
     /// Stack bound for the shed simulation; a longer list falls back to billing every lower checkpoint.
-    const SHED_SIM_MAX: usize = 192;
+    pub const SHED_SIM_MAX: usize = 192;
 
     /// The last retained checkpoint inherits the latest checkpoint's pooled bank.
     /// Price its sliced shape before allocating/copying any multi-GB KV prefix.
     /// Captured aux state already contains the destination's pos % ratio leftover.
-    fn trimmedCheckpointBytes(list: []const SSMCheckpoint, index: usize) u64 {
+    pub fn trimmedCheckpointBytes(list: []const SSMCheckpoint, index: usize) u64 {
         const dst = &list[index];
         const src = &list[list.len - 1];
         var bytes = ssmCheckpointBytes(dst);
@@ -1095,7 +1086,7 @@ pub const HotPrefixCache = struct {
 
     /// Bytes the checkpoints at or below a candidate trim point cost after the commit path's
     /// span-preserving shed to `allowance`; null when even the last survivor is over.
-    fn shedSurvivorBytes(positions: []const usize, bytes: []const u64, allowance: u64, policy: transformer_mod.ThinPolicy) ?u64 {
+    pub fn shedSurvivorBytes(positions: []const usize, bytes: []const u64, allowance: u64, policy: transformer_mod.ThinPolicy) ?u64 {
         var total: u64 = 0;
         for (bytes) |b| total += b;
         if (total <= allowance) return total;
@@ -1119,7 +1110,7 @@ pub const HotPrefixCache = struct {
     }
 
     /// Shared hybrid selector; checkpoints optionally supply the transferred QSA bank's bill.
-    fn trimLenForBudgetPure(
+    pub fn trimLenForBudgetPure(
         budget: u64,
         limit: usize,
         row_bytes: u64,
@@ -1151,79 +1142,13 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-    /// The MLA rows (a checkpoint position) a GLM commit keeps, chosen before anything is copied.
-    /// `budget` 0 keeps every row. A RAM tier keeps the rows, its checkpoints and the window within
-    /// `budget`, as `commitImpl`'s trim does, shedding checkpoints to fit; the SSD tier (`disk`)
-    /// keeps every checkpoint at or below the rows, so it prices all of them.
-    pub fn glmCommitLenFor(
-        policy: transformer_mod.ThinPolicy,
-        budget: u64,
-        disk: bool,
-        newest: usize,
-        row_bytes: u64,
-        window_bytes: u64,
-        positions: []const usize,
-        cp_bytes: []const u64,
-    ) ?usize {
-        if (newest == 0) return null;
-        if (budget == 0) return newest;
-        if (!disk) {
-            var cps_total: u64 = 0;
-            for (cp_bytes) |b| cps_total += b;
-            if (@as(u64, newest) * row_bytes + cps_total + window_bytes <= budget) return newest;
-            return trimLenForBudgetPure(budget -| window_bytes, newest, row_bytes, positions, cp_bytes, policy, null);
-        }
-        const price = struct {
-            fn at(p: usize, rb: u64, win: u64, pos: []const usize, bytes: []const u64) u64 {
-                var total: u64 = @as(u64, p) * rb + win;
-                for (pos, bytes) |q, b| {
-                    if (q <= p) total += b;
-                }
-                return total;
-            }
-        }.at;
-        if (price(newest, row_bytes, window_bytes, positions, cp_bytes) <= budget) return newest;
-        var k = positions.len;
-        while (k > 0) {
-            k -= 1;
-            if (positions[k] < newest and price(positions[k], row_bytes, 0, positions, cp_bytes) <= budget) return positions[k];
-        }
-        return null;
-    }
+    pub const glmCommitLenFor = glm5_prefix.glmCommitLenFor;
 
-    /// The rows a GLM commit copies into the RAM tier (`glmCommitLenFor` at its budget); null with
-    /// RAM retention off or nothing that fits.
-    pub fn glmCommitLen(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
-        if (!self.ram_enabled) return null;
-        return self.glmLenFor(cps, offset, self.max_kv_bytes, false, row_bytes, window_bytes);
-    }
+    pub const glmCommitLen = glm5_prefix.glmCommitLen;
 
-    /// The rows a GLM commit hands the SSD tier: through the newest checkpoint whose rows, every
-    /// checkpoint at or below and the window fit the tier's byte budget. The flush reads them from
-    /// the request's own buffers, piece by piece.
-    pub fn glmDiskLen(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, row_bytes: u64, window_bytes: u64) ?usize {
-        const d = if (self.disk) |*dd| dd else return null;
-        return self.glmLenFor(cps, offset, d.max_bytes, true, row_bytes, window_bytes);
-    }
+    pub const glmDiskLen = glm5_prefix.glmDiskLen;
 
-    fn glmLenFor(self: *const HotPrefixCache, cps: []const SSMCheckpoint, offset: usize, budget: u64, disk: bool, row_bytes: u64, window_bytes: u64) ?usize {
-        if (cps.len > SHED_SIM_MAX) return null;
-        var pos_buf: [SHED_SIM_MAX]usize = undefined;
-        var byte_buf: [SHED_SIM_MAX]u64 = undefined;
-        for (cps, 0..) |*cp, i| {
-            pos_buf[i] = cp.pos;
-            // A released state is on the SSD tier already, and counts against its budget.
-            byte_buf[i] = if (cp.isReleased()) cp.released_bytes else ssmCheckpointBytes(cp);
-        }
-        const newest = glm5_prefix.commitRows(cps, offset);
-        // Beside an SSD tier the hot entry keeps only its newest checkpoints, so only those are priced.
-        if (!disk and budget > 0 and newest > 0 and self.capturesLiveForDisk()) {
-            var kept: u64 = 0;
-            for (byte_buf[cps.len -| glm5_prefix.checkpoint_hot_kept .. cps.len]) |b| kept += b;
-            if (@as(u64, newest) * row_bytes + kept + window_bytes <= budget) return newest;
-        }
-        return glmCommitLenFor(self.cp_thin, budget, disk, newest, row_bytes, window_bytes, pos_buf[0..cps.len], byte_buf[0..cps.len]);
-    }
+    pub const glmLenFor = glm5_prefix.glmLenFor;
 
     /// Which arm `trimLenForBudget` bills a list of this length with (for the log).
     fn trimBillArm(list_len: usize, gated: bool) []const u8 {
@@ -1252,7 +1177,7 @@ pub const HotPrefixCache = struct {
     /// (hybrid entry) the trim point must be a RESTORABLE position — a
     /// checkpoint's own `pos`, and its cost includes the checkpoints that survive the commit's
     /// shed. Plain attention restores at any length. `limit` caps the answer.
-    fn trimLenForBudget(
+    pub fn trimLenForBudget(
         self: *const HotPrefixCache,
         budget: u64,
         limit: usize,
@@ -1470,46 +1395,13 @@ pub const HotPrefixCache = struct {
         return self.lookupImpl(target_cache, target_moe_seq_offset, rec, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, mtp_target, slot_id, skip);
     }
 
-    /// A GLM request restores its KDA state from the entry's checkpoints and its MLA rows from `Entry.glm`.
-    pub fn lookupAndRestoreGlm(
-        self: *HotPrefixCache,
-        target_cache: *KVCache,
-        target_moe_seq_offset: *usize,
-        request: *glm5_forward.Request,
-        s: mlx.mlx_stream,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        vision_key: u64,
-        media_start: ?usize,
-        media_chain: []const MediaSpan,
-        dflash_target: ?DflashTarget,
-        slot_id: ?usize,
-        skip: bool,
-    ) !LookupResult {
-        return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .glm = request }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
-    }
+    pub const lookupAndRestoreGlm = glm5_prefix.lookupAndRestoreGlm;
 
-    /// A DeepSeek-V4.1 request restores its whole state from the entry's checkpoint into the model.
-    pub fn lookupAndRestoreDsv41(
-        self: *HotPrefixCache,
-        target_cache: *KVCache,
-        target_moe_seq_offset: *usize,
-        model: *dsv41_model.Model,
-        s: mlx.mlx_stream,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        vision_key: u64,
-        media_start: ?usize,
-        media_chain: []const MediaSpan,
-        slot_id: ?usize,
-        skip: bool,
-    ) !LookupResult {
-        return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .dsv41 = model }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, null, null, slot_id, skip);
-    }
+    pub const lookupAndRestoreDsv41 = dsv41_prefix.lookupAndRestoreDsv41;
 
     /// An unreadable or corrupt file fails the same way on every later lookup, so its entry dies;
     /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
-    fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
+    pub fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
         switch (err) {
             error.MlxError, error.DiskCacheCorruptChunk, error.DiskCacheCorruptRing, error.DiskCacheCorruptSsm => {
                 _ = d.poisonId(d.entries.items[idx].id, @errorName(err));
@@ -1518,104 +1410,11 @@ pub const HotPrefixCache = struct {
         }
     }
 
-    /// GLM's SSD arm: the entry whose highest persisted KDA checkpoint under the match beats the RAM
-    /// match restores its MLA rows and that checkpoint into buffers the request then owns.
-    fn restoreGlmFromDisk(
-        self: *HotPrefixCache,
-        d: *kv_disk_cache.DiskTier,
-        request: *glm5_forward.Request,
-        target_cache: *KVCache,
-        ram_eff: usize,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        media_limits: kv_disk_cache.MediaLimits,
-        dflash_target: ?DflashTarget,
-        s: mlx.mlx_stream,
-    ) ?LookupResult {
-        const bits = target_cache.config.glmLatentBits() orelse return null;
-        const quant = glm5_prefix.diskQuant(bits);
-        const hm = d.bestHybridMatch(prompt_ids, has_tools, quant, @intCast(prompt_ids.len), media_limits) orelse return null;
-        if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
-        const sw = io_util.Stopwatch.init(d.io);
-        var pseudo = KVCache.initWithConfig(self.allocator, @intCast(request.layers.len * 2), quant) catch return null;
-        defer pseudo.deinit();
-        const kda = self.allocator.alloc(SSMCacheEntry, request.layers.len) catch return null;
-        for (kda) |*k| k.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-        defer {
-            resetSsmEntries(kda);
-            for (kda) |*k| {
-                _ = mlx.mlx_array_free(k.conv_state);
-                _ = mlx.mlx_array_free(k.ssm_state);
-            }
-            self.allocator.free(kda);
-        }
-        const restored = d.restoreIntoKda(&pseudo, kda, hm.idx, hm.cp, s) catch |err| {
-            log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-            poisonUnreadable(d, hm.idx, err);
-            return null;
-        };
-        var rows = glm5_prefix.rowsFromDisk(self.allocator, &pseudo, bits) catch return null;
-        defer rows.deinit();
-        rows.restore(request, restored) catch |err| {
-            log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-            request.reset();
-            return null;
-        };
-        for (request.layers, kda) |*layer, *k| {
-            std.mem.swap(mlx.mlx_array, &layer.recurrent.conv_state, &k.conv_state);
-            std.mem.swap(mlx.mlx_array, &layer.recurrent.ssm_state, &k.ssm_state);
-            layer.recurrent.initialized = k.initialized;
-        }
-        target_cache.truncate(0, s) catch {};
-        target_cache.step = restored;
-        self.last_restored_disk_id = d.entries.items[hm.idx].id;
-        log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (glm kda@{d})\n", .{ restored, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
-        return .{
-            .matched = restored,
-            .full_match = false,
-            .dflash_base = diskRestoreSpec(d, hm.idx, dflash_target, restored, s, .dflash),
-            .slot_owned = true,
-        };
-    }
+    pub const restoreGlmFromDisk = glm5_prefix.restoreGlmFromDisk;
 
-    /// DeepSeek: the live state rolled back in place to the deepest point of the slot's last request that this prompt
-    /// shares, when no stored point reaches further: no read, no copy. Null leaves the state as it was.
-    fn rollbackLiveDsv41(
-        self: *HotPrefixCache,
-        m: *dsv41_model.Model,
-        target_cache: *KVCache,
-        target_moe_seq_offset: *usize,
-        s: mlx.mlx_stream,
-        prompt_ids: []const u32,
-        has_tools: bool,
-        media_limits: kv_disk_cache.MediaLimits,
-        ram_match: anytype,
-    ) ?LookupResult {
-        const live = &self.live_dsv41;
-        const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
-        const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
-        const pos = live.points.items[idx].pos;
-        var stored: usize = if (ram_match) |rm| blk: {
-            const cps = self.entries.items[rm.idx].ssm_checkpoints orelse break :blk 0;
-            break :blk (highestCheckpointAtOrBelow(cps, rm.shared) orelse break :blk 0).pos;
-        } else 0;
-        if (self.disk) |*d| if (d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits)) |hm| {
-            stored = @max(stored, hm.cp);
-        };
-        if (stored > pos) return null;
-        live.rollback(self.allocator, m, idx, prompt_ids) catch |err| {
-            log.warn("  [dsv41-prefix] live state not rolled back: {s}; a stored point serves\n", .{@errorName(err)});
-            live.clear(self.allocator);
-            return null;
-        };
-        target_cache.truncate(0, s) catch {};
-        target_cache.step = pos;
-        target_moe_seq_offset.* = pos;
-        self.last_restored_live = true;
-        return .{ .matched = pos, .full_match = false, .slot_owned = true };
-    }
+    pub const rollbackLiveDsv41 = dsv41_prefix.rollbackLiveDsv41;
 
-    fn lookupImpl(
+    pub fn lookupImpl(
         self: *HotPrefixCache,
         target_cache: *KVCache,
         target_moe_seq_offset: *usize,
@@ -2012,9 +1811,8 @@ pub const HotPrefixCache = struct {
         // past the committed step, and `commit` snapshots them. Restoring that
         // (then skipping the truncate) left `cache.offset` AHEAD of the matched
         // length that generation tracks (`moe_seq_offset`) — a silent drift that
-        // corrupts RoPE positions and CRASHES the Gemma sliding-window prefill mask
-        // (`broadcast_shapes` mask-vs-KV mismatch; live 2026-07-09 on
-        // gemma-4-26B-A4B at ~16K ctx). truncate is a no-op when the buffer is
+        // corrupts RoPE positions and CRASHES the sliding-window prefill mask
+        // (`broadcast_shapes` mask-vs-KV mismatch). truncate is a no-op when the buffer is
         // already `final_len`, so unconditional clamping is safe and restores the
         // invariant cache.offset == matched. The stale KV tail has no matching
         // token id, so the match can never reach into it — discarding it is correct.
@@ -2243,45 +2041,11 @@ pub const HotPrefixCache = struct {
         return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, ssm_cps, dflash, mtp, prompt_len, ring_cps, .{});
     }
 
-    /// A GLM commit: `cps` are its KDA checkpoints and `rows` the MLA rows below them, for both
-    /// tiers; ownership of both transfers to the cache on every outcome.
-    pub fn commitGlm(
-        self: *HotPrefixCache,
-        source_cache: *const KVCache,
-        tokens: []const u32,
-        has_tools: bool,
-        vision_key: u64,
-        cache_key: u64,
-        media_start: ?usize,
-        cps: []SSMCheckpoint,
-        rows: glm5_prefix.MlaRows,
-        dflash: ?DflashCommit,
-        prompt_len: usize,
-    ) !CommitStatus {
-        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = rows });
-    }
+    pub const commitGlm = glm5_prefix.commitGlm;
 
-    /// `commitGlm` with each tier's own rows: `ram_rows` within the RAM budget (`glmCommitLen`),
-    /// `disk_rows` through the newest checkpoint the SSD tier keeps (`glmDiskLen`). Either may be
-    /// null; `cps` cover the longer.
-    pub fn commitGlmTiers(
-        self: *HotPrefixCache,
-        source_cache: *const KVCache,
-        tokens: []const u32,
-        has_tools: bool,
-        vision_key: u64,
-        cache_key: u64,
-        media_start: ?usize,
-        cps: []SSMCheckpoint,
-        ram_rows: ?glm5_prefix.MlaRows,
-        disk_rows: ?glm5_prefix.MlaRows,
-        dflash: ?DflashCommit,
-        prompt_len: usize,
-    ) !CommitStatus {
-        return self.commitImpl(source_cache, tokens, has_tools, vision_key, cache_key, media_start, cps, dflash, null, prompt_len, .{}, .{ .ram = ram_rows, .disk = disk_rows });
-    }
+    pub const commitGlmTiers = glm5_prefix.commitGlmTiers;
 
-    fn commitImpl(
+    pub fn commitImpl(
         self: *HotPrefixCache,
         source_cache: *const KVCache,
         tokens: []const u32,
@@ -2294,7 +2058,7 @@ pub const HotPrefixCache = struct {
         mtp: ?DflashCommit,
         prompt_len: usize,
         ring_cps: SlotRingCps,
-        glm: GlmTierRows,
+        glm: glm5_prefix.GlmTierRows,
     ) !CommitStatus {
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
@@ -3209,59 +2973,9 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
-    /// Flush the most recent commit to the SSD tier. Called by the scheduler
-    /// AFTER `markFinished` (the client already has its response) — the
-    /// chunk-append is bounded (partial tail + new chunks) but synchronous on
-    /// the inference thread. Snapshot arrays are refcount-shared with the RAM
-    /// entry, so slicing them here reads the same buffers the commit captured.
-    /// A GLM entry goes to disk as its MLA rows in the dense disk layout beside its KDA checkpoints.
-    /// `whole` writes every piece now, writer or not (`DiskTier.appendCommitWhole`).
-    fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const glm5_prefix.MlaRows, tokens: []const u32, has_tools: bool, media: MediaStamp, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, whole: bool, s: mlx.mlx_stream) !kv_disk_cache.PersistOutcome {
-        const entries = try glm5_prefix.diskEntries(d.allocator, rows);
-        defer glm5_prefix.freeDiskEntries(d.allocator, entries);
-        const quant = glm5_prefix.diskQuant(rows.latent_bits);
-        return d.appendCommitWith(.{
-            .kv_entries = entries,
-            .step = rows.len,
-            .config = quant,
-            .tokens = tokens,
-            .has_tools = has_tools,
-            .ssm_checkpoints = cps,
-            .dflash_snap = dflash,
-            .vision_key = media.key,
-            .media_start = media.start,
-        }, s, .{ .whole = whole });
-    }
+    pub const persistGlm = glm5_prefix.persistGlm;
 
-    /// GLM's prefill write-through: the rows through `request.offset` and the checkpoints so far go to the SSD tier
-    /// as the prefill produces them, and every checkpoint but the newest leaves RAM. `entry_id` follows the entry
-    /// across calls. Best effort: a failure leaves the checkpoints for the commit after the response.
-    pub fn writeThroughGlm(
-        self: *HotPrefixCache,
-        entry_id: *?u64,
-        request: *const glm5_forward.Request,
-        prompt: []const u32,
-        has_tools: bool,
-        media: MediaStamp,
-        cps: []SSMCheckpoint,
-        s: mlx.mlx_stream,
-    ) void {
-        const d = if (self.disk) |*dd| dd else return;
-        const len = prompt.len / glm5_prefix.pool_size * glm5_prefix.pool_size;
-        // Below the tier's floor nothing is written yet, so no state may be freed.
-        if (cps.len == 0 or len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
-        defer d.settleCheckpoints(entry_id.*, cps);
-        var rows = glm5_prefix.MlaRows.shareLive(self.allocator, request, len, s) catch |err| {
-            log.warn("  [disk-cache] GLM prefill write-through rows not shared: {s}\n", .{@errorName(err)});
-            return;
-        };
-        defer rows.deinit();
-        _ = persistGlm(d, &rows, prompt[0..len], has_tools, media, cps, null, false, s) catch |err| {
-            log.warn("  [disk-cache] GLM prefill write-through failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        if (d.last_store_id) |id| entry_id.* = id;
-    }
+    pub const writeThroughGlm = glm5_prefix.writeThroughGlm;
 
     /// Qwen's prefill write-through: the rows and checkpoints so far go to the SSD tier as the prefill produces
     /// them, and every checkpoint but the newest leaves RAM once its file is written. Best effort: what a failed
@@ -3295,43 +3009,11 @@ pub const HotPrefixCache = struct {
         if (floor) d.settleCheckpoints(d.last_store_id, cps);
     }
 
-    /// DeepSeek's write-through: the request's restore points so far go to the SSD tier and every one of them
-    /// leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
-    /// commit returns. Below the tier's floor nothing is written and the points stay for the commit.
-    /// `held` names the phase that waited on the writer, for the log.
-    pub fn writeThroughDsv41(self: *HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer_mod.KVCache, prompt: []const u32, has_tools: bool, media: MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
-        if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
-        var pending = false;
-        for (cps) |*cp| pending = pending or !cp.isReleased();
-        if (!pending) return;
-        dsv41_prefix.markRows(cache) catch |err| {
-            log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
-            return;
-        };
-        for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp) catch |err| {
-            log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
-        };
-        const staged_before = self.disk.?.point_bytes_written;
-        var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-        self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
-        const bytes = self.disk.?.point_bytes_written - staged_before;
-        for (cps) |*cp| cp.release();
-        // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
-        log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
-    }
+    pub const writeThroughDsv41 = dsv41_prefix.writeThroughDsv41;
 
-    /// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the
-    /// SSD tier: shared rows, staged and released before the next forward appends.
-    pub fn writeDecodePointDsv41(self: *HotPrefixCache, cache: *transformer_mod.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: MediaStamp, s: mlx.mlx_stream) !void {
-        var cps = [1]SSMCheckpoint{try dsv41_prefix.captureShared(self.allocator, m, tokens.len)};
-        defer cps[0].deinit(self.allocator);
-        self.writeThroughDsv41(m, cache, tokens, has_tools, media, &cps, s, "decode");
-    }
+    pub const writeDecodePointDsv41 = dsv41_prefix.writeDecodePointDsv41;
 
-    /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
-    pub fn publishLiveDsv41(self: *HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: MediaStamp) void {
-        self.live_dsv41.publish(self.allocator, m, tokens, has_tools, media.key, media.start);
-    }
+    pub const publishLiveDsv41 = dsv41_prefix.publishLiveDsv41;
 
     /// Write the pending record whole and release it: its rows may be a finished request's own
     /// buffers, which nothing could read again to resume a partial entry.
@@ -3969,7 +3651,7 @@ pub const HotPrefixCache = struct {
         list.* = self.allocator.realloc(cps, at) catch cps;
     }
 
-    fn shedCheckpointsToFit(self: *HotPrefixCache) void {
+    pub fn shedCheckpointsToFit(self: *HotPrefixCache) void {
         if (self.max_kv_bytes == 0 or self.current_kv_bytes <= self.max_kv_bytes) return;
         if (self.entries.items.len == 0) return;
         var newest: *Entry = &self.entries.items[0];
@@ -4088,7 +3770,7 @@ pub const HotPrefixCache = struct {
         return false;
     }
 
-    fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
+    pub fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
         var evicted = self.entries.swapRemove(lru_idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
@@ -4110,7 +3792,7 @@ pub const HotPrefixCache = struct {
 
     /// Does a commit record the live state for the SSD tier (`pending_disk`)? Wherever the flush
     /// lands it whole: SSD-first, or a tier with the background writer.
-    fn capturesLiveForDisk(self: *const HotPrefixCache) bool {
+    pub fn capturesLiveForDisk(self: *const HotPrefixCache) bool {
         const d = if (self.disk) |*dd| dd else return false;
         return self.ssd_first or d.writer != null;
     }
@@ -4394,20 +4076,8 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     // Plain attention: always allowed.
     try testing.expect(HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
-    // Hybrid (lfm2/nemotron_h-style): only with checkpoints enabled.
-    cfg.has_hybrid_layers = true;
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
-    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
-    // Qwen3.5-style full_attention_interval-marks-hybrid: same gate.
-    cfg.has_hybrid_layers = false;
+    // full_attention_interval-marks-hybrid: only with checkpoints enabled.
     cfg.full_attention_interval = 4;
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
-    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
-}
-
-test "HotPrefixCache: shouldUse admits deepseek_v41 only with checkpoints (its state restores from them)" {
-    var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "deepseek_v41";
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
@@ -4512,9 +4182,8 @@ test "HotPrefixCache: an entry holding the request's first images restores up to
     try testing.expectEqual(@as(usize, 3), cache.findBestRestorableMatch(&request, false, chainKey(&chain), 3, &.{}, dense, false, null).?.shared);
 }
 
-test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
-    // Root cause of the live gemma-4-26B-A4B crash (2026-07-09, broadcast_shapes
-    // mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
+test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (sliding mask crash)" {
+    // Root cause of a broadcast_shapes crash (mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
     // LONGER than its logical token count — PLD/speculative decode leaves stale
     // draft positions in the buffer past the committed step. When the NEXT prompt
     // matches the entry's ENTIRE token sequence but is longer (a partial hit,
@@ -4639,8 +4308,8 @@ test "prefix cache: DFlash assistant context round-trips, clamped to the trunk's
 test "prefix cache: MTP committed history round-trips, clamped; a history ending short is declined" {
     // Same DflashSnap machinery, second Entry field: the head's history is
     // built from trunk hiddens and a restore forwards nothing, so without
-    // this every reused prefix drafts blind (~70 -> ~38 tok/s on warm echo,
-    // Qwen3.6-27B). Unlike the trunk KV, a history that ends BEFORE the
+    // this every reused prefix drafts blind (~70 -> ~38 tok/s on warm echo).
+    // Unlike the trunk KV, a history that ends BEFORE the
     // matched cursor cannot be adopted — the missing tail's hiddens are
     // unrecoverable, and a gap right below the generation point is worse
     // than a blind start.
@@ -4693,7 +4362,7 @@ test "prefix cache: MTP committed history round-trips, clamped; a history ending
     try testing.expectEqual(@as(usize, 7), base2); // untouched
 }
 
-fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32) !void {
+pub fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: u32, step: u32) !void {
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     const count: f64 = @floatFromInt(step * 8);
@@ -4707,24 +4376,12 @@ fn testWriteCacheLayer(cache: *KVCache, s: mlx.mlx_stream, layer: u32, written: 
     view.deinit();
 }
 
-fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
+pub fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
     var written: u32 = 0;
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);
         var li: u32 = 0;
         while (li < n_layers) : (li += 1) try testWriteCacheLayer(cache, s, li, written, step);
-        written += step;
-    }
-}
-
-/// Fill a head-shaped cache: one layer at `layer` (the qwen4_exp MTP head's layer is never 0),
-/// driven through `Transformer.qwen4MtpAdvance` as `qwen4MtpForward` drives it.
-fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32, seq_offset: *usize) !void {
-    var written: u32 = 0;
-    while (written < tokens) {
-        const step: u32 = @min(64, tokens - written);
-        try testWriteCacheLayer(cache, s, layer, written, step);
-        transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
     }
 }
@@ -4766,7 +4423,7 @@ fn ringRowBytes(arr: mlx.mlx_array) u64 {
 }
 
 test "a hot entry holds a ringed layer's retained rows, not the ring buffer's capacity" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -4842,7 +4499,7 @@ fn ringTurn(live: *KVCache, s: mlx.mlx_stream, n_layers: u32, window: u32, promp
 }
 
 test "a ringed entry restores at its prompt-end checkpoint when the next turn diverges past the ring" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -4908,7 +4565,7 @@ test "a ringed entry restores at its prompt-end checkpoint when the next turn di
 }
 
 test "a ring checkpoint restore below the floor cold-prefills" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -4941,7 +4598,7 @@ test "a ring checkpoint restore below the floor cold-prefills" {
 }
 
 test "a restore declined at the ring clamp leaves its entry's recency alone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -4976,7 +4633,7 @@ test "a restore declined at the ring clamp leaves its entry's recency alone" {
 }
 
 test "ringed candidates rank by restorable position, not raw match" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5129,7 +4786,7 @@ test "a slot's ring restore points are freed by the slot and by a commit that ca
 }
 
 test "a new session sharing only another's preamble restores at the message mark that prefill took" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5192,7 +4849,7 @@ test "a new session sharing only another's preamble restores at the message mark
 }
 
 test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS checkpoints" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5220,7 +4877,7 @@ test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS
 }
 
 test "an entry extended in place keeps its older ring checkpoints" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5285,7 +4942,7 @@ fn ringExpectSameNext(ref: *KVCache, restored: *KVCache, s: mlx.mlx_stream, n_la
 }
 
 test "an oversized ringed entry trims to its end: the ring is a constant, not a per-token price" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4; // layer 0 global, 1..3 sliding
@@ -5329,7 +4986,7 @@ test "an oversized ringed entry trims to its end: the ring is a constant, not a 
 }
 
 test "an oversized ringed entry trims to the highest ring checkpoint that fits, and declines below every one" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5386,7 +5043,7 @@ test "an oversized ringed entry trims to the highest ring checkpoint that fits, 
 }
 
 test "a replacement over the budget sheds its lowest ring checkpoints before the entry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5430,7 +5087,7 @@ test "a replacement over the budget sheds its lowest ring checkpoints before the
 }
 
 test "a ring checkpoint taken at the restore keeps the fork when the donor is evicted before the commit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5490,7 +5147,7 @@ test "a ring checkpoint taken at the restore keeps the fork when the donor is ev
 }
 
 test "a fork entry keeps its donor's ring checkpoint, so evicting the donor still restores at the fork" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -5583,7 +5240,7 @@ fn expectRingContinuesCold(restored: *KVCache, s: mlx.mlx_stream, n_layers: u32,
 }
 
 test "a ringed entry persists to the SSD tier and restores only at a ring checkpoint after a restart" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5655,7 +5312,7 @@ fn persistRingTurn(io: std.Io, base: []const u8, fp: []const u8, toks: []const u
 }
 
 test "a ringed SSD entry bills its ring files, and a truncated one is salvaged away at scan" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -5718,7 +5375,7 @@ test "a ringed SSD entry bills its ring files, and a truncated one is salvaged a
 }
 
 test "an SSD entry without ring rows is never restored into a ringed cache" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -6228,12 +5885,12 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, 0, kv_quant.KVQuantConfig.dense));
 }
 
-// ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
+// ── Phase 3: two-tier hybrid restore (GatedDeltaNet) ──
 
-const conv_shape_pc = [_]c_int{ 1, 3, 8 };
+pub const conv_shape_pc = [_]c_int{ 1, 3, 8 };
 const ssm_shape_pc = [_]c_int{ 1, 2, 4, 4 };
 
-fn pcArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
+pub fn pcArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
     var count: f64 = 1;
     for (shape) |d| count *= @floatFromInt(d);
     var flat = mlx.mlx_array_new();
@@ -6245,7 +5902,7 @@ fn pcArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
     return out;
 }
 
-fn pcSsmVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
+pub fn pcSsmVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     _ = mlx.mlx_astype(&f, arr, .float32, s);
@@ -6253,7 +5910,7 @@ fn pcSsmVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
     return mlx.mlx_array_data_float32(f).?[idx];
 }
 
-fn pcBuildHybrid(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
+pub fn pcBuildHybrid(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
     return .{
         .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = pcArange(s, &ssm_shape_pc, ssm_base), .initialized = true },
         .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base + 10_000), .ssm_state = mlx.mlx_array_new(), .initialized = true },
@@ -6261,14 +5918,14 @@ fn pcBuildHybrid(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEn
     };
 }
 
-fn pcFreeHybrid(e: *[3]SSMCacheEntry) void {
+pub fn pcFreeHybrid(e: *[3]SSMCacheEntry) void {
     for (e) |*x| {
         _ = mlx.mlx_array_free(x.conv_state);
         _ = mlx.mlx_array_free(x.ssm_state);
     }
 }
 
-fn pcEmptySsm() [3]SSMCacheEntry {
+pub fn pcEmptySsm() [3]SSMCacheEntry {
     return .{
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
         .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
@@ -6778,86 +6435,6 @@ test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two c
 
 
 
-fn pcHeld(cps: []const SSMCheckpoint) usize {
-    var n: usize = 0;
-    for (cps) |*cp| n += @intFromBool(!cp.isReleased());
-    return n;
-}
-
-test "Qwen SSD-only: a prefill holds at most two checkpoint states, lists every position, and any of them restores from SSD exactly" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var tokens: [1500]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, 1500);
-    var srcs: [8][3]SSMCacheEntry = undefined;
-    for (&srcs, 0..) |*e, i| {
-        const f: f64 = @floatFromInt(i + 1);
-        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
-    }
-    defer for (&srcs) |*e| pcFreeHybrid(e);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-    hc.ssd_first = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-wt", 0, 128);
-    defer hc.deinit();
-    hc.disk.?.ssd_first = true;
-    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
-    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-    hc.disk.?.enableBackgroundWriter();
-
-    var cps = std.ArrayList(SSMCheckpoint).empty;
-    errdefer {
-        for (cps.items) |*cp| cp.deinit(testing.allocator);
-        cps.deinit(testing.allocator);
-    }
-    var peak: usize = 0;
-    // The prefill loop: a checkpoint after each chunk, then the write-through.
-    for (0..7) |i| {
-        const pos = 512 + 128 * i;
-        try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], pos, s));
-        peak = @max(peak, pcHeld(cps.items));
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
-        try testing.expectEqual(@as(usize, 1), pcHeld(cps.items));
-    }
-    // The prompt-end snapshot is taken after the loop, past the hook.
-    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[7], 1400, s));
-    try testing.expectEqual(@as(usize, 2), pcHeld(cps.items));
-    try testing.expect(peak <= 2);
-    try testing.expectEqual(@as(usize, 8), cps.items.len);
-
-    // The commit lists every position and the SSD record writes only the states still held.
-    const owned = try cps.toOwnedSlice(testing.allocator);
-    try testing.expectEqual(CommitStatus{ .disk_only = 1500 }, try hc.commitWithSsm(&cache, &tokens, false, owned, null, null));
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
-    try testing.expectEqualSlices(u32, &.{ 512, 640, 768, 896, 1024, 1152, 1280, 1400 }, hc.disk.?.entries.items[0].ssm_positions);
-
-    // Released and held alike: each position restores its own state from the file.
-    for ([_]struct { pos: u32, conv: f32, ssm: f32 }{
-        .{ .pos = 512, .conv = 100, .ssm = 500 },
-        .{ .pos = 896, .conv = 400, .ssm = 2000 },
-        .{ .pos = 1280, .conv = 700, .ssm = 3500 },
-        .{ .pos = 1400, .conv = 800, .ssm = 4000 },
-    }) |w| {
-        var cache2 = try KVCache.init(testing.allocator, 3);
-        defer cache2.deinit();
-        var dst = pcEmptySsm();
-        defer pcFreeHybrid(&dst);
-        try testing.expectEqual(w.pos, try hc.disk.?.restoreIntoHybrid(&cache2, &dst, 0, w.pos, s));
-        try testing.expectEqual(w.conv, pcSsmVal(dst[0].conv_state, 0, s));
-        try testing.expectEqual(w.ssm, pcSsmVal(dst[0].ssm_state, 0, s));
-    }
-}
-
 test "HotPrefixCache: a byte-budget trim never lands on a released checkpoint, which this entry cannot restore from" {
     const cps = [_]SSMCheckpoint{
         .{ .pos = 1024, .layers = &.{}, .released_bytes = 100 },
@@ -7049,7 +6626,7 @@ test "HotPrefixCache: a fork's SSD entry keeps the checkpoints its donor holds i
 }
 
 test "a fork's SSD entry keeps its donor's ring checkpoint, so a restart restores there with the donor gone" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7145,7 +6722,7 @@ fn ringCpSteps(hc: *const HotPrefixCache, entry: usize, out: *[RING_CHECKPOINT_M
 }
 
 test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints, and an older point restores its exact rows from SSD" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7208,7 +6785,7 @@ test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints,
 }
 
 test "RAM tier without an SSD tier keeps every ring checkpoint" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const window: u32 = 8;
     const n_layers: u32 = 4;
@@ -7226,7 +6803,7 @@ test "RAM tier without an SSD tier keeps every ring checkpoint" {
 }
 
 test "RAM and SSD: a ring checkpoint whose write failed stays in RAM" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7254,7 +6831,7 @@ test "RAM and SSD: a ring checkpoint whose write failed stays in RAM" {
 }
 
 test "a ring file past the rows its entry persisted is not a held restore point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7284,7 +6861,7 @@ test "a ring file past the rows its entry persisted is not a held restore point"
 }
 
 test "RAM and SSD: a fork inherits the donor's newest checkpoints, and the donor's older points stay on its SSD entry" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7803,7 +7380,7 @@ test "HotPrefixCache: byte budget rejects an oversized sole entry and preserves 
 // ── Issue #330: the oversized-entry decline is a cliff, not a cap ──
 
 /// Test-local: dense per-token KV bytes of a snapshot (k + v across layers).
-fn pcRowBytes(snap: *const transformer_mod.KVCacheSnapshot) u64 {
+pub fn pcRowBytes(snap: *const transformer_mod.KVCacheSnapshot) u64 {
     var total: u64 = 0;
     for (snap.entries) |e| {
         if (!e.initialized) continue;
@@ -8004,59 +7581,6 @@ test "HotPrefixCache: a trim priced after its checkpoint shed is retained, then 
     try testing.expectEqual(e.tokens.len, kept[kept.len - 1].pos);
 }
 
-/// A two-layer QSA hybrid: the layer counts differ from `pcBuildQsaHybrid`'s, which is how a
-/// slice between two snaps of this list fails deterministically.
-fn pcBuildQsaPair(s: mlx.mlx_stream, rows: c_int) [2]SSMCacheEntry {
-    const aux_shape = [_]c_int{ 1, rows, 8 };
-    const pooled_shape = [_]c_int{ 1, @divTrunc(rows, 4), 8 };
-    return .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_pooled = pcArange(s, &pooled_shape, 1000.0), .qsa_ratio = 4 },
-        .{ .conv_state = pcArange(s, &conv_shape_pc, 100.0), .ssm_state = mlx.mlx_array_new(), .initialized = true },
-    };
-}
-
-fn pcFreeSsmSlice(entries: []SSMCacheEntry) void {
-    for (entries) |*x| {
-        if (x.conv_state.ctx != null) _ = mlx.mlx_array_free(x.conv_state);
-        if (x.ssm_state.ctx != null) _ = mlx.mlx_array_free(x.ssm_state);
-        if (x.aux_state.ctx != null) _ = mlx.mlx_array_free(x.aux_state);
-        if (x.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(x.qsa_pooled);
-    }
-}
-
-test "HotPrefixCache: a trim that cannot carry the QSA history over declines instead of committing" {
-    // The bank lives only on the latest snap; a trim that drops it without slicing it onto the
-    // last kept snap leaves an entry whose every restore is a silent miss.
-    const s = mlx.gpuStream();
-
-    var toks: [900]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 3);
-
-    var wide = pcBuildQsaHybrid(s, 600, 100.0);
-    defer pcFreeQsaHybrid(&wide);
-    var narrow = pcBuildQsaPair(s, 600);
-    defer pcFreeSsmSlice(&narrow);
-
-    var c1 = try KVCache.init(testing.allocator, 3);
-    defer c1.deinit();
-    try testFillCache(&c1, s, 3, 900);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &wide, 300, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &narrow, 600, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &narrow, s);
-    try testing.expect(checkpointHasQsaPooled(&cps[1]));
-
-    var probe = try c1.snapshot();
-    defer probe.deinit();
-    const budget = pcRowBytes(&probe) * 300 + transformer_mod.ssmCheckpointBytes(&cps[0]);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
-    defer hc.deinit();
-    const status = try hc.commitWithSsm(&c1, &toks, false, cps, null, null);
-    try testing.expect(status == .declined);
-    try testing.expectEqual(@as(usize, 0), hc.entryCount());
-}
-
 test "HotPrefixCache: oversized hybrid entry with no checkpoint under budget declines (#330)" {
     const s = mlx.gpuStream();
 
@@ -8085,304 +7609,13 @@ test "HotPrefixCache: oversized hybrid entry with no checkpoint under budget dec
     try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
 }
 
-/// qwen4-shaped hybrid: layer 0 is a QSA full-attention layer (no conv/ssm,
-/// `aux_state` = `[1, rows, 8]` indexer key history), layer 1 GDN, layer 2 idle.
-fn pcBuildQsaHybrid(s: mlx.mlx_stream, rows: c_int, conv_base: f64) [3]SSMCacheEntry {
-    const aux_shape = [_]c_int{ 1, rows, 8 };
-    const pooled_shape = [_]c_int{ 1, @divTrunc(rows, 4), 8 };
-    return .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_pooled = pcArange(s, &pooled_shape, 1000.0), .qsa_ratio = 4 },
-        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = mlx.mlx_array_new(), .initialized = true },
-        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
-    };
-}
-
-fn pcFreeQsaHybrid(e: *[3]SSMCacheEntry) void {
+pub fn pcFreeQsaHybrid(e: *[3]SSMCacheEntry) void {
     for (e) |*x| {
         if (x.conv_state.ctx != null) _ = mlx.mlx_array_free(x.conv_state);
         if (x.ssm_state.ctx != null) _ = mlx.mlx_array_free(x.ssm_state);
         if (x.aux_state.ctx != null) _ = mlx.mlx_array_free(x.aux_state);
         if (x.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(x.qsa_pooled);
     }
-}
-
-test "HotPrefixCache: restore dump writes named tensors and is a no-op when unset" {
-    const s = mlx.gpuStream();
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, 8);
-    var live = pcBuildQsaHybrid(s, 8, 100.0);
-    defer pcFreeQsaHybrid(&live);
-
-    restore_dump.dump_restore_override = null;
-    try testing.expectEqual(@as(?u64, null), restore_dump.dumpRestoreIfEnabled(&cache, &live, s, .{
-        .kind = "restore",
-        .pos = 8,
-    }));
-
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const root_len = try tmp.dir.realPath(io, &buf);
-    const dir = buf[0..root_len];
-    restore_dump.dump_restore_override = dir;
-    defer restore_dump.dump_restore_override = null;
-    const n = restore_dump.dumpRestoreIfEnabled(&cache, &live, s, .{
-        .kind = "restore",
-        .pos = 8,
-        .cp = 8,
-        .bank_from = 8,
-        .source = "own",
-        .entry_idx = 1,
-        .entry_count = 1,
-    }) orelse return error.TestExpectedEqual;
-
-    const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/restore-{d}-pos8.safetensors", .{ dir, n }, 0);
-    defer testing.allocator.free(st_path);
-    const json_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/restore-{d}-pos8.json", .{ dir, n }, 0);
-    defer testing.allocator.free(json_path);
-    {
-        const sf = std.c.fopen(st_path, "r") orelse return error.TestExpectedEqual;
-        _ = std.c.fclose(sf);
-        const jf = std.c.fopen(json_path, "r") orelse return error.TestExpectedEqual;
-        _ = std.c.fclose(jf);
-    }
-    var tmap = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tmap);
-    var mmap = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(mmap);
-    try mlx.check(mlx.mlx_load_safetensors(&tmap, &mmap, st_path, s));
-    const names = [_][:0]const u8{
-        "pos",
-        "layers.0.aux_state",
-        "layers.0.qsa_pooled",
-        "layers.0.ple_prev",
-        "layers.0.qsa_rows",
-        "layers.0.qsa_key_rows",
-        "layers.0.ring_start",
-        "layers.1.conv_state",
-        "kv.0.k_tail",
-        "kv.0.v_tail",
-    };
-    for (names) |name| {
-        var got = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(got);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&got, tmap, name));
-        try testing.expect(got.ctx != null);
-    }
-}
-
-test "HotPrefixCache: a QSA arch restore with no indexer history is a miss, never a poisoned entry" {
-    // A snap without QSA history (a cancel handoff whose attach failed, an
-    // old on-disk entry) used to restore aux-less; the next prefill then died
-    // in qsaMaskFromQk with QsaHistoryGap on EVERY turn on that prefix. A
-    // QSA arch treats "no history after restore" like "no checkpoint".
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 70, 71 };
-    for ([_]bool{ false, true }) |with_history| {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        defer hc.deinit();
-        hc.qsa_history_required = true;
-        var cache = try KVCache.init(testing.allocator, 3);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 3, tokens.len);
-        var live = pcBuildQsaHybrid(s, 10, 100.0);
-        defer pcFreeQsaHybrid(&live);
-        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
-        if (with_history) try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-        _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
-        if (with_history) {
-            try testing.expectEqual(@as(usize, 4), r.matched);
-            try testing.expect(target[0].aux_state.ctx == null);
-            try testing.expectEqual(@as(c_int, 4), target[0].qsa_hist_rows);
-        } else {
-            try testing.expectEqual(@as(usize, 0), r.matched);
-            try testing.expectEqual(@as(usize, 0), moe_off);
-            try testing.expect(target[0].aux_state.ctx == null);
-        }
-    }
-}
-
-test "HotPrefixCache: a history tensor shorter than the checkpoint is a miss, not a short hit" {
-    const s = mlx.gpuStream();
-    var tokens: [70]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
-    var lookup_latest: [70]u32 = tokens;
-    lookup_latest[64] = 999;
-    var lookup_interior: [70]u32 = tokens;
-    lookup_interior[16] = 999;
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildQsaHybrid(s, 8, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 64, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    try testing.expect(cps[1].layers[0].aux_state.ctx == null);
-    try testing.expectEqual(@as(c_int, 64), cps[1].layers[0].qsa_rows);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    for ([_][]const u32{ &lookup_latest, &lookup_interior }) |lookup| {
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestore(&target_cache, &moe_off, &target, s, lookup, false, 0, null, null));
-        try testing.expectEqual(@as(usize, 0), target_cache.step);
-        try testing.expect(target[0].aux_state.ctx == null);
-    }
-}
-
-/// Two QSA layers, the second holding a SHORTER pooled bank than the first.
-fn pcBuildQsaHybridUneven(s: mlx.mlx_stream, rows: c_int, short_blocks: c_int) [3]SSMCacheEntry {
-    const aux_shape = [_]c_int{ 1, rows, 8 };
-    const pooled_shape = [_]c_int{ 1, @divTrunc(rows, 4), 8 };
-    const short_shape = [_]c_int{ 1, short_blocks, 8 };
-    return .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 0.0), .qsa_pooled = pcArange(s, &pooled_shape, 1000.0), .qsa_ratio = 4 },
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .aux_state = pcArange(s, &aux_shape, 2000.0), .qsa_pooled = pcArange(s, &short_shape, 3000.0), .qsa_ratio = 4 },
-        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
-    };
-}
-
-test "HotPrefixCache: a lookup that fails after binding the KV leaves nothing behind" {
-    // The sole caller reads any lookup error as "no match" and cold-prefills the WHOLE prompt:
-    // a half-restored cache would hold the prefix twice, at the wrong RoPE positions.
-    const s = mlx.gpuStream();
-    var tokens: [16]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
-    var lookup: [16]u32 = tokens;
-    lookup[10] = 999;
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    // The coverage pre-check maxes the pooled bank over layers; the apply is per layer.
-    var live = pcBuildQsaHybridUneven(s, 16, 1);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 12, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 7;
-    try testing.expectError(error.QsaHistoryGap, hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null));
-    try testing.expectEqual(@as(usize, 0), target_cache.step);
-    try testing.expectEqual(@as(usize, 0), moe_off);
-    for (&target) |*e| {
-        try testing.expect(!e.initialized);
-        try testing.expect(e.aux_state.ctx == null);
-        try testing.expect(e.qsa_pooled.ctx == null);
-    }
-}
-
-test "HotPrefixCache: prefix-extend keeps ONE QSA history across turns" {
-    // The replace path inherits the old entry's checkpoints. Its latest snap
-    // carried the full history and the new latest gets another one: one copy
-    // per committed turn, the leak the stride fix closed by another door.
-    const s = mlx.gpuStream();
-    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var c1 = try KVCache.init(testing.allocator, 3);
-    defer c1.deinit();
-    try testFillCache(&c1, s, 3, t1.len);
-    var l1 = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&l1);
-    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps1[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l1, 4, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps1, &l1, s);
-    _ = try hc.commitWithState(&c1, &t1, false, 0, cps1, null, null);
-
-    var c2 = try KVCache.init(testing.allocator, 3);
-    defer c2.deinit();
-    try testFillCache(&c2, s, 3, t2.len);
-    var l2 = pcBuildQsaHybrid(s, 14, 200.0);
-    defer pcFreeQsaHybrid(&l2);
-    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps2[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &l2, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps2, &l2, s);
-    _ = try hc.commitWithState(&c2, &t2, false, 0, cps2, null, null);
-
-    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
-    const merged = hc.entries.items[0].ssm_checkpoints.?;
-    try testing.expectEqual(@as(usize, 2), merged.len);
-    try testing.expect(!transformer_mod.checkpointHasQsaHistory(&merged[0]));
-    try testing.expect(transformer_mod.checkpointHasQsaHistory(&merged[1]));
-    try testing.expect(merged[1].layers[0].aux_state.ctx == null);
-    try testing.expect(merged[1].layers[0].qsa_pooled.ctx != null);
-}
-
-test "HotPrefixCache: a handed-off QSA history commits, restores and bills exactly like the prefill-end copy" {
-    // The commit handoff gives the newest snap a view of the slot's live history; the entry must
-    // be indistinguishable from the copy arm and outlive the slot.
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const lookup_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 70, 71 };
-    var restored_val: [2]f32 = .{ -1.0, -2.0 };
-    var billed: [2]u64 = .{ 0, 0 };
-    for ([_]bool{ false, true }, 0..) |handoff, arm| {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        defer hc.deinit();
-        hc.qsa_history_required = true;
-        var cache = try KVCache.init(testing.allocator, 3);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 3, tokens.len);
-        var live = pcBuildQsaHybrid(s, 10, 100.0);
-        const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 4, s);
-        if (handoff) {
-            try transformer_mod.handoffQsaHistoryToLatest(cps, &live, s);
-        } else {
-            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-        }
-        _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-        pcFreeQsaHybrid(&live);
-        billed[arm] = hc.entries.items[0].ssm_bytes;
-
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup_tokens, false, 0, null, null);
-        try testing.expectEqual(@as(usize, 4), r.matched);
-        try testing.expect(target[0].aux_state.ctx == null);
-        try testing.expectEqual(@as(c_int, 4), target[0].qsa_hist_rows);
-        try testing.expectEqual(@as(c_int, 1), target[0].qsa_pooled_blocks);
-        restored_val[arm] = 0;
-    }
-    try testing.expectEqual(restored_val[0], restored_val[1]);
-    try testing.expect(billed[0] > 0);
-    try testing.expectEqual(billed[0], billed[1]);
 }
 
 test "HotPrefixCache: replace path sheds inherited checkpoints instead of evicting its own entry (#330)" {
@@ -8455,7 +7688,7 @@ test "HotPrefixCache: a failed commit still frees the checkpoints it was handed 
 
     // fail_index 0: the first cache-side allocation (the tokens dupe) fails.
     // Ownership of the checkpoints transfers to the cache UNCONDITIONALLY —
-    // the scheduler's catch arm frees nothing (scan-pinned in scheduler.zig;
+    // the scheduler's catch arm frees nothing (commitCancelledPrefillSlot detaches them first;
     // pre-fix it freed too, a double free with a different allocator). The
     // cache's error paths therefore MUST free the slice; std.testing.allocator
     // flags both the leak and a double free.
@@ -8564,195 +7797,6 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     try testing.expectEqual(@as(f32, 200.0), pcSsmVal(target_ssm[0].conv_state, 0, s));
 }
 
-test "HotPrefixCache: inheriting a 1-token-tail commit cannot restore a bank-less leftover" {
-    const s = mlx.gpuStream();
-    var donor_toks: [30]u32 = undefined;
-    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var heir_toks: [19]u32 = undefined;
-    @memcpy(heir_toks[0..17], donor_toks[0..17]);
-    heir_toks[17] = 900;
-    heir_toks[18] = 901;
-
-    var live = pcBuildQsaHybrid(s, 25, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
-
-    var lookup = heir_toks;
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
-    const pos: c_int = @intCast(r.matched);
-    const ratio: c_int = if (target[0].qsa_ratio > 0) target[0].qsa_ratio else 4;
-    const blocks: c_int = if (target[0].qsa_pooled.ctx != null) mlx.getShape(target[0].qsa_pooled)[1] else 0;
-    const held: c_int = if (target[0].aux_state.ctx != null) mlx.getShape(target[0].aux_state)[1] else 0;
-    const backed = target[0].qsa_hist_rows == pos and blocks * ratio + held >= pos;
-    try testing.expect(r.matched == 0 or backed);
-}
-
-test "HotPrefixCache: a 1-token-tail heir restores a bank that sits at prompt_end-1" {
-    const s = mlx.gpuStream();
-    var prefix: [18]u32 = undefined;
-    for (&prefix, 0..) |*t, i| t.* = @intCast(i + 1);
-    const donor_toks = prefix ++ [_]u32{ 90, 91 };
-    const heir_toks = prefix ++ [_]u32{ 200, 201, 202, 203, 204, 205, 206, 207 };
-    var live = pcBuildQsaHybrid(s, 18, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_live = pcBuildQsaHybrid(s, 21, 100.0);
-    defer pcFreeQsaHybrid(&heir_live);
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 21, s);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
-
-    var lookup = heir_toks ++ [_]u32{ 300, 301 };
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &lookup, false, 0, null, null);
-    try testing.expectEqual(@as(usize, 18), r.matched);
-    try testing.expectEqual(@as(c_int, 18), target[0].qsa_hist_rows);
-    try testing.expect(target[0].qsa_pooled.ctx != null);
-    const ratio: c_int = if (target[0].qsa_ratio > 0) target[0].qsa_ratio else 4;
-    const blocks: c_int = mlx.getShape(target[0].qsa_pooled)[1];
-    const held: c_int = if (target[0].aux_state.ctx != null) mlx.getShape(target[0].aux_state)[1] else 0;
-    try testing.expect(blocks * ratio + held >= 18);
-}
-
-test "HotPrefixCache: a leftover-only checkpoint list is a lookup miss" {
-    const s = mlx.gpuStream();
-    var toks: [19]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 17, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, toks.len);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null) catch |err| blk: {
-        try testing.expectEqual(error.QsaHistoryGap, err);
-        break :blk LookupResult{ .matched = 0, .full_match = false };
-    };
-    try testing.expectEqual(@as(usize, 0), r.matched);
-}
-
-test "HotPrefixCache: v3 heir full-reuse clamp satisfies QSA at the restored position, all four residues" {
-    const s = mlx.gpuStream();
-    var donor_toks: [30]u32 = undefined;
-    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var heir_toks: [28]u32 = undefined;
-    @memcpy(heir_toks[0..21], donor_toks[0..21]);
-    for (heir_toks[21..], 0..) |*t, i| t.* = @intCast(900 + i);
-
-    var donor_live = pcBuildQsaHybrid(s, 25, 100.0);
-    defer pcFreeQsaHybrid(&donor_live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 16, s);
-    donor_cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_live = pcBuildQsaHybrid(s, 21, 200.0);
-    defer pcFreeQsaHybrid(&heir_live);
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 20, s);
-    try transformer_mod.attachQsaHistoryToLatest(heir_own, &heir_live, s);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
-
-    var n: usize = 17;
-    var hits: usize = 0;
-    while (n <= 20) : (n += 1) {
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        const r = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..n], false, 0, null, null) catch |err| blk: {
-            try testing.expectEqual(error.QsaHistoryGap, err);
-            break :blk LookupResult{ .matched = 0, .full_match = false };
-        };
-        try testing.expect(!r.full_match);
-        if (r.matched > 0) {
-            hits += 1;
-            try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
-            try testing.expectEqual(r.matched, moe_off);
-        }
-    }
-    try testing.expect(hits == 4);
-}
-
-fn pcQsaArangeKeys(s: mlx.mlx_stream, rows: c_int, hd: c_int) !mlx.mlx_array {
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    mlx.check(mlx.mlx_arange(&flat, 0.0, @floatFromInt(rows * hd), 1.0, .float32, s)) catch return error.TestUnexpectedResult;
-    var shaped = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(shaped);
-    mlx.check(mlx.mlx_reshape(&shaped, flat, &[_]c_int{ 1, rows, hd }, 3, s)) catch return error.TestUnexpectedResult;
-    var out = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_astype(&out, shaped, .bfloat16, s)) catch return error.TestUnexpectedResult;
-    _ = mlx.mlx_array_eval(out);
-    return out;
-}
-
 fn pcQsaBf16Equal(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
     try testing.expect(a.ctx != null);
     try testing.expect(b.ctx != null);
@@ -8767,14 +7811,14 @@ fn pcQsaBf16Equal(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
     try testing.expect(ok);
 }
 
-fn pcQsaSliceAxis1(s: mlx.mlx_stream, arr: mlx.mlx_array, from: c_int, to: c_int) !mlx.mlx_array {
+pub fn pcQsaSliceAxis1(s: mlx.mlx_stream, arr: mlx.mlx_array, from: c_int, to: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(arr);
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_slice(&out, arr, &[_]c_int{ 0, from, 0 }, 3, &[_]c_int{ sh[0], to, sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
     return out;
 }
 
-fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMCacheEntry, pos: c_int) !void {
+pub fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMCacheEntry, pos: c_int) !void {
     try testing.expectEqual(pos, warm.qsa_hist_rows);
     try testing.expectEqual(pos, cold.qsa_hist_rows);
     const ratio = @max(@max(warm.qsa_ratio, cold.qsa_ratio), 1);
@@ -8815,369 +7859,13 @@ fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMCache
     }
 }
 
-fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+pub fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
     const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
     defer _ = mlx.mlx_array_free(chunk);
     try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);
 }
 
-fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-    var r = lo;
-    while (r <= hi) : (r += 1) {
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        const got = hc.lookupAndRestore(&target_cache, &moe_off, &target, s, toks[0..r], false, 0, null, null) catch |err| {
-            log.warn("qsa value sweep lookup at r={d}: {s}\n", .{ r, @errorName(err) });
-            return err;
-        };
-        try testing.expect(got.matched > 0);
-        const pos: c_int = @intCast(got.matched);
-        var cold = pcEmptySsm();
-        defer pcFreeQsaHybrid(&cold);
-        cold[0].qsa_ratio = 4;
-        try pcQsaFeed(&xfm, &cold[0], keys, pos, s);
-        pcQsaExpectViewEqual(s, &target[0], &cold[0], pos) catch {
-            log.warn("qsa value sweep mismatch r={d} restored={d} full_match={}\n", .{ r, got.matched, got.full_match });
-            return error.TestExpectedEqual;
-        };
-    }
-}
-
-test "HotPrefixCache: restored QSA history values match a cold feed at every position" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const hd: c_int = 8;
-    const P: usize = 80;
-    const keys = try pcQsaArangeKeys(s, @intCast(P), hd);
-    defer _ = mlx.mlx_array_free(keys);
-    var toks: [P]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-
-    // Plain entry: checkpoints at every r in [P-40, P], bank on latest.
-    {
-        var live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&live);
-        const n_cps: usize = 41;
-        const cps = try testing.allocator.alloc(SSMCheckpoint, n_cps);
-        var i: usize = 0;
-        while (i < n_cps) : (i += 1) {
-            const pos: c_int = @intCast(P - 40 + i);
-            const chunk = try pcQsaSliceAxis1(s, keys, 0, pos);
-            defer _ = mlx.mlx_array_free(chunk);
-            transformer_mod.ssmFreeQsaState(&live[0]);
-            live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
-            cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, @intCast(pos), s);
-        }
-        try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        defer hc.deinit();
-        hc.qsa_history_required = true;
-        var cache = try KVCache.init(testing.allocator, 3);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 3, toks.len);
-        _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-        try pcQsaSweep(&hc, &toks, keys, P - 39, P, s);
-    }
-
-    // Inherited entry: donor bank sits above shared; heir is a short-tail commit.
-    {
-        const shared: usize = 48;
-        const donor_len: usize = 64;
-        const donor_keys = try pcQsaArangeKeys(s, @intCast(donor_len), hd);
-        defer _ = mlx.mlx_array_free(donor_keys);
-        var donor_toks: [64]u32 = undefined;
-        for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-        var heir_toks: [56]u32 = undefined;
-        @memcpy(heir_toks[0..shared], donor_toks[0..shared]);
-        for (heir_toks[shared..], 0..) |*t, i| t.* = @intCast(10_000 + i);
-
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        defer hc.deinit();
-        hc.qsa_history_required = true;
-
-        var donor_live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&donor_live);
-        const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 5);
-        for ([_]c_int{ 16, 32, 48, 56, 64 }, 0..) |pos, i| {
-            const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, pos);
-            defer _ = mlx.mlx_array_free(chunk);
-            transformer_mod.ssmFreeQsaState(&donor_live[0]);
-            donor_live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
-            donor_cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, @intCast(pos), s);
-        }
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
-        var donor_cache = try KVCache.init(testing.allocator, 3);
-        defer donor_cache.deinit();
-        try testFillCache(&donor_cache, s, 3, donor_toks.len);
-        _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-        var heir_live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&heir_live);
-        {
-            const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, @intCast(shared));
-            defer _ = mlx.mlx_array_free(chunk);
-            try transformer_mod.qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
-        }
-        const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-        heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, shared, s);
-        var heir_cache = try KVCache.init(testing.allocator, 3);
-        defer heir_cache.deinit();
-        try testFillCache(&heir_cache, s, 3, heir_toks.len);
-        _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
-
-        try pcQsaSweep(&hc, heir_toks[0..shared], donor_keys, 17, shared, s);
-    }
-}
-
-test "HotPrefixCache: QSA trim checkpoint bill matches materialized history" {
-    const s = mlx.gpuStream();
-    var live = pcBuildQsaHybrid(s, 1027, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var cps: [2]SSMCheckpoint = undefined;
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 1027, s);
-    defer cps[1].deinit(testing.allocator);
-    try transformer_mod.attachQsaHistoryToLatest(cps[1..], &live, s);
-    for ([_]usize{ 256, 257, 258, 259, 512, 1024, 1027 }) |pos| {
-        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, pos, s);
-        defer cps[0].deinit(testing.allocator);
-        const predicted = HotPrefixCache.trimmedCheckpointBytes(&cps, 0);
-        try sliceQsaHistoryOntoCheckpoint(&cps[0], &cps[1], pos, s);
-        try testing.expectEqual(predicted, ssmCheckpointBytes(&cps[0]));
-        // Pricing a checkpoint that already carries its bank must not double-bill it.
-        try testing.expectEqual(predicted, HotPrefixCache.trimmedCheckpointBytes(&cps, 0));
-    }
-}
-
-test "HotPrefixCache: oversized QSA trim bills the transferred bank and stays reusable" {
-    const s = mlx.gpuStream();
-    for ([_]transformer_mod.ThinPolicy{ .min_span_recency, .min_span }) |policy| {
-        for ([_]bool{ false, true }) |replace| {
-            var toks: [1024]u32 = undefined;
-            for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-            var live = pcBuildQsaHybrid(s, 1024, 100.0);
-            defer pcFreeQsaHybrid(&live);
-            var cache = try KVCache.init(testing.allocator, 3);
-            defer cache.deinit();
-            try testFillCache(&cache, s, 3, toks.len);
-            var snap = try cache.snapshot();
-            defer snap.deinit();
-            const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-            for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
-            try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-            // 768 KV rows and all small checkpoints fit, but the 768-row bank does not.
-            const budget = HotPrefixCache.snapshotRowBytes(&snap) * 768 + ssmCheckpointBytes(&cps[0]) * 4 + 1024;
-            var hc = HotPrefixCache.initWithMem(testing.allocator, 1, budget);
-            defer hc.deinit();
-            hc.cp_thin = policy;
-            hc.qsa_history_required = true;
-            if (replace) {
-                var seed = try KVCache.init(testing.allocator, 3);
-                defer seed.deinit();
-                try testFillCache(&seed, s, 3, 256);
-                const seed_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-                seed_cps[0] = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
-                try sliceQsaHistoryOntoCheckpoint(&seed_cps[0], &cps[3], 256, s);
-                _ = try hc.commitWithState(&seed, toks[0..256], false, 0, seed_cps, null, null);
-            }
-            const chosen = hc.trimLenForBudget(budget, toks.len, HotPrefixCache.snapshotRowBytes(&snap), cps);
-            _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-            try testing.expectEqual(@as(?usize, 512), chosen);
-            try testing.expectEqual(@as(usize, 1), hc.entryCount());
-            try testing.expect(hc.current_kv_bytes <= budget);
-            try testing.expectEqual(@as(usize, 512), hc.entries.items[0].tokens.len);
-            var restored = pcEmptySsm();
-            defer pcFreeQsaHybrid(&restored);
-            var target = try KVCache.init(testing.allocator, 3);
-            defer target.deinit();
-            var moe_off: usize = 0;
-            const hit = try hc.lookupAndRestore(&target, &moe_off, &restored, s, &toks, false, 0, null, null);
-            try testing.expectEqual(@as(usize, 512), hit.matched);
-        }
-    }
-}
-
-test "HotPrefixCache: shed rescues an interior QSA bank" {
-    const s = mlx.gpuStream();
-    var toks: [30]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 25, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var probe = try KVCache.init(testing.allocator, 3);
-    defer probe.deinit();
-    try testFillCache(&probe, s, 3, toks.len);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    hc.ssm_checkpoint_max = 8;
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    cps[2] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    try transformer_mod.sliceQsaHistoryOntoCheckpoint(&cps[1], &cps[2], cps[1].pos, s);
-    for (cps[2].layers) |*l| {
-        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
-        l.qsa_pooled = .{ .ctx = null };
-    }
-    _ = try hc.commitWithState(&probe, &toks, false, 0, cps, null, null);
-    const before = hc.current_kv_bytes;
-    const listed = hc.entries.items[0].ssm_checkpoints.?;
-    hc.max_kv_bytes = before - ssmCheckpointBytes(&listed[1]) + 1;
-    hc.shedCheckpointsToFit();
-    try testing.expect(hc.entryCount() == 1);
-    const kept = hc.entries.items[0].ssm_checkpoints.?;
-    try testing.expect(kept.len >= 1);
-    try testing.expect(transformer_mod.checkpointListHasQsaPooled(kept));
-}
-
-test "HotPrefixCache: dropLastRestored removes the restored entry so the next lookup is cold" {
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const first = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
-    try testing.expect(first.matched > 0);
-    try testing.expect(hc.dropLastRestored());
-    try testing.expectEqual(@as(usize, 0), hc.entryCount());
-    var target2 = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target2);
-    var moe2: usize = 0;
-    var cache2 = try KVCache.init(testing.allocator, 3);
-    defer cache2.deinit();
-    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
-    try testing.expectEqual(@as(usize, 0), second.matched);
-}
-
-test "HotPrefixCache: QSA self-heal drops the slot model cache and leaves a sibling cache" {
-    const s = mlx.gpuStream();
-    const tokens_a = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    const tokens_b = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
-
-    var last_loaded = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer last_loaded.deinit();
-    last_loaded.qsa_history_required = true;
-    var cache_a = try KVCache.init(testing.allocator, 3);
-    defer cache_a.deinit();
-    try testFillCache(&cache_a, s, 3, tokens_a.len);
-    var live_a = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&live_a);
-    const cps_a = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps_a[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_a, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps_a, &live_a, s);
-    _ = try last_loaded.commitWithState(&cache_a, &tokens_a, false, 0, cps_a, null, null);
-
-    var slot_hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer slot_hc.deinit();
-    slot_hc.qsa_history_required = true;
-    var cache_b = try KVCache.init(testing.allocator, 3);
-    defer cache_b.deinit();
-    try testFillCache(&cache_b, s, 3, tokens_b.len);
-    var live_b = pcBuildQsaHybrid(s, 10, 200.0);
-    defer pcFreeQsaHybrid(&live_b);
-    const cps_b = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps_b[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live_b, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps_b, &live_b, s);
-    _ = try slot_hc.commitWithState(&cache_b, &tokens_b, false, 0, cps_b, null, null);
-
-    var tgt_a = try KVCache.init(testing.allocator, 3);
-    defer tgt_a.deinit();
-    var ssm_a = pcEmptySsm();
-    defer pcFreeQsaHybrid(&ssm_a);
-    var moe_a: usize = 0;
-    const ra = try last_loaded.lookupAndRestore(&tgt_a, &moe_a, &ssm_a, s, &tokens_a, false, 0, null, null);
-    try testing.expect(ra.matched > 0);
-
-    var tgt_b = try KVCache.init(testing.allocator, 3);
-    defer tgt_b.deinit();
-    var ssm_b = pcEmptySsm();
-    defer pcFreeQsaHybrid(&ssm_b);
-    var moe_b: usize = 0;
-    const rb = try slot_hc.lookupAndRestore(&tgt_b, &moe_b, &ssm_b, s, &tokens_b, false, 0, null, null);
-    try testing.expect(rb.matched > 0);
-
-    try testing.expect(HotPrefixCache.dropQsaGapEntry(&slot_hc));
-    try testing.expectEqual(@as(usize, 0), slot_hc.entryCount());
-    try testing.expectEqual(@as(usize, 1), last_loaded.entryCount());
-}
-
-test "HotPrefixCache: inherited checkpoints never exceed the shared prefix" {
-    const s = mlx.gpuStream();
-    var prefix: [18]u32 = undefined;
-    for (&prefix, 0..) |*t, i| t.* = @intCast(i + 1);
-    const donor_toks = prefix ++ [_]u32{ 90, 91 };
-    const prompt_len: usize = 19;
-    const heir_toks = prefix ++ [_]u32{200} ++ [_]u32{ 300, 301, 302, 303, 304, 305, 306, 307 };
-    var live = pcBuildQsaHybrid(s, 18, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    donor_cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 18, s);
-    try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
-
-    var found = false;
-    for (hc.entries.items) |*e| {
-        if (e.tokens.len != heir_toks.len) continue;
-        found = true;
-        const cps = e.ssm_checkpoints orelse continue;
-        for (cps) |*cp| try testing.expect(cp.pos <= prompt_len - 1);
-    }
-    try testing.expect(found);
-}
-
-fn pcArrEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
+pub fn pcArrEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
     if (a.ctx == null and b.ctx == null) return;
     try testing.expect(a.ctx != null);
     try testing.expect(b.ctx != null);
@@ -9190,571 +7878,6 @@ fn pcArrEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !void {
     var ok: bool = false;
     try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
     try testing.expect(ok);
-}
-
-fn pcSsmDiffField(s: mlx.mlx_stream, a: []const SSMCacheEntry, b: []const SSMCacheEntry) ![]const u8 {
-    if (a.len != b.len) return "layer_count";
-    for (a, b, 0..) |*la, *lb, i| {
-        _ = i;
-        if (la.initialized != lb.initialized) return "initialized";
-        if (la.ple_prev_valid != lb.ple_prev_valid) return "ple_prev_valid";
-        if (!std.mem.eql(u32, &la.ple_prev, &lb.ple_prev)) return "ple_prev";
-        if (la.qsa_ratio != lb.qsa_ratio) return "qsa_ratio";
-        if (la.qsa_hist_rows != lb.qsa_hist_rows) return "qsa_hist_rows";
-        if (la.qsa_key_rows != lb.qsa_key_rows) return "qsa_key_rows";
-        if (la.qsa_pooled_blocks != lb.qsa_pooled_blocks) return "qsa_pooled_blocks";
-        pcArrEqual(s, la.conv_state, lb.conv_state) catch return "conv_state";
-        pcArrEqual(s, la.ssm_state, lb.ssm_state) catch return "ssm_state";
-        pcArrEqual(s, la.qsa_pooled, lb.qsa_pooled) catch return "qsa_pooled";
-        pcArrEqual(s, la.aux_state, lb.aux_state) catch return "aux_state";
-    }
-    return "";
-}
-
-fn pcCaptureFed(
-    allocator: std.mem.Allocator,
-    s: mlx.mlx_stream,
-    xfm: *transformer_mod.Transformer,
-    keys: mlx.mlx_array,
-    pos: c_int,
-    conv_base: f64,
-    ple0: u32,
-) !SSMCheckpoint {
-    var live: [3]SSMCacheEntry = .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = mlx.mlx_array_new(), .initialized = true, .ple_prev = .{ ple0, 0, 0, 0, 0, 0, 0, 0 }, .ple_prev_valid = true },
-        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
-    };
-    defer pcFreeQsaHybrid(&live);
-    try pcQsaFeed(xfm, &live[0], keys, pos, s);
-    return transformer_mod.captureSsmCheckpoint(allocator, &live, @intCast(pos), s);
-}
-
-test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const P: usize = 20;
-    const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-    const keys = try pcQsaArangeKeys(s, 40, hd);
-    defer _ = mlx.mlx_array_free(keys);
-    var donor_toks: [40]u32 = undefined;
-    var heir_toks: [40]u32 = undefined;
-    for (0..P) |i| {
-        donor_toks[i] = @intCast(i + 1);
-        heir_toks[i] = @intCast(i + 1);
-    }
-    for (P..40) |i| {
-        donor_toks[i] = @intCast(1000 + i);
-        heir_toks[i] = @intCast(2000 + i);
-    }
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 8, 100.0, 8);
-    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 16, 160.0, 16);
-    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 30, 300.0, 30);
-    donor_cps[3] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 40, 400.0, 40);
-    {
-        var live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&live);
-        try pcQsaFeed(&xfm, &live[0], keys, 40, s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, null, null, null);
-
-    var found = false;
-    for (hc.entries.items) |*e| {
-        if (e.tokens.len != heir_toks.len or e.tokens[P] != heir_toks[P]) continue;
-        found = true;
-        const cps = e.ssm_checkpoints orelse return error.TestExpectedEqual;
-        for (cps) |*cp| try testing.expect(cp.pos <= P);
-    }
-    try testing.expect(found);
-
-    var rpos: usize = P - 4;
-    while (rpos <= P) : (rpos += 1) {
-        var target_cache = try KVCache.init(testing.allocator, 3);
-        defer target_cache.deinit();
-        var target = pcEmptySsm();
-        defer pcFreeQsaHybrid(&target);
-        var moe_off: usize = 0;
-        const got = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, heir_toks[0..rpos], false, 0, null, null);
-        try testing.expect(got.matched > 0);
-        try testing.expect(got.matched <= P);
-        var cold = pcEmptySsm();
-        defer pcFreeQsaHybrid(&cold);
-        cold[0].qsa_ratio = 4;
-        try pcQsaFeed(&xfm, &cold[0], keys, @intCast(got.matched), s);
-        pcQsaExpectViewEqual(s, &target[0], &cold[0], @intCast(got.matched)) catch {
-            log.warn("inherit divergence restore mismatch pos={d} restored={d}\n", .{ rpos, got.matched });
-            return error.TestExpectedEqual;
-        };
-    }
-}
-
-test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const P: usize = 48;
-    const prompt_len: usize = P - 1;
-    const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-    const keys = try pcQsaArangeKeys(s, 80, hd);
-    defer _ = mlx.mlx_array_free(keys);
-
-    var donor_toks: [64]u32 = undefined;
-    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var heir_toks: [59]u32 = undefined;
-    @memcpy(&heir_toks, donor_toks[0..59]);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 19, 190.0, 19);
-    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(P), 480.0, 48);
-    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 64, 640.0, 64);
-    {
-        var live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&live);
-        try pcQsaFeed(&xfm, &live[0], keys, 64, s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    _ = try hc.commitWithMediaState(&heir_cache, &heir_toks, false, 0, 0, null, null, null, null, prompt_len);
-
-    var found = false;
-    for (hc.entries.items) |*e| {
-        if (e.tokens.len != heir_toks.len) continue;
-        found = true;
-        const cps = e.ssm_checkpoints orelse return error.TestExpectedEqual;
-        for (cps) |*cp| try testing.expect(cp.pos <= prompt_len);
-    }
-    try testing.expect(found);
-}
-
-test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at every residue" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const hd: c_int = 8;
-    const ratio: c_int = 4;
-    const B: usize = 19;
-    const H: usize = 80;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-    const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
-    defer _ = mlx.mlx_array_free(keys);
-
-    var live: [3]SSMCacheEntry = .{
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio },
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-    };
-    defer pcFreeQsaHybrid(&live);
-    try pcQsaFeed(&xfm, &live[0], keys, @intCast(B), s);
-    var cps = [_]SSMCheckpoint{
-        try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, B, s),
-        undefined,
-    };
-    transformer_mod.ssmFreeQsaState(&live[0]);
-    live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio };
-    try pcQsaFeed(&xfm, &live[0], keys, @intCast(H), s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, H, s);
-    defer for (&cps) |*c| c.deinit(testing.allocator);
-    try transformer_mod.attachQsaHistoryToLatest(&cps, &live, s);
-    if (live[0].aux_state.ctx != null) {
-        if (cps[1].layers[0].aux_state.ctx != null) _ = mlx.mlx_array_free(cps[1].layers[0].aux_state);
-        cps[1].layers[0].aux_state = try transformer_mod.materializedOwnedCopy(s, live[0].aux_state);
-        _ = mlx.mlx_array_eval(cps[1].layers[0].aux_state);
-    }
-
-    var cold = pcEmptySsm();
-    defer pcFreeQsaHybrid(&cold);
-    cold[0].qsa_ratio = ratio;
-    try pcQsaFeed(&xfm, &cold[0], keys, @intCast(B), s);
-
-    var from_full = pcEmptySsm();
-    defer pcFreeQsaHybrid(&from_full);
-    try transformer_mod.restoreSsmCheckpoint(&from_full, &cps[0]);
-    transformer_mod.applyQsaHistoryAt(&from_full, &cps[1], B, s, false) catch |err| {
-        std.debug.print("sliced-apply residue fail K=full field=apply {s}\n", .{@errorName(err)});
-        return err;
-    };
-    pcQsaExpectViewEqual(s, &from_full[0], &cold[0], @intCast(B)) catch {
-        std.debug.print("sliced-apply residue fail K=full field=cold_view hist={d}/{d} blocks={d}\n", .{
-            from_full[0].qsa_hist_rows,
-            from_full[0].qsa_key_rows,
-            from_full[0].qsa_pooled_blocks,
-        });
-        return error.TestExpectedEqual;
-    };
-
-    var K: usize = B + 1;
-    while (K < H) : (K += 1) {
-        var sliced = try transformer_mod.shareSsmCheckpoint(testing.allocator, &cps[0]);
-        defer sliced.deinit(testing.allocator);
-        sliced.pos = K;
-        try transformer_mod.sliceQsaHistoryOntoCheckpoint(&sliced, &cps[1], K, s);
-
-        var from_sliced = pcEmptySsm();
-        defer pcFreeQsaHybrid(&from_sliced);
-        try transformer_mod.restoreSsmCheckpoint(&from_sliced, &cps[0]);
-        transformer_mod.applyQsaHistoryAt(&from_sliced, &sliced, B, s, false) catch |err| {
-            std.debug.print("sliced-apply residue fail K={d} field=apply {s}\n", .{ K, @errorName(err) });
-            return err;
-        };
-
-        const field = try pcSsmDiffField(s, &from_full, &from_sliced);
-        if (field.len != 0) {
-            std.debug.print("sliced-apply residue fail K={d} field={s} full_hist={d}/{d} sliced_hist={d}/{d} full_blocks={d} sliced_blocks={d}\n", .{
-                K,
-                field,
-                from_full[0].qsa_hist_rows,
-                from_full[0].qsa_key_rows,
-                from_sliced[0].qsa_hist_rows,
-                from_sliced[0].qsa_key_rows,
-                from_full[0].qsa_pooled_blocks,
-                from_sliced[0].qsa_pooled_blocks,
-            });
-            return error.TestExpectedEqual;
-        }
-        pcQsaExpectViewEqual(s, &from_sliced[0], &cold[0], @intCast(B)) catch {
-            std.debug.print("sliced-apply residue fail K={d} field=cold_view\n", .{K});
-            return error.TestExpectedEqual;
-        };
-    }
-}
-
-test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const hd: c_int = 8;
-    const P: usize = 48;
-    const backoff: usize = 19;
-    const donor_gen: usize = 16;
-    const heir_gen: usize = 12;
-    const a2_extra: usize = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.s = s;
-    xfm.allocator = testing.allocator;
-
-    const donor_len = P + donor_gen;
-    const a2_len = donor_len + a2_extra;
-    const heir_len = (P - 1) + heir_gen;
-    const keys = try pcQsaArangeKeys(s, @intCast(a2_len), hd);
-    defer _ = mlx.mlx_array_free(keys);
-
-    var donor_toks: [P + donor_gen]u32 = undefined;
-    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var a2_toks: [P + donor_gen + a2_extra]u32 = undefined;
-    @memcpy(a2_toks[0..donor_toks.len], &donor_toks);
-    for (a2_toks[donor_toks.len..], 0..) |*t, i| t.* = @intCast(50_000 + i);
-    var heir_toks: [(P - 1) + heir_gen]u32 = undefined;
-    @memcpy(heir_toks[0 .. P - 1], donor_toks[0 .. P - 1]);
-    for (heir_toks[P - 1 ..], 0..) |*t, i| t.* = @intCast(90_000 + i);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    donor_cps[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(backoff), 190.0, 19);
-    donor_cps[1] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(P), 480.0, 48);
-    donor_cps[2] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(donor_len), 640.0, 64);
-    {
-        var live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&live);
-        try pcQsaFeed(&xfm, &live[0], keys, @intCast(donor_len), s);
-        try transformer_mod.attachQsaHistoryToLatest(donor_cps, &live, s);
-    }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    var a2_cache = try KVCache.init(testing.allocator, 3);
-    defer a2_cache.deinit();
-    try testFillCache(&a2_cache, s, 3, a2_toks.len);
-    const a2_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    a2_own[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, @intCast(a2_len), 720.0, 72);
-    {
-        var live: [3]SSMCacheEntry = .{
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-            .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false },
-        };
-        defer pcFreeQsaHybrid(&live);
-        try pcQsaFeed(&xfm, &live[0], keys, @intCast(a2_len), s);
-        try transformer_mod.attachQsaHistoryToLatest(a2_own, &live, s);
-    }
-    _ = try hc.commitWithState(&a2_cache, &a2_toks, false, 0, a2_own, null, null);
-
-    var donor_restored = pcEmptySsm();
-    defer pcFreeQsaHybrid(&donor_restored);
-    var donor_kv = try KVCache.init(testing.allocator, 3);
-    defer donor_kv.deinit();
-    var donor_moe: usize = 0;
-    const donor_hit = try hc.lookupAndRestore(&donor_kv, &donor_moe, &donor_restored, s, a2_toks[0..P], false, 0, null, null);
-    try testing.expectEqual(backoff, donor_hit.matched);
-
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try pcCaptureFed(testing.allocator, s, &xfm, keys, 44, 440.0, 44);
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
-
-    var heir_restored = pcEmptySsm();
-    defer pcFreeQsaHybrid(&heir_restored);
-    var heir_kv = try KVCache.init(testing.allocator, 3);
-    defer heir_kv.deinit();
-    var heir_moe: usize = 0;
-    const heir_hit = try hc.lookupAndRestore(&heir_kv, &heir_moe, &heir_restored, s, &heir_toks, false, 0, null, null);
-    try testing.expectEqual(backoff, heir_hit.matched);
-
-    const field = try pcSsmDiffField(s, &donor_restored, &heir_restored);
-    if (field.len != 0) {
-        log.warn("heir vs donor restore differed in {s} (donor_pos={d} heir_pos={d} heir_hist={d}/{d} donor_hist={d}/{d})\n", .{
-            field,
-            donor_hit.matched,
-            heir_hit.matched,
-            heir_restored[0].qsa_hist_rows,
-            heir_restored[0].qsa_key_rows,
-            donor_restored[0].qsa_hist_rows,
-            donor_restored[0].qsa_key_rows,
-        });
-        return error.TestExpectedEqual;
-    }
-    _ = heir_len;
-}
-
-test "HotPrefixCache: a verbatim re-send restores at prompt_len-1" {
-    const s = mlx.gpuStream();
-    var toks: [19]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 18, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, toks.len);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, toks.len - 1, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
-    try testing.expectEqual(toks.len - 1, r.matched);
-    try testing.expect(!r.full_match);
-    try testing.expect(transformer_mod.qsaRestoreSatisfiesForward(&target, r.matched));
-}
-
-test "HotPrefixCache: a hybrid full-prefix extend checks out under SSD-first" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    restore_move_override = true;
-    defer restore_move_override = null;
-    var toks: [10]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var prompt: [12]u32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 8, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    hc.ssd_first = true;
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, toks.len);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-
-    var slot = try KVCache.init(testing.allocator, 3);
-    defer slot.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestoreForSlot(&slot, &moe_off, &target, s, &prompt, false, 0, null, null, null, 0xA11CE);
-    try testing.expect(r.matched > 0);
-    try testing.expect(r.checked_out);
-    try testing.expectEqual(@as(?usize, 0xA11CE), hc.entries.items[0].checked_out_by);
-}
-
-test "HotPrefixCache: walk-down restores the higher covering checkpoint, not a lower one" {
-    const s = mlx.gpuStream();
-    var toks: [20]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 16, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, toks.len);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 16, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &toks, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &toks, false, 0, null, null);
-    try testing.expectEqual(@as(usize, 16), r.matched);
-    try testing.expect(target[0].qsa_pooled.ctx != null);
-}
-
-test "HotPrefixCache: skip set on the cache without a lookup does not poison the next request" {
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, &.{}, null, null, null, true);
-    try testing.expectEqual(@as(usize, 0), skipped.matched);
-    var cache2 = try KVCache.init(testing.allocator, 3);
-    defer cache2.deinit();
-    var target2 = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target2);
-    var moe2: usize = 0;
-    const leaked = try hc.lookupAndRestoreWithMedia(&cache2, &moe2, &target2, s, &tokens, false, 0, null, &.{}, null, null, null, false);
-    try testing.expect(leaked.matched > 0);
-}
-
-test "HotPrefixCache: skip_prefix_cache lookup is cold even when a covering entry exists" {
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target);
-    var moe_off: usize = 0;
-    const skipped = try hc.lookupAndRestoreWithMedia(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, &.{}, null, null, null, true);
-    try testing.expectEqual(@as(usize, 0), skipped.matched);
-
-    var target2 = pcEmptySsm();
-    defer pcFreeQsaHybrid(&target2);
-    var moe2: usize = 0;
-    var cache2 = try KVCache.init(testing.allocator, 3);
-    defer cache2.deinit();
-    const second = try hc.lookupAndRestore(&cache2, &moe2, &target2, s, &tokens, false, 0, null, null);
-    try testing.expect(second.matched > 0);
-}
-
-test "HotPrefixCache: a skipped lookup of a covering prompt matches a cold cache" {
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildQsaHybrid(s, 10, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-
-    var skipped_cache = try KVCache.init(testing.allocator, 3);
-    defer skipped_cache.deinit();
-    var skipped_ssm = pcEmptySsm();
-    defer pcFreeQsaHybrid(&skipped_ssm);
-    var skip_off: usize = 7;
-    const skipped = try hc.lookupAndRestoreWithMedia(&skipped_cache, &skip_off, &skipped_ssm, s, &tokens, false, 0, null, &.{}, null, null, null, true);
-
-    var cold = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer cold.deinit();
-    cold.qsa_history_required = true;
-    var cold_cache = try KVCache.init(testing.allocator, 3);
-    defer cold_cache.deinit();
-    var cold_ssm = pcEmptySsm();
-    defer pcFreeQsaHybrid(&cold_ssm);
-    var cold_off: usize = 7;
-    const cold_r = try cold.lookupAndRestore(&cold_cache, &cold_off, &cold_ssm, s, &tokens, false, 0, null, null);
-    try testing.expectEqual(cold_r.matched, skipped.matched);
-    try testing.expectEqual(cold_off, skip_off);
-    try testing.expectEqual(@as(usize, 0), skipped.matched);
 }
 
 test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
@@ -9814,117 +7937,6 @@ test "HotPrefixCache: dropping a disk hybrid restore poisons that disk entry" {
     try testing.expectEqual(@as(usize, 0), res3.matched);
 }
 
-test "HotPrefixCache: inherit-branch QSA invariant drop unbills the dropped SSM bytes" {
-    const s = mlx.gpuStream();
-    var donor_toks: [30]u32 = undefined;
-    for (&donor_toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var heir_toks: [19]u32 = undefined;
-    @memcpy(heir_toks[0..17], donor_toks[0..17]);
-    heir_toks[17] = 900;
-    heir_toks[18] = 901;
-
-    var live = pcBuildQsaHybrid(s, 17, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var ctrl = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer ctrl.deinit();
-    var ctrl_cache = try KVCache.init(testing.allocator, 3);
-    defer ctrl_cache.deinit();
-    try testFillCache(&ctrl_cache, s, 3, heir_toks.len);
-    _ = try ctrl.commitWithState(&ctrl_cache, &heir_toks, false, 0, null, null, null);
-    const snap_only = ctrl.entries.items[0].kv_bytes;
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    var donor_cache = try KVCache.init(testing.allocator, 3);
-    defer donor_cache.deinit();
-    try testFillCache(&donor_cache, s, 3, donor_toks.len);
-    const donor_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    donor_cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 17, s);
-    for (donor_cps[0].layers) |*l| {
-        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
-        l.qsa_pooled = .{ .ctx = null };
-    }
-    _ = try hc.commitWithState(&donor_cache, &donor_toks, false, 0, donor_cps, null, null);
-
-    hc.qsa_history_required = true;
-    var heir_live = pcBuildQsaHybrid(s, 19, 100.0);
-    defer pcFreeQsaHybrid(&heir_live);
-    var heir_cache = try KVCache.init(testing.allocator, 3);
-    defer heir_cache.deinit();
-    try testFillCache(&heir_cache, s, 3, heir_toks.len);
-    const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
-    heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, 18, s);
-    for (heir_own[0].layers) |*l| {
-        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
-        l.qsa_pooled = .{ .ctx = null };
-    }
-    _ = try hc.commitWithState(&heir_cache, &heir_toks, false, 0, heir_own, null, null);
-
-    var found = false;
-    for (hc.entries.items) |*e| {
-        if (e.tokens.len != heir_toks.len) continue;
-        found = true;
-        try testing.expect(e.ssm_checkpoints == null);
-        try testing.expectEqual(@as(u64, 0), e.ssm_bytes);
-        try testing.expectEqual(snap_only, e.kv_bytes);
-    }
-    try testing.expect(found);
-}
-
-test "HotPrefixCache: shedding the oldest QSA bank with no lower destination drops the list" {
-    const s = mlx.gpuStream();
-    var toks: [30]u32 = undefined;
-    for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
-    var live = pcBuildQsaHybrid(s, 8, 100.0);
-    defer pcFreeQsaHybrid(&live);
-    var live2 = pcBuildQsaHybrid(s, 25, 200.0);
-    defer pcFreeQsaHybrid(&live2);
-    var probe = try KVCache.init(testing.allocator, 3);
-    defer probe.deinit();
-    try testFillCache(&probe, s, 3, toks.len);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.qsa_history_required = true;
-    hc.ssm_checkpoint_max = 8;
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live2, 25, s);
-    try transformer_mod.attachQsaHistoryToLatest(cps[0..1], &live, s);
-    for (cps[1].layers) |*l| {
-        if (l.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(l.qsa_pooled);
-        l.qsa_pooled = .{ .ctx = null };
-    }
-    _ = try hc.commitWithState(&probe, &toks, false, 0, cps, null, null);
-    hc.max_kv_bytes = 1;
-    hc.shedCheckpointsToFit();
-    try testing.expect(hc.entryCount() == 1);
-    try testing.expect(hc.entries.items[0].ssm_checkpoints == null);
-}
-
-test "HotPrefixCache: a QSA-required restore without indexer history is a miss even when forward-satisfy is vacuous" {
-    const s = mlx.gpuStream();
-    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, tokens.len);
-    var live = pcBuildHybrid(s, 123.0, 456.0);
-    defer pcFreeHybrid(&live);
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 8, s);
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, cps, null, null);
-    hc.qsa_history_required = true;
-
-    var target_cache = try KVCache.init(testing.allocator, 3);
-    defer target_cache.deinit();
-    var target = pcEmptySsm();
-    defer pcFreeHybrid(&target);
-    var moe_off: usize = 0;
-    const r = try hc.lookupAndRestore(&target_cache, &moe_off, &target, s, &tokens, false, 0, null, null);
-    try testing.expectEqual(@as(usize, 0), r.matched);
-}
-
 test "prefix cache: a hybrid miss with a raw token match names itself" {
     // The silent null: `findBestRestorableMatch` rejects every candidate that
     // has no SSM checkpoint at or below its shared prefix, so the lookup can
@@ -9939,29 +7951,6 @@ test "prefix cache: a hybrid miss with a raw token match names itself" {
     // At and above it, a cold prefill of that many tokens owes an explanation.
     try testing.expectEqual(MissKind.no_checkpoint, missKind(1, MIN_CANCELLED_COMMIT_TOKENS));
     try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
-}
-
-test "prefix cache: the no-match lookup arm consults missKind, never returns silently" {
-    // Class guard for the 560 s unexplained cold prefill: every early return
-    // from the lookup owes a reason. The `match == null` arm is the one that
-    // had none, and it is reachable only through this file.
-    const source = @embedFile("prefix_cache.zig");
-    const start = std.mem.indexOf(u8, source, "if (match == null) {") orelse
-        return error.MissingNoMatchArm;
-    const arm = source[start .. start + 900];
-    const end = std.mem.indexOf(u8, arm, "return .{ .matched = 0, .full_match = false };") orelse
-        return error.MissingNoMatchReturn;
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "missKind(") != null);
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "[hot-cache] hybrid miss") != null);
-    // The probe must be filled BEFORE the restorability filter can `continue`
-    // a candidate away, or `best_raw` is always 0 and the line never fires.
-    const fbr = std.mem.indexOf(u8, source, "fn findBestRestorableMatch(") orelse
-        return error.MissingFinder;
-    const body = source[fbr .. fbr + 2600];
-    const probe_at = std.mem.indexOf(u8, body, "if (probe) |p| {") orelse return error.MissingProbe;
-    const filter_at = std.mem.indexOf(u8, body, "const effective = if (require_ssm_checkpoint)") orelse
-        return error.MissingFilter;
-    try testing.expect(probe_at < filter_at);
 }
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {
@@ -10484,87 +8473,6 @@ test "the admission pass weighs an eviction after the GPU work still reading the
     try t.expect(!rep.shared_stop);
     try t.expect(rep.bytes * HotPrefixCache.SHARED_RETURN_DIVISOR >= rep.accounted_bytes);
 }
-test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
-    // The qwen4_exp head's KV is meaningless without its index-key history, so the two halves
-    // adopt together or not at all. Everything else is KV-only and keeps the old rule.
-    const Tag = std.meta.Tag(SpecAdopt);
-    const Plan = struct {
-        fn tag(p: SpecAdopt) Tag {
-            return std.meta.activeTag(p);
-        }
-        fn len(p: SpecAdopt) usize {
-            return switch (p) {
-                .kv_only, .head => |w| w,
-                else => std.math.maxInt(usize),
-            };
-        }
-    };
-    try testing.expectEqual(Tag.kv_only, Plan.tag(specAdoptPlan(10, 40, 31, false, false)));
-    try testing.expectEqual(@as(usize, 21), Plan.len(specAdoptPlan(10, 40, 31, false, false)));
-    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(40, 40, 31, false, false))); // starts past the reuse
-    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, false, false))); // ends short of it
-    try testing.expectEqual(@as(usize, 31), Plan.len(specAdoptPlan(0, 31, 31, false, false))); // exact
-
-    try testing.expectEqual(Tag.head, Plan.tag(specAdoptPlan(10, 40, 31, true, true)));
-    try testing.expectEqual(@as(usize, 21), Plan.len(specAdoptPlan(10, 40, 31, true, true)));
-    try testing.expectEqual(Tag.decline_head_no_history, Plan.tag(specAdoptPlan(10, 40, 31, true, false)));
-    // A payload the trunk cannot use is skipped before the aux question.
-    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(40, 40, 31, true, false)));
-    try testing.expectEqual(Tag.skip, Plan.tag(specAdoptPlan(0, 20, 31, true, false)));
-}
-
-test "qwen4 MTP head persist: the head's row count IS its cache step, so a committed history adopts" {
-    // `KVCache.update` advances `step` only at layer 0, so `qwen4MtpAdvance` sets the head's;
-    // the commit snapshots it and `qwen4MtpAdopt` demands the key history be exactly that long.
-    const s = mlx.gpuStream();
-    const head_layer: u32 = 3; // stands in for `num_hidden_layers`
-    var kv = try KVCache.init(testing.allocator, head_layer + 1);
-    defer kv.deinit();
-    var seq_offset: usize = 0;
-    try testFillHeadCache(&kv, s, head_layer, 100, &seq_offset);
-    try testing.expectEqual(@as(usize, 100), seq_offset);
-    try testing.expectEqual(seq_offset, kv.step);
-
-    var snap = DflashSnap{ .snapshot = try kv.snapshot(), .base_pos = 0 };
-    defer snap.deinit();
-    try testing.expectEqual(seq_offset, snap.snapshot.step);
-
-    const Tag = std.meta.Tag(SpecAdopt);
-    const plan = specAdoptPlan(snap.base_pos, snap.snapshot.step, seq_offset, true, true);
-    try testing.expectEqual(Tag.head, std.meta.activeTag(plan));
-    try testing.expectEqual(seq_offset, plan.head);
-    try testing.expectEqual(@as(usize, 100), snap.snapshot.step);
-
-    // The shape the bug had: the step `KVCache.update` left at a non-zero layer is not adoptable.
-    try testing.expectEqual(Tag.skip, std.meta.activeTag(specAdoptPlan(0, 0, seq_offset, true, true)));
-}
-
-test "spec snap bytes: the qwen4 head's QSA half is billed into the entry" {
-    const s = mlx.gpuStream();
-    // Head-shaped: one layer at the head's own index, never layer 0.
-    const head_layer: u32 = 3;
-    var kv = try KVCache.init(testing.allocator, head_layer + 1);
-    defer kv.deinit();
-    var head_rows: usize = 0;
-    try testFillHeadCache(&kv, s, head_layer, 16, &head_rows);
-    try testing.expectEqual(head_rows, kv.step);
-    var snap = DflashSnap{ .snapshot = try kv.snapshot(), .base_pos = 0 };
-    defer snap.deinit();
-    const kv_only = HotPrefixCache.specSnapBytes(&snap);
-    try testing.expect(kv_only > 0);
-
-    var entry: SSMCacheEntry = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = true };
-    defer transformer_mod.ssmFreeQsaState(&entry);
-    defer _ = mlx.mlx_array_free(entry.conv_state);
-    defer _ = mlx.mlx_array_free(entry.ssm_state);
-    const shape = [_]c_int{ 1, 16, 128 };
-    entry.aux_state = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_zeros(&entry.aux_state, &shape, 3, .bfloat16, s));
-    entry.qsa_ratio = 4;
-    snap.head_aux = transformer_mod.ssmSnapshot(&entry);
-    const with_head = HotPrefixCache.specSnapBytes(&snap);
-    try testing.expectEqual(kv_only + 16 * 128 * 2, with_head);
-}
 
 test "SSD-first: the disk flush carries the full prefix while RAM keeps a trim" {
     const io = std.testing.io;
@@ -10767,11 +8675,12 @@ test "SSD-first: an in-flight write does not stall the tick — the entry is re-
     // Generous allowance: this test is about the write state, not the cap.
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
+    // Held before the commits: the second commit flushes the first entry, which a running writer would finish.
+    hc.disk.?.writer.?.setPaused(true);
+    defer hc.disk.?.writer.?.setPaused(false);
     _ = try hc.commit(&cache, &tok_a, false);
     _ = try hc.commit(&cache, &tok_b, false);
 
-    hc.disk.?.writer.?.setPaused(true);
-    defer hc.disk.?.writer.?.setPaused(false);
     hc.spillIdleEntries(s);
     // It returned, the index knows the entry, and RAM still holds it.
     try testing.expect(hc.disk.?.writer.?.pendingBytes() > 0);
@@ -11584,7 +9493,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
     // the first `writeAtOffset` cannot donate: `copy_gpu` privatised the whole prefix (5.13 GB /
     // ~110 ms at 393k, 45% of the warm TTFT). The observable is allocation, not address: under
     // suite-wide pressure the buffer pool recycles addresses.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -11678,7 +9587,7 @@ fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void 
 }
 
 test "a one-token prompt that hits its own entry prefills cold: a restore leaves a token to forward" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const tokens = [_]u32{42};
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -11696,7 +9605,7 @@ test "a one-token prompt that hits its own entry prefills cold: a restore leaves
 
 test "restore by move ON DEMAND: a share that does not fit is taken over, off SSD-first" {
     // The admission pass converts a full-entry hit into a checkout; a partial hit and a second call decline.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     restore_move_override = true;
     defer restore_move_override = null;
@@ -12103,12 +10012,13 @@ test "SSD-first: the durability check STATS the chunks — a truncated file is n
     hc.disk.?.enableBackgroundWriter();
     hc.ssd_idle_mem = 64 * 1024 * 1024 * 1024;
 
+    // Pass 1 stages A with the writer held; pass 2, after the files land, is the healthy control.
+    // Held before the commits: the second commit flushes the first entry, which a running writer would finish.
+    hc.disk.?.writer.?.setPaused(true);
+    defer hc.disk.?.writer.?.setPaused(false);
     _ = try hc.commit(&cache, &tok_a, false);
     _ = try hc.commit(&cache, &tok_b, false);
 
-    // Pass 1 stages A with the writer held; pass 2, after the files land, is the healthy control.
-    hc.disk.?.writer.?.setPaused(true);
-    defer hc.disk.?.writer.?.setPaused(false);
     hc.spillIdleEntries(s);
     try testing.expect(!(try testEntryFor(&hc, &tok_a)).spill_durable);
     hc.disk.?.writer.?.setPaused(false);
@@ -12273,7 +10183,7 @@ fn testCheckedOutRetentionCap(max_entries: u32, max_bytes: u64) !void {
 }
 
 test "a restore names its entry, and a commit that extends it in place keeps the id" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [64]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -12298,7 +10208,7 @@ test "a restore names its entry, and a commit that extends it in place keeps the
 }
 
 test "a donated checkout names the bytes its slot now holds; a share names none" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
@@ -12391,69 +10301,8 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
     }
 }
 
-test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and restart" {
-    const a = testing.allocator;
-    const io = testing.io;
-    const s = mlx.gpuStream();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var path: [512]u8 = undefined;
-    const base = path[0..try tmp.dir.realPath(io, &path)];
-    var config = model_mod.ModelConfig{ .model_type = "lfm2", .has_hybrid_layers = true };
-    try testing.expect(HotPrefixCache.shouldUse(&config, true));
-    try testing.expect(ssdFirstActive(&config, true, false));
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 7);
-    for (0..2) |boot| {
-        var hc = HotPrefixCache.initWithMem(a, 0, 0);
-        hc.ssd_first = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
-        hc.disk.?.ssd_first = true;
-        hc.disk.?.enableBackgroundWriter();
-        defer hc.deinit();
-        try testing.expect(hc.disk.?.writer != null);
-        var cache = try KVCache.init(a, 3);
-        defer cache.deinit();
-        if (boot == 0) {
-            var written: u32 = 0;
-            while (written < tokens.len) : (written += 64) {
-                try testWriteCacheLayer(&cache, s, 1, written, @intCast(@min(64, tokens.len - written)));
-            }
-            var source = pcEmptySsm();
-            defer pcFreeHybrid(&source);
-            _ = mlx.mlx_array_free(source[0].conv_state);
-            source[0].conv_state = pcArange(s, &conv_shape_pc, 300);
-            source[0].initialized = true;
-            const cps = try a.alloc(SSMCheckpoint, 1);
-            cps[0] = try transformer_mod.captureSsmCheckpoint(a, &source, 512, s);
-            const status = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
-            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
-            try testing.expectEqual(std.meta.Tag(CommitStatus).disk_only, std.meta.activeTag(status));
-            try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
-            hc.flushPendingDisk(s);
-            hc.disk.?.drainWriter();
-            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        } else {
-            var restored = pcEmptySsm();
-            defer pcFreeHybrid(&restored);
-            var offset: usize = 0;
-            const hit = try hc.lookupAndRestore(&cache, &offset, &restored, s, &tokens, false, 0, null, null);
-            try testing.expectEqual(@as(usize, 512), hit.matched);
-            try testing.expectEqual(@as(usize, 512), offset);
-            try testing.expect(!cache.entries[0].initialized);
-            try testing.expect(cache.entries[1].initialized);
-            try testing.expectEqual(@as(usize, 512), cache.entries[1].offset);
-            try testing.expect(restored[0].initialized);
-            try testing.expectEqual(@as(f32, 300), pcSsmVal(restored[0].conv_state, 0, s));
-            try testing.expect(restored[0].ssm_state.ctx == null);
-        }
-        try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-    }
-}
-
 test "SSD-only ring checkpoints survive restart without idle RAM" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const a = testing.allocator;
     const io = testing.io;
     const s = mlx.gpuStream();
@@ -12504,1165 +10353,14 @@ test "SSD-only ring checkpoints survive restart without idle RAM" {
     }
 }
 
-/// A GLM fixture turn: `tokens` prefilled in `chunks`, a KDA checkpoint after each chunk listed in
-/// `checkpoints` (chunk indices), MLA rows to the request's last pool boundary.
-const GlmTurn = struct {
-    cps: []SSMCheckpoint,
-    rows: glm5_prefix.MlaRows,
-    cache: KVCache,
-
-    fn run(net: *const glm5_forward.Model, bits: u8, tokens: []const u32, chunks: []const usize, checkpoints: []const usize) !GlmTurn {
-        var req = try glm5_prefix.servedRequest(bits);
-        defer req.deinit();
-        var cps = try testing.allocator.alloc(SSMCheckpoint, checkpoints.len);
-        var built: usize = 0;
-        errdefer {
-            for (cps[0..built]) |*cp| cp.deinit(testing.allocator);
-            testing.allocator.free(cps);
-        }
-        var at: usize = 0;
-        for (chunks, 0..) |n, i| {
-            _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &req, tokens[at .. at + n], &.{n}));
-            at += n;
-            if (std.mem.indexOfScalar(usize, checkpoints, i) != null) {
-                cps[built] = try glm5_prefix.captureKda(testing.allocator, &req, mlx.gpuStream());
-                built += 1;
-            }
-        }
-        var rows = try glm5_prefix.MlaRows.capture(testing.allocator, &req, req.offset / 4 * 4, mlx.gpuStream());
-        errdefer rows.deinit();
-        var cache = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
-        cache.step = req.offset;
-        return .{ .cps = cps, .rows = rows, .cache = cache };
-    }
-
-    /// Hands `cps` and `rows` to the cache.
-    fn commit(self: *GlmTurn, hc: *HotPrefixCache, tokens: []const u32, vision_key: u64, media_start: ?usize) !CommitStatus {
-        defer self.cache.deinit();
-        return hc.commitGlm(&self.cache, tokens, false, vision_key, 0, media_start, self.cps, self.rows, null, tokens.len);
-    }
-};
-
-fn glmKvConfig(bits: u8) kv_quant.KVQuantConfig {
-    return if (bits == 0) kv_quant.KVQuantConfig.dense else kv_quant.KVQuantConfig.affine(bits);
-}
-
-const glm_first = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 0, 0 };
-const glm_next = [_]u32{ 1, 2, 3, 0, 2, 2, 1, 3, 0, 1, 1, 2, 3, 3, 0, 2, 1, 3, 2, 1, 3, 1, 0, 2 };
-const glm_other = [_]u32{ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 };
-
-fn glmLookup(hc: *HotPrefixCache, req: *glm5_forward.Request, bits: u8, prompt: []const u32, vision_key: u64, media_start: ?usize, chain: []const MediaSpan) !LookupResult {
-    var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreGlm(&target, &moe, req, mlx.gpuStream(), prompt, false, vision_key, media_start, chain, null, null, false);
-    try testing.expectEqual(res.matched, target.step);
-    try testing.expectEqual(res.matched, req.offset);
-    return res;
-}
-
-const GlmNet = struct {
-    weights: model_mod.Weights,
-    net: glm5_forward.Model,
-
-    fn load(self: *GlmNet) !void {
-        self.weights = model_mod.Weights.init(testing.allocator);
-        errdefer self.weights.deinit();
-        var cfg = try glm5_forward.nonzeroDecodeFixture(&self.weights);
-        cfg.max_position_embeddings = 4096;
-        self.net = try glm5_forward.Model.load(testing.allocator, cfg, &self.weights, mlx.gpuStream());
-    }
-    fn deinit(self: *GlmNet) void {
-        self.net.deinit();
-        self.weights.deinit();
-    }
-};
-
-test "GLM hot cache restores the highest checkpoint under the match and continues like a cold prefill" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    for ([_]u8{ 0, 8 }) |bits| {
-        var hc = HotPrefixCache.init(testing.allocator, 4);
-        defer hc.deinit();
-        var turn = try GlmTurn.run(&fx.net, bits, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
-        try testing.expectEqual(CommitStatus{ .ok = glm_first.len }, try turn.commit(&hc, &glm_first, 0, null));
-        const e = &hc.entries.items[0];
-        var cps_bytes: u64 = 0;
-        for (e.ssm_checkpoints.?) |*cp| cps_bytes += ssmCheckpointBytes(cp);
-        try testing.expectEqual(e.glm.?.bytes() + cps_bytes, e.kv_bytes);
-        try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
-
-        var warm = try glm5_prefix.servedRequest(bits);
-        defer warm.deinit();
-        const res = try glmLookup(&hc, &warm, bits, &glm_next, 0, null, &.{});
-        try testing.expectEqual(@as(usize, 16), res.matched);
-        const got = try glm5_prefix.prefill(&fx.net, &warm, glm_next[16..], &.{8});
-        defer _ = mlx.mlx_array_free(got);
-        var cold = try glm5_prefix.servedRequest(bits);
-        defer cold.deinit();
-        const want = try glm5_prefix.prefill(&fx.net, &cold, &glm_next, &.{ 8, 8, 8 });
-        defer _ = mlx.mlx_array_free(want);
-        try glm5_forward.expectArrayBits(want, got);
-        try glm5_prefix.expectSameLogicalState(&cold, &warm);
-
-        // The other latent width never restores this entry, and its miss leaves the request cold.
-        const other_bits: u8 = if (bits == 0) 8 else 0;
-        var other = try glm5_prefix.servedRequest(other_bits);
-        defer other.deinit();
-        try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, other_bits, &glm_next, 0, null, &.{})).matched);
-    }
-}
-
-test "GLM hot cache trims an entry over the byte budget to a checkpoint and bills what it keeps" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var long: [300]u32 = undefined;
-    for (&long, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var probe = try GlmTurn.run(&fx.net, 8, &long, &.{ 264, 32, 4 }, &.{ 0, 1 });
-    const row = probe.rows.rowBytes();
-    const per_cp = ssmCheckpointBytes(&probe.cps[0]);
-    probe.cache.deinit();
-    probe.rows.deinit();
-    for (probe.cps) |*cp| cp.deinit(testing.allocator);
-    testing.allocator.free(probe.cps);
-
-    // The assistant window survives the trim and is priced inside the budget.
-    var window = try KVCache.init(testing.allocator, 2);
-    defer window.deinit();
-    try testFillCache(&window, mlx.gpuStream(), 2, 64);
-    var window_snap = try window.snapshot();
-    defer window_snap.deinit();
-    const window_bytes = HotPrefixCache.snapshotBytes(&window_snap);
-
-    // Room for the window, the rows to 264 and one checkpoint, not for 300 rows and two.
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, window_bytes + 264 * row + per_cp);
-    defer hc.deinit();
-    var turn = try GlmTurn.run(&fx.net, 8, &long, &.{ 264, 32, 4 }, &.{ 0, 1 });
-    defer turn.cache.deinit();
-    try testing.expectEqual(CommitStatus{ .ok = 264 }, try hc.commitGlm(&turn.cache, &long, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 236 }, long.len));
-    const e = &hc.entries.items[0];
-    try testing.expectEqual(@as(usize, 264), e.glm.?.len);
-    try testing.expect(e.dflash != null);
-    try testing.expectEqual(window_bytes + 264 * row + per_cp, e.kv_bytes);
-    try testing.expect(hc.current_kv_bytes <= hc.max_kv_bytes);
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    try testing.expectEqual(@as(usize, 264), (try glmLookup(&hc, &warm, 8, &long, 0, null, &.{})).matched);
-}
-
-test "GLM hot cache evicts by count, invalidates, and a miss leaves the request cold" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var hc = HotPrefixCache.init(testing.allocator, 1);
-    defer hc.deinit();
-    var a = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
-    _ = try a.commit(&hc, &glm_first, 0, null);
-    var b = try GlmTurn.run(&fx.net, 0, &glm_other, &.{ 8, 4 }, &.{0});
-    _ = try b.commit(&hc, &glm_other, 0, null);
-    try testing.expectEqual(@as(usize, 1), hc.entryCount());
-    var warm = try glm5_prefix.servedRequest(0);
-    defer warm.deinit();
-    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 0, &glm_next, 0, null, &.{})).matched);
-    const again = glm_other ++ [_]u32{1};
-    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
-    hc.invalidateAll("test");
-    try testing.expectEqual(@as(u64, 0), hc.current_kv_bytes);
-    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
-    try testing.expectEqual(@as(usize, 0), warm.layers[3].attention.processed);
-}
-
-test "GLM hot cache gives entries back LRU first to admit a long prefill, sparing the one it restored from" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var hc = HotPrefixCache.init(testing.allocator, 4);
-    defer hc.deinit();
-    var a = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
-    _ = try a.commit(&hc, &glm_first, 0, null);
-    var b = try GlmTurn.run(&fx.net, 0, &glm_other, &.{ 8, 4 }, &.{0});
-    _ = try b.commit(&hc, &glm_other, 0, null);
-    var warm = try glm5_prefix.servedRequest(0);
-    defer warm.deinit();
-    const again = glm_other ++ [_]u32{1};
-    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
-    const Room = struct {
-        fn oneEntry(ctx: ?*anyopaque) bool {
-            const cache: *HotPrefixCache = @ptrCast(@alignCast(ctx.?));
-            return cache.entryCount() <= 1;
-        }
-        fn never(_: ?*anyopaque) bool {
-            return false;
-        }
-    };
-    const report = hc.evictLruToAdmit(again.len, &hc, Room.oneEntry, true);
-    try testing.expect(report.admitted);
-    try testing.expectEqual(@as(usize, 1), report.entries);
-    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &again, 0, null, &.{})).matched);
-    try testing.expect(!hc.evictLruToAdmit(again.len, &hc, Room.never, true).admitted);
-    try testing.expectEqual(@as(usize, 1), hc.entryCount());
-}
-
-test "GLM hot cache shares across media keys only below the first block the request lacks" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var hc = HotPrefixCache.init(testing.allocator, 4);
-    defer hc.deinit();
-    // One media block at 10 (key 0xA); the next turn appends a second block at 20 (key 0xB).
-    var turn = try GlmTurn.run(&fx.net, 0, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
-    _ = try turn.commit(&hc, &glm_first, 0xA, 10);
-    var warm = try glm5_prefix.servedRequest(0);
-    defer warm.deinit();
-    const chain = [_]MediaSpan{ .{ .start = 10, .key = 0xA }, .{ .start = 20, .key = 0xB } };
-    try testing.expectEqual(@as(usize, 16), (try glmLookup(&hc, &warm, 0, &glm_next, 0xB, 10, &chain)).matched);
-    const stranger = [_]MediaSpan{.{ .start = 10, .key = 0xC }};
-    try testing.expectEqual(@as(usize, 8), (try glmLookup(&hc, &warm, 0, &glm_next, 0xC, 10, &stranger)).matched);
-}
-
-test "GLM hot cache checkout hands the MLA rows to the slot so its first append donates" {
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    restore_move_override = true;
-    defer restore_move_override = null;
-    var hc = HotPrefixCache.init(testing.allocator, 4);
-    defer hc.deinit();
-    hc.ssd_first = true;
-    var turn = try GlmTurn.run(&fx.net, 8, &glm_first, &.{ 8, 8, 4 }, &.{ 0, 1 });
-    _ = try turn.commit(&hc, &glm_first, 0, null);
-    const billed = hc.entries.items[0].glm_bytes;
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
-    defer target.deinit();
-    var moe: usize = 0;
-    const longer = glm_first ++ [_]u32{ 2, 2, 2, 2 };
-    const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, mlx.gpuStream(), &longer, false, 0, null, &.{}, null, 7, false);
-    try testing.expect(res.checked_out);
-    try testing.expectEqual(@as(usize, 16), res.matched);
-    hc.donateCheckout(7);
-    try testing.expectEqual(@as(u64, 0), hc.entries.items[0].glm.?.bytes());
-    try testing.expectEqual(billed, hc.donatedBytes(7));
-    hc.releaseCheckout(7, "test");
-    try testing.expectEqual(@as(usize, 0), hc.entryCount());
-}
-
-test "GLM SSD tier restores a checkpoint after the RAM copy is gone and continues like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    for ([_]u8{ 0, 8, 6 }) |bits| {
-        var fp_buf: [32]u8 = undefined;
-        const fp = try std.fmt.bufPrint(&fp_buf, "fp-glm-{d}", .{bits});
-        {
-            var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
-            defer hc.deinit();
-            var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-            _ = try turn.commit(&hc, &first, 0, null);
-            hc.flushPendingDisk(s);
-            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        }
-        // A restart: nothing in RAM.
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
-        defer hc.deinit();
-        var warm = try glm5_prefix.servedRequest(bits);
-        defer warm.deinit();
-        const res = try glmLookup(&hc, &warm, bits, &next, 0, null, &.{});
-        try testing.expectEqual(@as(usize, 512), res.matched);
-        try testing.expect(res.ownsRestoredRows());
-        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
-        defer _ = mlx.mlx_array_free(got);
-        var cold = try glm5_prefix.servedRequest(bits);
-        defer cold.deinit();
-        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
-        defer _ = mlx.mlx_array_free(want);
-        try glm5_forward.expectArrayBits(want, got);
-        try glm5_prefix.expectSameLogicalState(&cold, &warm);
-        for ([_]u8{ 0, 8, 6 }) |other_bits| {
-            if (other_bits == bits) continue;
-            var other = try glm5_prefix.servedRequest(other_bits);
-            defer other.deinit();
-            try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &other, other_bits, &next, 0, null, &.{})).matched);
-        }
-    }
-}
-
-test "GLM SSD tier: one fingerprint dir serves each latent width its own entry, and a lookup at another width misses" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    for ([_]u8{ 6, 8, 0 }) |written| {
-        var tmp = std.testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        var buf: [512]u8 = undefined;
-        const base = buf[0..try tmp.dir.realPath(io, &buf)];
-        {
-            var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-shared", 0, 128);
-            defer hc.deinit();
-            var turn = try GlmTurn.run(&fx.net, written, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-            _ = try turn.commit(&hc, &first, 0, null);
-            hc.flushPendingDisk(s);
-            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        }
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-shared", 0, 128);
-        defer hc.deinit();
-        for ([_]u8{ 0, 8, 6 }) |asked| {
-            var req = try glm5_prefix.servedRequest(asked);
-            defer req.deinit();
-            const want: usize = if (asked == written) 512 else 0;
-            try testing.expectEqual(want, (try glmLookup(&hc, &req, asked, &next, 0, null, &.{})).matched);
-        }
-    }
-}
-
-test "GLM entries carry the assistant window, and a restore hands back its rows below the checkpoint, RAM and SSD" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    // The window as prefill left it: 300 rows ending at the prompt end.
-    var window = try KVCache.init(testing.allocator, 2);
-    defer window.deinit();
-    try testFillCache(&window, s, 2, 300);
-    var committing = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    committing.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
-    var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-    defer turn.cache.deinit();
-    _ = try committing.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
-    committing.flushPendingDisk(s);
-    var restarted = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer restarted.deinit();
-    for ([_]*HotPrefixCache{ &committing, &restarted }) |hc| {
-        if (hc == &restarted) {
-            committing.deinit();
-            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spec", 0, 128);
-        }
-        var drafter = try KVCache.init(testing.allocator, 2);
-        defer drafter.deinit();
-        var drafter_base: usize = 0;
-        var warm = try glm5_prefix.servedRequest(8);
-        defer warm.deinit();
-        var target = try KVCache.initWithConfig(testing.allocator, 4, kv_quant.KVQuantConfig.affine(8));
-        defer target.deinit();
-        var moe: usize = 0;
-        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, null, false);
-        try testing.expectEqual(@as(usize, 512), res.matched);
-        try testing.expectEqual(@as(?usize, 400), res.dflash_base);
-        try testing.expectEqual(@as(usize, 112), drafter.step);
-    }
-}
-
-fn glmSsdOnlyCache(io: std.Io, base: []const u8, fp: []const u8, max_bytes: u64, budget_from_volume: bool) !HotPrefixCache {
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-    errdefer hc.deinit();
-    hc.ssd_first = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, max_bytes, 128);
-    hc.disk.?.ssd_first = budget_from_volume;
-    if (budget_from_volume) hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-    hc.disk.?.enableBackgroundWriter();
-    return hc;
-}
-
-test "GLM SSD-only: a commit reaches disk with no idle RAM entry, and a restart restores it like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    var window = try KVCache.init(testing.allocator, 2);
-    defer window.deinit();
-    try testFillCache(&window, s, 2, 300);
-    for ([_]u8{ 0, 8, 6 }) |bits| {
-        var fp_buf: [32]u8 = undefined;
-        const fp = try std.fmt.bufPrint(&fp_buf, "glm-ssd-only-{d}", .{bits});
-        {
-            var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
-            defer hc.deinit();
-            var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-            defer turn.cache.deinit();
-            const status = try hc.commitGlm(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
-            try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
-            try testing.expectEqual(@as(usize, 0), hc.entryCount());
-            try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-            hc.flushPendingDisk(s);
-            hc.disk.?.drainWriter();
-            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-            try testing.expect(hc.pending_disk == null);
-        }
-        var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
-        defer hc.deinit();
-        var drafter = try KVCache.init(testing.allocator, 2);
-        defer drafter.deinit();
-        var drafter_base: usize = 0;
-        var warm = try glm5_prefix.servedRequest(bits);
-        defer warm.deinit();
-        var target = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
-        defer target.deinit();
-        var moe: usize = 0;
-        const res = try hc.lookupAndRestoreGlm(&target, &moe, &warm, s, &next, false, 0, null, &.{}, .{ .cache = &drafter, .base_pos = &drafter_base }, 9, false);
-        try testing.expectEqual(@as(usize, 512), res.matched);
-        try testing.expect(res.ownsRestoredRows());
-        try testing.expectEqual(@as(?usize, 400), res.dflash_base);
-        try testing.expectEqual(@as(usize, 112), drafter.step);
-        try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
-        defer _ = mlx.mlx_array_free(got);
-        var cold = try glm5_prefix.servedRequest(bits);
-        defer cold.deinit();
-        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
-        defer _ = mlx.mlx_array_free(want);
-        try glm5_forward.expectArrayBits(want, got);
-        try glm5_prefix.expectSameLogicalState(&cold, &warm);
-    }
-}
-
-test "GLM: the SSD tier gets every row in one flush whatever the RAM tier keeps, and the longer tier restores" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    const Arm = struct { ram: bool, fp: []const u8 };
-    for ([_]u8{ 0, 8 }) |bits| for ([_]Arm{ .{ .ram = true, .fp = "glm-tiers-both" }, .{ .ram = false, .fp = "glm-tiers-ssd" } }) |arm| {
-        var fp_buf: [32]u8 = undefined;
-        const fp = try std.fmt.bufPrint(&fp_buf, "{s}-{d}", .{ arm.fp, bits });
-        var hc = if (arm.ram) HotPrefixCache.initWithMem(testing.allocator, 4, 0) else try glmSsdOnlyCache(io, base, fp, 0, false);
-        defer hc.deinit();
-        if (arm.ram) {
-            hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
-            hc.disk.?.enableBackgroundWriter();
-        }
-        hc.disk.?.max_flush_bytes = 1; // one chunk per piece
-        var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-        defer turn.cache.deinit();
-        // The RAM tier keeps the rows through the first checkpoint; the SSD tier gets them all.
-        const ram_rows: ?glm5_prefix.MlaRows = if (arm.ram) try turn.rows.trimmedCopy(256, s) else null;
-        const status = try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, ram_rows, turn.rows, null, first.len);
-        if (arm.ram) {
-            try testing.expectEqual(CommitStatus{ .ok = first.len }, status);
-            try testing.expectEqual(@as(usize, 256), hc.entries.items[0].glm.?.len);
-            try testing.expectEqual(@as(usize, 1), hc.entries.items[0].ssm_checkpoints.?.len);
-        } else {
-            try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
-            try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        }
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expect(!hc.disk_dirty);
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        const on_disk = &hc.disk.?.entries.items[0];
-        try testing.expectEqual(@as(u32, 700), on_disk.kv_len);
-        try testing.expectEqualSlices(u32, &.{ 256, 512 }, on_disk.ssm_positions);
-
-        // The SSD tier's checkpoint at 512 beats the RAM entry's at 256.
-        var warm = try glm5_prefix.servedRequest(bits);
-        defer warm.deinit();
-        const res = try glmLookup(&hc, &warm, bits, &next, 0, null, &.{});
-        try testing.expectEqual(@as(usize, 512), res.matched);
-        try testing.expect(res.ownsRestoredRows());
-        const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
-        defer _ = mlx.mlx_array_free(got);
-        var cold = try glm5_prefix.servedRequest(bits);
-        defer cold.deinit();
-        const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
-        defer _ = mlx.mlx_array_free(want);
-        try glm5_forward.expectArrayBits(want, got);
-        try glm5_prefix.expectSameLogicalState(&cold, &warm);
-    };
-}
-
-/// A GLM prefill driven chunk by chunk as the scheduler drives it: a KDA checkpoint after each chunk, then the write-through.
-const GlmPrefill = struct {
-    req: glm5_forward.Request,
-    cps: std.ArrayList(SSMCheckpoint) = .empty,
-    entry_id: ?u64 = null,
-    /// Most checkpoint states in RAM at once, read right after a capture.
-    peak_held: usize = 0,
-
-    /// The last chunk is the loop's end: its checkpoint is taken after the loop, past the hook, and the
-    /// rest of `tokens` is the final span.
-    fn run(hc: *HotPrefixCache, net: *const glm5_forward.Model, bits: u8, tokens: []const u32, chunks: []const usize) !GlmPrefill {
-        var self = GlmPrefill{ .req = try glm5_prefix.servedRequest(bits) };
-        errdefer self.deinit();
-        var at: usize = 0;
-        for (chunks, 0..) |n, i| {
-            _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at .. at + n], &.{n}));
-            at += n;
-            if (i + 1 < chunks.len) try self.capture();
-            hc.writeThroughGlm(&self.entry_id, &self.req, tokens[0..at], false, .{}, self.cps.items, mlx.gpuStream());
-        }
-        try self.capture();
-        if (at < tokens.len) _ = mlx.mlx_array_free(try glm5_prefix.prefill(net, &self.req, tokens[at..], &.{tokens.len - at}));
-        return self;
-    }
-
-    fn capture(self: *GlmPrefill) !void {
-        try self.cps.append(testing.allocator, try glm5_prefix.captureKda(testing.allocator, &self.req, mlx.gpuStream()));
-        self.peak_held = @max(self.peak_held, self.held());
-    }
-
-    fn held(self: *const GlmPrefill) usize {
-        var n: usize = 0;
-        for (self.cps.items) |*cp| n += @intFromBool(!cp.isReleased());
-        return n;
-    }
-
-    /// The request's end-of-request commit for the SSD tier alone, as `commitGlmSlot` builds it.
-    fn commitSsdOnly(self: *GlmPrefill, hc: *HotPrefixCache, bits: u8, tokens: []const u32) !CommitStatus {
-        var cache = try KVCache.initWithConfig(testing.allocator, 4, glmKvConfig(bits));
-        defer cache.deinit();
-        cache.step = self.req.offset;
-        const disk_rows = try glm5_prefix.MlaRows.shareLive(testing.allocator, &self.req, glm5_prefix.commitRows(self.cps.items, self.req.offset), mlx.gpuStream());
-        const owned = try self.cps.toOwnedSlice(testing.allocator);
-        return hc.commitGlmTiers(&cache, tokens, false, 0, 0, null, owned, null, disk_rows, null, tokens.len);
-    }
-
-    fn deinit(self: *GlmPrefill) void {
-        for (self.cps.items) |*cp| cp.deinit(testing.allocator);
-        self.cps.deinit(testing.allocator);
-        self.req.deinit();
-    }
-};
-
-/// A prompt that shares `shared` tokens with `first` and then differs.
-fn glmDiverging(buf: []u32, first: []const u32, shared: usize) []const u32 {
-    @memcpy(buf[0..shared], first[0..shared]);
-    for (buf[shared..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    return buf;
-}
-
-/// Restores `prompt` from `hc` at `at` and checks the continuation against a cold prefill of it, bit for bit.
-fn expectGlmRestoreLikeCold(hc: *HotPrefixCache, net: *const glm5_forward.Model, bits: u8, prompt: []const u32, at: usize) !void {
-    var warm = try glm5_prefix.servedRequest(bits);
-    defer warm.deinit();
-    const res = try glmLookup(hc, &warm, bits, prompt, 0, null, &.{});
-    try testing.expectEqual(at, res.matched);
-    const got = try glm5_prefix.prefill(net, &warm, prompt[at..], &.{prompt.len - at});
-    defer _ = mlx.mlx_array_free(got);
-    var cold = try glm5_prefix.servedRequest(bits);
-    defer cold.deinit();
-    const want = try glm5_prefix.prefill(net, &cold, prompt, &.{ at, prompt.len - at });
-    defer _ = mlx.mlx_array_free(want);
-    try glm5_forward.expectArrayBits(want, got);
-    try glm5_prefix.expectSameLogicalState(&cold, &warm);
-}
-
-test "GLM SSD-only: a prefill keeps at most two checkpoint states in RAM, and a restore at a released one reads SSD like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    for ([_]u8{ 0, 8 }) |bits| {
-        var fp_buf: [32]u8 = undefined;
-        const fp = try std.fmt.bufPrint(&fp_buf, "glm-wt-{d}", .{bits});
-        var hc = try glmSsdOnlyCache(io, base, fp, 0, true);
-        defer hc.deinit();
-        var turn = try GlmPrefill.run(&hc, &fx.net, bits, &first, &.{ 512, 64, 64, 48 });
-        defer turn.deinit();
-        try testing.expect(turn.peak_held <= 2);
-        // The checkpoint of the last hooked chunk and the loop-end one beside it.
-        try testing.expectEqual(@as(usize, 2), turn.held());
-        for (turn.cps.items[0 .. turn.cps.items.len - 2]) |cp| try testing.expect(cp.isReleased());
-        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try turn.commitSsdOnly(&hc, bits, &first));
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        const on_disk = &hc.disk.?.entries.items[0];
-        try testing.expectEqual(@as(u32, 688), on_disk.kv_len);
-        try testing.expectEqualSlices(u32, &.{ 512, 576, 640, 688 }, on_disk.ssm_positions);
-
-        // The oldest, a middle one and the newest: each state comes off the disk.
-        var other: [800]u32 = undefined;
-        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..600], &first, 530), 512);
-        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..680], &first, 650), 640);
-        @memcpy(other[0..700], &first);
-        for (other[700..750], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, other[0..750], 688);
-    }
-}
-
-test "GLM RAM tier beside an SSD tier judges the byte budget by the two checkpoints that stay" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var probe = try GlmTurn.run(&fx.net, 8, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
-    // Room for every row and two checkpoints, not for four.
-    const budget = probe.rows.bytes() + 2 * ssmCheckpointBytes(&probe.cps[0]) + 1;
-    probe.rows.deinit();
-    for (probe.cps) |*cp| cp.deinit(testing.allocator);
-    testing.allocator.free(probe.cps);
-    probe.cache.deinit();
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
-    defer hc.deinit();
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-price", 0, 128);
-    hc.disk.?.enableBackgroundWriter();
-    // The same session twice: the second commit replaces the first instead of being judged oversized and dropped.
-    for (0..2) |_| {
-        var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
-        defer turn.cache.deinit();
-        const disk_rows = try turn.rows.share();
-        try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
-        try testing.expectEqual(@as(usize, 2), hc.entries.items[0].ssm_checkpoints.?.len);
-        try testing.expect(hc.current_kv_bytes <= budget);
-    }
-}
-
-test "GLM SSD-only: past the checkpoint cap the loop-end checkpoint still reaches disk" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [1400]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var hc = try glmSsdOnlyCache(io, base, "glm-wt-cap", 0, true);
-    defer hc.deinit();
-    hc.disk.?.ssm_max_per_entry = glm5_prefix.checkpoint_cap;
-    var chunks: [15]usize = @splat(64);
-    chunks[0] = 512;
-    chunks[14] = 40;
-    // 512 + 13 x 64 + 40 = 1384: thirteen grid checkpoints, the loop-end one after them, a 16-token final span.
-    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &chunks);
-    defer turn.deinit();
-    try testing.expect(turn.peak_held <= 2);
-    _ = try turn.commitSsdOnly(&hc, 8, first[0..1400]);
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-    const on_disk = &hc.disk.?.entries.items[0];
-    try testing.expectEqual(@as(usize, glm5_prefix.checkpoint_cap), on_disk.ssm_positions.len);
-    try testing.expectEqual(@as(u32, 1384), on_disk.ssm_positions[on_disk.ssm_positions.len - 1]);
-    var other: [1500]u32 = undefined;
-    @memcpy(other[0..1400], &first);
-    for (other[1400..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, &other, 1384);
-}
-
-test "GLM SSD-only: a restore at an 8192 grid point reads SSD like a cold prefill" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    fx.net.cfg.max_position_embeddings = 2 * kv_disk_cache.POINT_GRID;
-    var first: [8300]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var hc = try glmSsdOnlyCache(io, base, "glm-wt-grid", 0, true);
-    defer hc.deinit();
-    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
-    // The grid point closes the first chunk; the loop's end follows it before the final span.
-    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &.{ kv_disk_cache.POINT_GRID, 40 });
-    defer turn.deinit();
-    try testing.expect(turn.peak_held <= 2);
-    _ = try turn.commitSsdOnly(&hc, 8, &first);
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-    const on_disk = &hc.disk.?.entries.items[0];
-    try testing.expectEqualSlices(u32, &.{ kv_disk_cache.POINT_GRID, kv_disk_cache.POINT_GRID + 40 }, on_disk.ssm_positions);
-    var other: [8400]u32 = undefined;
-    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, glmDiverging(&other, &first, kv_disk_cache.POINT_GRID + 8), kv_disk_cache.POINT_GRID);
-}
-
-test "Qwen SSD-only: a 40k prefill keeps the 8192 grid and the prompt end on SSD, holding two states, and a grid point restores its state" {
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    const generate_mod = @import("generate.zig");
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    const len = 40_000;
-    var tokens: [len]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    var cache = try KVCache.init(testing.allocator, 3);
-    defer cache.deinit();
-    try testFillCache(&cache, s, 3, len);
-    var srcs: [5][3]SSMCacheEntry = undefined;
-    for (&srcs, 0..) |*e, i| {
-        const f: f64 = @floatFromInt(i + 1);
-        e.* = pcBuildHybrid(s, 100.0 * f, 500.0 * f);
-    }
-    defer for (&srcs) |*e| pcFreeHybrid(e);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-    hc.ssd_first = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-qwen-grid", 0, 128);
-    defer hc.deinit();
-    hc.disk.?.ssd_first = true;
-    hc.disk.?.cp_thin = .min_span_recency;
-    hc.disk.?.ssm_max_per_entry = kv_disk_cache.SSM_DISK_MAX_PER_ENTRY;
-    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-    hc.disk.?.enableBackgroundWriter();
-
-    var cps = std.ArrayList(SSMCheckpoint).empty;
-    errdefer {
-        for (cps.items) |*cp| cp.deinit(testing.allocator);
-        cps.deinit(testing.allocator);
-    }
-    const stride = generate_mod.effectiveSsmCheckpointStride(256, 8192);
-    const loop_end = len - 1 - generate_mod.SSM_SNAPSHOT_BACKOFF;
-    var peak: usize = 0;
-    var pos: usize = 0;
-    while (pos < loop_end) {
-        pos = generate_mod.nextChunkEnd(pos, loop_end, 8192, true, stride, 0, true);
-        if (pos % stride == 0) {
-            try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[cps.items.len], pos, s));
-            peak = @max(peak, pcHeld(cps.items));
-        }
-        hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..pos], false, .{}, cps.items, std.math.maxInt(u64), s);
-    }
-    try cps.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[4], loop_end, s));
-    try testing.expect(peak <= 2);
-
-    const owned = try cps.toOwnedSlice(testing.allocator);
-    _ = try hc.commitWithSsm(&cache, &tokens, false, owned, null, null);
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-    try testing.expectEqualSlices(u32, &.{ 8192, 16384, 24576, 32768, loop_end }, hc.disk.?.entries.items[0].ssm_positions);
-
-    var cache2 = try KVCache.init(testing.allocator, 3);
-    defer cache2.deinit();
-    var dst = pcEmptySsm();
-    defer pcFreeHybrid(&dst);
-    try testing.expectEqual(@as(u32, 16384), try hc.disk.?.restoreIntoHybrid(&cache2, &dst, 0, 16384, s));
-    try testing.expectEqual(@as(f32, 200), pcSsmVal(dst[0].conv_state, 0, s));
-    try testing.expectEqual(@as(f32, 1000), pcSsmVal(dst[0].ssm_state, 0, s));
-}
-
-test "GLM SSD-only: a checkpoint whose write failed is not a restore point" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var hc = try glmSsdOnlyCache(io, base, "glm-wt-fail", 0, true);
-    defer hc.deinit();
-    hc.disk.?.writer.?.injectFailure("s0000512", .write);
-    var turn = try GlmPrefill.run(&hc, &fx.net, 8, &first, &.{ 512, 64, 112 });
-    defer turn.deinit();
-    try testing.expect(turn.peak_held <= 2);
-    _ = try turn.commitSsdOnly(&hc, 8, &first);
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-    const on_disk = &hc.disk.?.entries.items[0];
-    try testing.expect(!on_disk.poisoned);
-    try testing.expectEqualSlices(u32, &.{ 576, 688 }, on_disk.ssm_positions);
-    try testing.expectEqual(@as(u32, 688), on_disk.kv_len);
-
-    var other: [800]u32 = undefined;
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 8, glmDiverging(other[0..600], &first, 530), 0, null, &.{})).matched);
-    try expectGlmRestoreLikeCold(&hc, &fx.net, 8, glmDiverging(other[0..680], &first, 650), 576);
-}
-
-test "GLM RAM tier beside an SSD tier: the hot entry keeps its two newest checkpoints, the SSD tier all of them" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    for ([_]u8{ 0, 8 }) |bits| {
-        var fp_buf: [32]u8 = undefined;
-        const fp = try std.fmt.bufPrint(&fp_buf, "glm-ram-newest-{d}", .{bits});
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        defer hc.deinit();
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
-        hc.disk.?.enableBackgroundWriter();
-        var turn = try GlmTurn.run(&fx.net, bits, &first, &.{ 512, 64, 64, 60 }, &.{ 0, 1, 2, 3 });
-        defer turn.cache.deinit();
-        const disk_rows = try turn.rows.share();
-        try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitGlmTiers(&turn.cache, &first, false, 0, 0, null, turn.cps, turn.rows, disk_rows, null, first.len));
-        const e = &hc.entries.items[0];
-        try testing.expectEqual(@as(usize, 2), e.ssm_checkpoints.?.len);
-        try testing.expectEqualSlices(usize, &.{ 640, 700 }, &.{ e.ssm_checkpoints.?[0].pos, e.ssm_checkpoints.?[1].pos });
-        var bytes: u64 = 0;
-        for (e.ssm_checkpoints.?) |*cp| bytes += ssmCheckpointBytes(cp);
-        try testing.expectEqual(bytes, e.ssm_bytes);
-        try testing.expectEqual(e.glm.?.bytes() + bytes, e.kv_bytes);
-        try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqualSlices(u32, &.{ 512, 576, 640, 700 }, hc.disk.?.entries.items[0].ssm_positions);
-
-        // Under the RAM entry's oldest checkpoint the SSD tier restores.
-        var other: [800]u32 = undefined;
-        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..600], &first, 530), 512);
-        try expectGlmRestoreLikeCold(&hc, &fx.net, bits, glmDiverging(other[0..680], &first, 600), 576);
-    }
-}
-
-test "GLM SSD-only: two commits before one flush (two cancels culled in one pass) both reach disk" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var prompts: [2][600]u32 = undefined;
-    for (&prompts, 0..) |*p, k| for (p, 0..) |*t, i| {
-        t.* = @intCast((i * (k + 3) + k + i / 7) % 4);
-    };
-    var hc = try glmSsdOnlyCache(io, base, "glm-two-cancels", 0, false);
-    defer hc.deinit();
-    for (&prompts) |*p| {
-        var turn = try GlmTurn.run(&fx.net, 8, p, &.{ 512, 88 }, &.{0});
-        try testing.expectEqual(CommitStatus{ .disk_only = p.len }, try turn.commit(&hc, p, 0, null));
-    }
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expect(hc.pending_disk == null);
-    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    for (&prompts) |*p| {
-        const again = p.* ++ [_]u32{1};
-        try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again, 0, null, &.{})).matched);
-    }
-}
-
-test "GLM SSD-only without the writer: one flush finishes the whole entry before its source goes" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-    defer hc.deinit();
-    hc.ssd_first = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-no-writer", 0, 128);
-    hc.disk.?.ssd_first = true;
-    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-    hc.disk.?.max_flush_bytes = 1; // one chunk per synchronous piece
-    try testing.expect(hc.disk.?.writer == null);
-    var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-    try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try turn.commit(&hc, &first, 0, null));
-    hc.flushPendingDisk(s);
-    try testing.expect(hc.pending_disk == null);
-    const e = &hc.disk.?.entries.items[0];
-    try testing.expectEqual(@as(u32, 700), e.kv_len);
-    try testing.expectEqualSlices(u32, &.{ 256, 512 }, e.ssm_positions);
-    try testing.expect(hc.disk.?.entryWholeOnDisk(e.id));
-}
-
-test "a GLM commit hands the SSD tier every row through its newest checkpoint, past any one flush" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    const cp = struct {
-        fn at(pos: usize) SSMCheckpoint {
-            return .{ .pos = pos, .layers = &.{} };
-        }
-    }.at;
-    const cps = [_]SSMCheckpoint{ cp(2048), cp(524_288), cp(1_040_000) };
-    const row: u64 = 6688;
-    {
-        var hc = try glmSsdOnlyCache(io, base, "glm-len-ssd", 20 << 30, false);
-        defer hc.deinit();
-        try testing.expectEqual(@as(?usize, null), hc.glmCommitLen(&cps, 1_040_003, row, 0));
-        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
-    }
-    {
-        // Both tiers: the RAM tier keeps what its 1 GiB holds, the SSD tier every row.
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 1 << 30);
-        defer hc.deinit();
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "glm-len-both", 20 << 30, 128);
-        try testing.expectEqual(@as(?usize, 2048), hc.glmCommitLen(&cps, 1_040_003, row, 0));
-        try testing.expectEqual(@as(?usize, 1_040_000), hc.glmDiskLen(&cps, 1_040_003, row, 0));
-    }
-}
-
-test "GLM SSD-only: the disk budget evicts the least recently used conversation" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var prompts: [3][600]u32 = undefined;
-    for (&prompts, 0..) |*p, k| for (p, 0..) |*t, i| {
-        t.* = @intCast((i * (k + 3) + k + i / 7) % 4);
-    };
-    // Measure one entry, then allow two.
-    var one: u64 = 0;
-    {
-        var hc = try glmSsdOnlyCache(io, base, "glm-ssd-probe", 0, false);
-        defer hc.deinit();
-        var turn = try GlmTurn.run(&fx.net, 8, &prompts[0], &.{ 512, 88 }, &.{0});
-        _ = try turn.commit(&hc, &prompts[0], 0, null);
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        one = hc.disk.?.total_bytes;
-    }
-    var hc = try glmSsdOnlyCache(io, base, "glm-ssd-budget", one * 5 / 2, false);
-    defer hc.deinit();
-    for (&prompts) |*p| {
-        var turn = try GlmTurn.run(&fx.net, 8, p, &.{ 512, 88 }, &.{0});
-        _ = try turn.commit(&hc, p, 0, null);
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-    }
-    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
-    try testing.expect(hc.disk.?.total_bytes <= one * 5 / 2);
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    const again: [3][601]u32 = .{ prompts[0] ++ [_]u32{1}, prompts[1] ++ [_]u32{1}, prompts[2] ++ [_]u32{1} };
-    try testing.expectEqual(@as(usize, 0), (try glmLookup(&hc, &warm, 8, &again[0], 0, null, &.{})).matched);
-    try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again[1], 0, null, &.{})).matched);
-    try testing.expectEqual(@as(usize, 512), (try glmLookup(&hc, &warm, 8, &again[2], 0, null, &.{})).matched);
-}
-
-test "GLM's 1 GiB RAM tier keeps a 30K or 60K session at its prompt end and sheds checkpoints, a longer one trims" {
-    const cp: u64 = 147_619_840;
-    const row: u64 = 6688;
-    const window: u64 = 2047 * 5 * 8 * 128 * 2 * 2;
-    const budget: u64 = (1 << 30) - window;
-    const Case = struct { positions: [8]usize, kept: usize, cps: u64 };
-    const cases = [_]Case{
-        .{ .positions = .{ 2048, 8192, 14336, 20480, 24576, 26624, 28672, 30688 }, .kept = 30688, .cps = 5 },
-        .{ .positions = .{ 2048, 14336, 26624, 38912, 51200, 55296, 59392, 61408 }, .kept = 61408, .cps = 4 },
-        .{ .positions = .{ 2048, 34816, 67584, 100352, 120832, 133120, 137216, 140256 }, .kept = 120832, .cps = 1 },
-    };
-    const bytes: [8]u64 = @splat(cp);
-    for (cases) |c| {
-        const tl = HotPrefixCache.trimLenForBudgetPure(budget, std.math.maxInt(usize), row, &c.positions, &bytes, .min_span_recency, null);
-        try testing.expectEqual(@as(?usize, c.kept), tl);
-        const k = std.mem.indexOfScalar(usize, &c.positions, c.kept).? + 1;
-        const survivors = HotPrefixCache.shedSurvivorBytes(c.positions[0..k], bytes[0..k], budget - c.kept * row, .min_span_recency).?;
-        try testing.expectEqual(c.cps * cp, survivors);
-    }
-}
-
-test "a GLM commit copies only the rows its destination tier keeps, chosen before the copy" {
-    const t = testing;
-    const row: u64 = 6688;
-    const cp: u64 = 147_619_840;
-    const gib: u64 = 1 << 30;
-    const positions = [_]usize{ 2048, 131072, 262144, 524288, 1_040_000 };
-    const bytes: [5]u64 = @splat(cp);
-    const policy: transformer_mod.ThinPolicy = .min_span_recency;
-    // Everything fits: every row to the newest checkpoint.
-    try t.expectEqual(@as(?usize, 64), HotPrefixCache.glmCommitLenFor(policy, gib, false, 64, row, 0, &.{64}, &.{cp}));
-    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 0, false, 1_040_000, row, 0, &positions, &bytes));
-    // A 1 GiB RAM tier keeps the newest checkpoint whose rows and a surviving checkpoint fit, never the full 7 GB.
-    const ram = HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 0, &positions, &bytes).?;
-    try t.expectEqual(@as(usize, 131072), ram);
-    try t.expect(@as(u64, ram) * row + cp <= gib);
-    // The window comes out of the budget first.
-    try t.expectEqual(@as(?usize, 2048), HotPrefixCache.glmCommitLenFor(policy, gib, false, 1_040_000, row, 200 << 20, &positions, &bytes));
-    // The SSD tier keeps every row through the newest checkpoint; only its own byte budget bounds
-    // them, priced with every checkpoint it keeps at or below.
-    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 0, true, 1_040_000, row, 0, &positions, &bytes));
-    try t.expectEqual(@as(?usize, 1_040_000), HotPrefixCache.glmCommitLenFor(policy, 20 * gib, true, 1_040_000, row, 0, &positions, &bytes));
-    // 262,144 rows (1.75 GB) fit 2 GiB alone; with their three checkpoints (0.44 GB) they do not.
-    try t.expectEqual(@as(?usize, 131072), HotPrefixCache.glmCommitLenFor(policy, 2 * gib, true, 1_040_000, row, 0, &positions, &bytes));
-    // A 1 GiB tier and ~131K rows with eight checkpoints: 0.82 GiB of rows, 1.92 GiB in all.
-    const eight = [_]usize{ 2048, 18432, 43008, 69632, 92160, 116736, 126976, 131040 };
-    const eight_bytes: [8]u64 = @splat(cp);
-    const kept = HotPrefixCache.glmCommitLenFor(policy, gib, true, 131040, row, 0, &eight, &eight_bytes).?;
-    var priced: u64 = @as(u64, kept) * row;
-    for (eight) |p| priced += if (p <= kept) cp else 0;
-    try t.expect(priced <= gib);
-    try t.expect(kept < 131040);
-    try t.expectEqual(@as(?usize, null), HotPrefixCache.glmCommitLenFor(policy, gib, false, 0, row, 0, &.{}, &.{}));
-}
-
-test "a GLM commit whose retention snapshot fails still destroys every transferred checkpoint once" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const cps = try testing.allocator.alloc(SSMCheckpoint, 3);
-    for (cps, 0..) |*cp, i| {
-        const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 2);
-        for (layers) |*l| l.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-        cp.* = .{ .pos = (i + 1) * 8, .layers = layers };
-    }
-    const rows: glm5_prefix.MlaRows = .{
-        .allocator = testing.allocator,
-        .layers = try testing.allocator.alloc(glm5_prefix.MlaRows.Layer, 2),
-        .len = 8,
-        .latent_bits = 8,
-    };
-    @memset(rows.layers, .{});
-
-    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
-    var source = try KVCache.initWithConfig(failing.allocator(), 2, glmKvConfig(8));
-    // The next allocation is the retention snapshot's.
-    failing.fail_index = failing.alloc_index;
-    defer source.deinit();
-
-    var hc = HotPrefixCache.init(testing.allocator, 2);
-    defer hc.deinit();
-    const tokens: [24]u32 = @splat(1);
-    try testing.expectError(error.OutOfMemory, hc.commitGlm(&source, &tokens, false, 0, 0, null, cps, rows, null, tokens.len));
-    try testing.expectEqual(@as(usize, 0), hc.entryCount());
-}
-
-test "a GLM replace commit that fails at any allocation leaks nothing and leaves the cache consistent" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const Stub = struct {
-        fn cps(pos: usize) ![]SSMCheckpoint {
-            const out = try testing.allocator.alloc(SSMCheckpoint, 1);
-            const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
-            layers[0] = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-            out[0] = .{ .pos = pos, .layers = layers };
-            return out;
-        }
-        fn rows() !glm5_prefix.MlaRows {
-            const layers = try testing.allocator.alloc(glm5_prefix.MlaRows.Layer, 1);
-            @memset(layers, .{});
-            return .{ .allocator = testing.allocator, .layers = layers, .len = 8, .latent_bits = 8 };
-        }
-    };
-    const tokens: [24]u32 = @splat(1);
-    var k: usize = 0;
-    while (k < 64) : (k += 1) {
-        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize) });
-        var hc = HotPrefixCache.init(failing.allocator(), 2);
-        defer hc.deinit();
-        var source = try KVCache.initWithConfig(testing.allocator, 1, glmKvConfig(8));
-        defer source.deinit();
-        _ = try hc.commitGlm(&source, tokens[0..16], false, 0, 0, null, try Stub.cps(8), try Stub.rows(), null, 16);
-        try testing.expectEqual(@as(usize, 1), hc.entryCount());
-
-        failing.fail_index = failing.alloc_index + k;
-        const res = hc.commitGlm(&source, &tokens, false, 0, 0, null, try Stub.cps(16), try Stub.rows(), null, 24);
-        var sum: u64 = 0;
-        for (hc.entries.items) |e| sum += e.kv_bytes;
-        try testing.expectEqual(sum, hc.current_kv_bytes);
-        if (res) |_| break else |err| try testing.expectEqual(error.OutOfMemory, err);
-    }
-    try testing.expect(k < 64);
-}
-
-fn mediaTurnTokens(comptime n: usize) [n]u32 {
+pub fn mediaTurnTokens(comptime n: usize) [n]u32 {
     var tokens: [n]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     return tokens;
 }
 
 test "an image turn persists its WHOLE turn to the SSD tier, image rows included" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(3072);
@@ -13773,7 +10471,7 @@ test "truncatedMediaKey: a record claims exactly the media blocks its rows cover
 test "the prefill write-through persists an image turn, keyed by the media it has forwarded" {
     // Step 4: a media turn's chunks were skipped outright, so a long image conversation banked
     // nothing until its end-of-request commit. Each chunk record now claims the blocks inside it.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(2048);
@@ -13808,7 +10506,7 @@ test "SSD: a record holding the request's first image restores up to the new one
     // The disk half of the chain rule (`crossKeyBoundary`), which only the RAM tier could serve
     // before: an agent turn that appends a second screenshot to a conversation already holding
     // one reuses the persisted record through the FIRST image's rows, and stops at the new block.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(3072);
@@ -13858,7 +10556,7 @@ test "SSD: a record holding the request's first image restores up to the new one
 }
 
 test "an image turn's speculative snapshots ride its whole SSD record" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const tokens = mediaTurnTokens(1200);
@@ -13892,7 +10590,7 @@ test "an image turn's speculative snapshots ride its whole SSD record" {
 }
 
 test "an image turn on a ringed cache persists whole and restores at its ring point under its own key" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const io = std.testing.io;
     const s = mlx.gpuStream();
     const window: u32 = 8;
@@ -13944,1211 +10642,6 @@ test "an image turn on a ringed cache persists whole and restores at its ring po
     }
 }
 
-test "an image turn on a QSA hybrid persists the indexer history its checkpoint needs" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    const tokens = mediaTurnTokens(1024);
-    {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.hybrid = true;
-        hc.qsa_history_required = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-qsa", 0, 128);
-        defer hc.deinit();
-        var live = pcBuildQsaHybrid(s, 1024, 100.0);
-        defer pcFreeQsaHybrid(&live);
-        const cps = try testing.allocator.alloc(SSMCheckpoint, 4);
-        for (cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, (i + 1) * 256, s);
-        // The pooled bank lives on the newest checkpoint, which is past the item.
-        try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
-        var cache = try KVCache.init(testing.allocator, 3);
-        defer cache.deinit();
-        try testFillCache(&cache, s, 3, tokens.len);
-        _ = try hc.commitWithMediaState(&cache, &tokens, false, 0xABCD, 0, 600, cps, null, null, tokens.len);
-        hc.flushPendingDisk(s);
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        // Whole, with the pooled bank's checkpoint; the foreign-key restore below still needs the
-        // indexer history for its OWN checkpoint, which is the point of this test.
-        try testing.expectEqual(@as(u32, tokens.len), hc.disk.?.entries.items[0].kv_len);
-    }
-    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    hc2.hybrid = true;
-    hc2.qsa_history_required = true;
-    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-qsa", 0, 128);
-    defer hc2.deinit();
-    var dst = try KVCache.init(testing.allocator, 3);
-    defer dst.deinit();
-    var ssm = pcEmptySsm();
-    defer pcFreeQsaHybrid(&ssm);
-    var moe: usize = 0;
-    const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, &ssm, s, &tokens, false, 0x1234, 600, &.{}, null, null, null, false);
-    try testing.expectEqual(@as(usize, 512), res.matched);
-}
-
-test "GLM image turn persists its whole turn, and a foreign key restarts like a cold prefill below its item" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fx: GlmNet = undefined;
-    try fx.load();
-    defer fx.deinit();
-    var first: [700]u32 = undefined;
-    for (&first, 0..) |*t, i| t.* = @intCast((i * 7 + i / 5) % 4);
-    var next: [750]u32 = undefined;
-    @memcpy(next[0..650], first[0..650]);
-    for (next[650..], 0..) |*t, i| t.* = @intCast((i * 3 + 1) % 4);
-    var window = try KVCache.init(testing.allocator, 2);
-    defer window.deinit();
-    try testFillCache(&window, s, 2, 300);
-    {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.hybrid = true;
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-media", 0, 128);
-        defer hc.deinit();
-        var turn = try GlmTurn.run(&fx.net, 8, &first, &.{ 256, 256, 188 }, &.{ 0, 1 });
-        defer turn.cache.deinit();
-        _ = try hc.commitGlm(&turn.cache, &first, false, 0xABCD, 0, 600, turn.cps, turn.rows, .{ .cache = &window, .base_pos = 400 }, first.len);
-        hc.flushPendingDisk(s);
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        try testing.expectEqual(@as(u32, first.len), hc.disk.?.entries.items[0].kv_len);
-        // The record is not cut at the item any more, so the dflash window covers its rows.
-        try testing.expect(hc.disk.?.entries.items[0].spec_dflash != null);
-    }
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    hc.hybrid = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-glm-media", 0, 128);
-    defer hc.deinit();
-    var warm = try glm5_prefix.servedRequest(8);
-    defer warm.deinit();
-    const res = try glmLookup(&hc, &warm, 8, &next, 0x1234, 600, &.{});
-    try testing.expectEqual(@as(usize, 512), res.matched);
-    const got = try glm5_prefix.prefill(&fx.net, &warm, next[512..], &.{238});
-    defer _ = mlx.mlx_array_free(got);
-    var cold = try glm5_prefix.servedRequest(8);
-    defer cold.deinit();
-    const want = try glm5_prefix.prefill(&fx.net, &cold, &next, &.{ 256, 256, 238 });
-    defer _ = mlx.mlx_array_free(want);
-    try glm5_forward.expectArrayBits(want, got);
-    try glm5_prefix.expectSameLogicalState(&cold, &warm);
-}
-
-const Dsv41Net = struct {
-    m: *dsv41_model.Model,
-    ids: []u32,
-    fx: model_mod.Weights,
-
-    fn load(self: *Dsv41Net) !void {
-        const dir = try dsv41_model.fixtureDir();
-        self.fx = try dsv41_model.loadFixture(dir, "fixture_noqat.safetensors");
-        errdefer self.fx.deinit();
-        var sc = @import("dsv41_scope.zig").Scope.init(testing.allocator, mlx.gpuStream());
-        defer sc.deinit();
-        self.ids = try dsv41_model.tokens(&sc, &self.fx);
-        errdefer testing.allocator.free(self.ids);
-        self.m = try dsv41_model.tinyModel(dir, .{ .act = .bfloat16, .dspark = true }, mlx.gpuStream());
-    }
-
-    fn deinit(self: *Dsv41Net) void {
-        self.m.deinit();
-        testing.allocator.free(self.ids);
-        self.fx.deinit();
-    }
-
-    /// Prefills `tokens` in `chunks` from the request's current position, a checkpoint after each listed chunk.
-    fn prefill(self: *Dsv41Net, tokens: []const u32, chunks: []const usize, at_start: usize, checkpoints: []const usize, cps: *std.ArrayList(SSMCheckpoint)) !void {
-        var at = at_start;
-        for (chunks, 0..) |n, i| {
-            _ = mlx.mlx_array_free(try dsv41_model.extend(self.m, tokens[at .. at + n], .last));
-            at += n;
-            if (std.mem.indexOfScalar(usize, checkpoints, i) != null) try cps.append(testing.allocator, try dsv41_prefix.capture(testing.allocator, self.m, at));
-        }
-    }
-};
-
-fn dsv41Lookup(hc: *HotPrefixCache, net: *Dsv41Net, prompt: []const u32) !LookupResult {
-    return dsv41LookupMedia(hc, net, prompt, 0, null);
-}
-
-fn dsv41LookupMedia(hc: *HotPrefixCache, net: *Dsv41Net, prompt: []const u32, vision_key: u64, media_start: ?usize) !LookupResult {
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer target.deinit();
-    var off: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &off, net.m, mlx.gpuStream(), prompt, false, vision_key, media_start, &.{}, null, false);
-    try testing.expectEqual(res.matched, target.step);
-    try testing.expectEqual(res.matched, (try dsv41_model.ensureState(net.m)).n);
-    return res;
-}
-
-test "DeepSeek hot cache: an image prompt restores whole for its own images and only up to the image for others (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    const prompt = net.ids[0..30];
-    var hc = HotPrefixCache.init(testing.allocator, 4);
-    defer hc.deinit();
-
-    // The prompt holds an image from position 15; checkpoints sit at 12 (before it) and 20 (inside its span).
-    dsv41_model.resetState(net.m);
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    try net.prefill(prompt, &.{ 12, 8, 10 }, 0, &.{ 0, 1 }, &cps);
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    cache.step = prompt.len;
-    defer cache.deinit();
-    const owned = try cps.toOwnedSlice(testing.allocator);
-    const own_key: u64 = 0xdee5eec;
-    try testing.expectEqual(CommitStatus{ .ok = prompt.len }, try hc.commitWithMediaState(&cache, prompt, false, own_key, 0, 15, owned, null, null, prompt.len));
-
-    // Another image under the same ids: equal ids do not make equal rows, so only the text before it is shared.
-    const other = try dsv41LookupMedia(&hc, &net, prompt, own_key ^ 1, 15);
-    try testing.expectEqual(@as(usize, 12), other.matched);
-    // The same image shares the checkpoint inside its span.
-    const same = try dsv41LookupMedia(&hc, &net, prompt, own_key, 15);
-    try testing.expectEqual(@as(usize, 20), same.matched);
-    // A text prompt with the same ids is no image prompt either.
-    const text = try dsv41LookupMedia(&hc, &net, prompt, 0, null);
-    try testing.expectEqual(@as(usize, 12), text.matched);
-}
-
-test "DeepSeek hot cache restores the highest checkpoint under the match and continues like a cold prefill (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    const first = net.ids[0..30];
-    var hc = HotPrefixCache.init(testing.allocator, 4);
-    defer hc.deinit();
-
-    // Turn one: chunks of 12, 8 and 10 with a checkpoint after the first two (positions 12 and 20).
-    dsv41_model.resetState(net.m);
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    try net.prefill(first, &.{ 12, 8, 10 }, 0, &.{ 0, 1 }, &cps);
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    cache.step = first.len;
-    defer cache.deinit();
-    const owned = try cps.toOwnedSlice(testing.allocator);
-    try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, owned, null, null));
-    const e = &hc.entries.items[0];
-    var billed: u64 = 0;
-    for (e.ssm_checkpoints.?) |*cp| billed += ssmCheckpointBytes(cp);
-    try testing.expect(billed > 0);
-    try testing.expectEqual(billed, e.kv_bytes);
-    try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
-
-    // Turn two shares the first 25 tokens and goes its own way: it restores at 20 and runs the same chunks as cold.
-    var next: [40]u32 = undefined;
-    @memcpy(next[0..25], first[0..25]);
-    for (next[25..], 25..) |*t, i| t.* = (net.ids[i] + 1) % 90;
-    const res = try dsv41Lookup(&hc, &net, &next);
-    try testing.expectEqual(@as(usize, 20), res.matched);
-    const warm = try dsv41_model.extend(net.m, next[20..], .all);
-    defer _ = mlx.mlx_array_free(warm);
-    var warm_cp = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
-    defer warm_cp.deinit(testing.allocator);
-
-    dsv41_model.resetState(net.m);
-    var cold_cps: std.ArrayList(SSMCheckpoint) = .empty;
-    defer {
-        for (cold_cps.items) |*cp| cp.deinit(testing.allocator);
-        cold_cps.deinit(testing.allocator);
-    }
-    try net.prefill(&next, &.{ 12, 8 }, 0, &.{}, &cold_cps);
-    const cold = try dsv41_model.extend(net.m, next[20..], .all);
-    defer _ = mlx.mlx_array_free(cold);
-    var cold_cp = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
-    defer cold_cp.deinit(testing.allocator);
-    try glm5_forward.expectArrayBits(cold, warm);
-    for (cold_cp.layers, warm_cp.layers) |a, b| {
-        for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state }, .{ a.aux_state, b.aux_state }, .{ a.qsa_pooled, b.qsa_pooled } }) |pair| {
-            try testing.expectEqual(pair[0].ctx == null, pair[1].ctx == null);
-            if (pair[0].ctx != null and mlx.mlx_array_size(pair[0]) > 0) try glm5_forward.expectArrayBits(pair[0], pair[1]);
-        }
-    }
-
-    // A prompt that shares nothing restores nothing and leaves the model's state empty.
-    var other: [20]u32 = undefined;
-    for (&other) |*t| t.* = 90;
-    try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &other)).matched);
-    // A prompt that diverges before the first checkpoint cannot use any.
-    var early: [20]u32 = undefined;
-    @memcpy(early[0..5], first[0..5]);
-    for (early[5..]) |*t| t.* = 91;
-    try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &early)).matched);
-}
-
-test "DeepSeek hot cache bills the held checkpoints in its residency and gives them back on eviction (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var hc = HotPrefixCache.init(testing.allocator, 1);
-    defer hc.deinit();
-    var billed: [2]u64 = undefined;
-    for (&billed, 0..) |*b, turn| {
-        var prompt: [24]u32 = undefined;
-        for (&prompt, 0..) |*t, i| t.* = (net.ids[i] + @as(u32, @intCast(turn)) * 7) % 90;
-        dsv41_model.resetState(net.m);
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        try net.prefill(&prompt, &.{ 16, 8 }, 0, &.{ 0, 1 }, &cps);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        cache.step = prompt.len;
-        _ = try hc.commitWithState(&cache, &prompt, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-        var held: u64 = 0;
-        for (hc.entries.items) |*e| for (e.ssm_checkpoints.?) |*cp| {
-            held += ssmCheckpointBytes(cp);
-        };
-        b.* = held;
-        try testing.expect(held > 0);
-        try testing.expectEqual(held, hc.residentBytes());
-    }
-    // The second turn shares nothing with the first, so the one-entry cache evicted it: only the second is billed.
-    try testing.expectEqual(@as(usize, 1), hc.entryCount());
-    try testing.expectEqual(billed[1], hc.residentBytes());
-}
-
-test "DeepSeek hot cache over its byte budget keeps the entry with fewer checkpoints, billed exactly (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    dsv41_model.resetState(net.m);
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    try net.prefill(net.ids[0..24], &.{ 8, 8, 8 }, 0, &.{ 0, 1, 2 }, &cps);
-    // The tiny state is far shorter than the commit floor (256 tokens): relabel the positions, as the budget only reads bytes.
-    for (cps.items, 0..) |*cp, i| cp.pos = 800 * (i + 1);
-    const one = ssmCheckpointBytes(&cps.items[0]);
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, one * 2 + one / 2);
-    defer hc.deinit();
-    hc.cp_thin = .min_span_recency;
-    var tokens: [2400]u32 = undefined;
-    for (&tokens, 0..) |*t, i| t.* = net.ids[i % net.ids.len];
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer cache.deinit();
-    cache.step = tokens.len;
-    _ = try hc.commitWithState(&cache, &tokens, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-    try testing.expectEqual(@as(usize, 1), hc.entryCount());
-    try testing.expect(hc.residentBytes() <= one * 2 + one / 2);
-    const e = &hc.entries.items[0];
-    var sum: u64 = 0;
-    for (e.ssm_checkpoints.?) |*cp| sum += ssmCheckpointBytes(cp);
-    try testing.expectEqual(sum, e.kv_bytes);
-    try testing.expectEqual(e.kv_bytes, hc.residentBytes());
-}
-
-fn dsv41SsdOnlyCache(io: std.Io, base: []const u8, fp: []const u8) !HotPrefixCache {
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
-    errdefer hc.deinit();
-    hc.ssd_first = true;
-    hc.hybrid = true;
-    hc.cp_thin = .min_span_recency;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
-    hc.disk.?.ssd_first = true;
-    hc.disk.?.cp_thin = .min_span_recency;
-    hc.disk.?.armTestSpace(256 << 30, 1 << 40);
-    hc.disk.?.enableBackgroundWriter();
-    return hc;
-}
-
-fn cloneCheckpointForTest(src: *const SSMCheckpoint) !SSMCheckpoint {
-    const layers = try testing.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, src.layers.len);
-    for (src.layers, layers) |l, *out| out.* = .{
-        .conv_state = try transformer_mod.materializedOwnedCopy(mlx.gpuStream(), l.conv_state),
-        .ssm_state = try transformer_mod.materializedOwnedCopy(mlx.gpuStream(), l.ssm_state),
-        .initialized = true,
-    };
-    return .{ .pos = src.pos, .layers = layers };
-}
-
-fn expectCheckpointBits(want: *const SSMCheckpoint, got: *const SSMCheckpoint) !void {
-    try testing.expectEqual(want.pos, got.pos);
-    try testing.expectEqual(want.layers.len, got.layers.len);
-    for (want.layers, got.layers) |a, b| {
-        for ([_][2]mlx.mlx_array{ .{ a.conv_state, b.conv_state }, .{ a.ssm_state, b.ssm_state } }) |pair| {
-            try testing.expectEqualSlices(c_int, mlx.getShape(pair[0]), mlx.getShape(pair[1]));
-            try testing.expectEqual(mlx.mlx_array_dtype(pair[0]), mlx.mlx_array_dtype(pair[1]));
-            try glm5_forward.expectArrayBits(pair[0], pair[1]);
-        }
-    }
-}
-
-fn dsv41LongPrompt(net: *const Dsv41Net, buf: []u32, shared_with: ?[]const u32, shared: usize) []const u32 {
-    for (buf, 0..) |*t, i| t.* = if (shared_with != null and i < shared) shared_with.?[i] else net.ids[(i * 5 + 3) % net.ids.len];
-    return buf;
-}
-
-test "DeepSeek SSD tier: a checkpoint written to disk reads back as the same bytes, and a restart restores it like a cold prefill (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [700]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [760]u32 = undefined;
-    for (&next_buf, 0..) |*t, i| t.* = if (i < 650) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
-    const next: []const u32 = &next_buf;
-
-    var want_512: SSMCheckpoint = undefined;
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-ssd");
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        try net.prefill(first, &.{ 256, 256, 188 }, 0, &.{ 0, 1 }, &cps);
-        // the in-RAM state at 512, kept for the byte comparison
-        want_512 = try cloneCheckpointForTest(&cps.items[1]);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
-        const status = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, status);
-        try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-    }
-    defer want_512.deinit(testing.allocator);
-
-    // A fresh tier on the same directory: nothing in RAM, the entry only on disk.
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-ssd");
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, 512), res.matched);
-    try testing.expect(hc.last_restored_disk_id != null);
-    try testing.expectEqual(@as(usize, 512), target.step);
-    try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
-    var got_512 = try dsv41_prefix.capture(testing.allocator, net.m, 512);
-    defer got_512.deinit(testing.allocator);
-    try expectCheckpointBits(&want_512, &got_512);
-
-    const warm = try dsv41_model.extend(net.m, next[512..], .all);
-    defer _ = mlx.mlx_array_free(warm);
-    dsv41_model.resetState(net.m);
-    var cold_cps: std.ArrayList(SSMCheckpoint) = .empty;
-    defer {
-        for (cold_cps.items) |*cp| cp.deinit(testing.allocator);
-        cold_cps.deinit(testing.allocator);
-    }
-    try net.prefill(next, &.{ 256, 256 }, 0, &.{}, &cold_cps);
-    const cold = try dsv41_model.extend(net.m, next[512..], .all);
-    defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
-}
-
-test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as they are taken and restore the same bytes (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [700]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [760]u32 = undefined;
-    for (&next_buf, 0..) |*t, i| t.* = if (i < 650) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
-    const next: []const u32 = &next_buf;
-
-    var want_512: SSMCheckpoint = undefined;
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-wt");
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        var at: usize = 0;
-        for ([_]usize{ 512, 188 }, 0..) |n, i| {
-            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at .. at + n], .last));
-            at += n;
-            if (i != 0) continue;
-            // The state at 512 as an owned copy, kept for the byte comparison.
-            want_512 = try dsv41_prefix.capture(testing.allocator, net.m, at);
-            _ = mlx.mlx_synchronize(s);
-            var before: usize = 0;
-            _ = mlx.mlx_get_active_memory(&before);
-            try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
-            cache.step = at;
-            hc.writeThroughDsv41(net.m, &cache, first[0..at], false, .{}, cps.items, s, "prefill");
-            try testing.expect(cps.items[0].isReleased());
-            _ = mlx.mlx_synchronize(s);
-            var after: usize = 0;
-            _ = mlx.mlx_get_active_memory(&after);
-            // What the prefill still holds is the tier's row markers (a byte a token for keys and for values) and the point's
-            // fixed arrays kept for the next turn's rollback, not the state.
-            try testing.expect(after <= before + 2 * at + hc.live_dsv41.bytes());
-        }
-        cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
-        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-    }
-    defer want_512.deinit(testing.allocator);
-
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-wt");
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, 512), res.matched);
-    var got_512 = try dsv41_prefix.capture(testing.allocator, net.m, 512);
-    defer got_512.deinit(testing.allocator);
-    try expectCheckpointBits(&want_512, &got_512);
-
-    const warm = try dsv41_model.extend(net.m, next[512..], .all);
-    defer _ = mlx.mlx_array_free(warm);
-    dsv41_model.resetState(net.m);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[0..512], .last));
-    const cold = try dsv41_model.extend(net.m, next[512..], .all);
-    defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
-}
-
-/// `dsv41SsdOnlyCache` as the scheduler arms it: restore points split into a row store per entry, on a grid of `span` tokens.
-fn dsv41SplitCache(io: std.Io, base: []const u8, fp: []const u8, net: *const Dsv41Net, span: u32) !HotPrefixCache {
-    var hc = try dsv41SsdOnlyCache(io, base, fp);
-    errdefer hc.deinit();
-    const divs = try dsv41_prefix.rowDivisors(testing.allocator, &net.m.cfg, true);
-    defer testing.allocator.free(divs);
-    hc.disk.?.ssm_max_per_entry = dsv41_prefix.disk_checkpoint_cap;
-    try hc.disk.?.setGrownSpec(span, divs, net.m.cfg.stateBytesPerToken());
-    return hc;
-}
-
-test "DeepSeek SSD tier split: the layers the tier treats as rows are the arrays a capture holds as rows (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    dsv41_model.resetState(net.m);
-    var first_buf: [512]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first, .last));
-    var cp = try dsv41_prefix.capture(testing.allocator, net.m, first.len);
-    defer cp.deinit(testing.allocator);
-    const divs = try dsv41_prefix.rowDivisors(testing.allocator, &net.m.cfg, true);
-    defer testing.allocator.free(divs);
-    try testing.expectEqual(cp.layers.len, divs.len);
-    var rows_layers: usize = 0;
-    for (cp.layers, divs) |l, d| for ([_]mlx.mlx_array{ l.conv_state, l.ssm_state }) |a| {
-        const sh = mlx.getShape(a);
-        if (d == 0) {
-            // A fixed layer's arrays are never rows of a compressed history: either a ring or a placeholder.
-            continue;
-        }
-        try testing.expectEqual(@as(usize, 2), sh.len);
-        try testing.expectEqual(@as(c_int, @intCast(first.len / d)), sh[0]);
-        rows_layers += 1;
-    };
-    try testing.expect(rows_layers > 0);
-    // The window rings and DSpark windows are not rows.
-    for (0..net.m.cfg.layers) |li| try testing.expectEqual(@as(u32, 0), divs[4 * li]);
-    for (divs[4 * net.m.cfg.layers ..]) |d| try testing.expectEqual(@as(u32, 0), d);
-}
-
-test "DeepSeek SSD tier split: every restore point on the grid reads back the bytes a full capture holds, and a restore between two points prefills like cold (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [700]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    // The next turn repeats 400 tokens: between the points at 384 and 512.
-    var next_buf: [760]u32 = undefined;
-    for (&next_buf, 0..) |*t, i| t.* = if (i < 400) first[i] else (net.ids[i % net.ids.len] + 1) % 90;
-    const next: []const u32 = &next_buf;
-
-    const points = [_]usize{ 128, 256, 384, 512, 700 };
-    var want: [points.len]SSMCheckpoint = undefined;
-    var made: usize = 0;
-    defer for (want[0..made]) |*cp| cp.deinit(testing.allocator);
-    {
-        var hc = try dsv41SplitCache(io, base, "dsv41-split", &net, 128);
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        try net.prefill(first, &.{ 128, 128, 128, 128, 188 }, 0, &.{ 0, 1, 2, 3, 4 }, &cps);
-        for (cps.items, 0..) |*cp, i| {
-            want[i] = try cloneCheckpointForTest(cp);
-            made += 1;
-        }
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
-        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        const e = &hc.disk.?.entries.items[0];
-        try testing.expectEqualSlices(u32, &.{ 128, 256, 384, 512, 700 }, e.ssm_positions);
-        // 700 / 128 whole spans, stored once; the points past them keep the rest.
-        try testing.expectEqual(@as(usize, 5), e.grown.len);
-        // A point on the grid keeps its fixed arrays only: no bigger than the one before it plus the rings' share of a prompt end.
-        try testing.expect(e.ssm_bytes[3] <= e.ssm_bytes[0]);
-    }
-
-    var hc = try dsv41SplitCache(io, base, "dsv41-split", &net, 128);
-    defer hc.deinit();
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer target.deinit();
-    for (points, 0..) |p, i| {
-        var one = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer one.deinit();
-        var got = try hc.disk.?.restoreCheckpointInto(&one, 0, @intCast(p), dsv41_prefix.snapshotLayers(net.m), s);
-        defer got.deinit(testing.allocator);
-        try expectCheckpointBits(&want[i], &got);
-    }
-
-    dsv41_model.resetState(net.m);
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, 384), res.matched);
-    const warm = try dsv41_model.extend(net.m, next[384..], .all);
-    defer _ = mlx.mlx_array_free(warm);
-    dsv41_model.resetState(net.m);
-    // Cold on the grid the points were taken on.
-    for (0..3) |c| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, next[c * 128 ..][0..128], .last));
-    const cold = try dsv41_model.extend(net.m, next[384..], .all);
-    defer _ = mlx.mlx_array_free(cold);
-    try glm5_forward.expectArrayBits(cold, warm);
-}
-
-test "DeepSeek SSD tier split: a write-through prefill stages each point with only the rows past the store, and reports the bytes it staged (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [700]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-
-    var hc = try dsv41SplitCache(io, base, "dsv41-split-wt", &net, 128);
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer cache.deinit();
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    defer {
-        for (cps.items) |*cp| cp.deinit(testing.allocator);
-        cps.deinit(testing.allocator);
-    }
-    var at: usize = 0;
-    var seen_ssm: usize = 0;
-    var seen_grown: usize = 0;
-    // Under the tier's floor nothing is written, so the first point is at 512.
-    for ([_]usize{ 512, 188 }, 0..) |n, step| {
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at .. at + n], .last));
-        at += n;
-        try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, at));
-        cache.step = at;
-        const before = hc.disk.?.point_bytes_written;
-        hc.writeThroughDsv41(net.m, &cache, first[0..at], false, .{}, cps.items, s, "prefill");
-        hc.disk.?.drainWriter();
-        const e = &hc.disk.?.entries.items[0];
-        // What the call reports is what the entry's files gained: the new point and the new segments.
-        var gained: u64 = 0;
-        for (e.ssm_bytes[seen_ssm..]) |b| gained += b;
-        for (e.grown[seen_grown..]) |b| gained += b;
-        try testing.expectEqual(gained, hc.disk.?.point_bytes_written - before);
-        // The first point stores four spans; the second only the one past them, not the rows from 0.
-        try testing.expectEqual(@as(usize, if (step == 0) 4 else 1), e.grown.len - seen_grown);
-        seen_ssm = e.ssm_bytes.len;
-        seen_grown = e.grown.len;
-        try testing.expect(cps.items[cps.items.len - 1].isReleased());
-    }
-    try testing.expectEqual(@as(usize, 2), hc.disk.?.entries.items[0].ssm_positions.len);
-}
-
-test "DeepSeek decode point: a restore point taken mid-decode serves the next turn from RAM and from an SSD file, like cold on the same grid (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    const first_len = 600;
-    var first_buf: [first_len]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    // The turn generates 40 tokens one forward at a time; the thought ends after 24 and the reply goes on to 40.
-    var gen: [40]u32 = undefined;
-    for (&gen, 0..) |*t, i| t.* = (net.ids[(i * 7 + 1) % net.ids.len] + 3) % 90;
-    const point = first_len + 24;
-    // The next turn re-renders the thought, then goes its own way.
-    var next_buf: [point + 60]u32 = undefined;
-    @memcpy(next_buf[0..first_len], first);
-    @memcpy(next_buf[first_len..point], gen[0..24]);
-    for (next_buf[point..], point..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
-    const next: []const u32 = &next_buf;
-
-    var want_point: SSMCheckpoint = undefined;
-    var ram = HotPrefixCache.init(testing.allocator, 4);
-    defer ram.deinit();
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-decode");
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
-        try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, 512));
-        cache.step = 512;
-        hc.writeThroughDsv41(net.m, &cache, first[0..512], false, .{}, cps.items, s, "prefill");
-        try testing.expect(cps.items[0].isReleased());
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[512..], .last));
-        for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
-
-        cache.step = point;
-        var tokens: [point]u32 = undefined;
-        @memcpy(tokens[0..first_len], first);
-        @memcpy(tokens[first_len..], gen[0..24]);
-        want_point = try dsv41_prefix.capture(testing.allocator, net.m, point);
-        // The RAM tier gets the same point as an owned copy.
-        var ram_cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer ram_cache.deinit();
-        ram_cache.step = point;
-        const ram_cps = try testing.allocator.alloc(SSMCheckpoint, 1);
-        ram_cps[0] = try dsv41_prefix.capture(testing.allocator, net.m, point);
-        try testing.expectEqual(CommitStatus{ .ok = point }, try ram.commitWithState(&ram_cache, &tokens, false, 0, ram_cps, null, null));
-
-        try hc.writeDecodePointDsv41(&cache, net.m, &tokens, false, .{}, s);
-        // The writer has the state; the request goes on decoding from where it stood.
-        for (gen[24..]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
-
-        cache.step = first_len + gen.len;
-        var all: [first_len + 40]u32 = undefined;
-        @memcpy(all[0..first_len], first);
-        @memcpy(all[first_len..], &gen);
-        try dsv41_prefix.markRows(&cache);
-        // The end-of-request commit hands over the prefill's released point and adds none of its own.
-        try testing.expectEqual(CommitStatus{ .disk_only = all.len }, try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        const e = &hc.disk.?.entries.items[0];
-        try testing.expectEqualSlices(u32, &.{ 512, point }, e.ssm_positions);
-    }
-    defer want_point.deinit(testing.allocator);
-
-    // The cold run replays turn one's forwards up to the point, then the suffix.
-    dsv41_model.resetState(net.m);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[0..512], .last));
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[512..], .last));
-    for (gen[0..24]) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
-    const cold = try dsv41_model.extend(net.m, next[point..], .all);
-    defer _ = mlx.mlx_array_free(cold);
-
-    // From RAM: the point is the highest under the match, and the suffix runs like cold.
-    const from_ram = try dsv41Lookup(&ram, &net, next);
-    try testing.expectEqual(point, from_ram.matched);
-    const ram_warm = try dsv41_model.extend(net.m, next[point..], .all);
-    defer _ = mlx.mlx_array_free(ram_warm);
-    try glm5_forward.expectArrayBits(cold, ram_warm);
-
-    // From the file, by a tier that never saw it written.
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-decode");
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(point, res.matched);
-    try testing.expect(hc.last_restored_disk_id != null);
-    var got_point = try dsv41_prefix.capture(testing.allocator, net.m, point);
-    defer got_point.deinit(testing.allocator);
-    try expectCheckpointBits(&want_point, &got_point);
-    const warm = try dsv41_model.extend(net.m, next[point..], .all);
-    defer _ = mlx.mlx_array_free(warm);
-    try glm5_forward.expectArrayBits(cold, warm);
-}
-
-test "DeepSeek live rollback: the state rolled back to each kept point is a full capture of that point, byte for byte (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var turn_buf: [60]u32 = undefined;
-    const turn = dsv41LongPrompt(&net, &turn_buf, null, 0);
-    const marks = [_]usize{ 12, 20, 30 };
-
-    var want: [marks.len]SSMCheckpoint = undefined;
-    dsv41_model.resetState(net.m);
-    var at: usize = 0;
-    for (marks, &want) |mark, *w| {
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[at..mark], .last));
-        at = mark;
-        w.* = try dsv41_prefix.capture(a, net.m, mark);
-    }
-    defer for (&want) |*w| w.deinit(a);
-
-    for (marks, 0..) |target, t| {
-        dsv41_model.resetState(net.m);
-        var live: dsv41_prefix.Live = .{};
-        defer live.deinit(a);
-        at = 0;
-        for (marks) |mark| {
-            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[at..mark], .last));
-            at = mark;
-            var cp = try dsv41_prefix.capture(a, net.m, mark);
-            defer cp.deinit(a);
-            try live.keep(a, net.m, &cp);
-        }
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[at..45], .last));
-        live.publish(a, net.m, turn[0..45], false, 0, null);
-
-        // The next prompt repeats the turn through the target and three tokens more, then goes its own way.
-        var prompt: [50]u32 = undefined;
-        @memcpy(prompt[0 .. target + 3], turn[0 .. target + 3]);
-        for (prompt[target + 3 ..]) |*tok| tok.* = 91;
-        const idx = live.pick(net.m, &prompt, false, std.math.maxInt(u32)) orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(t, idx);
-        try live.rollback(a, net.m, idx, &prompt);
-        try testing.expectEqual(t + 1, live.points.items.len);
-        try testing.expect(!live.ready);
-
-        var got = try dsv41_prefix.capture(a, net.m, target);
-        defer got.deinit(a);
-        try expectCheckpointBits(&want[t], &got);
-    }
-}
-
-test "DeepSeek live rollback: only a state still standing for the same history serves, at a point the prompt shares (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var turn_buf: [40]u32 = undefined;
-    const turn = dsv41LongPrompt(&net, &turn_buf, null, 0);
-    var live: dsv41_prefix.Live = .{};
-    defer live.deinit(a);
-    dsv41_model.resetState(net.m);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[0..20], .last));
-    var cp = try dsv41_prefix.capture(a, net.m, 20);
-    defer cp.deinit(a);
-    try live.keep(a, net.m, &cp);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn[20..], .last));
-    const max: usize = std.math.maxInt(u32);
-
-    // A request is still running over the points: nothing to roll back to.
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn, false, max));
-    live.publish(a, net.m, turn, false, 0, null);
-    try testing.expectEqual(@as(?usize, 0), live.pick(net.m, turn[0..30], false, max));
-    // The point is 20 tokens in: a prompt that leaves the turn earlier, or ends at it, or crosses an image, cannot use it.
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn[0..19], false, max));
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn[0..20], false, max));
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn[0..30], false, 19));
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn[0..30], true, max));
-    // Rows past what the prompt's own state would hold are not billed.
-    try testing.expect(dsv41_model.liveRowsFit(net.m, 40));
-    // Another state took the model's place.
-    dsv41_model.resetState(net.m);
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, turn[0..30], false, max));
-}
-
-test "DeepSeek live rollback: a turn that diverges inside the last turn's generation rolls back to its deepest kept point and continues like an SSD restore (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    const first_len = 600;
-    var first_buf: [first_len]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var gen: [24]u32 = undefined;
-    for (&gen, 0..) |*t, i| t.* = (net.ids[(i * 7 + 1) % net.ids.len] + 3) % 90;
-    var all: [first_len + gen.len]u32 = undefined;
-    @memcpy(all[0..first_len], first);
-    @memcpy(all[first_len..], &gen);
-    // The template re-renders the generation from its 10th token on.
-    var next_buf: [first_len + 40]u32 = undefined;
-    @memcpy(next_buf[0 .. first_len + 10], all[0 .. first_len + 10]);
-    for (next_buf[first_len + 10 ..], first_len + 10..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
-    const next: []const u32 = &next_buf;
-    const prompt_end = 570;
-
-    var live_point: SSMCheckpoint = undefined;
-    var live_end: SSMCheckpoint = undefined;
-    var via_live: mlx.mlx_array = undefined;
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-live");
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        var at: usize = 0;
-        for ([_]usize{ 512, prompt_end }) |point| {
-            _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..point], .last));
-            at = point;
-            try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, net.m, point));
-            cache.step = point;
-            hc.writeThroughDsv41(net.m, &cache, first[0..point], false, .{}, cps.items, s, "prefill");
-        }
-        _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, first[at..], .last));
-        for (gen) |t| _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, &.{t}, .last));
-        cache.step = all.len;
-        try dsv41_prefix.markRows(&cache);
-        _ = try hc.commitWithState(&cache, &all, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-        hc.publishLiveDsv41(net.m, &all, false, .{});
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        // The two points' fixed arrays and the history's ids ride beside the model's state.
-        const sets = hc.live_dsv41.points.items.len;
-        try testing.expectEqual(@as(usize, 2), sets);
-        try testing.expect(hc.live_dsv41.bytes() > all.len * @sizeOf(u32));
-        try testing.expect(hc.live_dsv41.bytes() <= sets * net.m.cfg.stateFixedBytes(true) + all.len * @sizeOf(u32));
-
-        // The live state serves: the deepest point under the 610 shared tokens, with no stored copy read.
-        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer target.deinit();
-        var moe: usize = 0;
-        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-        try testing.expectEqual(@as(usize, prompt_end), res.matched);
-        try testing.expectEqual(@as(usize, prompt_end), target.step);
-        try testing.expectEqual(@as(usize, prompt_end), moe);
-        try testing.expect(hc.last_restored_live);
-        try testing.expectEqual(@as(?u64, null), hc.last_restored_disk_id);
-        live_point = try dsv41_prefix.capture(testing.allocator, net.m, prompt_end);
-        via_live = try dsv41_model.extend(net.m, next[prompt_end..], .all);
-        live_end = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
-    }
-    defer live_point.deinit(testing.allocator);
-    defer _ = mlx.mlx_array_free(via_live);
-    defer live_end.deinit(testing.allocator);
-
-    // A tier that never saw the write restores the same point from its file.
-    var fresh = try dsv41SsdOnlyCache(io, base, "dsv41-live");
-    defer fresh.deinit();
-    dsv41_model.resetState(net.m);
-    var ssd_target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer ssd_target.deinit();
-    var ssd_moe: usize = 0;
-    const from_ssd = try fresh.lookupAndRestoreDsv41(&ssd_target, &ssd_moe, net.m, s, next, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, prompt_end), from_ssd.matched);
-    try testing.expect(!fresh.last_restored_live);
-    try testing.expect(fresh.last_restored_disk_id != null);
-    var ssd_point = try dsv41_prefix.capture(testing.allocator, net.m, prompt_end);
-    defer ssd_point.deinit(testing.allocator);
-    try expectCheckpointBits(&ssd_point, &live_point);
-    const via_ssd = try dsv41_model.extend(net.m, next[prompt_end..], .all);
-    defer _ = mlx.mlx_array_free(via_ssd);
-    try glm5_forward.expectArrayBits(via_ssd, via_live);
-    var ssd_end = try dsv41_prefix.capture(testing.allocator, net.m, next.len);
-    defer ssd_end.deinit(testing.allocator);
-    try expectCheckpointBits(&ssd_end, &live_end);
-}
-
-test "DeepSeek live rollback: another conversation, a replaced state or a point behind a stored one takes the normal path (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-live-miss");
-    defer hc.deinit();
-
-    const Turn = struct {
-        fn run(h: *HotPrefixCache, n: *Dsv41Net, tokens: []const u32) !void {
-            dsv41_model.resetState(n.m);
-            var cache = try KVCache.initWithConfig(testing.allocator, n.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-            defer cache.deinit();
-            var cps: std.ArrayList(SSMCheckpoint) = .empty;
-            _ = mlx.mlx_array_free(try dsv41_model.extend(n.m, tokens[0..512], .last));
-            try cps.append(testing.allocator, try dsv41_prefix.captureShared(testing.allocator, n.m, 512));
-            cache.step = 512;
-            h.writeThroughDsv41(n.m, &cache, tokens[0..512], false, .{}, cps.items, mlx.gpuStream(), "prefill");
-            _ = mlx.mlx_array_free(try dsv41_model.extend(n.m, tokens[512..], .last));
-            cache.step = tokens.len;
-            try dsv41_prefix.markRows(&cache);
-            _ = try h.commitWithState(&cache, tokens, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-            h.publishLiveDsv41(n.m, tokens, false, .{});
-            h.flushPendingDisk(mlx.gpuStream());
-            h.disk.?.drainWriter();
-        }
-    };
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..580], first[0..580]);
-    for (next_buf[580..], 580..) |*t, i| t.* = (net.ids[i % net.ids.len] + 1) % 90;
-
-    // Another conversation shares 100 tokens, short of every point: nothing is restored and the points are dropped.
-    try Turn.run(&hc, &net, first);
-    var other: [620]u32 = undefined;
-    @memcpy(other[0..100], first[0..100]);
-    for (other[100..]) |*t| t.* = 92;
-    try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &other)).matched);
-    try testing.expect(!hc.last_restored_live);
-    try testing.expectEqual(@as(usize, 0), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(u64, 0), hc.live_dsv41.bytes());
-
-    // The model's state was replaced after the turn: the stored point serves.
-    try Turn.run(&hc, &net, first);
-    dsv41_model.resetState(net.m);
-    const stored = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), stored.matched);
-    try testing.expect(!hc.last_restored_live);
-    try testing.expect(hc.last_restored_disk_id != null);
-    // The restored point is the first of this request's own.
-    try testing.expectEqual(@as(usize, 1), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(usize, 512), hc.live_dsv41.points.items[0].pos);
-
-    // The live state serves where it can: the same prompt after a finished turn.
-    try Turn.run(&hc, &net, first);
-    const again = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), again.matched);
-    try testing.expect(hc.last_restored_live);
-}
-
-// A cancelled request publishes its live record when the scheduler culls it, before the next exclusive request is
-// admitted (`cullDecodingWith`); its tokens are never paired with that request's state, whatever happens to it.
-test "DeepSeek live rollback: a cancelled request's record, published at the cull, never serves a request that continues it from the next one's state (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const a = testing.allocator;
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var a_buf: [60]u32 = undefined;
-    const turn_a = dsv41LongPrompt(&net, &a_buf, null, 0);
-    var b_buf: [60]u32 = undefined;
-    for (&b_buf, 0..) |*t, i| t.* = if (i < 10) turn_a[i] else (net.ids[(i * 3 + 1) % net.ids.len] + 7) % 90;
-    var live: dsv41_prefix.Live = .{};
-    defer live.deinit(a);
-
-    // A: a prefill point at 20, decodes to 40, is cancelled, and publishes at the cull.
-    dsv41_model.resetState(net.m);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[0..20], .last));
-    {
-        var cp = try dsv41_prefix.capture(a, net.m, 20);
-        defer cp.deinit(a);
-        try live.keep(a, net.m, &cp);
-    }
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, turn_a[20..40], .last));
-    live.publish(a, net.m, turn_a[0..40], false, 0, null);
-
-    // B shares 10 tokens, short of every point: its lookup drops the record, it prefills cold to a point at 30 and
-    // is cancelled mid-prefill, which publishes nothing.
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, &b_buf, false, std.math.maxInt(u32)));
-    live.clear(a);
-    dsv41_model.resetState(net.m);
-    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, b_buf[0..30], .last));
-    {
-        var cp = try dsv41_prefix.capture(a, net.m, 30);
-        defer cp.deinit(a);
-        try live.keep(a, net.m, &cp);
-    }
-
-    // C continues A's conversation: B's state is no state for it.
-    var c_buf: [50]u32 = undefined;
-    @memcpy(c_buf[0..40], turn_a[0..40]);
-    for (c_buf[40..]) |*t| t.* = 93;
-    try testing.expectEqual(@as(?usize, null), live.pick(net.m, &c_buf, false, std.math.maxInt(u32)));
-}
-
-test "DeepSeek SSD tier: the namespace names the layout, and another layout's entries are never read (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const dir = try dsv41_model.fixtureDir();
-    var cfg = try model_mod.parseConfig(io, testing.allocator, dir);
-    defer cfg.deinit(testing.allocator);
-    cfg.stream_mtp_head = true;
-    const tag = cfg.cacheLayoutNamespace() orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(dsv41_prefix.namespaceTag(cfg.dsparkOn()), tag);
-    try testing.expect(!std.mem.eql(u8, dsv41_prefix.namespaceTag(true), dsv41_prefix.namespaceTag(false)));
-    const a = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(true));
-    defer testing.allocator.free(a);
-    const b = try kv_disk_cache.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(false));
-    defer testing.allocator.free(b);
-    try testing.expect(!std.mem.eql(u8, a, b));
-
-    // An entry stored under one fingerprint is a miss under the other.
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, a);
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer cache.deinit();
-        cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
-        _ = try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null);
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-    }
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..600], first);
-    for (next_buf[600..]) |*t| t.* = 91;
-    for ([_]struct { fp: []const u8, want: usize }{ .{ .fp = a, .want = 512 }, .{ .fp = b, .want = 0 } }) |arm| {
-        var hc = try dsv41SsdOnlyCache(io, base, arm.fp);
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-        defer target.deinit();
-        var moe: usize = 0;
-        const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
-        try testing.expectEqual(arm.want, res.matched);
-    }
-}
-
-test "DeepSeek with both tiers: the RAM entry serves the active session and, once it is gone, the SSD entry does (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..600], first);
-    for (next_buf[600..]) |*t| t.* = 91;
-
-    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    defer hc.deinit();
-    hc.hybrid = true;
-    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "dsv41-both", 0, 128);
-    hc.disk.?.enableBackgroundWriter();
-    dsv41_model.resetState(net.m);
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
-    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
-    defer cache.deinit();
-    cache.step = first.len;
-    try dsv41_prefix.markRows(&cache);
-    try testing.expectEqual(CommitStatus{ .ok = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-    hc.flushPendingDisk(s);
-    hc.disk.?.drainWriter();
-    try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-
-    const ram = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), ram.matched);
-    try testing.expect(hc.last_restored_disk_id == null);
-    // Dropping the RAM entry leaves the disk copy, which restores the same point.
-    hc.evictAt(0, "test");
-    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-    const disk = try dsv41Lookup(&hc, &net, &next_buf);
-    try testing.expectEqual(@as(usize, 512), disk.matched);
-    try testing.expect(hc.last_restored_disk_id != null);
-}
-
-test "DeepSeek SSD tier under the engine's default KV scheme, which every slot cache carries: commit, restart, restore (DSV41_TINY)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const io = std.testing.io;
-    const s = mlx.gpuStream();
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = buf[0..try tmp.dir.realPath(io, &buf)];
-    var net: Dsv41Net = undefined;
-    try net.load();
-    defer net.deinit();
-    var first_buf: [600]u32 = undefined;
-    const first = dsv41LongPrompt(&net, &first_buf, null, 0);
-    var next_buf: [620]u32 = undefined;
-    @memcpy(next_buf[0..600], first);
-    for (next_buf[600..]) |*t| t.* = 91;
-    const kv = kv_quant.KVQuantConfig.engine_default;
-    try testing.expect(kv.scheme != .off);
-    {
-        var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
-        defer hc.deinit();
-        dsv41_model.resetState(net.m);
-        var cps: std.ArrayList(SSMCheckpoint) = .empty;
-        try net.prefill(first, &.{ 256, 256, 88 }, 0, &.{ 0, 1 }, &cps);
-        var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
-        defer cache.deinit();
-        cache.step = first.len;
-        try dsv41_prefix.markRows(&cache);
-        try testing.expectEqual(CommitStatus{ .disk_only = first.len }, try hc.commitWithState(&cache, first, false, 0, try cps.toOwnedSlice(testing.allocator), null, null));
-        hc.flushPendingDisk(s);
-        hc.disk.?.drainWriter();
-        try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-    }
-    var hc = try dsv41SsdOnlyCache(io, base, "dsv41-kv8");
-    defer hc.deinit();
-    dsv41_model.resetState(net.m);
-    var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv);
-    defer target.deinit();
-    var moe: usize = 0;
-    const res = try hc.lookupAndRestoreDsv41(&target, &moe, net.m, s, &next_buf, false, 0, null, &.{}, 9, false);
-    try testing.expectEqual(@as(usize, 512), res.matched);
-    try testing.expectEqual(@as(usize, 512), (try dsv41_model.ensureState(net.m)).n);
-}
-
 test "restoreLogLine: one shape for every arch, the tag aside" {
     var buf: [160]u8 = undefined;
     try testing.expectEqualStrings(
@@ -15196,4 +10689,42 @@ test "HotPrefixCache: a checkpoint taken inside the generated reply is where a p
         try testing.expectEqual(c.at, moe_off);
         try testing.expectEqual(c.conv, pcSsmVal(ssm[0].conv_state, 0, s));
     }
+}
+
+test "a write-through under other pixels never extends the record that holds the first image's rows" {
+    // Two images of one size render the same placeholder ids, so the token match alone cannot tell them apart.
+    try mlx.requireGpu();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    const tokens = mediaTurnTokens(2048);
+    const at: usize = 600;
+    const ka: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const kb: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.ssd_first = true;
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "fp-media-swap", 0, 1024);
+    defer hc.deinit();
+    var rows_a = try KVCache.init(testing.allocator, 3);
+    defer rows_a.deinit();
+    try kv_disk_cache.fillCache(&rows_a, s, 3, tokens.len, 8, 0.0, .float32);
+    var rows_b = try KVCache.init(testing.allocator, 3);
+    defer rows_b.deinit();
+    try kv_disk_cache.fillCache(&rows_b, s, 3, tokens.len, 8, 5_000_000.0, .float32);
+
+    // Image A's prefill stops after its first chunk (a disconnect); image B's request has the same ids.
+    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.disk.?.drainWriter();
+
+    const chain = [_]MediaSpan{.{ .start = at, .key = kb }};
+    var dst = try KVCache.init(testing.allocator, 3);
+    defer dst.deinit();
+    var moe: usize = 0;
+    const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, kb, at, &chain, null, null, null, false);
+    try testing.expect(res.matched > at);
+    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, rows_b.entries[li].keys, res.matched);
 }

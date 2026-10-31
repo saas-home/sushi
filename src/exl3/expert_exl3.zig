@@ -235,11 +235,26 @@ pub fn packedHalfwords(k: u32) usize {
 
 /// K1 to K8 in 1/8-bit steps. An odd n would leave a tile's bitstream short of
 /// a whole uint32 word, which every reader indexes by.
+/// The packed rates a sweep tests: every shipped pack's rate and the table's ends.
+pub const ADMITTED_SAMPLE = [_]u32{ 16, 22, 24, 26, 28, 32, 36, 40, 42, 44, 48, 52, 56, 64, 66, 96, 128 };
+
 pub fn kFromPackedDim(packed_hw: usize) ?Rate {
     if (packed_hw % 2 != 0) return null;
     if (packed_hw < Rate.min_n or packed_hw > Rate.max_n) return null;
     return .{ .n = @intCast(packed_hw) };
 }
+
+/// How a routed expert's trellis tiles lie in the pack: `[IT][OT][n]` (`pack`), or `[OT/2][IT][2][n]` (`pair_major`),
+/// the order the decode and prefill kernels read.
+pub const TileOrder = enum {
+    pack,
+    pair_major,
+
+    /// The `expert_quant.tile_order` value; the legacy order is the field's absence.
+    pub fn fromName(name: []const u8) ?TileOrder {
+        return if (std.mem.eql(u8, name, "pair_major")) .pair_major else null;
+    }
+};
 
 pub fn f16BitsToF32(bits: u16) f32 {
     return @floatCast(@as(f16, @bitCast(bits)));

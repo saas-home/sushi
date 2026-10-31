@@ -1,4 +1,4 @@
-//! Interleaved M-RoPE host math for Qwen3.5/3.6 vision-language models.
+//! Interleaved M-RoPE host math for Flash-Next vision-language models.
 //!
 //! Faithful port of mlx-vlm's `rope_utils._interleaved_position_selector` and
 //! `Qwen3_5Model.get_rope_index` (mlx_vlm/models/qwen3_5/language.py). All math
@@ -230,7 +230,7 @@ pub fn computeInvFreq(out: []f64, rotary_dim: usize, theta: f64) void {
 /// YaRN rope scaling (Peng et al., github.com/jquesnelle/yarn) as HF's
 /// `_compute_yarn_parameters` computes it from a `rope_parameters` block with
 /// `rope_type: "yarn"` — the mechanism vLLM exposes through `--hf-overrides`
-/// to stretch Qwen3.5 past its trained window. Pure f64 host math (no MLX), so
+/// to stretch a Qwen trunk past its trained window. Pure f64 host math (no MLX), so
 /// it unit-tests straight against the reference values.
 ///
 /// The trunk ropes every one of its rotary tables (attention, the QSA indexer,
@@ -539,7 +539,7 @@ const QWEN4_YARN = Yarn{
 };
 
 /// `_compute_yarn_parameters` output for QWEN4_YARN, produced by the reference
-/// (tests/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
+/// (tests/qwen4/dump_qwen4_yarn_fixtures.py, transformers 5.9) — and independently by
 /// a transcription of vLLM's `YaRNScalingRotaryEmbedding._compute_inv_freq`,
 /// which agrees with HF bit-for-bit here. f64: the references compute in f32,
 /// which is 1e-7 sloppier than these.
@@ -754,7 +754,7 @@ test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
     // `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS["yarn"]`, cross-checked
     // inside the dumper against a transcription of vLLM's
     // `YaRNScalingRotaryEmbedding` — for THIS checkpoint's own geometry, dumped by
-    // `tests/dump_qwen4_yarn_fixtures.py`. Dormant in normal CI:
+    // `tests/qwen4/dump_qwen4_yarn_fixtures.py`. Dormant in normal CI:
     //
     //     QWEN4_YARN_FIXTURES=/tmp/qwen4_yarn.json \
     //         zig build test -Dtest-filter="qwen4 yarn parity"
@@ -855,7 +855,4 @@ test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
         }
     }
     try std.testing.expect(rows_seen >= 12);
-    std.debug.print("[qwen4-yarn] {d} freqs + {d} position rows (through {d}) match HF/vLLM\n", .{
-        got.len, rows_seen, fx.get("extended_max_position_embeddings").?.integer,
-    });
 }

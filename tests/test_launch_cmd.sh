@@ -1,5 +1,5 @@
 #!/bin/bash
-. "$(dirname "$0")/private_cache.sh"
+# sushi-test: tier=live boot=api
 # Integration test: `sushi launch <agent>` (issue #188) — configures and
 # launches a third-party coding agent against the local server, ollama-style.
 #
@@ -22,22 +22,11 @@
 
 set -u
 
-MODEL_DIR=${1:-${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw}
-PORT=${2:-8097}
-BASE="http://127.0.0.1:$PORT"
-BIN=./zig-out/bin/sushi
+. "$(dirname "$0")/lib/boot.sh"; sushi_attach
+BASE=$SUSHI_URL
 PASS=0
 FAIL=0
 TOTAL=0
-
-if [ ! -d "$MODEL_DIR" ]; then
-    echo "SKIP: Model not found at $MODEL_DIR"
-    exit 0
-fi
-if [ ! -x "$BIN" ]; then
-    echo "FAIL: sushi not built — run 'zig build -Doptimize=ReleaseFast' first"
-    exit 1
-fi
 
 run_test() {
     TOTAL=$((TOTAL+1))
@@ -46,7 +35,7 @@ run_test() {
 }
 
 # ── [1] unknown agent ──
-OUT=$("$BIN" launch not-an-agent 2>&1)
+OUT=$(sushi_cli launch not-an-agent 2>&1)
 if [ $? -ne 0 ] && echo "$OUT" | grep -q "claude" && echo "$OUT" | grep -q "aider"; then
     run_test "unknown agent errors naming the choices" PASS
 else
@@ -54,25 +43,17 @@ else
 fi
 
 # ── [2] no server ──
-OUT=$("$BIN" launch omp --url http://127.0.0.1:59999 2>&1)
+OUT=$(sushi_cli launch omp --url http://127.0.0.1:59999 2>&1)
 if [ $? -ne 0 ] && echo "$OUT" | grep -qi "sushi serve"; then
     run_test "dead server instructs how to start one" PASS
 else
     run_test "dead server instructs how to start one" FAIL "$OUT"
 fi
 
-echo "Starting server..."
-"$BIN" --model "$MODEL_DIR" --serve --port "$PORT" >/tmp/sushi-launch-test.log 2>&1 &
-SERVER_PID=$!
-cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
-trap cleanup EXIT
-for i in $(seq 1 40); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; exit 1; }
-    sleep 1
-done
-
-MODEL_ID=$(basename "$MODEL_DIR")
+MODEL_ID=$(curl -s "$BASE/v1/models" | python3 -c '
+import sys, json
+print(json.loads(sys.stdin.read())["data"][0]["id"])
+')
 ADV_CTX=$(curl -s "$BASE/v1/models" | python3 -c '
 import sys, json
 r = json.loads(sys.stdin.read())
@@ -80,7 +61,7 @@ print((r["data"][0].get("meta") or {}).get("context_length") or 0)
 ')
 
 # ── [3] omp --print ──
-OUT=$("$BIN" launch omp --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch omp --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export PI_CODING_AGENT_DIR="$HOME/.sushi/omp"' || OK=0
 echo "$OUT" | grep -q "omp --model 'sushi/$MODEL_ID'" || OK=0
@@ -94,7 +75,7 @@ else
 fi
 
 # ── [4] codex --print ──
-OUT=$("$BIN" launch codex --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch codex --print --url "$BASE" 2>&1)
 OK=1
 echo "$OUT" | grep -q 'export CODEX_HOME="$HOME/.sushi/codex"' || OK=0
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
@@ -112,7 +93,7 @@ else
 fi
 
 # ── [5] claude --print ──
-OUT=$("$BIN" launch claude --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch claude --print --url "$BASE" 2>&1)
 EXPECT_OUT=$(python3 -c "print(min(65536, max(1024, $ADV_CTX // 2)))")
 OK=1
 echo "$OUT" | grep -q "export ANTHROPIC_BASE_URL='$BASE'" || OK=0
@@ -128,7 +109,7 @@ else
 fi
 
 # ── [6] passthrough args ──
-OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
+OUT=$(sushi_cli launch codex --print --url "$BASE" -- resume 2>&1)
 if echo "$OUT" | grep -q "\"\$CODEX_BIN\" 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
@@ -136,7 +117,7 @@ else
 fi
 
 # ── [7] pi --print: every thinking level reaches the server as a word it accepts ──
-OUT=$("$BIN" launch pi --print --url "$BASE" 2>&1)
+OUT=$(sushi_cli launch pi --print --url "$BASE" 2>&1)
 WORDS=$(python3 - "$BASE" ~/.sushi/pi/models.json <<'PY'
 import json, sys, urllib.request
 rows = {r["id"]: r for r in json.load(urllib.request.urlopen(sys.argv[1] + "/v1/models"))["data"]}
@@ -147,7 +128,8 @@ words = set()
 for m in p["models"]:
     accepted = rows.get(m["id"], {}).get("reasoning_efforts")
     for lvl, w in m["thinkingLevelMap"].items():
-        if accepted is not None and w not in accepted: bad.append(f"{m['id']}:{lvl}->{w}")
+        # A null word is a level the model does not offer (GLM has no off).
+        if w and accepted is not None and w not in accepted: bad.append(f"{m['id']}:{lvl}->{w}")
         if w: words.add(w)
 print("BAD " + " ".join(bad) if bad else " ".join(sorted(words)))
 PY
@@ -158,7 +140,7 @@ case "$WORDS" in BAD*|"") OK=0 ;; esac
 for w in $WORDS; do
     [ "$OK" = 1 ] || break
     CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
-        -d "{\"model\":\"x\",\"max_tokens\":1,\"reasoning_effort\":\"$w\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+        -d "{\"model\":\"x\",\"max_tokens\":1,\"reasoning_effort\":\"$w\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE hi\"}]}")
     [ "$CODE" = 200 ] || { OK=0; WORDS="$WORDS ($w -> $CODE)"; }
 done
 if [ "$OK" = 1 ]; then

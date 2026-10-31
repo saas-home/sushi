@@ -5,7 +5,7 @@ const io_mod = @import("expert_io.zig");
 const kernels = @import("expert_bf16_kernels.zig");
 pub const quant = @import("expert_quant.zig");
 const sushi_exl3 = @import("sushi_exl3");
-const expert_usage = @import("expert_usage.zig");
+const expert_usage = @import("dsv41/expert_usage.zig");
 const Ragged = sushi_exl3.Ragged;
 
 pub const Span = struct {
@@ -1333,6 +1333,16 @@ const CacheSnapshot = struct {
     ready: []bool,
     tick: u64,
 
+    fn take(allocator: std.mem.Allocator, cache: *const GroupCache) !CacheSnapshot {
+        const expert_to_slot = try allocator.dupe(i32, cache.expert_to_slot);
+        errdefer allocator.free(expert_to_slot);
+        const slot_to_expert = try allocator.dupe(u16, cache.slot_to_expert);
+        errdefer allocator.free(slot_to_expert);
+        const ages = try allocator.dupe(u64, cache.ages);
+        errdefer allocator.free(ages);
+        return .{ .expert_to_slot = expert_to_slot, .slot_to_expert = slot_to_expert, .ages = ages, .ready = try allocator.dupe(bool, cache.ready), .tick = cache.tick };
+    }
+
     fn restore(self: *const CacheSnapshot, cache: *GroupCache) void {
         @memcpy(cache.expert_to_slot, self.expert_to_slot);
         @memcpy(cache.slot_to_expert, self.slot_to_expert);
@@ -1347,6 +1357,54 @@ const CacheSnapshot = struct {
         allocator.free(self.ages);
         allocator.free(self.ready);
         self.* = undefined;
+    }
+};
+
+const AgedSlot = struct { slot: u16, age: u64 };
+
+/// What puts a cache back as it was before a `resolve`. Experts that all sit ready only touch their slots' ages and
+/// the tick, which a log of those ages undoes; a miss can move any slot and takes a full copy.
+const CacheUndo = union(enum) {
+    touched: struct { tick: u64, first: usize, end: usize },
+    full: CacheSnapshot,
+
+    /// The log is the caller's, kept across routes; `experts` are the group-local ids about to be resolved.
+    fn begin(allocator: std.mem.Allocator, aged: *std.ArrayList(AgedSlot), cache: *const GroupCache, experts: []const u16) !CacheUndo {
+        if (allReady(cache, experts) and experts.len <= cache.ages.len) {
+            const first = aged.items.len;
+            for (experts) |expert| {
+                const slot: u16 = @intCast(cache.expert_to_slot[expert]);
+                try aged.append(allocator, .{ .slot = slot, .age = cache.ages[slot] });
+            }
+            return .{ .touched = .{ .tick = cache.tick, .first = first, .end = aged.items.len } };
+        }
+        return .{ .full = try CacheSnapshot.take(allocator, cache) };
+    }
+
+    fn allReady(cache: *const GroupCache, experts: []const u16) bool {
+        for (experts) |expert| {
+            if (expert >= cache.expert_to_slot.len) return false;
+            const raw = cache.expert_to_slot[expert];
+            if (raw < 0 or !cache.ready[@intCast(raw)]) return false;
+        }
+        return true;
+    }
+
+    fn restore(self: *const CacheUndo, aged: []const AgedSlot, cache: *GroupCache) void {
+        switch (self.*) {
+            .touched => |t| {
+                for (aged[t.first..t.end]) |entry| cache.ages[entry.slot] = entry.age;
+                cache.tick = t.tick;
+            },
+            .full => |*snapshot| snapshot.restore(cache),
+        }
+    }
+
+    fn deinit(self: *CacheUndo, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .touched => {},
+            .full => |*snapshot| snapshot.deinit(allocator),
+        }
     }
 };
 
@@ -1392,9 +1450,11 @@ const GroupedLayer = struct {
     cache_ragged: Ragged = .{},
     union_ragged: Ragged = .{},
     tile_major: bool = false,
+    /// The source stores trellis tiles already in the pools' tile-major order: a fill reads them as they are.
+    source_tile_major: bool = false,
 
-    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64, tile_major: bool) !GroupedLayer {
-        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter, .tile_major = tile_major };
+    fn init(allocator: std.mem.Allocator, groups: quant.LayerGroups, hidden: u32, inter: u32, allot_bytes: u64, tile_major: bool, source_tile_major: bool) !GroupedLayer {
+        var self: GroupedLayer = .{ .groups = groups, .hidden = hidden, .inter = inter, .tile_major = tile_major, .source_tile_major = source_tile_major };
         errdefer self.deinitCaches();
         try self.sizePools(allot_bytes);
         var union_at: [3]u64 = @splat(0);
@@ -1406,6 +1466,8 @@ const GroupedLayer = struct {
             self.union_base[g] = union_slots;
             union_slots += groups.keptOf(g);
             for (0..3) |pi| {
+                cache_at[pi] = self.padTo(cache_at[pi]);
+                union_at[pi] = self.padTo(union_at[pi]);
                 self.cache_off[g][pi] = cache_at[pi];
                 self.union_off[g][pi] = union_at[pi];
                 cache_at[pi] += self.slots[g] * self.trellisBytes(g, pi);
@@ -1414,6 +1476,15 @@ const GroupedLayer = struct {
         }
         try self.initCaches(allocator);
         return self;
+    }
+
+    /// `at` moved up to the next pool start; every pool of a layer whose pack lies page-aligned starts on a page.
+    fn padTo(self: *const GroupedLayer, at: u64) u64 {
+        return if (self.groups.align_bytes == 0) at else std.mem.alignForward(u64, at, self.groups.align_bytes);
+    }
+
+    fn alignWords(self: *const GroupedLayer) u64 {
+        return @max(1, self.groups.align_bytes / 2);
     }
 
     fn expertCount(self: *const GroupedLayer) usize {
@@ -1430,9 +1501,10 @@ const GroupedLayer = struct {
     /// slot, paid first; `ExpertCacheTooSmall` when one slot per group does not fit.
     fn sizePools(self: *GroupedLayer, allot_bytes: u64) !void {
         const count: usize = self.groups.count;
+        const pad = self.groups.padBytes();
         var pinned: [quant.rate_group_limit]bool = @splat(false);
         while (true) {
-            var spare = allot_bytes;
+            var spare = std.math.sub(u64, allot_bytes, pad) catch return error.ExpertCacheTooSmall;
             var free_bytes: u64 = 0;
             for (0..count) |g| {
                 if (!pinned[g]) {
@@ -1475,9 +1547,9 @@ const GroupedLayer = struct {
 
     /// Elements of projection pi's flat trellis storage holding `per_group[g]` slots of every group.
     fn trellisElems(self: *const GroupedLayer, pi: usize, per_group: []const u32) usize {
-        var total: u64 = 0;
-        for (0..self.groups.count) |g| total += @as(u64, per_group[g]) * self.trellisBytes(g, pi) / 2;
-        return @intCast(total);
+        var bytes: u64 = 0;
+        for (0..self.groups.count) |g| bytes = self.padTo(bytes) + @as(u64, per_group[g]) * self.trellisBytes(g, pi);
+        return @intCast(bytes / 2);
     }
 
     /// Bytes of one slot's piece of component `ci` in group g.
@@ -1501,10 +1573,10 @@ const GroupedLayer = struct {
     }
 
     /// The fill of component `ci` of one expert of group `g` from `source` into `dst`; a trellis lands tile-major
-    /// when the layer is.
+    /// when the layer is, by a reshuffle unless the source already is.
     fn fillSpan(self: *const GroupedLayer, source: SourceSpan, dst: []u8, g: usize, ci: usize) io_mod.FillSpan {
         var span: io_mod.FillSpan = .{ .file = source.file, .offset = source.offset, .len = source.len, .dst = dst.ptr };
-        if (self.tile_major and ci % 3 == 0) {
+        if (self.tile_major and !self.source_tile_major and ci % 3 == 0) {
             const pi = ci / 3;
             const it: u32 = (if (pi == 2) self.inter else self.hidden) / 16;
             const ot: u32 = (if (pi == 2) self.hidden else self.inter) / 16;
@@ -1530,13 +1602,13 @@ const GroupedLayer = struct {
         try self.buildCacheBank(s, cache);
         errdefer self.cache_ragged.deinit();
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
-        self.union_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(true, &pool_buf), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
+        self.union_ragged = try Ragged.initPoolsAligned(s, self.hidden, self.inter, self.pools(true, &pool_buf), self.alignWords(), slabTriple(union_set, 0), slabTriple(union_set, 1), slabTriple(union_set, 2));
         self.union_ragged.tile_major = self.tile_major;
     }
 
     fn buildCacheBank(self: *GroupedLayer, s: mlx.mlx_stream, cache: []const SlabOperand) !void {
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
-        self.cache_ragged = try Ragged.initPools(s, self.hidden, self.inter, self.pools(false, &pool_buf), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
+        self.cache_ragged = try Ragged.initPoolsAligned(s, self.hidden, self.inter, self.pools(false, &pool_buf), self.alignWords(), slabTriple(cache, 0), slabTriple(cache, 1), slabTriple(cache, 2));
         self.cache_ragged.tile_major = self.tile_major;
     }
 
@@ -1712,6 +1784,44 @@ fn presentSlabCount(slabs: []const SlabOperand) u64 {
     return count;
 }
 
+/// A wide route's SSD fill in stages: stage 0 every miss's scale pieces, stage 1 + g rate group g's trellis.
+pub const Staged = struct {
+    layer: u16,
+    gl: *GroupedLayer,
+    groups: usize,
+    /// Slab sets the route fills and leases: the layer's cache, then the union workspace when a group spills.
+    sets: usize,
+    begun: [2]usize = @splat(0),
+    spans: [1 + quant.rate_group_limit]std.ArrayList(io_mod.FillSpan) = @splat(.empty),
+    /// Admitted misses as (group, slot), ready once every stage has landed.
+    admitted: std.ArrayList([2]u16) = .empty,
+    misses: u64 = 0,
+    /// Stages read so far.
+    done: usize = 0,
+    ended: bool = false,
+
+    pub fn stages(self: *const Staged) usize {
+        return 1 + self.groups;
+    }
+
+    fn slabSets(self: *const Staged, engine: *Engine) [2][]SlabOperand {
+        return .{ engine.layers[self.layer].slabs, engine.grouped_union };
+    }
+
+    /// Gives the slabs back unpublished and drops the admitted misses from the caches.
+    fn abort(self: *Staged, engine: *Engine) void {
+        for (self.slabSets(engine)[0..self.sets], self.begun[0..self.sets]) |set, begun| for (set[0..begun]) |*operand| abortFill(operand);
+        self.begun = @splat(0);
+        for (self.gl.caches[0..self.groups]) |*cache| cache.invalidateUnready();
+    }
+
+    fn destroy(self: *Staged, allocator: std.mem.Allocator) void {
+        for (&self.spans) |*list| list.deinit(allocator);
+        self.admitted.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 pub const Prepared = struct {
     allocator: std.mem.Allocator,
     gate: mlx.mlx_array = .{ .ctx = null },
@@ -1730,6 +1840,8 @@ pub const Prepared = struct {
     defer_to: ?*Engine = null,
     /// A split route's own bank (`ragged` points at it), freed with the route.
     split: ?*Ragged = null,
+    /// A wide route's fill, read by `Engine.fillStaged`; one dropped before it ends is aborted.
+    staged: ?*Staged = null,
 
     pub fn quantOperand(self: *const Prepared, c: quant.Component) mlx.mlx_array {
         return self.quant_raw[@backingInt(c)];
@@ -1751,6 +1863,10 @@ pub const Prepared = struct {
             }
             held.slab.release(held.lease) catch {};
             held.slab.retire() catch {};
+        }
+        if (self.staged) |st| {
+            if (!st.ended) if (self.defer_to) |engine| st.abort(engine);
+            st.destroy(self.allocator);
         }
         if (self.split) |bank| {
             bank.deinit();
@@ -1824,8 +1940,14 @@ pub const Engine = struct {
     fill_experts_total: u64 = 0,
     fill_bytes_total: u64 = 0,
     fill_ns_total: u64 = 0,
+    /// Full cache copies a route took to be able to undo itself (`CacheUndo`).
+    cache_snapshots: u64 = 0,
+    /// The ages a hit-only resolve overwrote, kept between routes.
+    age_log: std.ArrayList(AgedSlot) = .empty,
     copy_ns_total: u64 = 0,
     copy_bytes_total: u64 = 0,
+    /// Wide routes whose fill the caller staged (`prepareHostStaged`).
+    staged_routes: u64 = 0,
     forward_clock: Clock,
     last: Breakdown = .{},
     route_linear: RouteClass = .{},
@@ -1869,6 +1991,8 @@ pub const Engine = struct {
     pub fn initWithOptions(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, requested_bytes: u64, s: mlx.mlx_stream, opts: Options) !Engine {
         var store = try ExpertStore.openLayout(allocator, model_dir, geometry, opts.layout);
         errdefer store.deinit();
+        // Pair-major tiles are the pools' tile-major order; the pack order's pools cannot take them without a reshuffle back.
+        if (store.quantized) |q| if (q.tile_order == .pair_major and !opts.tile_major) return error.Exl3TileOrderNeedsTileMajor;
         var sized = geometry;
         if (store.quantized) |*q| sized.shape = q.shape();
         const plan = try cachePlanBytesForGeometry(requested_bytes, sized, store.perExpertBytes());
@@ -1913,7 +2037,7 @@ pub const Engine = struct {
                 const layer_allot = if (plan.resident)
                     groups.allBytes(geometry.hidden, geometry.intermediate)
                 else if (allot) |bytes| bytes[layer_index] else @as(u64, plan.slots_per_layer) * plan.expert_bytes;
-                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot, opts.tile_major) catch |err| {
+                grouped.* = GroupedLayer.init(allocator, groups.*, geometry.hidden, geometry.intermediate, layer_allot, opts.tile_major, q.tile_order == .pair_major) catch |err| {
                     allocator.destroy(grouped);
                     return err;
                 };
@@ -2025,6 +2149,7 @@ pub const Engine = struct {
         self.releaseSlabs();
         for (self.layers) |*layer| if (layer.active) layer.cache.deinit();
         self.allocator.free(self.layers);
+        self.age_log.deinit(self.allocator);
         self.store.deinit();
         if (self.drop_owned) |d| {
             d.deinit();
@@ -2109,6 +2234,18 @@ pub const Engine = struct {
         self.forward_clock = Clock.init();
     }
 
+    /// Every fill since boot, the serving pool's and the prefetcher's.
+    pub fn fillStats(self: *const Engine) io_mod.FillStats {
+        var out: io_mod.FillStats = if (self.io_pool) |p| p.stats() else .{};
+        if (self.prefetcher) |pf| {
+            const more = pf.pool.stats();
+            out.bytes_read += more.bytes_read;
+            out.bytes_bounced += more.bytes_bounced;
+            out.bytes_reshuffled += more.bytes_reshuffled;
+        }
+        return out;
+    }
+
     pub fn breakdown(self: *const Engine) Breakdown {
         return self.last;
     }
@@ -2139,7 +2276,8 @@ pub const Engine = struct {
         // At debug level every prefill chunk gets its line: a chunk is one forward, so the schedule would skip them.
         if (!scheduled and !acc.probe and !(rows > 64 and log.isDebug())) return;
         const fill_seconds = @as(f64, @floatFromInt(acc.fill_ns)) / 1e9;
-        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d}\n", .{
+        const fills = self.fillStats();
+        log.info("[expert-stream] forward={d} rows={d} wall_ms={d:.1} route_ms={d:.1} fill_ms={d:.1} compute_ms={d:.1} other_ms={d:.1} fill_gb={d:.3} fill_gbps={d:.2} fill_bytes_per_row={d} hits={d}/{d} slab_leaks={d} copy_ms={d:.1} unions={d} staged_routes={d} bounced_gb={d:.3} reshuffled_gb={d:.3} reads={d} reads_direct={d} issued_gb={d:.3} pread_s={d:.2} fill_s={d:.2}\n", .{
             acc.forward,
             acc.rows,
             @as(f64, @floatFromInt(acc.wall_ns)) / 1e6,
@@ -2155,6 +2293,14 @@ pub const Engine = struct {
             slab_release_timeouts.load(.monotonic),
             @as(f64, @floatFromInt(acc.copy_ns)) / 1e6,
             acc.unions,
+            self.staged_routes,
+            @as(f64, @floatFromInt(fills.bytes_bounced)) / 1e9,
+            @as(f64, @floatFromInt(fills.bytes_reshuffled)) / 1e9,
+            fills.reads_issued,
+            fills.reads_direct,
+            @as(f64, @floatFromInt(fills.bytes_issued)) / 1e9,
+            @as(f64, @floatFromInt(fills.pread_ns)) / 1e9,
+            @as(f64, @floatFromInt(self.fill_ns_total)) / 1e9,
         });
         log.info("[expert-stream] route forward={d} rows={d} probe={} linear n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2} full n={d} build_ms={d:.2} xwait_ms={d:.2} idswait_ms={d:.2} read_ms={d:.2}\n", .{
             acc.forward,
@@ -2252,21 +2398,16 @@ pub const Engine = struct {
     /// `prepareHost` for a route only the per-group prefill GEMMs read (`rate_groups.moePrefill`): a rate-grouped layer
     /// whose group overflows its pool then reads its cached experts in place instead of copying them into the union.
     pub fn prepareHostWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
-        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
-        if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
-        self.prefetchWait(layer_index);
-        self.drainPendingReaders();
-        return self.prepareSlab(layer_index, occurrences, true);
+        var prepared = try self.prepareWide(layer_index, occurrences);
+        errdefer prepared.deinit();
+        var unused: u8 = 0;
+        try self.fillStaged(&prepared, &unused, noReady);
+        return prepared;
     }
 
     fn snapshotCache(self: *Engine, cache: *const GroupCache) !CacheSnapshot {
-        return .{
-            .expert_to_slot = try self.allocator.dupe(i32, cache.expert_to_slot),
-            .slot_to_expert = try self.allocator.dupe(u16, cache.slot_to_expert),
-            .ages = try self.allocator.dupe(u64, cache.ages),
-            .ready = try self.allocator.dupe(bool, cache.ready),
-            .tick = cache.tick,
-        };
+        self.cache_snapshots += 1;
+        return CacheSnapshot.take(self.allocator, cache);
     }
 
     fn runFill(self: *Engine, layer_index: u16, spans: []const io_mod.FillSpan) !void {
@@ -2329,6 +2470,14 @@ pub const Engine = struct {
         pf.mu.lockUncancelable(io);
         defer pf.mu.unlock(io);
         if (pf.len == Prefetcher.jobs_max) return;
+        // With no job on the layer the host owns its cache map, so a prediction that holds nothing new queues and wakes nothing.
+        if (!prefetchTouches(pf, layer)) {
+            const gl = self.layers[layer].grouped.?;
+            var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
+            var wanted: usize = 0;
+            for (0..rows) |r| self.collectWanted(layer, gl, cand[r * n ..][0..n], m, &want, &wanted);
+            if (wanted == 0) return;
+        }
         const job = &pf.jobs[(pf.head + pf.len) % Prefetcher.jobs_max];
         job.layer = layer;
         job.rows = @intCast(rows);
@@ -2396,6 +2545,23 @@ pub const Engine = struct {
         }
     }
 
+    /// Adds to `want` the first `m` of one row's ranked candidates the layer's pool does not hold ready.
+    fn collectWanted(self: *const Engine, layer: u16, gl: *const GroupedLayer, cand: []const u16, m: usize, want: []u16, wanted: *usize) void {
+        var taken: usize = 0;
+        for (cand) |expert| {
+            if (expert >= gl.expertCount() or self.isDropped(layer, expert)) continue;
+            const g = gl.groups.groupOf(expert);
+            const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
+            if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
+            taken += 1;
+            if (std.mem.indexOfScalar(u16, want[0..wanted.*], expert) == null) {
+                want[wanted.*] = expert;
+                wanted.* += 1;
+            }
+            if (taken == m) break;
+        }
+    }
+
     /// Reads the job's uncached experts into their pools. Where anything fails the pool is left as it was.
     fn prefetchFill(self: *Engine, pf: *Prefetcher, job: *const Prefetcher.Job) !void {
         const layer = &self.layers[job.layer];
@@ -2404,21 +2570,7 @@ pub const Engine = struct {
         const count: usize = gl.groups.count;
         var want: [Prefetcher.rows_max * Prefetcher.cand_max]u16 = undefined;
         var wanted: usize = 0;
-        for (0..job.rows) |r| {
-            var taken: usize = 0;
-            for (job.cand[r][0..job.n]) |expert| {
-                if (expert >= gl.expertCount() or self.isDropped(job.layer, expert)) continue;
-                const g = gl.groups.groupOf(expert);
-                const raw = gl.caches[g].expert_to_slot[expert - gl.groups.base[g]];
-                if (raw >= 0 and gl.caches[g].ready[@intCast(raw)]) continue;
-                taken += 1;
-                if (std.mem.indexOfScalar(u16, want[0..wanted], expert) == null) {
-                    want[wanted] = expert;
-                    wanted += 1;
-                }
-                if (taken == job.m) break;
-            }
-        }
+        for (0..job.rows) |r| self.collectWanted(job.layer, gl, job.cand[r][0..job.n], job.m, &want, &wanted);
         if (wanted == 0) return;
 
         var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
@@ -2577,7 +2729,7 @@ pub const Engine = struct {
         errdefer self.dropUnion();
         var pool_buf: [quant.rate_group_limit]rate_groups_pool = undefined;
         for (self.layers[self.borrow_from..]) |*layer| if (layer.grouped) |g| {
-            g.union_ragged = try Ragged.initPools(self.s, g.hidden, g.inter, g.pools(true, &pool_buf), slabTriple(self.grouped_union, 0), slabTriple(self.grouped_union, 1), slabTriple(self.grouped_union, 2));
+            g.union_ragged = try Ragged.initPoolsAligned(self.s, g.hidden, g.inter, g.pools(true, &pool_buf), g.alignWords(), slabTriple(self.grouped_union, 0), slabTriple(self.grouped_union, 1), slabTriple(self.grouped_union, 2));
             g.union_ragged.tile_major = g.tile_major;
         };
     }
@@ -2844,14 +2996,16 @@ pub const Engine = struct {
         const count: usize = gl.groups.count;
         if (layer.slabs.len != n) return error.MissingExpertSlab;
 
-        var snapshots: [quant.rate_group_limit]CacheSnapshot = undefined;
-        var snapshotted: usize = 0;
-        defer for (snapshots[0..snapshotted]) |*snapshot| snapshot.deinit(self.allocator);
-        while (snapshotted < count) : (snapshotted += 1) snapshots[snapshotted] = try self.snapshotCache(&gl.caches[snapshotted]);
+        self.age_log.clearRetainingCapacity();
+        var undos: [quant.rate_group_limit]CacheUndo = undefined;
+        var undoable: usize = 0;
+        defer for (undos[0..undoable]) |*undo| undo.deinit(self.allocator);
         var committed = false;
         var wrote_cache = false;
-        errdefer if (!committed) for (0..count) |g| {
-            if (wrote_cache) gl.caches[g].invalidateUnready() else snapshots[g].restore(&gl.caches[g]);
+        errdefer if (!committed) {
+            if (wrote_cache) {
+                for (0..count) |g| gl.caches[g].invalidateUnready();
+            } else for (undos[0..undoable], 0..) |*undo, g| undo.restore(self.age_log.items, &gl.caches[g]);
         };
 
         var resolutions: [quant.rate_group_limit]GroupResolution = undefined;
@@ -2866,13 +3020,16 @@ pub const Engine = struct {
                 for (occurrences) |expert| {
                     if (gl.groups.groupOf(expert) == resolved) try local.append(self.allocator, expert - gl.groups.base[resolved]);
                 }
+                undos[resolved] = try CacheUndo.begin(self.allocator, &self.age_log, &gl.caches[resolved], local.items);
+                undoable += 1;
+                self.cache_snapshots += @intFromBool(undos[resolved] == .full);
                 resolutions[resolved] = try gl.caches[resolved].resolve(self.allocator, local.items);
                 use_union = use_union or resolutions[resolved].workspace;
                 resolved += 1;
             }
         }
         if (use_union and self.grouped_union.len != n) return error.MissingExpertSlab;
-        if (use_union and wide) {
+        if (wide) {
             wrote_cache = true;
             const split = try self.prepareSplit(layer_index, gl, occurrences, resolutions[0..count]);
             committed = true;
@@ -3010,9 +3167,9 @@ pub const Engine = struct {
         };
     }
 
-    /// The union path of a wide route: each group keeps its hits and admitted misses in its pool, its declined misses
-    /// are read into the union workspace, and `Ragged.initSplit` serves both where they lie. The caller restores the
-    /// caches on an error.
+    /// A wide route: each group keeps its hits and admitted misses in its pool, its declined misses (a group that
+    /// overflows) are read into the union workspace, and `Ragged.initSplit` serves both where they lie. Nothing is
+    /// read yet: `fillStaged` reads it, `Prepared.staged` says how. The caller restores the caches on an error.
     fn prepareSplit(self: *Engine, layer_index: u16, gl: *GroupedLayer, occurrences: []const u16, resolutions: []const GroupResolution) !Prepared {
         const layer = &self.layers[layer_index];
         const n = quant.component_count;
@@ -3021,62 +3178,45 @@ pub const Engine = struct {
         var spill_base: [quant.rate_group_limit]u32 = @splat(0);
         var at: u32 = 0;
         var experts: usize = 0;
+        var spills = false;
         for (resolutions, 0..) |resolution, g| {
             overflow[g] = @intCast(resolution.declined);
+            spills = spills or overflow[g] > 0;
             cache_base[g] = at;
             spill_base[g] = at + gl.slots[g];
             at += gl.slots[g] + overflow[g];
             experts += gl.groups.experts[g];
         }
-        const sets = [2][]SlabOperand{ layer.slabs, self.grouped_union };
-        var begun: [2]usize = @splat(0);
-        errdefer for (sets, begun) |set, done| for (set[0..done]) |*operand| abortFill(operand);
-        for (0..2) |k| while (begun[k] < n) : (begun[k] += 1) {
-            const slab = sets[k][begun[k]].slab orelse return error.MissingExpertSlab;
+        const st = try self.allocator.create(Staged);
+        st.* = .{ .layer = layer_index, .gl = gl, .groups = resolutions.len, .sets = if (spills) 2 else 1 };
+        errdefer st.destroy(self.allocator);
+        const sets = st.slabSets(self);
+        for (sets[0..st.sets], 0..) |set, k| while (st.begun[k] < n) : (st.begun[k] += 1) {
+            const slab = set[st.begun[k]].slab orelse return error.MissingExpertSlab;
             _ = try slab.tryBeginFill();
         };
+        errdefer st.abort(self);
 
         const to_slot = try self.allocator.alloc(u16, experts);
         defer self.allocator.free(to_slot);
-        var spans: std.ArrayList(io_mod.FillSpan) = .empty;
-        defer spans.deinit(self.allocator);
-        var misses: u64 = 0;
         for (resolutions, 0..) |resolution, g| {
             var spilled: u32 = 0;
             for (resolution.bindings) |binding| {
                 const global = gl.groups.base[g] + binding.expert;
                 to_slot[global] = @intCast(if (binding.slot) |slot| cache_base[g] + slot else spill_base[g] + spilled);
                 if (binding.hit) continue;
-                misses += 1;
+                st.misses += 1;
+                if (binding.slot) |slot| try st.admitted.append(self.allocator, .{ @intCast(g), slot });
                 for (0..n) |ci| {
                     const source = self.store.spanAt(layer_index, global, ci);
                     const dst = if (binding.slot) |slot| gl.cacheRegion(&layer.slabs[ci], g, ci, slot) else gl.unionRegion(&self.grouped_union[ci], g, ci, spilled);
-                    try spans.append(self.allocator, gl.fillSpan(source, dst, g, ci));
+                    // The scales go first: every group's GEMM prepares its rows with all of them.
+                    const stage = if (ci % 3 == 0) 1 + g else 0;
+                    try st.spans[stage].append(self.allocator, gl.fillSpan(source, dst, g, ci));
                 }
                 if (binding.slot == null) spilled += 1;
             }
         }
-        try self.runFill(layer_index, spans.items);
-        self.fill_experts_total += misses;
-        for (resolutions, 0..) |resolution, g| {
-            for (resolution.bindings) |binding| {
-                if (!binding.hit) if (binding.slot) |slot| gl.caches[g].markReady(slot);
-            }
-        }
-
-        var held: [HELD_MAX]?HeldLease = @splat(null);
-        var leased: usize = 0;
-        errdefer for (held[0..leased]) |entry| {
-            const taken = entry orelse continue;
-            taken.slab.release(taken.lease) catch {};
-            taken.slab.retire() catch {};
-        };
-        for (sets) |set| for (set) |operand| {
-            const slab = operand.slab orelse return error.MissingExpertSlab;
-            _ = try slab.publish();
-            held[leased] = .{ .slab = slab, .lease = try slab.lease() };
-            leased += 1;
-        };
 
         const bank = try self.allocator.create(Ragged);
         errdefer self.allocator.destroy(bank);
@@ -3085,22 +3225,21 @@ pub const Engine = struct {
         const remapped = try self.allocator.alloc(u16, occurrences.len);
         for (occurrences, remapped) |expert, *slot| slot.* = to_slot[expert];
 
-        layer.stats.unions += 1;
+        if (spills) layer.stats.unions += 1;
         for (resolutions) |resolution| {
             layer.stats.union_members += resolution.union_ids.len;
             layer.stats.hits += resolution.hits;
             layer.stats.misses += resolution.misses;
         }
         layer.stats.groups += 1;
-        for (spans.items) |span_value| layer.stats.fill_bytes += span_value.len;
         return .{
             .allocator = self.allocator,
             .remapped = remapped,
             .quantized = true,
-            .workspace = true,
+            .workspace = spills,
             .ragged = bank,
             .split = bank,
-            .held = held,
+            .staged = st,
             .defer_to = self,
         };
     }
@@ -3109,6 +3248,56 @@ pub const Engine = struct {
     pub fn isDropped(self: *const Engine, layer: u16, expert: u16) bool {
         const d = self.geometry.drop orelse return false;
         return d.isDropped(layer, expert);
+    }
+
+    /// `prepareHostWide` with the fill left to `fillStaged`, which hands each rate group to the caller as its experts
+    /// land: the caller can run a group's GEMMs while the next group is read.
+    pub fn prepareHostStaged(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        const prepared = try self.prepareWide(layer_index, occurrences);
+        if (prepared.staged != null) self.staged_routes += 1;
+        return prepared;
+    }
+
+    /// Reads a staged route: the scales of every miss, then each rate group's trellis in turn. `ready(ctx, g)` runs
+    /// once a group's experts are all in place (those with no misses right after the scales), then the slabs are
+    /// published and leased for the route.
+    pub fn fillStaged(self: *Engine, p: *Prepared, ctx: *anyopaque, ready: *const fn (ctx: *anyopaque, group: usize) anyerror!void) !void {
+        const st = p.staged orelse return;
+        try self.runFill(st.layer, st.spans[0].items);
+        st.done = 1;
+        for (0..st.groups) |g| if (st.spans[1 + g].items.len == 0) try ready(ctx, g);
+        for (0..st.groups) |g| {
+            if (st.spans[1 + g].items.len == 0) continue;
+            try self.runFill(st.layer, st.spans[1 + g].items);
+            st.done = 2 + g;
+            try ready(ctx, g);
+        }
+        st.done = st.stages();
+        for (st.admitted.items) |pair| st.gl.caches[pair[0]].markReady(pair[1]);
+        const layer = &self.layers[st.layer];
+        var leased: usize = 0;
+        for (st.slabSets(self)[0..st.sets]) |set| for (set) |operand| {
+            const slab = operand.slab orelse return error.MissingExpertSlab;
+            _ = try slab.publish();
+            p.held[leased] = .{ .slab = slab, .lease = try slab.lease() };
+            leased += 1;
+        };
+        st.ended = true;
+        self.fill_experts_total += st.misses;
+        for (st.spans[0 .. st.stages()]) |list| for (list.items) |span_value| {
+            layer.stats.fill_bytes += span_value.len;
+        };
+    }
+
+    fn noReady(_: *anyopaque, _: usize) anyerror!void {}
+
+    /// A wide grouped route through `prepareSplit`; any other layer as `prepareSlab` serves it.
+    fn prepareWide(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
+        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
+        if (!self.layers[layer_index].active) return error.ExpertLayerAbsent;
+        self.prefetchWait(layer_index);
+        self.drainPendingReaders();
+        return self.prepareSlab(layer_index, occurrences, true);
     }
 
     fn prepareSlab(self: *Engine, layer_index: u16, occurrences: []const u16, wide: bool) !Prepared {
@@ -3447,7 +3636,7 @@ test "expert stream rate-grouped pools and the union hold the kept experts of ea
     groups.n[1] = .{ 32, 32, 40 };
     groups.n[2] = .{ 24, 24, 24 };
     groups.base[0..3].* = .{ 0, 3, 33 };
-    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40, false);
+    var layer = try GroupedLayer.init(t.allocator, groups, 2560, 640, 1 << 40, false, false);
     defer layer.deinitCaches();
     // A bill that holds everything caps every pool at its kept experts, never its stored ones.
     try t.expectEqualSlices(u32, &.{ 3, 20, 94 }, layer.slots[0..3]);
@@ -3719,6 +3908,7 @@ test "bf16 ngram store gathers rows across safetensors shards" {
 }
 
 test "expert stream slab operand preserves direct gather output" {
+    try mlx.requireGpu();
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -4279,6 +4469,7 @@ fn bf16Of(bits: u16) f32 {
 }
 
 test "expert stream bf16 kernels read the imported slab operand" {
+    try mlx.requireGpu();
     const t = std.testing;
     var fixture = try TinyEngine.open(2, 4);
     defer fixture.close();
@@ -4667,7 +4858,7 @@ test "expert stream MXFP4 header spans and fills preserve native bytes" {
 
 test "expert stream original MiMo source warms exact MXFP4 bytes" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const raw = try quant.writeTinyMxfp4IndividualCheckpoint(t.allocator, tmp.dir, 2, 32, 32);
@@ -4698,7 +4889,7 @@ test "expert stream original MiMo source warms exact MXFP4 bytes" {
 
 test "expert stream MXFP4 keeps nine component ids but imports and leases only six" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const raw = try writeTinyMxfp4Checkpoint(t.allocator, tmp.dir, 2, 32, 32);
@@ -5127,6 +5318,48 @@ test "expert substitution stops swapping an expert out after the starvation limi
     try t.expectEqual(@as(u32, 1), sc.run(&again, &logits, &cached, 0.3, 3));
 }
 
+test "a cache undo puts a cache back after a resolve of hits or of misses, and copies the cache only for the misses" {
+    const t = std.testing;
+    var cache = try GroupCache.init(t.allocator, 3, 6);
+    defer cache.deinit();
+    var warm = try cache.resolve(t.allocator, &.{ 0, 1, 2 });
+    defer warm.deinit(t.allocator);
+    markResolvedReady(&cache, &warm);
+    var aged: std.ArrayList(AgedSlot) = .empty;
+    defer aged.deinit(t.allocator);
+    try aged.ensureTotalCapacity(t.allocator, 8);
+
+    var before = try CacheSnapshot.take(t.allocator, &cache);
+    defer before.deinit(t.allocator);
+    // Hits need no allocation at all, repeats of an expert included.
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    const hit_undo = try CacheUndo.begin(failing.allocator(), &aged, &cache, &.{ 2, 0, 2 });
+    try t.expect(hit_undo == .touched);
+    var hit = try cache.resolve(t.allocator, &.{ 2, 0, 2 });
+    hit.deinit(t.allocator);
+    try t.expect(!std.mem.eql(u64, before.ages, cache.ages));
+    hit_undo.restore(aged.items, &cache);
+    try expectCacheIs(&before, &cache);
+
+    var miss_undo = try CacheUndo.begin(t.allocator, &aged, &cache, &.{ 0, 4 });
+    defer miss_undo.deinit(t.allocator);
+    try t.expect(miss_undo == .full);
+    var miss = try cache.resolve(t.allocator, &.{ 0, 4 });
+    miss.deinit(t.allocator);
+    try t.expect(cache.expert_to_slot[4] >= 0);
+    miss_undo.restore(aged.items, &cache);
+    try expectCacheIs(&before, &cache);
+}
+
+fn expectCacheIs(want: *const CacheSnapshot, cache: *const GroupCache) !void {
+    const t = std.testing;
+    try t.expectEqualSlices(i32, want.expert_to_slot, cache.expert_to_slot);
+    try t.expectEqualSlices(u16, want.slot_to_expert, cache.slot_to_expert);
+    try t.expectEqualSlices(u64, want.ages, cache.ages);
+    try t.expectEqualSlices(bool, want.ready, cache.ready);
+    try t.expectEqual(want.tick, cache.tick);
+}
+
 test "group cache reports only ready residents as cached" {
     const t = std.testing;
     var cache = try GroupCache.init(t.allocator, 3, 8);
@@ -5229,8 +5462,9 @@ test "a failed spec map refresh leaves no GPU map until a rebuild matches the ca
 }
 
 test "GLM BF16 stream imports split expert slabs and preserves bytes across cache and union" {
+    try mlx.requireGpu();
     const t = std.testing;
-    const fixture = @import("glm_stream_fixture.zig");
+    const fixture = @import("glm5/glm_stream_fixture.zig");
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try fixture.write(t.allocator, tmp.dir, .none);

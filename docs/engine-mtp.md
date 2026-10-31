@@ -2,8 +2,8 @@
 
 How the native MTP heads draft and verify: Qwen3.8-Flash-Next's one head and MiMo-V2.6's three, their inputs, the
 spec-verify invariant, draft re-scoring, the measured round-cost table, head KV and norms. Read this before touching
-`src/mtp.zig`, `src/mtp_*.zig`, `src/mimo_mtp.zig`, `src/round_cost.zig` or the MTP orchestration in
-`src/generate.zig`.
+`src/mtp.zig`, `src/mtp_*.zig`, `src/mimo2/mimo_mtp.zig`, `src/round_cost.zig` or the MTP orchestration in
+`src/generate.zig`, `src/mtp_policy.zig` and `src/mtp_round.zig`.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md),
 [qwen4-qsa-long-context](qwen4-qsa-long-context.md), [engine-prefix-cache](engine-prefix-cache.md#spec-state),
@@ -17,10 +17,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 | `src/mtp_acceptance.zig` | acceptance modes `exact|typical|tokenv3` |
 | `src/mtp_group_planner.zig` / `src/mtp_group_cost.zig` | grouped verify planner |
 | `src/mtp_qmv.zig` | M=1-exact qmv rows |
-| `src/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
+| `src/mimo2/mimo_mtp.zig` | MiMo's three trained heads (`model.mtp.layers.{0,1,2}`), per-request row state |
 | `src/round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`) |
 | `src/mtp_lookup.zig` | Prompt lookup inside the MTP round: the committed-context index and its gate |
-| `src/generate.zig` | MTP orchestration, `commitForcedTokens` |
+| `src/generate.zig` | MTP entry, `commitForcedTokens` |
+| `src/mtp_policy.zig` | adaptive serial/MTP, regime, EV plan and cost table, depth caps (`Generator` methods) |
+| `src/mtp_round.zig` | round chain build and dispatch, batched accept graphs, serial ticks, group verify (`Generator` methods) |
 
 ## The head
 
@@ -50,10 +52,11 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   invariant; a committed argmax is a `CommittedArgmax` (only `verifyArgmax` builds one, masking reserved ids).
 - A reasoning budget (or loop-recovery close) keeps MTP on for the answer: the forced closer re-seeds the head
   (`mtpResumeAfterForced`: qwen4 head reset; MiMo's three heads take the hole like an adaptive serial block) and the slot
-  ramps back through the serial exit. A round before the bound may emit at most the thought room (`ThinkBound.room`):
-  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. DSpark and DFlash2
-  still decode the answer plain. Grouped rounds take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1
-  is a plain planner row), and a planner-owned slot rejoins the planner after the close instead of the serial ramp.
+  ramps back through the serial exit. A round before the bound may emit at most the thought room (`mtp_plan.ThinkBound.room`):
+  drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. Grouped rounds
+  take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1 is a plain planner row), and a
+  planner-owned slot rejoins the planner after the close instead of the serial ramp. DSpark takes the same cut
+  (`dsparkRowsForRoom`) and resumes by draining the commit (`dsparkResumeAfterForced`); DFlash2 still decodes the answer plain.
 - A think penalty shifts every verify block right after its forward (`thinkShiftRows`, solo, grouped and batched-head
   alike): row j is gated on the verify ids through j, so it reads the logits its serial tick would; drafts stay raw.
 - Scoped file/request logit biases share these prefix-dependent shifts for MTP and prompt lookup; active
@@ -81,19 +84,18 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **MTP is ON by default for Qwen and MiMo** (GLM keeps its head off and drafts with DFlash2; DeepSeek drafts with DSpark) (owner policy, `server.defaultEnableMtp` `served`): a request
   that omits `enable_mtp` runs the loaded head. `--no-mtp`, `"mtp": false` in `model-settings.json` or
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
-  `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
+  `model_load.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
   head's KV whenever it runs by default (`server.mtpHeadDefaultOn`).
 - **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
-  tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`;
-  `mergedVerifyDeclineReason` names the decline). Four MTP streams on MCG K3
+  tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`). Four MTP streams on MCG K3
   aggregate ~85 tok/s; a linear model of the measured verify-row cost predicts ~95-125 with merged verify at depth
   2-3. Measure before any code.
 - <a id="greedy-shortlist"></a>**A greedy MiMo forward reads the trunk head through the drafts' shortlist**
   (`lmHeadShortlistFor`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
   re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
-  exists with MTP or without, so MTP == serial holds by construction. Gate `generate.argmaxOnlyRequest` (greedy or
+  exists with MTP or without, so MTP == serial holds by construction. Gate `sampler.argmaxOnlyRequest` (greedy or
   top-1; no penalty, logprobs, grammar, forced call); `kld` reads the full head. Not certified: a full argmax
   outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
   reads the full head ([perf-baselines](mimo2-perf.md#mimo-lmhead-shortlist)).
@@ -215,6 +217,7 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
 - **Sampled auto-mode output follows the round times**: the plan reads measured round costs, and the draft counts
   decide which draws land where. A seeded byte comparison pins the plan (`SUSHI_MTP_ADAPTIVE=0
   SUSHI_MTP_COST_TABLE=0`, or a pinned depth).
+- **Trellis (STQ) trunk projections are row-invariant per arm**: a verify row equals its serial tick bit for bit on the machine's own arm (NAX where present, else SIMD, exact rows); NAX and SIMD boxes may differ from each other, the accepted cross-hardware rule ([engine-exl3-experts](engine-exl3-experts.md#dense-linears)).
 - Pinned-depth outputs are byte-equal to the pack's own no-MTP greedy (48/48 on two K3 packs).
 - The router and shared-expert gate run the dense-rows kernel at every width, serial decode included, so one arithmetic
   serves a row whether it decodes alone or verifies beside others on any device
@@ -226,9 +229,9 @@ chain/group paths still capture per row. `dflash_policy.ladder()` is that table 
 - **Head KV**: dense by default; `--mtp-head-kv-quant` opts qwen4's into `--kv-quant` (billed at its effective width
   either way, `mtpHeadKvBytesPerToken`; MiMo's heads keep their dense window and the boot log says the flag does
   nothing there, `server.mtpHeadKvLine`); a spec sidecar under another scheme is declined at restore and rewritten
-  on the next commit. Head persistence with its QSA half: `tests/test_qwen4_mtp_head_persist.sh`.
+  on the next commit. Head persistence with its QSA half: `tests/qwen4/test_qwen4_mtp_head_persist.sh`.
 - Acceptance modes `exact|typical|tokenv3` (`mtp_acceptance.zig`, per-model `mtp_acceptance`).
-  Only sampled decoding reads the mode: temperature < 0.01 (`isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
+  Only sampled decoding reads the mode: temperature < 0.01 (`sampler.isGreedyTemperature`, shared with serial sampling) always takes the argmax check (`mtpAcceptRowGreedy`), so
   greedy output is identical under every mode. Sushi-4bpw at T=1.0 / top_k 20 / top_p 0.95, 16 fixture prompts x 512,
   2 seeds, binary b64c5a0e: typical 0.2 decoded 80.0 / 76.6 tok/s vs exact 69.2 / 63.3 (2.4-2.6 vs 2.1-2.2 tokens per
   round); target NLL of the emitted text 0.7819 vs 0.7805 nats, a paired difference inside the seed noise (~0.1 nats).

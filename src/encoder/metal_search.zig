@@ -1511,6 +1511,7 @@ test "metal_search: invalid rate, window or slice length is refused by name" {
 }
 
 test "metal_search: every admitted rate and window matches the CPU search code for code" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(20261017);
@@ -1571,6 +1572,7 @@ test "metal_search: the 1024-thread single-cost plan needs 1024 threads and a lo
 }
 
 test "metal_search: a pipeline limit below the launch size searches the same codes at a smaller threadgroup" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(20261019);
@@ -1610,6 +1612,7 @@ test "metal_search: a pipeline limit below the launch size searches the same cod
 }
 
 test "metal_search: full tensor LDLQ and global scale match the CPU quantizer code for code" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var file = try st.parse(t.allocator, st.tensor);
@@ -1655,6 +1658,7 @@ test "metal_search: full tensor LDLQ and global scale match the CPU quantizer co
 }
 
 test "metal_search: a Flash-Next sized tensor quantizes near its source at K1.5 and K2.5" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const in = 2560;
@@ -1686,6 +1690,7 @@ test "metal_search: a Flash-Next sized tensor quantizes near its source at K1.5 
 }
 
 test "metal_search: a batch of tensors quantizes to the same bytes as one tensor at a time" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var file = try st.parse(t.allocator, st.tensor);
@@ -1731,6 +1736,7 @@ test "metal_search: a batch of tensors quantizes to the same bytes as one tensor
 }
 
 test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quantizer's bytes" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     const in = 512;
@@ -1780,6 +1786,7 @@ fn hessianError(allocator: std.mem.Allocator, w: []const f32, decoded: []const u
 }
 
 test "metal_search: a float32 GPU factor quantizes as well as the float64 factor" {
+    try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
     var file = try st.parse(t.allocator, st.tensor);
@@ -1847,29 +1854,4 @@ test "metal_search: the blocked feedback update equals the row-at-a-time loop bi
     };
     feedbackUpdate(prod, cols, err, lt, chunk);
     for (want, prod) |a, b| try t.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
-}
-
-test "metal_search: search throughput (SUSHI_ENCODER_SEARCH_UBENCH)" {
-    if (std.c.getenv("SUSHI_ENCODER_SEARCH_UBENCH") == null) return error.SkipZigTest;
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    const n_tiles: usize = 4096;
-    var prng = std.Random.DefaultPrng.init(4096);
-    const r = prng.random();
-    const tiles = try t.allocator.alloc(f32, n_tiles * tile_len);
-    defer t.allocator.free(tiles);
-    for (tiles) |*v| v.* = r.floatNorm(f32);
-    const rate = format.Rate{ .n = 40 };
-    const dec = format.Decode{ .codebook = .mcg, .window = .w15 };
-    const packed_out = try t.allocator.alloc(u16, n_tiles * rate.n);
-    defer t.allocator.free(packed_out);
-    const recon = try t.allocator.alloc(f32, n_tiles * tile_len);
-    defer t.allocator.free(recon);
-    try encodeTiles(t.allocator, s, rate, dec, tiles, packed_out, recon);
-    // Sustained, not burst: a conversion keeps the GPU busy for minutes.
-    const t0 = stages_mod.nowNs();
-    var calls: usize = 0;
-    while (stages_mod.nowNs() - t0 < 20 * std.time.ns_per_s) : (calls += 1) try encodeTiles(t.allocator, s, rate, dec, tiles, packed_out, recon);
-    const us = @as(f64, @floatFromInt(stages_mod.nowNs() - t0)) / 1e3 / @as(f64, @floatFromInt(calls * n_tiles));
-    std.debug.print("search K2.5 mcg w15: {d:.2} us/tile sustained over {d} tiles\n", .{ us, calls * n_tiles });
 }

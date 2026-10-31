@@ -1,4 +1,5 @@
 #!/bin/bash
+# sushi-test: tier=live boot=api
 # Integration test: chat completions emit a llama.cpp-style `timings` block
 # alongside `usage`, on both the non-stream JSON body and the final SSE chunk
 # of a streaming response (when stream_options.include_usage is set).
@@ -7,30 +8,29 @@
 #   prompt_n, prompt_ms, prompt_per_second,
 #   predicted_n, predicted_ms, predicted_per_second
 #
-# Run against a live server:
-#   ./tests/test_timings.sh [port]
+# `timings.tokenize_ms` rides every API surface (chat completions, Anthropic messages, responses) as a finite,
+# non-negative number. Its size is not asserted: a wall-clock bound flips with the box.
+#
+# Attaches to the shared api boot: tests/run.sh --tier live --model <m> --only test_timings.sh
 
-set -u
-PORT=${1:-8080}
-BASE="http://127.0.0.1:$PORT"
+. "$(dirname "$0")/lib/boot.sh"
+sushi_attach
+BASE=$SUSHI_URL
 FAIL=0
 
 echo "=== Chat-completions timings field ==="
-echo "Server: $BASE"
+echo "Server: $BASE ($SUSHI_ARCH)"
 
-if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
-    echo "SKIP: Server not running on port $PORT"
-    exit 0
-fi
+command -v jq >/dev/null || { echo "SKIP test_timings.sh: jq is required"; exit 3; }
 
 # ── Test 1: non-streaming chat completion ──────────────────────────────────
 echo
 echo "--- Test 1: non-stream chat.completion carries a top-level 'timings' object ---"
-RESULT=$(curl -sf "$BASE/v1/chat/completions" \
+RESULT=$(curl -sf -m 600 "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "messages": [{"role":"user","content":"Say hi in five words."}],
+    "messages": [{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in five words."}],
     "max_tokens": 16,
     "temperature": 0.0,
     "stream": false
@@ -40,9 +40,9 @@ if [ -z "$RESULT" ]; then
     exit 1
 fi
 
-python3 - <<PY
+python3 -I - "$RESULT" <<'PY'
 import json, sys
-r = json.loads('''$RESULT''')
+r = json.loads(sys.argv[1])
 t = r.get("timings")
 if not isinstance(t, dict):
     print(f"  FAIL: no 'timings' object in response. keys={list(r.keys())}")
@@ -81,11 +81,11 @@ RC=$?
 # ── Test 2: streaming chat completion ──────────────────────────────────────
 echo
 echo "--- Test 2: streaming final SSE chunk carries 'timings' alongside 'usage' ---"
-STREAM=$(curl -sN "$BASE/v1/chat/completions" \
+STREAM=$(curl -sN -m 600 "$BASE/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "sushi",
-    "messages": [{"role":"user","content":"Say hi in five words."}],
+    "messages": [{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in five words."}],
     "max_tokens": 16,
     "temperature": 0.0,
     "stream": true,
@@ -96,9 +96,9 @@ if [ -z "$STREAM" ]; then
     exit 1
 fi
 
-python3 - <<PY
+python3 -I - "$STREAM" <<'PY'
 import json, sys
-raw = '''$STREAM'''
+raw = sys.argv[1]
 chunks = []
 for line in raw.splitlines():
     if not line.startswith("data: "):
@@ -140,6 +140,45 @@ print(f"  PASS  timings={json.dumps(t)}")
 PY
 RC=$?
 [ $RC -ne 0 ] && FAIL=1
+
+# ── Tests 3-5: timings.tokenize_ms on every API surface ────────────────────
+# Pull `.timings.tokenize_ms` from a JSON response and verify it is a finite non-negative number.
+assert_tokenize_ms_in() {
+    local label="$1" body="$2" val
+    val="$(echo "$body" | jq -r '.timings.tokenize_ms // empty')"
+    if [ -z "$val" ]; then
+        echo "  FAIL: $label: timings.tokenize_ms missing"
+        FAIL=1
+        return
+    fi
+    if ! python3 -I -c "import sys, math; v=float(sys.argv[1]); assert v >= 0 and math.isfinite(v)" "$val" 2>/dev/null; then
+        echo "  FAIL: $label: tokenize_ms=$val (not a finite non-negative number)"
+        FAIL=1
+        return
+    fi
+    echo "  PASS  $label: tokenize_ms=${val}ms"
+}
+
+echo
+echo "--- Test 3: /v1/chat/completions carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in one word."}],"max_tokens":5,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "chat-completions" "$RESP"
+
+echo
+echo "--- Test 4: /v1/messages carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/messages" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"sushi","messages":[{"role":"user","content":"'"$SUSHI_NONCE"' Say hi in one word."}],"max_tokens":5,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "anthropic-messages" "$RESP"
+
+echo
+echo "--- Test 5: /v1/responses carries timings.tokenize_ms ---"
+RESP="$(curl -sf -m 600 -X POST "$BASE/v1/responses" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"sushi","input":"'"$SUSHI_NONCE"' Say hi in one word.","max_output_tokens":16,"temperature":0,"stream":false}')"
+assert_tokenize_ms_in "responses" "$RESP"
 
 echo
 if [ $FAIL -ne 0 ]; then

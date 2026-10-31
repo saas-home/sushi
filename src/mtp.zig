@@ -13,7 +13,9 @@ const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
+const moe_gqmv = @import("moe_gqmv.zig");
 const log = @import("log.zig");
+const trunk_stq = @import("trunk_stq.zig");
 const Transformer = transformer_mod.Transformer;
 const expert_quant = @import("expert_quant.zig");
 
@@ -21,7 +23,7 @@ const expert_quant = @import("expert_quant.zig");
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
 /// 3-bit draft-only lm_head replaced the old full trunk re-forward): the old
 /// cost model was what made depth 1 optimal. 2026-07-12 validation matrix on
-/// Qwen3.6-27B 4-bit (M4 Max, adaptive controller active, decode tok/s
+/// a 27B 4-bit trunk (M4 Max, adaptive controller active, decode tok/s
 /// depth-3 vs depth-1): code 54.3 vs 43.3 (+25%), coding-agent ladder 2K
 /// 52.1 vs 41.4 (+26%) and 16K 43.9 vs 38.1 (+15%), 2-turn pi agentic
 /// (weighted) 48.6 vs 40.9 (+19%), creative temp-0.8 39.1 vs 37.9 (+3% —
@@ -57,7 +59,7 @@ pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = fals
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
-    // Base M4 (2026-08-22, tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
+    // Base M4 (2026-08-22, tester report, a 9B 6-bit trunk, 16 GB):
     // saturated echo, median of 5, decode tok/s by forced depth —
     //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
     // Depth 4 is the only width where the cap BINDS (m_lo == cap), so the
@@ -85,67 +87,13 @@ pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
 /// name. `generic` retains the conservative M1-M4 surface and auto cap.
 pub const MtpCostProfile = enum {
     generic,
-    g17_nax_q8_gs32,
-    g17_nax_q4_gs32,
-    g17_nax_q4_gs64,
-    g17_nax_q6_gs64,
-    g17_nax_q8_gs64,
-    g17_nax_oq4e_q4_gs64,
     g17_nax_qwen4_q4_gs64,
     g17_nax_qwen4_mixed_4_8_gs64,
     /// MiMo's three heads over the MCG K2.5 EXL3 pack: a verify row is ~45% of a forward.
     mimo_exl3,
 };
 
-/// Target-side tensors that contribute materially to a complete MTP round.
-/// This is deliberately a single classification rather than independent
-/// booleans: one bound target can match at most one measured cost surface.
-pub const MtpNaxTargetSurface = enum {
-    none,
-    uniform_quantized_embedding,
-    uniform_bf16_embedding,
-    uniform_q6_quantized_embedding,
-    uniform_q8_bf16_embedding,
-    oqe_quantized_embedding,
-};
-
-/// Pure first-stage classifier for a complete head/target fingerprint.
-/// Runtime tensor-shape validation must still pass before the returned
-/// calibrated profile is used.
-pub fn m5NaxCostProfileForFingerprint(
-    bits: u32,
-    group_size: u32,
-    target_surface: MtpNaxTargetSurface,
-) MtpCostProfile {
-    return switch (target_surface) {
-        .uniform_quantized_embedding => if (group_size == 32) switch (bits) {
-            8 => .g17_nax_q8_gs32,
-            4 => .g17_nax_q4_gs32,
-            else => .generic,
-        } else .generic,
-        .uniform_bf16_embedding => if (bits == 4 and group_size == 64)
-            .g17_nax_q4_gs64
-        else
-            .generic,
-        .uniform_q6_quantized_embedding => if (bits == 6 and group_size == 64)
-            .g17_nax_q6_gs64
-        else
-            .generic,
-        .uniform_q8_bf16_embedding => if (bits == 8 and group_size == 64)
-            .g17_nax_q8_gs64
-        else
-            .generic,
-        .oqe_quantized_embedding => if (bits == 4 and group_size == 64)
-            .g17_nax_oq4e_q4_gs64
-        else
-            .generic,
-        .none => .generic,
-    };
-}
-
-/// Pure first-stage classifier for the qwen4_exp in-checkpoint head. The
-/// trunk is MoE, so the fingerprint path above can never match it;
-/// this is its own measured surface, not a widening of the others.
+/// Pure first-stage classifier for the qwen4_exp in-checkpoint head.
 pub fn qwen4G17CostProfileForFingerprint(
     trunk_affine: bool,
     trunk_bits: u32,
@@ -534,6 +482,11 @@ pub fn fullReadoutArgmax(
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
 ) !mlx.mlx_array {
+    if (trunk_stq.isStq(target.lm_head_w)) {
+        const head_logits = try target.lmHeadLogits(x);
+        defer _ = mlx.mlx_array_free(head_logits);
+        return maskAndArgmax(s, head_logits, suppress_mask);
+    }
     var logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(logits);
     if (target.lm_head_s.ctx == null) {
@@ -1651,7 +1604,7 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     // concerned; convicting on the id would be judging our output against our
     // output's ordering. Id equality is still demanded wherever the reference's
     // OWN margin says the winner is unique.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1771,7 +1724,7 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
     // caller passing `buildRerankCoarse` an explicit width, which both the
     // qwen4 and MiMo arms do. Packed geometry implies K, so a mismatched
     // width does not degrade gracefully: it reads a different vocab entirely.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1861,7 +1814,7 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
 }
 
 test "mtp: batched rerank ids equal N solo rerankSelect" {
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 256, 8, 64, 0xBA7C);
     defer fx.deinit();
@@ -1901,7 +1854,7 @@ test "mtp: rerankSelect declines without a coarse head, and the full readout is 
     // and a mid-chain shortlist failure all land here, and the answer must
     // still be a legal draft — the full-vocab argmax, which is what the qwen4
     // head did before this change.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -1934,7 +1887,7 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     // that never enters the shortlist cannot be re-scored back into the draft.
     // Both paths are checked because a rerank build refusal silently routes
     // every draft through the other one.
-    if (mlx.noGpuBackend()) return;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
 
@@ -2108,13 +2061,12 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 }
 
 test "mtp: row-axis coarse logits equal each solo readout" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const s = mlx.gpuStream();
     var fx = try RerankFixture.init(s, TOP32_MIN_ROWS + 96, 2560, 8, 64, 0x3B17);
     defer fx.deinit();
     var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
     defer rc.deinit();
-    const tx = @import("transformer.zig");
     {
         for ([_]usize{ 2, 4, 8, 17 }) |n| {
             var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
@@ -2127,10 +2079,10 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             var x = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 0, s));
-            const before = tx.mtp_head_row_dispatches;
+            const before = moe_gqmv.mtp_head_row_dispatches;
             const got = try rerankCoarseRows(s, x, &rc);
             defer _ = mlx.mlx_array_free(got);
-            try testing.expectEqual(@as(usize, if (n <= 16) 1 else 0), tx.mtp_head_row_dispatches - before);
+            try testing.expectEqual(@as(usize, if (n <= 16) 1 else 0), moe_gqmv.mtp_head_row_dispatches - before);
             for (parts[0..n], 0..) |input, i| {
                 var want = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(want);

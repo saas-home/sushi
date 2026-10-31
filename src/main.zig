@@ -4,6 +4,7 @@ const build_options = @import("build_options");
 pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 const model_mod = @import("model.zig");
+const effort_mod = @import("effort.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 pub const tokenizer = tokenizer_mod;
 pub const kld = kld_mod;
@@ -22,11 +23,13 @@ const dflash_mod = @import("dflash.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
+const model_load = @import("model_load.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
 const cli_mod = @import("cli.zig");
 const kld_mod = @import("kld.zig");
+const pack_cmds = @import("dsv41/commands.zig");
 const bench_mod = @import("bench.zig");
 const encoder_cli = @import("sushi_encoder").cli;
 const launch_mod = @import("launch.zig");
@@ -36,6 +39,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
+const sampler = @import("sampler.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -126,13 +130,19 @@ fn printUsage(io: std.Io) void {
         \\                      every greedy position), or teacher-force one
         \\                      through a model and report KLD / top-1 / NLL.
         \\                      `sushi kld --help` for options
-        \\  bench               Drive a running server through the release bench
-        \\                      (tests/bench.sh boots it and takes the box rules).
+        \\  bench               Bench a model in this process (--model <dir>), or
+        \\                      drive a running server (--url; tests/bench.sh boots
+        \\                      it and takes the box rules).
         \\                      `sushi bench --help` for options
         \\  convert exl3        Convert a Qwen3.8-Flash-Next, MiMo-V2.6-Flash or
         \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
         \\                      (routed experts as EXL3). `sushi convert --help`
         \\                      for options
+        \\  repack <pack>       Rewrite an STQ pack in place into the
+        \\                      pair-major layout (no flags). A shard is replaced
+        \\                      only after its rewrite reads back equal; a cut-off
+        \\                      run resumes when repeated. Stop any server using
+        \\                      the pack first. Never downloads.
         \\  update              Replace this install with the newest release,
         \\                      after checking its SHA-256, its signature and
         \\                      that it runs; the old one stays as
@@ -420,7 +430,7 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| {
         try args_list.append(allocator, try allocator.dupe(u8, arg));
     }
-    const args = args_list.items;
+    var args: []const []const u8 = args_list.items;
     // Runs after every other defer: an update asked for by /v1/update or the REPL replaces this process only once
     // the server has shut down the way a SIGTERM exit does.
     defer update_mod.relaunchIfRequested(allocator, io, args);
@@ -437,6 +447,8 @@ pub fn main(init: std.process.Init) !void {
     var run_model_dir: ?[]u8 = null;
     defer if (run_model_dir) |d| allocator.free(d);
     var use_default_models_root = false;
+    var bench_run: ?*bench_mod.InProcess = null;
+    defer if (bench_run) |r| r.finish();
     var repl_after_serve = false;
     var run_opts: cli_mod.ReplOptions = .{};
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
@@ -489,16 +501,27 @@ pub fn main(init: std.process.Init) !void {
             try kld_mod.cmdKld(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "bench")) {
-            try bench_mod.cmdBench(allocator, io, args[2..]);
-            return;
+            switch (try bench_mod.start(allocator, io, args[2..])) {
+                .done => return,
+                .in_process => |run| {
+                    bench_run = run;
+                    bench_mod.setCurrent(run);
+                    // The serve parser below reads the flags the bench left, as `sushi serve --model` does.
+                    args = try run.argv(args[0]);
+                    arg_start = 1;
+                },
+            }
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
+            return;
+        } else if (std.mem.eql(u8, cmd, "repack")) {
+            try pack_cmds.repack.cmdRepack(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, update, or serve)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, kld, bench, convert, repack, update, or serve)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -535,7 +558,7 @@ pub fn main(init: std.process.Init) !void {
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var vision = false;
-    var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
+    var drafter_dir: ?[]const u8 = null; // Path to a DFlash2 assistant checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     // --mtp: force the head ON where requests do not default to it: an SSD-streamed
@@ -549,7 +572,7 @@ pub fn main(init: std.process.Init) !void {
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
     var kv_quant_explicit = false;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
-    // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
+    // 32–64 GB systems running small models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
@@ -898,7 +921,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--drop-expert") and i + 1 < args.len) {
             i += 1;
-            model_mod.drop_expert = @import("expert_usage.zig").parseCount(args[i]) orelse {
+            model_mod.drop_expert = pack_cmds.expert_usage.parseCount(args[i]) orelse {
                 log.err("--drop-expert: expected a multiple of 8 routed experts per layer (0 = off); got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -932,6 +955,10 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
 
+    if (bench_run != null and (host_flag != null or port_flag != null or prompt != null)) {
+        log.err("sushi bench --model: --host, --port and --prompt do not apply, it starts no server\n", .{});
+        std.process.exit(1);
+    }
     if (tool_flag_given and run_model_dir == null) {
         log.err("--tool: only valid with `sushi run <model>`\n", .{});
         std.process.exit(1);
@@ -945,7 +972,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
         return error.PromptModeConflict;
     }
-    const bind = server_mod.resolveBind(host_flag, if (prompt != null) @as(u16, 0) else port_flag);
+    const bind = server_mod.resolveBind(host_flag, if (prompt != null or bench_run != null) @as(u16, 0) else port_flag);
     const host = bind.host;
     const port = bind.port;
 
@@ -992,7 +1019,7 @@ pub fn main(init: std.process.Init) !void {
         serve_mode = true;
         repl_after_serve = false;
     }
-    model_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
+    effort_mod.think_effort_flag = if (run_opts.think == .effort) run_opts.think.effort else null;
     const prompt_body = if (prompt) |text| try cli_mod.buildPromptBody(allocator, text, run_opts.think, .{ .max_tokens = max_tokens, .temperature = temperature, .top_p = top_p_flag orelse 1.0, .top_k = top_k_flag orelse 0 }) else null;
     defer if (prompt_body) |body| allocator.free(body);
     var prompt_state: PromptClient = .{ .allocator = allocator, .io = io, .body = prompt_body orelse "", .stream = stream_mode };
@@ -1024,6 +1051,10 @@ pub fn main(init: std.process.Init) !void {
     // NOTE: opened AFTER `--log-level` is parsed (so the level gates what
     // reaches disk) and BEFORE model discovery/loading (so weight-load and
     // auto-context lines land in the file).
+    if (bench_run) |r| {
+        try r.prepare();
+        if (log_file_arg == null) log_file_arg = try r.logPath();
+    }
     if (serve_mode or repl_after_serve) {
         var log_path_buf: [1024]u8 = undefined;
         const chosen: ?[]const u8 = if (log_file_arg) |a|
@@ -1041,7 +1072,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check);
+    if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1093,7 +1124,7 @@ pub fn main(init: std.process.Init) !void {
     }
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
-    if (serve_mode) {
+    if (serve_mode and bench_run == null) {
         server_mod.ensurePortFree(io, host, port) catch |err| {
             var msg_buf: [512]u8 = undefined;
             if (server_mod.startupRefusal(err, host, port, &msg_buf)) |msg| {
@@ -1215,18 +1246,18 @@ pub fn main(init: std.process.Init) !void {
     };
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
-    scheduler_mod.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
-    if (model_mod.think_effort_flag) |e| if (model_mod.effortArms(config.model_type)) |arms| {
-        var choices: [std.enums.values(model_mod.Effort).len]model_mod.Effort = undefined;
+    model_load.applyModelSettings(config, model_settings_mod.overrideFor(allocator, io, model_dir));
+    if (effort_mod.think_effort_flag) |e| if (effort_mod.effortArms(config.model_type)) |arms| {
+        var choices: [std.enums.values(effort_mod.Effort).len]effort_mod.Effort = undefined;
         for (arms, 0..) |arm, ai| choices[ai] = arm.effort;
-        if (model_mod.armForWord(arms, @tagName(e)) == null) {
+        if (effort_mod.armForWord(arms, @tagName(e)) == null) {
             var w = std.Io.Writer.Allocating.init(allocator);
             defer w.deinit();
             try cli_mod.writeEffortRefusal(&w.writer, @tagName(e), config.model_type, choices[0..arms.len]);
             log.err("--think: {s}\n", .{w.written()});
             std.process.exit(1);
-        } else if (model_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
-            log.info("[effort] " ++ model_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
+        } else if (effort_mod.selectEffortPick(choices[0..arms.len], e)) |pick| if (pick.rerouted_from) |from| {
+            log.info("[effort] " ++ effort_mod.effort_reroute_notice ++ "\n", .{ config.model_type, @tagName(from), @tagName(pick.effort) });
         };
     };
     if (config.glm_fp8_trunk) {
@@ -1394,7 +1425,7 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
-        const params = scheduler_mod.LoadParams{
+        const params = model_load.LoadParams{
             .registry = registry,
             .entry = entry,
             .config = config,
@@ -1426,9 +1457,11 @@ pub fn main(init: std.process.Init) !void {
         };
         var serve_cfg = launch_serve.serverConfig();
         serve_cfg.on_ready = if (prompt != null) PromptClient.ready else null;
+        serve_cfg.embedded_client = if (bench_run != null) bench_mod.embeddedClient else null;
         serve_cfg.default_force_mtp = force_mtp;
         try server_mod.serve(io, allocator, params, config, host, port, serve_cfg);
         if (prompt_state.err) |err| return err;
+        if (bench_run) |r| if (r.err) |err| return err;
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
@@ -1447,7 +1480,8 @@ pub fn main(init: std.process.Init) !void {
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
 
         // Reserved-token suppression, same derivation as the serve path.
-        generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
+        config.mergeTokenizerStops(tok);
+        sampler.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
         generate_mod.installThinkMarkers(&xfm, tok);
         try generate_mod.installLogitBias(io, &xfm, tok);
 
@@ -1456,7 +1490,7 @@ pub fn main(init: std.process.Init) !void {
         // Transformer's own legacy cache to match.
         const kv_cache = server_mod.kvCacheForLaunch(config, kv_quant_config, kv_quant_explicit);
         log.info("[kv-cache] {s} ({s})\n", .{ kv_cache.label(), kv_cache.sourceName() });
-        const mtp_choice = scheduler_mod.mtpChoiceFor(enable_mtp, mtp_explicit, config);
+        const mtp_choice = model_load.mtpChoiceFor(enable_mtp, mtp_explicit, config);
         log.info("[mtp] {s} ({s})\n", .{ mtp_choice.label(), mtp_choice.sourceName() });
         if (kv_cache.config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_cache.config);
@@ -1491,7 +1525,7 @@ pub fn main(init: std.process.Init) !void {
         _ = mlx.mlx_reset_peak_memory();
 
         const eos_slice = config.eosTokenSlice();
-        const sampling = generate_mod.SamplingParams{ .temperature = temperature };
+        const sampling = sampler.SamplingParams{ .temperature = temperature };
 
         var stdout_buf: [16 * 1024]u8 = undefined;
         var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
@@ -1515,7 +1549,7 @@ pub fn main(init: std.process.Init) !void {
             var completion_tokens: u32 = 0;
             while (try gen.next(allocator)) |token_id| {
                 const ids = [_]u32{token_id};
-                const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
+                const piece = try tok.decode(allocator, &ids);
                 defer allocator.free(piece);
                 if (piece.len > 0) {
                     try stdout_w.writeAll(piece);
@@ -1620,8 +1654,8 @@ fn runHeadlessServe(
     log.info("sushi {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
 
-    var stub = try scheduler_mod.headlessStubCpuState(allocator);
-    defer scheduler_mod.freeCpuState(allocator, &stub);
+    var stub = try model_load.headlessStubCpuState(allocator);
+    defer model_load.freeCpuState(allocator, &stub);
 
     const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
     if (effective_max_resident_mem > 0) {
@@ -1669,7 +1703,7 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
-    const params = scheduler_mod.LoadParams{
+    const params = model_load.LoadParams{
         .registry = registry,
         .entry = carrier,
         .config = stub.config,

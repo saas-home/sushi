@@ -8,12 +8,12 @@ prefill that borrows decoder pools and the fully resident load. Index: [CLAUDE.m
 
 | term | GB |
 |---|---|
-| trunk (resident STQ banks, head, the 384-expert routers as stored in bf16; the 0.37 GB embedding is read from SSD) | 4.25 |
+| trunk (resident STQ banks, head, the 384-expert routers as stored in bf16, the 0.37 GB embedding) | 4.62 |
 | DSpark stages (resident) | 3.92 |
 | union workspace (one layer's 384 experts at the widest layer) | 3.70 |
 | bounce + selected | 0.60 |
 | MLX buffer pool, decode cap (`dsv41_pool_bytes`, 1 GiB) | 1.07 |
-| expert cache | 89.6 |
+| expert cache (what is left; whole slots a layer) | 89.2 |
 
 Routed experts by layer, rate-sized (shard headers): the encoder (layers 0-19) holds 57.13 GB (6.8-9.6 MB an
 expert), the decoder (20-39) holds 62.46 GB (7.1-9.2 MB), 119.6 GB in all. The cache holds 75% of it.
@@ -76,7 +76,7 @@ the forward before it) and by `enterVision` around an image encode. The pool cou
 pool on demand and the phase's bytes plus the pool never pass the limit. A request that reaches it fails as
 `TransientCapExceeded` (503) and the server keeps serving. A request's end lifts the cap. There is no flag.
 
-The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `server.visionEncodeBill` for an image.
+The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `request_media.visionEncodeBill` for an image.
 
     prefill-width forward (> 17 rows):  (rows x dim x 480 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
     decode or verify forward (<= 17):   (seq x 16 x 4 x 3 + seq x (state/16 + worst layer)) x 5/4 + 256 MiB
@@ -195,6 +195,15 @@ flip (about 3.3 s at 9 GB/s) and loses at every decode length, with the swap in 
 
 ## The 1M KV reserve
 
+An auto boot serves 1,000,000 tokens (`ModelConfig.defaultContext`) whenever the margined memory context
+(`safeAutoContext`, 93% of what the bill admits, so the memory search runs past the checkpoint's window to about
+1.08M tokens) reaches it, and the checkpoint's window caps it. A box whose margined context falls short keeps that
+margined value and logs one warning naming both numbers. A request that omits
+`max_tokens` gets 256,000 (`defaultMaxTokens`); admission reserves 8192 of it, so the budget bills nothing more up front.
+`--ctx-size` and `--max-tokens` outrank both, and `model-settings.json` has no `max_tokens` key.
+
+With no `--ssd-budget-gb` and no `ssd_budget_gb` setting the load picks one from physical RAM (`ramDefaultBudget`): 80 GiB on 96 GB, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), resident on 192 and 256 GB. The step-down bound is the lower of the residency limit (the declared wired limit, else Metal's working set) and `vm.global_user_wire_limit` / `vm.user_wire_limit`, each less its margin, beside the 1M request bill (`dsv41DefaultRequestBill`) and the image encode.
+
 The state (0.93 GB at 1M) is billed per request in admission. The SSD budget is fixed at load, so the expert cache
 never squeezes the state.
 
@@ -216,7 +225,7 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
 (`Config.chunkCap`, [below](#transient-caps)), billed only where the decoder pools a prefill may still release
 (`ModelConfig.expert_borrow_bytes`, published live by the engine) do not cover it. At 1M: 3.4 GB in all.
 
-**The borrow** (`src/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
+**The borrow** (`src/dsv41/dsv41_borrow.zig`, `Engine.borrowLayer`/`restoreLayer`):
 - Before every forward wider than 17 rows, its need, `Config.forwardCap(rows, seq)` (6.6 GB at 2048 rows),
   against the live headroom (ceiling less MLX's active bytes). Short of it, whole decoder pools go, latest layer first
   (39 down to the CED split, 20): the plan is made from the pools' bytes before anything is released, a forward the

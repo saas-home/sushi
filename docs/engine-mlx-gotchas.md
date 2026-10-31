@@ -79,6 +79,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   template arg: read it from `threads_per_grid`, an input's `_shape`, or a small input buffer. DeepSeek's index top-k
   width and packed-KV row counts did, and decode below 512 tokens of context compiled a library every token (the
   "slow state"). `SUSHI_KERNEL_BUILD_LOG=1` logs each new key; guard: the `dsv41 kernels:` zero-new-library tests.
+- **MLX rebuilds and hashes a kernel's whole source and header on every launch**: `mlx_fast_metal_kernel_new` minifies
+  both once and drops the header's struct, alias and function definitions the source never reaches
+  (`metal_minify.zig`). `SUSHI_KERNEL_RAW_SOURCE=1` passes the text as written. Guard: the `a minified kernel gives` test.
 
 ## Laziness and barriers
 
@@ -117,6 +120,7 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A struct inside a generic fn that captures NO comptime param is memoized to ONE type.
 - `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
 - `.string` on unchecked `std.json.Value` panics.
+- `clearRetainingCapacity` poisons the cleared bytes (0xAA) in safe builds: never return `list.items` and clear it in a `defer`; drop the length with `items.len = 0`.
 - A test that aliases embedded bytes through an alignment cast is a coin flip per binary: copy fixtures to aligned
   storage (Debug builds catch what ReleaseFast hides).
 - A failing `std.debug.assert` is UB in ReleaseFast: the full suite can pass while the same test, filtered alone,
@@ -145,9 +149,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
   `tests/test_tokenizer_reference.sh` compares the three real tokenizer files to HF on CPU without loading weights.
   Its synthetic inputs are normalized first to isolate Split/BPE: the older missing NFC-normalizer behavior on
   decomposed text is a separate, still-open issue. `TOKENIZER_CASES_JSON` can add an already-normalized prompt pack.
-- The cased `llama3` grammar needs `\p{Lu}` in the Split regex: contractions plus `\p{N}{1,3}` is also GLM's plain
-  Llama-3 pattern, which is the gpt2 path with `.letters` word rules and 3-digit groups. The BPE `ignore_merges` flag
+- GLM's Split regex is the plain Llama-3 pattern (contractions plus `\p{N}{1,3}`): the gpt2 path with `.letters` word
+  rules and 3-digit groups. The BPE `ignore_merges` flag
   (GLM sets it) is honoured in `bpeMerge`. The parity script covers GLM, Qwen and MiMo on code and tool-call text.
 - DeepSeek's `Scope.out` handle belongs to the caller: a `block` result chained through a loop in a scope must be
   adopted with `sc.keep` or it leaks every iteration (the DSpark draft leaked its stage outputs per round). Guard: the
-  `DSpark requests leave the MLX active memory flat` test in `generate.zig`.
+  `DSpark requests leave the MLX active memory flat` test in `dsv41/dsv41_generate_test.zig`.

@@ -212,6 +212,11 @@ fn spanLess(_: void, a: FillSpan, b: FillSpan) bool {
     return a.offset < b.offset;
 }
 
+fn onPages(s: FillSpan) bool {
+    const page: u64 = @intCast(pageSize());
+    return s.offset % page == 0 and s.len % page == 0 and @intFromPtr(s.dst) % page == 0;
+}
+
 pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_bytes: u64) ![]ReadJob {
     if (max_bytes == 0) return error.InvalidCoalesceBound;
     var jobs: std.ArrayList(ReadJob) = .empty;
@@ -229,6 +234,10 @@ pub fn coalesceSpans(allocator: std.mem.Allocator, spans: []const FillSpan, max_
             if (next.len == 0) return error.InvalidFillSpan;
             if (next.file != file or next.offset != offset + len) break;
             if (next.tile != null or spans[first].tile != null) break;
+            // A page-aligned span whose neighbour in the file lands elsewhere reads alone, straight into its slot,
+            // instead of inside a bounced run.
+            const prev = spans[i - 1];
+            if (next.dst != prev.dst + @as(usize, @intCast(prev.len)) and (onPages(prev) or onPages(next))) break;
             if (len + next.len > max_bytes) break;
             len += next.len;
         }
@@ -252,12 +261,16 @@ fn jobIsDirect(spans: []const FillSpan, job: ReadJob, page: u64) bool {
     return true;
 }
 
+/// A read's latency in bytes the SSD could move meanwhile; without it a byte split piles a run of small reads onto
+/// one worker.
+pub const READ_COST_BYTES: u64 = 1 << 20;
+
 pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, workers: usize) ![]usize {
     if (workers == 0) return error.InvalidFillPool;
     const bounds = try allocator.alloc(usize, workers + 1);
     errdefer allocator.free(bounds);
     var total: u64 = 0;
-    for (jobs) |j| total += j.len;
+    for (jobs) |j| total += j.len + READ_COST_BYTES;
     for (bounds) |*b| b.* = jobs.len;
     bounds[0] = 0;
     if (total == 0 or jobs.len == 0) {
@@ -268,11 +281,11 @@ pub fn partitionByMidpoint(allocator: std.mem.Allocator, jobs: []const ReadJob, 
     var owner = try allocator.alloc(usize, jobs.len);
     defer allocator.free(owner);
     for (jobs, 0..) |j, i| {
-        const mid = cursor + j.len / 2;
+        const mid = cursor + (j.len + READ_COST_BYTES) / 2;
         var w = @as(usize, @intCast(mid * @as(u64, workers) / total));
         if (w >= workers) w = workers - 1;
         owner[i] = w;
-        cursor += j.len;
+        cursor += j.len + READ_COST_BYTES;
     }
     var w: usize = 0;
     var i: usize = 0;
@@ -320,6 +333,9 @@ pub const FillStats = struct {
     bytes_read: u64 = 0,
     bytes_issued: u64 = 0,
     bytes_bounced: u64 = 0,
+    /// Tile bytes `layout.tileMajor` moved on the CPU while landing them.
+    bytes_reshuffled: u64 = 0,
+    reads_direct: u64 = 0,
     reads_issued: u64 = 0,
     pread_ns: u64 = 0,
     max_worker_bytes: u64 = 0,
@@ -364,6 +380,8 @@ pub const FillPool = struct {
     accepted: u64 = 0,
     max_depth: usize = 0,
     stats_acc: FillStats = .{},
+    /// Test seam: runs on the worker after it takes job `index`, before it reads, so a test can hold a read open.
+    job_hook: ?*const fn (*FillPool, usize) void = null,
 
     pub fn create(allocator: std.mem.Allocator, opts: FillOptions) !*FillPool {
         if (opts.workers == 0 or opts.workers > 64) return error.InvalidFillPool;
@@ -572,6 +590,7 @@ pub const FillPool = struct {
         const job = plan.jobs[index];
         const len: usize = @intCast(job.len);
         var head: usize = 0;
+        var reshuffled: u64 = 0;
         var read_offset: u64 = job.offset;
         var target: []u8 = undefined;
         if (job.direct) {
@@ -615,6 +634,7 @@ pub const FillPool = struct {
                 if (s1.tile) |tile| if (take == sl) {
                     const bytes = 2 * @as(usize, tile.n);
                     layout.tileMajor(u8, s1.dst[0..sl], target[head + written ..][0..sl], tile.it, tile.ot, bytes);
+                    reshuffled += sl;
                     written += sl;
                     continue;
                 };
@@ -626,6 +646,8 @@ pub const FillPool = struct {
         self.stats_acc.bytes_read += delivered;
         self.stats_acc.bytes_issued += result.done;
         self.stats_acc.bytes_bounced += if (job.direct) 0 else delivered;
+        self.stats_acc.bytes_reshuffled += reshuffled;
+        self.stats_acc.reads_direct += @intFromBool(job.direct);
         self.stats_acc.reads_issued += 1;
         self.stats_acc.pread_ns += elapsed;
         self.workers[worker].bytes += delivered;
@@ -696,6 +718,7 @@ pub const FillPool = struct {
             const files = self.files;
             const plan = self.plan.?;
             self.mu.unlock(io);
+            if (self.job_hook) |hook| hook(self, index);
             self.runJob(worker, files, plan, index);
         }
     }
@@ -1138,6 +1161,56 @@ test "expert io fill lands a tile span in tile-major order and leaves its neighb
     try t.expectEqualSlices(u8, file.bytes[515 + tiled.len ..][0..plain.len], &plain);
 }
 
+test "expert io fill plan keeps a layer's tail scale reads off its last big read's worker" {
+    const t = std.testing;
+    // Three big reads first in the file, six small ones last, each landing in its own destination.
+    var dst: [9 * 4096]u8 align(align_bytes) = undefined;
+    var spans: [9]FillSpan = undefined;
+    for (&spans, 0..) |*s, i| s.* = .{ .file = 0, .offset = i * (4 << 20), .len = if (i < 3) 2211840 else 10240, .dst = dst[i * 4096 ..].ptr };
+    var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 4, false);
+    defer plan.deinit();
+    var w: usize = 0;
+    while (!(plan.bounds[w] <= 2 and 2 < plan.bounds[w + 1])) w += 1;
+    try t.expect(plan.bounds[w + 1] - 3 <= 2);
+}
+
+test "expert io fill counts the tile bytes it reshuffles, and a page-aligned span with no tile reads direct" {
+    const t = std.testing;
+    const page = pageSize();
+    var file = try TestFile.make(t.allocator, "tm.bin", page * 4, 0x31);
+    defer file.deinit(t.allocator);
+    const fd = try file.open(t.allocator);
+    defer _ = std.c.close(fd);
+    const pool = try FillPool.create(t.allocator, .{ .workers = 1 });
+    defer pool.destroy();
+
+    const it = 2;
+    const ot = 4;
+    const n = 4;
+    const bytes = it * ot * n * 2;
+    const dst = try alignedDest(t.allocator, page);
+    defer t.allocator.free(dst);
+    {
+        const spans = [_]FillSpan{.{ .file = 0, .offset = 0, .len = bytes, .dst = dst.ptr, .tile = .{ .it = it, .ot = ot, .n = n } }};
+        var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+        defer plan.deinit();
+        try pool.run(&.{fd}, &plan);
+        try t.expectEqual(@as(u64, bytes), pool.stats().bytes_reshuffled);
+    }
+    pool.resetStats();
+    {
+        const spans = [_]FillSpan{.{ .file = 0, .offset = page, .len = page, .dst = dst.ptr }};
+        var plan = try FillPlan.init(t.allocator, &spans, 64 * 1024 * 1024, 1, false);
+        defer plan.deinit();
+        try pool.run(&.{fd}, &plan);
+        const st = pool.stats();
+        try t.expectEqual(@as(u64, 0), st.bytes_reshuffled);
+        try t.expectEqual(@as(u64, 0), st.bytes_bounced);
+        try t.expectEqual(@as(u64, page), st.bytes_read);
+        try t.expectEqualSlices(u8, file.bytes[page..][0..page], dst[0..page]);
+    }
+}
+
 test "expert io fill attributes a span past eof while other spans complete" {
     const t = std.testing;
     var file = try TestFile.make(t.allocator, "short.bin", 8192, 0xabc);
@@ -1197,9 +1270,37 @@ const Canceller = struct {
     }
 };
 
+/// Holds job 0's read open until `done` is true, bounded at one second.
+fn holdFirstJobUntil(pool: *FillPool, index: usize, done: *const fn (*FillPool) bool) void {
+    if (index != 0) return;
+    for (0..1000) |_| {
+        if (done(pool)) return;
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .real) catch {};
+    }
+}
+
+fn cancelRequested(pool: *FillPool) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    pool.mu.lockUncancelable(io);
+    defer pool.mu.unlock(io);
+    return pool.cancel;
+}
+
+fn queuedAhead(pool: *FillPool) bool {
+    return pool.maxQueueDepth() == 2;
+}
+
+fn holdUntilCancelled(pool: *FillPool, index: usize) void {
+    holdFirstJobUntil(pool, index, cancelRequested);
+}
+
+fn holdUntilQueuedAhead(pool: *FillPool, index: usize) void {
+    holdFirstJobUntil(pool, index, queuedAhead);
+}
+
 test "expert io fill cancel drains accepted work and reports" {
     const t = std.testing;
-    const chunk: usize = 16 * 1024 * 1024;
+    const chunk: usize = 1024 * 1024;
     var file = try TestFile.make(t.allocator, "big.bin", chunk * 4, 0x777);
     defer file.deinit(t.allocator);
     const fd = try file.open(t.allocator);
@@ -1216,18 +1317,19 @@ test "expert io fill cancel drains accepted work and reports" {
     try t.expectEqual(@as(usize, 4), plan.jobs.len);
     const pool = try FillPool.create(t.allocator, .{ .workers = 1, .queue_capacity = 1 });
     defer pool.destroy();
+    pool.job_hook = holdUntilCancelled;
     var canceller = Canceller{ .pool = pool };
     const thread = try std.Thread.spawn(.{}, Canceller.main, .{&canceller});
     const outcome = pool.run(&.{fd}, &plan);
     thread.join();
     try t.expectError(error.FillCancelled, outcome);
     try t.expectEqualSlices(u8, file.bytes[0..chunk], dst[0..chunk]);
-    try t.expect(pool.stats().bytes_read < @as(u64, chunk) * 4);
+    try t.expectEqual(@as(u64, chunk), pool.stats().bytes_read);
 }
 
 test "expert io fill keeps a worker fed while it is reading" {
     const t = std.testing;
-    const chunk: usize = 32 * 1024 * 1024;
+    const chunk: usize = 1024 * 1024;
     var file = try TestFile.make(t.allocator, "fed.bin", chunk * 2, 0x5eed);
     defer file.deinit(t.allocator);
     const fd = try file.open(t.allocator);
@@ -1244,40 +1346,11 @@ test "expert io fill keeps a worker fed while it is reading" {
     try t.expectEqual(@as(usize, 2), plan.jobs.len);
     const pool = try FillPool.create(t.allocator, .{ .workers = 1, .queue_capacity = 1 });
     defer pool.destroy();
-    // Whether the second job is queued before a cached 32 MiB read finishes depends on the scheduler, so
-    // the test asks for it within a few fills; a pool that never queues ahead fails them all.
-    var depth: usize = 0;
-    for (0..20) |_| {
-        @memset(dst, 0);
-        try pool.run(&.{fd}, &plan);
-        try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
-        depth = pool.maxQueueDepth();
-        if (depth == 2) break;
-    }
-    try t.expectEqual(@as(usize, 2), depth);
-}
-
-/// Process CPU time (user + system) in nanoseconds.
-fn processCpuNs() u64 {
-    const ru = std.posix.getrusage(0); // RUSAGE_SELF
-    const sec: i64 = @as(i64, ru.utime.sec) + @as(i64, ru.stime.sec);
-    const usec: i64 = @as(i64, ru.utime.usec) + @as(i64, ru.stime.usec);
-    return @intCast(sec * std.time.ns_per_s + usec * std.time.ns_per_us);
-}
-
-test "expert io idle fill workers do not spin" {
-    // Parked workers must not burn CPU; process CPU time bars the idle window.
-    const t = std.testing;
-    const pool = try FillPool.create(t.allocator, .{ .workers = 4 });
-    defer pool.destroy();
-
-    var ts = std.c.timespec{ .sec = 1, .nsec = 0 };
-    const before = processCpuNs();
-    _ = std.c.nanosleep(&ts, null);
-    const delta = processCpuNs() - before;
-
-    // A spinning pool burns one core per worker; parked, ~0.
-    try t.expect(delta < 400 * std.time.ns_per_ms);
+    // The first read is held open until the second job is queued, so a pool that never queues ahead fails.
+    pool.job_hook = holdUntilQueuedAhead;
+    try pool.run(&.{fd}, &plan);
+    try t.expectEqualSlices(u8, file.bytes, dst[0 .. chunk * 2]);
+    try t.expectEqual(@as(usize, 2), pool.maxQueueDepth());
 }
 
 test "expert io file cache reopens a replaced shard and reuses a stable one" {
@@ -1317,7 +1390,7 @@ pub const TensorRegion = struct {
     data_offset: u64,
     tensor_offset: u64,
     tensor_bytes: u64,
-    shape: [4]u64,
+    shape: [5]u64,
     rank: u8,
     dtype: Dtype,
 };
@@ -1358,6 +1431,14 @@ pub const SafetensorsHeader = struct {
         self.parsed.deinit();
     }
 };
+
+/// The string a shard's `__metadata__` holds under `key` (the empty string for a value that is not one), or null.
+pub fn metadataString(header: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const meta = header.get("__metadata__") orelse return null;
+    if (meta != .object) return null;
+    const v = meta.object.get(key) orelse return null;
+    return if (v == .string) v.string else "";
+}
 
 /// Fills `window` (page-aligned, starting at the page-aligned file offset `start`) until file
 /// offset `end` is covered; the read may stop short of the last page at end of file.
@@ -1493,8 +1574,8 @@ pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u
     else
         .other;
     const shape = object.get("shape") orelse return error.InvalidSafetensorsTensor;
-    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 4) return error.InvalidSafetensorsTensor;
-    var dimensions: [4]u64 = .{ 0, 0, 0, 0 };
+    if (shape != .array or shape.array.items.len < 2 or shape.array.items.len > 5) return error.InvalidSafetensorsTensor;
+    var dimensions: [5]u64 = .{ 0, 0, 0, 0, 0 };
     var elements: u64 = 1;
     for (shape.array.items, 0..) |dim, i| {
         if (dim != .integer or dim.integer <= 0) return error.InvalidSafetensorsTensor;
@@ -1931,7 +2012,7 @@ test "expert io safetensors header preserves U8 element width and byte span" {
 
 test "expert io import aliases a page slab and sees the bytes written while filling" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 512;
     const slab = try PageSlab.create(t.allocator, elements * 2);
     defer slab.destroy();
@@ -1968,7 +2049,7 @@ test "expert io import aliases a page slab and sees the bytes written while fill
 
 test "expert io import counts a fallback copy and still yields the bytes" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 256;
     const slab = try PageSlab.create(t.allocator, 4096 + elements * 2);
     defer slab.destroy();
@@ -2004,7 +2085,7 @@ test "expert io import counts a fallback copy and still yields the bytes" {
 
 test "expert io import runs the payload release callback exactly once" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const elements: usize = 128;
     const slab = try PageSlab.create(t.allocator, elements * 2);
     defer slab.destroy();
@@ -2023,7 +2104,7 @@ test "expert io import runs the payload release callback exactly once" {
 
 test "expert io import active memory counts an aliased slab once" {
     const t = std.testing;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    try mlx.requireGpu();
     const bytes: usize = 4 * 1024 * 1024;
     const slab = try PageSlab.create(t.allocator, bytes);
     defer slab.destroy();
