@@ -41,9 +41,14 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - `zig build test` runs the host tier, the MLX buckets, the exl3 binaries and the encoder binary.
 - build.zig names a bucket's files at configure time, so every folder or file it scans is declared with
   `b.dependOnDirectoryContents`/`dependOnFileContents`; without that a new test file never runs until the cache goes.
+- A filtered run keeps the parallel binaries: the scan keeps the tests whose full name holds a `-Dtest-filter` substring
+  and balances them over the same binaries, and the host tier runs once, in `test-host`.
 - `SUSHI_TEST_NO_GPU=1` makes a test build see no Metal backend, so `requireGpu` skips (diagnostic, test builds only).
-- The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `QWEN4_TEST_MODEL`,
-  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`. A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
+- The pack tier's envs: `DSV41_TINY`, `DSV41_STQ_TINY`, `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+  folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
+  `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
+  `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
+  its `SUSHI_DSV41_PROBE_*` knobs are in [envvar](envvar.md); a ~40 GB-budget run, GPU lock). A landing on main sets the tiny-fixture envs; the real-pack envs run with the release gate. Without them a green
   suite proves nothing there.
 - Two real-weight runs have no script. The encoder's real-checkpoint capture:
   `SUSHI_ENCODER_REAL_MODEL=1 SUSHI_MODELS_DIR=<root holding Qwen/Qwen3.8-Flash-Next> zig build test -Doptimize=ReleaseFast -Dmodel=enc`.
@@ -124,14 +129,18 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | host files only (chat, parsers, grammar, tokenizer, pure planners) | `zig build test-host` |
 | one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows) |
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
-| a shared file, `build.zig` or `mlx.zig` | `zig build test` |
+| a broad area | `-Dmodel=` (above); a narrow check names its tests with `-Dtest-filter=`, which stays parallel |
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
-| a landing on main, a release, a bisect of an unexplained failure | `zig build test` with the tiny-fixture envs set, plus the touched area's scripts |
+| a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `python3 tests/suite_guards.py` and the touched area's scripts |
+| a wide stacked change: a shared file, `build.zig`, `mlx.zig`, or one landing that stacks changes across several areas | `zig build test` with the tiny-fixture envs set |
+| a version bump (release step 1) | `zig build test` with the tiny-fixture envs set |
+| a bisect of an unexplained failure | the subset that fails, widened only if it does not reproduce there |
 
 The full suite is the only run that sees every test in its real binary and order: a test that leaks or fails alone can
-pass after its neighbours warm a cache. Run it where the table says, never as a habit while iterating (filter instead).
-A landing compares its test total (`Build Summary` plus `test-host`) with the previous landing's: an unexplained drop
-means tests were not built, and blocks the push.
+pass after its neighbours warm a cache. That is why a wide change and a version bump pay for it; a landing confined to
+one area does not.
+A full-suite run compares its test total (`Build Summary` plus `test-host`) with the previous full run's: an
+unexplained drop means tests were not built, and blocks the push.
 
 CI runs `test-build` (every test compiles), `test-host` and the hermetic guards on every PR; the GPU tier is a
 `workflow_dispatch` choice (`tier: all`), because a hosted runner's GPU flips rounding ties the M5 holds.

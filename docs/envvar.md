@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 137 vars. By kind: tradeoff levers 14, diagnostics 51, microbenches 19, test-only seams 43, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 143 vars. By kind: tradeoff levers 14, diagnostics 52, microbenches 19, test-only seams 48, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (51)
+## Diagnostics (52)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -63,6 +63,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_EXPERT_DEFER_SYNC` | `qwen4_forward.zig:2007` | `1` forces synchronous expert verification for an exact schedule comparison | once | yes: engine-expert-streaming |
 | `SUSHI_FORCE_GPU_FAMILY_FALLBACK` | `nax_gate.zig:136, exl3/expert_exl3_kernels.zig:1112` | `1` pretends the matrix units are absent to rehearse the M1-M4 path on an M5; the EXL3 and verify-qmm parity tests set it | once | yes: glm5-arch, glm5-kernels, glm5-perf, ... |
 | `SUSHI_KERNEL_BUILD_LOG` | `mlx_kernel_keys.zig` (the `mlx_fast_metal_kernel_*` wrappers of `mlx.zig`) | `1` logs every custom-kernel library key MLX has not compiled yet as `[kernel-build] #N name src=... template args -> outputs in: inputs`; each is a Metal compile on the inference thread | once | yes: engine-mlx-gotchas |
+| `SUSHI_KERNEL_RAW_SOURCE` | `mlx.zig` (`mlx_fast_metal_kernel_new`) | `1` hands MLX every custom kernel's source and header as written instead of minified and shaken, so a Metal compile error names the source lines | once | yes: engine-mlx-gotchas |
 | `SUSHI_KVQ_PARITY_TRACE`, `SUSHI_MIMO_VISION_DIAG`, `SUSHI_EXL3_PARITY_TRACE` | `test_support.zig`, `mimo_forward.zig`, `mimo_vision.zig`, `mimo_fixture_test.zig` | prints extra parity / vision diagnostics inside a test (the EXL3 one: the MiMo EXL3 tests' relative RMS) | test | yes: CLAUDE |
 | `SUSHI_LAYER_CAP` | `forward_diag.zig:63` | `<n>` runs only the first n layers so a ms-vs-layers slope is measurable (`tests/fwd_ubench.sh`) | once | yes: tests/CLAUDE |
 | `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `transformer.zig:1821` | `1` re-reads the full head on every shortlist row and counts disagreements | once | yes: engine-mtp, mimo2-perf |
@@ -96,7 +97,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load; arm list; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (43)
+## Test-only seams (48)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -108,6 +109,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `QWEN4_FIXTURE`, `QWEN4_FIXTURE_BF16`, `QWEN4_FIXTURE_VISION`, `QWEN4_ROWS_OLD`, `QWEN4_TEST_HF_MODEL`, `QWEN4_TEST_PREFIX_TOKENS`, `QWEN4_VERIFY_BENCH`, `QWEN4_YARN_FIXTURES`, `QWEN4_BF16_STREAM_MODEL` | `qwen4_fixture_test.zig`, `mrope.zig`, `expert_io.zig` | oracle fixtures, HF source dir and probe switches for the Qwen4 oracle tests | test | yes: tests/CLAUDE |
 | `QWEN4_TEST_MODEL` | `qwen4_fixture_test.zig:474, 618, 641, +24`, `qwen4_generate_test.zig:387, 531, 640` | `<pack dir>` for the real-pack Qwen4 tests; they skip without it | test | yes: mlx-serve-sync, server-lifecycle, tests/CLAUDE |
 | `QWEN_VISION_TEST_MODEL`, `QWEN_VISION_FIXTURE`, `QWEN_PREPROCESS_FIXTURE`, `QV_GH`, `QV_GW`, `QWEN_MID_SYSTEM_MODEL_DIR` | `qwen_vision.zig`, `chat.zig` | Qwen vision/preprocess oracle inputs and a chat-template pack | test | yes: server-tool-calling, tests/CLAUDE |
+| `SUSHI_DSV41_REAL_PACK`, `SUSHI_DSV41_PROBE_AT`, `SUSHI_DSV41_PROBE_WIDTH`, `SUSHI_DSV41_PROBE_TEXT`, `SUSHI_DSV41_PROBE_VERBOSE` | `dsv41_generate_test.zig` | the real-pack width probe (skips without `SUSHI_DSV41_REAL_PACK=<pack dir>`): at each context in `PROBE_AT` (comma list, default 17) of `PROBE_TEXT` (a text file with more tokens than the largest context + width + 1) a `PROBE_WIDTH`-row verify (default 4) must give every row the bits of its own one-row round, layer by layer; `PROBE_VERBOSE` prints each differing tensor | test | yes: dsv41-arch, testsuite |
 | `SUSHI_FORCE_BATCHED` | `scheduler.zig:1209` | `1` routes single-slot ticks through the batched kernel (`tests/test_batched_equivalence.sh`) | boot | yes: tests/CLAUDE |
 | `SUSHI_MEMORY_AUDIT_MODEL`, `SUSHI_TOKENIZER_PARITY_FIXTURE` | `server.zig`, `model_load.zig`, `tokenizer.zig` | memory-bill audit pack and tokenizer parity fixture | test | no |
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |

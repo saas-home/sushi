@@ -295,6 +295,9 @@ pub const ModelConfig = struct {
 
     // BOS id from config.json.
     bos_token_id: ?u32 = null,
+    /// The id a raw-text prompt must open with, where the model's chat template writes BOS itself and its base model
+    /// collapses to EOS without one. Null where the config's "BOS" (Qwen's `<|endoftext|>`) must not open a prompt.
+    text_prompt_bos: ?u32 = null,
 
     // Context length from config.json (0 = unknown)
     max_position_embeddings: u32 = 0,
@@ -1492,7 +1495,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (v == .bool) config.attn_output_gate = v.bool;
     }
 
-    if (cfg_obj.get("bos_token_id")) |v| {
+    if (cfgField(cfg_obj, "bos_token_id") orelse root.get("bos_token_id")) |v| {
         if (v == .integer and v.integer >= 0) config.bos_token_id = try cfgInt(u32, v);
     }
 
@@ -1689,6 +1692,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         const c = try dsv41_config.parse(cfg_obj, root);
         config.model_type = "deepseek_v41";
         config.weight_prefix = "";
+        config.text_prompt_bos = config.bos_token_id;
         config.hidden_act = .silu;
         config.num_experts = c.experts;
         config.num_experts_per_tok = c.top_k;
@@ -4318,4 +4322,10 @@ test "wrapOwned: an empty region is refused as OwnedImportCopied and the owned b
     try testing.expectError(error.OwnedImportCopied, wrapOwned(empty, &.{0}, .uint8));
     try testing.expectEqual(start, owned_bytes.load(.monotonic));
     try testing.expectEqual(refused + 1, refused_imports.load(.monotonic));
+}
+
+test "a text prompt's BOS comes from the release config, whose bos_token_id sits outside text_config" {
+    var config = try parseConfigFromJson(testing.allocator, dsv41_config.release_config);
+    defer config.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u32, 0), config.text_prompt_bos);
 }

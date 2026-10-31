@@ -75,7 +75,7 @@ link to or quote them from a committed file.
 | `docs/private/sashimi-codebooks.md` | MCG decision, decoder dead ends, fractional-rate trellis |
 | `docs/private/quality-kld-research.md` | KLD of every intermediate and experimental pack, sweeps, how packs were made |
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
-| `docs/private/future.md` | work still to explore; an entry leaves when it starts or lands |
+| `docs/private/future.md` | future repo work; read at each release; an entry leaves when it starts or lands |
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
 | `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
@@ -139,17 +139,18 @@ Box: M5 Max 128 GB, macOS 27.
 
 ## Testing — TDD is mandatory
 
-Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset or full suite that
+Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; (3) the subset that
 [testsuite](docs/testsuite.md#what-a-change-runs) names; (4) refactor. A live curl is NOT a test.
+- A landing runs its change's subset. The full suite runs only for a wide stacked change (shared files, several areas) or
+  a version bump.
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test
 red→fix→green. Refactor = characterization test first. A live failure revealing a CLASS ships the instance test plus a
 corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the matching doc.
 
 `zig build test-host` runs the MLX-free tier beside a live server.
-Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live:
-`tests/qwen4/test_qwen4_exp.sh`, `tests/qwen4/test_bf16_streaming.sh`, `tests/test_mtp_equivalence.sh`,
-`tests/test_prefix_cache_*.sh`, `tests/test_smoke_matrix.sh`. Matrix: `tests/CLAUDE.md`.
+Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Live scripts and
+their matrix: `tests/CLAUDE.md`.
 
 - **A test never writes to stdout** (stderr only): under `zig build test` fd 1 is the build runner's protocol pipe;
   one stray line hangs the runner while the standalone binary passes.
@@ -160,21 +161,23 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter=
   Test the behaviour or state the rule in a comment.
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
-- `zig build test` sometimes reports `failed command` on a FIRST run and is green on a direct re-run (Metal
-  contention between parallel test binaries, benign, unpinned).
+- `zig build test` sometimes fails a FIRST run and is green on a direct re-run (Metal contention, benign, unpinned).
 
 ## Releases & benchmarking
 
-`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` (`sushi bench`: code and prose arms, ONE cold prefill each,
-8k restore windows, 3 decode samples a rung) on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM 2.4bpw, DeepSeek STQ 1.75bpw),
-report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per release. Protocol:
-[process-measurement](docs/process-measurement.md#release-bench). `/bench` for methodology: same-methodology cells only, spec
-cells are variance (sample across boots), an A/B arm is proven by ENGAGEMENT lines in its log. Interleave A/B kernels in
-ONE process (separate runs drift 15%); same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for
-cross-engine comparisons only.
+`/release` for process, SemVer, CHANGELOG. Perf gate = `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw,
+GLM 2.4bpw, DeepSeek STQ 1.75bpw), report in `docs/bench/v<ver>/`, vs the previous one; ONE new `benchmarks.md` column per
+release. Protocol: [process-measurement](docs/process-measurement.md#release-bench).
+- Release order: local tests, push the version bump; `./release.sh` (CI's DRAFT) beside the local perf and KLD gates;
+  both green: publish. Any issue: fix, push, delete the draft and its tag, rerun it.
+- Future repo work (a deferred task or plan) goes to `docs/private/future.md`, never agent memory. A
+  release starts by reading it and telling the owner what is due.
 
-Release notes thank every outside contributor by @handle for each merged PR the release ships (`gh pr list --state
-merged` since the last tag); a credit missed in a shipped release goes into the next one, marked as belated.
+`/bench` for methodology: same-methodology cells only. Interleave A/B kernels in ONE process (separate runs drift 15%);
+same-boot medians per cell; sub-2% calls need an IDLE box. llmprobe is for cross-engine comparisons only.
+
+Release notes thank every outside contributor by @handle for each merged PR the release ships; a missed credit goes
+into the next release, marked as belated (`/release`).
 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
@@ -230,12 +233,13 @@ Procedures and examples: [docs/process-measurement.md](docs/process-measurement.
 **GPU sharing.** The lock is for jobs that need the box to themselves: a full model load (server boot, KLD, live test)
 and a quiet-box bench or timing whose absolute number is recorded. Conversions, pilots, builds and tests run in
 parallel without it, as long as the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
-- Acquire the lock immediately before EACH run and release right after: `scripts/gpu-lock.sh acquire|release <owner>`;
-  waiters are served FIFO by ticket, `status` shows holder + queue (`${GPU_LOCK_DIR:-/tmp/sushi-gpu.lock.d}`).
+- Take the lock right before EACH run: `scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd>` (releases on any
+  exit; `acquire|release` if it cannot wrap). Declare `--max-min` over ~15 min; model-free tests
+  never take it. FIFO by ticket; `status`: holder, age, queue (`$GPU_LOCK_DIR`).
 - Never hold it across a batch or queue, or while analysing, editing, building or waiting. An A B B A re-acquires per
   arm. Every brief that runs on the GPU names the lock.
-- A holder that looks dead (its run gone, lock still held): a worker never breaks it; it tells the coordinator, who
-  verifies the run is gone, clears it with `gpu-lock.sh break <holder>`, and the queue proceeds.
+- A dead `run` holder frees itself. A plain-`acquire`, OVERDUE or idle one: workers report it; the coordinator
+  verifies, stops it, runs `gpu-lock.sh break <holder>`.
 
 **Baselines.**
 - Never rerun an old-binary/old-code baseline that is already recorded: run only the new arm and compare it with the
@@ -270,7 +274,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Reports partial work to the owner every :00 and :30 while work runs.
 - Relays owner decisions and rule changes to ALL live workers at once.
 - Keeps docs/ fresh: every landing updates the matching doc (knowledge, numbers, lessons learned) in the same
-  landing, and this index when a doc appears. CLAUDE.md stays rules + index, never the knowledge store.
+  landing, and this index when a doc appears.
 
 **Workers.**
 - Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.

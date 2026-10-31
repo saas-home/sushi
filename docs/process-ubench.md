@@ -34,8 +34,10 @@ runs); 3 the box refused the run.
 ## The quiet box, taken by the binary
 
 1. Refuse a binary older than HEAD or built from a dirty tree (untracked files do not count).
-2. Refuse below `taskpolicy -a` priority, or while a `sushi` server or another GPU tool runs.
-3. Take the GPU lock as `ubench:<bench>`, then touch `~/.sushi/runs/QUIET` and wait until no `zig`, `clang` or `ld` runs.
+2. Refuse below `taskpolicy -a` priority.
+3. Take the GPU lock as `ubench:<bench>` (queueing behind a locked server rather than refusing), then wait up to 60 s for
+   a `sushi` server or another GPU tool to exit; one still live runs outside the lock and refuses the run. Then touch
+   `~/.sushi/runs/QUIET` and wait until no `zig`, `clang` or `ld` runs.
 4. Refuse on battery.
 5. Fans to max (renewed every 5 min), idle until the hottest die sensor is under 50 °C (at most 180 s), run, fans back
    to auto, release the lock, remove QUIET.
@@ -76,7 +78,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `shared.exl3_prefill_gemm` | shared | the sorted prefill GEMM of one projection at Flash-Next and MiMo shapes: served body against the reference body, a rate against n32 and n64, by slot count |
 | `shared.exl3_trunk_rows` | shared | DeepSeek-V4.1 trunk linears by width (1 to 256 rows) over distinct banks: the served arm, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor |
 | `glm5.routed_t1` | glm5 | GLM's one-row routed chain (E288, n36 and n40, MCG w14) up to each phase, per layer: lane GEMVs against the one-row cooperative ones |
-| `dsv41.index_decode` | dsv41 | a decode block's indexer stages over packed keys (scores, mask applied, top-512, candidate-source blocks, scores + top-k), by keys and rows |
+| `dsv41.index_decode` | dsv41 | a decode block's indexer stages over packed keys (scores on the scalar and the integer matrix kernel, the candidate-block gather on both, mask applied, top-512, candidate-source blocks, scores + top-k), by keys and rows; the setup refuses a matrix arm that differs by a bit |
 | `dsv41.index_peak` | dsv41 | one wide span's indexer, whole scores against the streamed top-k, by context; MLX peak beyond the inputs in MB, reported as the lowest and the highest over the rounds (when freed buffers are released varies from run to run, so the floor and the worst case differ; a bill covers the worst) |
 | `dsv41.index_block_peak` | dsv41 | a 16-row decode block's indexer with and without the candidate mask, by context; peak MB (min and max) |
 | `dsv41.rows_growth` | dsv41 | a full row store growing by one chunk: time, held MB and the peak beyond them (min and max) |
@@ -85,6 +87,8 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `dsv41.attn_epilogue` | dsv41 | one prefill span's heads as `wo_a` takes them (64 heads x 512, 8 groups, QAT on): the fused kernel then rotation, fp8 round trip and transpose as ops, against the kernel's store doing all three; peak MB (min and max) |
 | `dsv41.hc_expand` | dsv41 | the hyper-connection expand of a wide chunk (hc 4 x 5120, bf16): the op chain against the fused kernel, alone (the layer tail) and with the FFN stage's mix and norm kernels, at 512 and 2048 rows |
 | `dsv41.hc_expand_decode` | dsv41 | the hyper-connection expand of one decode row (hc 4 x 5120, bf16), 40 chained calls: a thread a column against a thread an output element |
+| `dsv41.launch_fusions` | dsv41 | decode kernel pairs that became one launch, as 40 dependent layers: the router and the FFN hc split, the query rotation and the window row, and the chain's link alone; bytes checked equal, at 1 and 4 rows |
+| `dsv41.reduce_expand` | dsv41 | the plan's layer 2 chain with the shared expert: the reduce, the bf16 cast and the hc expand kernel as three launches against the reduce writing the stream, and the reduce alone, at 1 to 8 rows |
 | `dsv41.hc_stages` | dsv41 | the wide chunk's hyper-connection dispatches one by one (hc 4 x 5120, bf16): mix, norm, split, expand, the attention stage and the FFN stage against a copy of the stream; arms are the mix kernel's row x mix tile (4 x 6, 2 x 12), bytes checked equal, at 512 and 2048 rows |
 | `dsv41.picks_glue` | dsv41 | a decode layer's picks glue (512 picks of 512-wide FP4 rows, some -1) as 40 dependent layers: the op chain against the one kernel, and the link between layers alone, by store rows and query rows |
 | `dsv41.topk` | dsv41 | the decode top-k over index scores, one threadgroup a row against the served split, per row of work in one eval of one or eight |
@@ -95,6 +99,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `glm5.mla_decode_attn` | glm5 | one decode row's MLA attention as a 16-layer dependent chain, cumulative stages, by context |
 | `glm5.mla_chunk_attn` | glm5 | whole sparse attention of a short chunk on a kv8 state: scalar, packed FP32 composite, packed NAX, served |
 | `glm5.mla_chunk_stages` | glm5 | a 2048-row chunk's index scores, top-512 selection and whole attention, by context |
+| `shared.kernel_launch` | shared | the host side of one custom-kernel launch on tiny f16 inputs with a 1k or a 32k header, us a launch over 64 launches: the apply alone, and the apply plus its share of one eval of the batch |
 | `shared.exl3_rate_groups` | shared | one Flash-Next MoE layer as uniform n32, the masked `moeGroups` and the one-dispatch grouped chain: seven rate layouts at decode rows 1 and 4 and three at prefill chunks 512 and 2048, SPEC1 and PAIR1 |
 | `shared.exl3_rate_groups_rows` | shared | a DeepSeek-V4.1 layer (384 experts, four PAIR1 groups) through the grouped prefill chain with every expert routed 1 to 48 rows, as ms per layer, us per expert and TFLOP/s |
 | `shared.shared_expert_fold` | shared | one MoE layer with the shared expert separate, folded into the routed launches, and absent, over 8 distinct banks: Flash-Next (one bank, rate groups), GLM (one bank), DeepSeek-V4.1 (layer 2's four PAIR1 groups, with the fused chain's launch count), at 1 to 8 rows |

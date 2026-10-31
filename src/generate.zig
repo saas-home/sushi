@@ -909,6 +909,7 @@ pub const Generator = struct {
     /// scans only this suffix; a later loop in the answer is still handled by
     /// the ordinary repetition-stop policy.
     loop_guard_start: usize = 0,
+    loop_guard: degenerate.TailGuard = .{},
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
     stall: degenerate.StallClock = .{},
@@ -1011,7 +1012,13 @@ pub const Generator = struct {
     /// One verify mask per row (`row_grammar.plan`), reused across rounds.
     dspark_masks: std.ArrayList(bool) = .empty,
     dspark_serial_logged: bool = false,
-    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_dspark.dsv41_max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0 } = .{},
+    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dsv41_dspark.dsv41_max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0, copy_rounds: u64 = 0, copy_drafted: u64 = 0, copy_accepted: u64 = 0 } = .{},
+    /// Whether adaptive rounds may draft from the context (`mtp_lookup.matchBest`) ahead of the stage block; a test turns it off.
+    dspark_copy: bool = true,
+    /// Rows a copy round verifies at most.
+    /// Null: the widest exactly verified block.
+    dspark_copy_rows: ?usize = null,
+    dspark_copy_backoff: mtp_lookup.CopyBackoff = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -1313,6 +1320,7 @@ pub const Generator = struct {
                     rows_w.buffered(),
                 },
             );
+            if (st.copy_rounds > 0) log.info("  [spec-stats] mode=dspark copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ st.copy_rounds, st.copy_drafted, st.copy_accepted });
             if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
             return;
         }
