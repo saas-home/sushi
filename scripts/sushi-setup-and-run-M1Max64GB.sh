@@ -285,6 +285,27 @@ build_and_deploy_from_source() {
     if [ -d "${REPO_DIR}/lib/mlx/lib" ]; then
         cp -f "${REPO_DIR}/lib/mlx/lib/"*.dylib "${BIN_DIR}/lib/" 2>/dev/null || true
         cp -f "${REPO_DIR}/lib/mlx/lib/mlx.metallib" "${BIN_DIR}/lib/" 2>/dev/null || true
+        # The staged dylibs reference each other through @rpath, whose baked search
+        # paths are relative to the BUILD tree; a copied bundle cannot resolve them
+        # (dyld: Library not loaded: @rpath/libmlx.dylib). Rewire every intra-bundle
+        # @rpath reference to @loader_path so BIN_DIR/lib is self-contained, then
+        # re-sign (install_name_tool invalidates the signature; dyld kills unsigned edits).
+        if command -v install_name_tool >/dev/null 2>&1; then
+            for dep in "${BIN_DIR}/lib/"*.dylib; do
+                [ -f "${dep}" ] || continue
+                while IFS= read -r ref; do
+                    base="$(basename "${ref}")"
+                    [ -f "${BIN_DIR}/lib/${base}" ] || continue
+                    install_name_tool -change "${ref}" "@loader_path/${base}" "${dep}" 2>/dev/null || true
+                done < <(otool -L "${dep}" 2>/dev/null | awk 'NR>1 {print $1}' | grep '^@rpath/' || true)
+            done
+        fi
+        if command -v codesign >/dev/null 2>&1; then
+            for dep in "${BIN_DIR}/lib/"*.dylib; do
+                [ -f "${dep}" ] || continue
+                codesign -s - -f "${dep}" 2>/dev/null || true
+            done
+        fi
     fi
     if command -v install_name_tool >/dev/null 2>&1; then
         install_name_tool -change @rpath/libmlxc.dylib @executable_path/lib/libmlxc.dylib "${BIN_DIR}/sushi" 2>/dev/null || true
