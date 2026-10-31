@@ -195,6 +195,15 @@ install_latest_sushi() {
     fi
 }
 
+# Pop our stash entry only when the push actually saved one (git stash silently
+# skips submodule dirt, so an unconditional pop would false-alarm).
+restore_local_stash() {
+    if (cd "${REPO_DIR}" && git stash list | head -1 | grep -q "sushi-local-customizations"); then
+        (cd "${REPO_DIR}" && git stash pop) \
+            || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
+    fi
+}
+
 build_and_deploy_from_source() {
     if [ -z "${REPO_DIR}" ] || [ ! -d "${REPO_DIR}" ]; then
         print_error "Sushi git repository not found. Cannot build from source."
@@ -227,7 +236,9 @@ build_and_deploy_from_source() {
         if [ "${behind_count}" -gt 0 ]; then
             print_info "Merging ${behind_count} new upstream commit(s) into main..."
             local has_local_changes=false
-            if [ -n "$(cd "${REPO_DIR}" && git status --porcelain 2>/dev/null | grep -E '^ M|^M ')" ]; then
+            # build-mlx.sh leaves the submodules patch-dirty on purpose; git stash cannot
+            # stash submodule content, so that dirt must not trigger the stash dance.
+            if [ -n "$(cd "${REPO_DIR}" && git status --porcelain --ignore-submodules=dirty 2>/dev/null | grep -E '^ M|^M ')" ]; then
                 has_local_changes=true
                 print_info "Stashing local customizations..."
                 (cd "${REPO_DIR}" && git stash push -m "sushi-local-customizations")
@@ -235,16 +246,12 @@ build_and_deploy_from_source() {
             if ! (cd "${REPO_DIR}" && git merge origin/main); then
                 print_error "Merge with origin/main hit conflicts; aborting the merge and the build."
                 (cd "${REPO_DIR}" && git merge --abort 2>/dev/null || true)
-                if [ "${has_local_changes}" = "true" ]; then
-                    (cd "${REPO_DIR}" && git stash pop) \
-                        || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
-                fi
+                restore_local_stash
                 return 1
             fi
             if [ "${has_local_changes}" = "true" ]; then
                 print_info "Restoring local customizations..."
-                (cd "${REPO_DIR}" && git stash pop) \
-                    || print_warning "Stash pop failed; recover with: git stash list (message 'sushi-local-customizations')"
+                restore_local_stash
             fi
         else
             print_success "Main branch is already up to date with origin/main."
