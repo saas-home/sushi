@@ -1360,10 +1360,17 @@ start_server() {
         print_info "Process priority: pinned to high-performance cores (taskpolicy -a)"
     fi
 
-    # Start the server in background, preserving startup logs in LOG_FILE
+    # Start the server in background, preserving startup logs in LOG_FILE.
+    # Detach into its own session: nohup alone leaves the job in the terminal's
+    # foreground process group, so a Ctrl-C in the launching shell would SIGINT the
+    # server mid-load. perl+setsid exec's in place, so $! stays the server's PID.
     build_server_args
-    nohup "${launcher[@]}" "${SERVER_ARGS[@]}" >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
-    
+    if command -v perl >/dev/null 2>&1; then
+        nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV or die "exec failed: $!"' \
+            "${launcher[@]}" "${SERVER_ARGS[@]}" >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
+    else
+        nohup "${launcher[@]}" "${SERVER_ARGS[@]}" >> "${LOGS_DIR}/sushi-console.log" 2>&1 &
+    fi
     NEW_PID=$!
     echo "${NEW_PID}" > "${PID_FILE}"
     
