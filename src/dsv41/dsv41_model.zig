@@ -28,6 +28,7 @@ const dim = sc_mod.dim;
 const ci = sc_mod.ci;
 const evalAll = sc_mod.evalAll;
 const Config = cfg_mod.Config;
+const PrefetchGate = @import("prefetch_gate.zig").PrefetchGate;
 const prefetch_cand_max = @import("../expert_stream.zig").Prefetcher.cand_max;
 
 /// Rows one attention span handles: the compressed rows each query gathers are its largest
@@ -731,6 +732,7 @@ pub const Model = struct {
     prefetch_lead_rows: u8 = 0,
     prefetch_n: u8 = 12,
     prefetch_m: u8 = 1,
+    prefetch_gate: PrefetchGate = .{},
     /// Layers a pass may rebuild, plus a third of the layers built so far, before it stops queueing: a cold pool misses
     /// on most layers, and each miss costs the successor's work twice.
     route_spec_rebuilds: u32 = 3,
@@ -3180,7 +3182,7 @@ fn prefetchTarget(m: *const Model, li: usize, rows: usize) ?usize {
         .resident => return null,
         .hook => |hk| hk,
     };
-    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS) return null;
+    if (hk.prefetch == null or rows < 2 or rows > NARROW_ROWS or !m.prefetch_gate.on()) return null;
     const lead: usize = m.prefetch_lead_rows;
     if (lead == 0 or li + lead >= m.cfg.layers) return null;
     if (hk.can_prefetch) |can| if (!can(hk.ctx, li + lead)) return null;
@@ -3899,17 +3901,21 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
     var named: usize = 0;
     defer for (names[0..named], lens[0..named]) |*b, n| source.drop(w, b[0..n]);
     var probe: NameBuf = undefined;
-    const grouped = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.trellis", .{si})) != null;
+    const major = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.trellis_pm", .{si})) != null or
+        w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.trellis_pm", .{si})) != null;
+    const order: exl3.format.TileOrder = if (major) .pair_major else .pack;
+    const leaves = [3][]const u8{ if (major) "trellis_pm" else "trellis", "suh", "svh" };
+    const grouped = w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g0.{s}", .{ si, leaves[0] })) != null;
     var count: usize = 0;
     while (count < banks.len) : (count += 1) {
-        if (grouped and w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g{d}.trellis", .{ si, count })) == null) break;
+        if (grouped and w.get(try key(&probe, "mtp.{d}.mlp.switch_mlp.gate_proj.g{d}.{s}", .{ si, count, leaves[0] })) == null) break;
         if (!grouped and count == 1) break;
         var g: [16]u8 = undefined;
         const tag = if (grouped) try std.fmt.bufPrint(&g, ".g{d}", .{count}) else "";
         inline for (.{ "gate", "up", "down" }) |pn| {
             var parts: [3]A = undefined;
-            inline for (.{ "trellis", "suh", "svh" }, 0..) |part, pi| {
-                const name = try key(&names[named], "mtp.{d}.mlp.switch_mlp." ++ pn ++ "_proj{s}." ++ part, .{ si, tag });
+            for (leaves, 0..) |part, pi| {
+                const name = try key(&names[named], "mtp.{d}.mlp.switch_mlp." ++ pn ++ "_proj{s}.{s}", .{ si, tag, part });
                 lens[named] = name.len;
                 named += 1;
                 parts[pi] = try getW(w, name);
@@ -3926,7 +3932,7 @@ fn loadStqExperts(m: *Model, w: *model_mod.Weights, si: usize) !exl3.Ragged {
         }
     };
     var drop_ctx: drop_group.Ctx = .{ .w = w, .names = names[0 .. count * 9], .lens = lens[0 .. count * 9] };
-    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], .{ .ctx = &drop_ctx, .run = drop_group.run });
+    var rb = try owned_mod.raggedOwned(m.s, banks[0..count], order, .{ .ctx = &drop_ctx, .run = drop_group.run });
     errdefer rb.deinit();
     if (rb.experts != c.dspark.experts or rb.hidden != c.dim or rb.inter != c.moe_inter) {
         log.err("deepseek_v41: DSpark stage {d}'s trellis experts are {d} of {d}x{d}, config says {d} of {d}x{d}\n", .{ si, rb.experts, rb.hidden, rb.inter, c.dspark.experts, c.dim, c.moe_inter });
