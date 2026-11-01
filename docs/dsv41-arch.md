@@ -619,18 +619,20 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   2 workers 55.8 ms, more than 4 nothing). The predictor costs ~0.9 ms a round at R4 (a 7.9 MB f32 gate read a layer). At one
   row it measured 41.0 -> 42.4 tok/s on a cold cache but lost on a warmed one (46.6/49.8 -> 46.0/46.1 on main `d810c50c`), so
   a one-row forward is left alone.
-  Gated by misses (`prefetch_gate.zig`): the prefetch adds reads, so where the SSD is the bottleneck it loses. After each
-  forward of 1 to 16 rows an EMA (window 8) of distinct missed experts per row (`union_members - hits`) decides; at 8 or more
-  the prefetch is off (no prediction GEMV, no reads) and it returns when the EMA falls below 8. Adaptive DSpark, greedy md5
-  equal in every arm, P2 = rename in a 4129-token file, 800 tokens (diag branch `diag/dsv41-prefetch`, scratch): at
-  `--ssd-budget-gb 60` the ungated prefetch lost 8.5% on P2 (off 30.91 / 30.90 vs on 28.32 / 28.53 / 28.49 / 28.46 tok/s;
-  89 misses x 9.3 MB per 134 ms round is SSD-bound, the prefetch adds ~66 reads a pass of which 78% go unused, and its fills
-  evict experts that then miss); at 108 it ties on P2 (off 81.7 / 80.1, on 80.4 / 82.65) and gains 2.6% on P1 (41.6 / 41.9
-  vs 40.6 / 40.5), halving multi-row misses 4.5 to 2.1 a pass. Misses a row with the prefetch off: at 108 at most 2.2 (5.0 for
-  the 7 passes after a 4k prefill), at 60 at least 12.6 at one row and 18-29 multi-row. The "forced R4" numbers above (59.0 to
-  53.2 ms) are forced 4-row verifies, not the adaptive path, which mixes in 1-row rounds where the prefetch never runs. Lost, kept out: one-row prefetch (-4 to -12% at 60,
-  the host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper predictor
-  are worth under 0.5%. The `[dsv41] expert prefetch on|off (misses/row ema X)` line marks a gate change.
+  On by the SSD budget, once, at load (`dsv41_serving.prefetchOn`): from `--ssd-budget-gb 108` up the prefetch runs; below it
+  nothing is created (no hook, no workers, no buffers) and the load logs `[dsv41] expert prefetch on|off (ssd budget N GB, on
+  from 108)`. The prefetch adds reads, so where the SSD is the bottleneck it loses. Measured on scratch `5ea5784c` (main
+  `0d1aba98`; adaptive DSpark, legacy STQ-1.75bpw pack, greedy md5 equal in every arm, ReleaseFast, `taskpolicy -a`, GPU lock
+  a boot, die 49-50 C), prefetch forced off vs on: P2 (rename in a 4129-token file, 800 tokens) -8.5% at 60, -13.7% at 75, -6.7%
+  at 90; P1 (free prose) ties at 75 and 90. At 108, on off off on in one session: P2 102.9 vs 99.1 tok/s (+3.8%, misses
+  0.97 vs 1.29 a token); P1 47.48 vs 46.90 at a matched low-row DSpark mix and 41.74 vs 37.68 / 33.49 at a high-row one.
+  At 60 the round is SSD-bound (89 misses x 9.3 MB per 134 ms round); at 75-90 only ~40% of the prefetched experts are
+  used, its fills evict about as many demand experts as it catches, and its reads cut the demand fill rate ~20%; at 108
+  the cache is roomy enough that those evictions cost a third of what it catches. A miss-rate gate (EMA of missed experts a row, off at 8 or more) shipped first and was
+  removed: the budget decides. The "forced R4" numbers above (59.0 to 53.2 ms) are forced 4-row verifies, not the adaptive
+  path, which mixes in 1-row rounds where the prefetch never runs. Lost, kept out: one-row prefetch (-4 to -12% at 60, the
+  host waits), LOWAGE (reads doubled), CANCEL (never fires), d=2, a wider set; skipping when warm and a cheaper predictor are
+  worth under 0.5%.
 
 Differences from mlx-serve: the attention-output fp8 round trip stays (upstream drops it), the verify block takes the same
 masked argmax as serial decode, and a verify is not split from the draft with a host sync per Markov step (the chain is
@@ -674,7 +676,18 @@ pick sat in the slot the GPU read, else the exact sum. A miss rebuilds the layer
 stream, `Unresolved`), restores what the successor's pass changed (`Undo`: the open pooling group, the verify copies, the
 compressed/index row counts and, over several rows, the window ring, because a later row's write can land on a slot an
 earlier row still reads; a one-row pass's ring slot and appended rows are written again at the same places) and runs the
-successor again. The settle keeps its pick and slot buffers between layers (`StqStream.picks`, `slots`), and the layers of a pass share
+successor again. Where only some picks left their slot, the settle recomputes only those (`model.stqRoutedRedo`): `queue`
+keeps the chain's per-pick down planes and the shared expert's (`rate_groups.Kept`, `Unresolved.kept`, references, no
+copy), each bad pick runs alone as a row of a smaller chain (prepare, pair, mid, down at its resolved slot), and the
+reduce reads each slot's plane from the kept ones or the new ones and sums in the same order, so the bytes are the whole
+recompute's: a plane depends on its expert and its row's input only. A settle with every pick off, or over the union
+workspace (a group spilled its pool), recomputes everything. `model.spec_redone`, `spec_redo_picks` and `spec_rebuilt_picks`
+count them, and the 4096th-settle log line reports the picks recomputed. Live (the served adaptive DSpark, 400 tokens of the lighthouse prompt, `--ssd-budget-gb` 108 / 60, prefetch at its default): 723 / 3539
+rebuilt layers recompute 1634 of 22872 / 6057 of 39006 picks (7% / 16% of the work a whole recompute did); the text md5 equals
+the whole recompute's. Decode tok/s, base `c1f23a44` vs `c8543034`, one boot an arm, GPU lock, fans max, die under 50 C at
+boot, `taskpolicy -a`, fresh prefix cache: branch vs main 42.3 vs 41.7 at 108 and 25.8 vs 25.9 at 60 (a hot-box 108 pair, 69 and 75 C at boot, read 36.4 vs 40.1 and is not used), so inside the run-to-run noise (process CPU seconds were not measured; the launch count is unchanged at five): the
+settle's expert work is a small part of a rebuild, whose cost is the successor layer run again. The settle itself drops from 150 to 40 us at one pick and one row
+([engine-exl3-experts](engine-exl3-experts.md#dsv41-shared-fused)). The settle keeps its pick and slot buffers between layers (`StqStream.picks`, `slots`), and the layers of a pass share
 the position and group-count arrays they have in common (`Shared.index`, one build per distinct key). Only the settle touches the cache, so a discarded route moves no LRU or stat. The picks of a layer
 are verified against the pool before any later layer's, so a DSpark target, a verify round's rows and the state arrays
 of a kept layer never come from a wrong sum. An Engram layer is rebuilt from the rows its pass read once
