@@ -66,8 +66,8 @@ PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-${REPEAT_PENALTY:-1.0}}"
 REPEAT_PENALTY="${REPETITION_PENALTY}"
 FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-0.0}"
-# 228k tokens is the safe single-request ceiling for 64 GB Mac with Qwen resident; override with 262144 if needed
-CTX_SIZE="${CTX_SIZE:-228000}"
+# 245k tokens is the safe single-request ceiling for 64 GB Mac with Qwen resident; override with 262144 if needed
+CTX_SIZE="${CTX_SIZE:-245760}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 REASONING_EFFORT="${REASONING_EFFORT:-medium}"
 WIRED_MARGIN_GIB="${WIRED_MARGIN_GIB:-2}"
